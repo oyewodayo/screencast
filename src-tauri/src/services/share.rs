@@ -134,6 +134,51 @@ pub fn copy_file_to_clipboard(path: String) -> Result<(), String> {
     }
 }
 
+// Plain text on the clipboard - "Beam" between a paired phone and this computer
+// (phone_transfer.rs). None when the clipboard holds no text.
+pub(crate) fn clipboard_text() -> Option<String> {
+    let _serial = serial();
+    #[cfg(windows)]
+    {
+        win::clipboard_text()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+pub(crate) fn set_clipboard_text(text: &str) -> Result<(), String> {
+    let _serial = serial();
+    #[cfg(windows)]
+    {
+        win::set_clipboard_text(text)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        Err("The clipboard is only available on Windows".to_string())
+    }
+}
+
+// A web page a paired phone sent with "Open on computer". Web pages only - never file:, a custom
+// scheme or anything else a link could smuggle in.
+pub(crate) fn open_web_link(url: &str) -> Result<(), String> {
+    let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return Err("Only web links can be opened on the computer".to_string());
+    }
+    let _serial = serial();
+    #[cfg(windows)]
+    {
+        win::shell_open(url)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Opening links is only available on Windows".to_string())
+    }
+}
+
 // Files copied in Explorer (the clipboard's CF_HDROP list) - what the video editor's Ctrl+V adds.
 #[command(async)]
 pub fn clipboard_file_paths() -> Vec<String> {
@@ -327,6 +372,75 @@ mod win {
             let _ = CloseClipboard();
         }
         out
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+    // Longer than any script or link anyone beams; keeps a runaway clipboard from flooding a phone.
+    const MAX_TEXT: usize = 200_000;
+
+    // Another app can hold the clipboard for a moment (clipboard managers, Office) - a few short
+    // retries rather than failing the first time.
+    unsafe fn open_clipboard() -> Result<(), String> {
+        let mut last = String::new();
+        for _ in 0..5 {
+            match OpenClipboard(HWND(0)) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e.to_string(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Err(format!("Clipboard busy: {last}"))
+    }
+
+    pub fn clipboard_text() -> Option<String> {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
+        unsafe {
+            if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() || open_clipboard().is_err() {
+                return None;
+            }
+            let mut out = None;
+            if let Ok(handle) = GetClipboardData(CF_UNICODETEXT) {
+                let mem = HGLOBAL(handle.0 as _);
+                let ptr = GlobalLock(mem) as *const u16;
+                if !ptr.is_null() {
+                    let mut len = 0;
+                    while len < MAX_TEXT && *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len)));
+                    let _ = GlobalUnlock(mem);
+                }
+            }
+            let _ = CloseClipboard();
+            out.filter(|t| !t.is_empty())
+        }
+    }
+
+    pub fn set_clipboard_text(text: &str) -> Result<(), String> {
+        let wide: Vec<u16> = text.encode_utf16().take(MAX_TEXT).chain([0]).collect();
+        unsafe {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(|e| e.to_string())?;
+            let ptr = GlobalLock(mem) as *mut u16;
+            if ptr.is_null() {
+                let _ = GlobalFree(mem);
+                return Err("Couldn't copy the text".to_string());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            let _ = GlobalUnlock(mem);
+            if let Err(e) = open_clipboard() {
+                let _ = GlobalFree(mem);
+                return Err(e);
+            }
+            let _ = EmptyClipboard();
+            // On success the clipboard owns the memory.
+            let set = SetClipboardData(CF_UNICODETEXT, HANDLE(mem.0 as isize));
+            if set.is_err() {
+                let _ = GlobalFree(mem);
+            }
+            let _ = CloseClipboard();
+            set.map(|_| ()).map_err(|e| format!("Couldn't copy the text: {}", e))
+        }
     }
 
     pub fn copy_file(path: &Path) -> Result<(), String> {

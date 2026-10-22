@@ -84,6 +84,10 @@ pub struct AppState {
     // audio that isn't assembled (which enhances as it assembles): camera and audio-only modes, and
     // every mode outside Windows. See services/audio_enhance.rs.
     post_enhance: Arc<Mutex<bool>>,
+    // A recording where a phone is the only camera ("Camera + Mic" / "Camera only" with just the
+    // phone): ffmpeg captures only this computer's mic, and stop_recording joins that sound to the
+    // phone's `_webcam.mp4` into one video. Some(keep_audio) while such a recording runs.
+    phone_only_camera: Arc<Mutex<Option<bool>>>,
     // The parts of a screen recording in progress (Windows) - the picture-only intermediate, its
     // frame timing, and the mic/system audio captured beside it - which stop_recording assembles
     // into the final file. See recording/assembly.rs.
@@ -1846,16 +1850,26 @@ pub async fn start_recording(
     // The single case that genuinely cannot work is a camera-only recording where the phone is the
     // ONLY camera selected: stripping the sentinel leaves ffmpeg with no video input at all, so
     // the main recording would have no picture. Everything else is now allowed.
+    // The phone as the only camera: ffmpeg has no picture of its own to record, so it records this
+    // computer's mic by itself, and stop_recording puts the phone's video and that sound together
+    // (join_phone_only_recording). "Camera only" records the mic too - it's the clock the phone's
+    // video is lined up against - and drops it at the join.
+    *state.phone_only_camera.lock().await = None;
     if uses_phone_camera
         && matches!(form_data.record_type.as_str(), "v" | "va")
         && form_data.video_devices.is_empty()
     {
-        return Err(
-            "The phone can't be the only camera for this recording type yet. Also tick a camera \
-             attached to this computer, or pick a \"Screen…\" recording option - either way the \
-             phone is recorded as its own layer you can position in the editor."
-                .to_string(),
-        );
+        if form_data.audio_device.trim().is_empty() {
+            return Err(
+                "To record with the phone as the camera, pick a microphone on this computer too - \
+                 its sound is what the phone's video is lined up with."
+                    .to_string(),
+            );
+        }
+        let keep_audio = form_data.record_type == "va";
+        form_data.record_type = "a".to_string();
+        form_data.file_ext = "wav".to_string();
+        *state.phone_only_camera.lock().await = Some(keep_audio);
     }
 
     // The phone claims the `<stem>_webcam.mp4` sidecar slot (save_phone_camera_capture writes
@@ -2750,6 +2764,11 @@ pub async fn stop_recording(
         }
     }
 
+    let output_path = match state.phone_only_camera.lock().await.take() {
+        Some(keep_audio) => join_phone_only_recording(&app_handle, &output_path, keep_audio).await?,
+        None => output_path,
+    };
+
     let output_str = path_to_str(&output_path)?.to_string();
 
     if let Err(e) = app_handle.emit("refresh-file-list", ()) {
@@ -2767,11 +2786,70 @@ pub async fn stop_recording(
         Ok(_) => ("done", None),
         Err(e) => ("failed", Some(e.as_str())),
     };
+    let modal_path = finished.as_ref().map(|p| p.clone()).unwrap_or(modal_path);
     if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
         warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
 
     finished
+}
+
+// The phone was the only camera (see start_recording): its picture - `<stem>_webcam.mp4`, saved by
+// the WebView before stop_recording ran, already lined up with the recording's start - and this
+// computer's mic recording become one `<stem>.mp4`, and both parts go. Camera only keeps no sound.
+// If the phone's video never arrived, the sound is still the recording rather than nothing.
+async fn join_phone_only_recording(app_handle: &AppHandle, audio_path: &Path, keep_audio: bool) -> Result<PathBuf, String> {
+    let stem = audio_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording").to_string();
+    let video_path = audio_path.with_file_name(format!("{stem}_webcam.mp4"));
+    if !video_path.exists() {
+        warn!("The phone camera's video never arrived - keeping {:?} as the recording", audio_path);
+        return Ok(audio_path.to_path_buf());
+    }
+    let mut out = audio_path.with_extension("mp4");
+    let mut n = 2;
+    while out.exists() {
+        out = audio_path.with_file_name(format!("{stem} ({n}).mp4"));
+        n += 1;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), path_to_str(&video_path)?.to_string()];
+    if keep_audio {
+        args.extend(["-i".into(), path_to_str(audio_path)?.to_string(), "-map".into(), "0:v:0".into(), "-map".into(), "1:a:0".into()]);
+        // AAC rather than the WAV's raw PCM, which mp4 can't hold; the picture is copied untouched
+        // (it was encoded once already, by save_phone_camera_capture).
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-shortest".into()]);
+    } else {
+        args.extend(["-map".into(), "0:v:0".into(), "-an".into()]);
+    }
+    args.extend(["-c:v".into(), "copy".into(), "-movflags".into(), "+faststart".into(), path_to_str(&out)?.to_string()]);
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    hide_console_window(&mut cmd);
+    let output = tauri::async_runtime::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| format!("Couldn't put the phone's video and the sound together: {e}"))?
+        .map_err(|e| format!("Couldn't put the phone's video and the sound together: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&out);
+        log::error!("Joining the phone camera recording failed: {}", stderr);
+        // Both parts are kept - the footage can't be re-shot.
+        return Err(format!(
+            "Couldn't put the phone's video and the sound together ({}). Both were kept: {} and {}.",
+            stderr.lines().last().unwrap_or("unknown ffmpeg error"),
+            video_path.display(),
+            audio_path.display()
+        ));
+    }
+    let _ = fs::remove_file(&video_path);
+    let _ = fs::remove_file(audio_path);
+    info!("Joined the phone camera recording into {:?}", out);
+    Ok(out)
 }
 
 // Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each

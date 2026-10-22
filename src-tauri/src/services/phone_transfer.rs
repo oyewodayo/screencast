@@ -65,6 +65,8 @@ const PHONE_PAGE: &str = include_str!("phone_transfer_page.html");
 // only run the service worker) over HTTPS; over HTTP it's an ordinary home-screen shortcut.
 const MANIFEST: &str = include_str!("phone_transfer_manifest.json");
 const SERVICE_WORKER: &str = include_str!("phone_transfer_sw.js");
+// The Remote, Voice-over, Prompter and Beam tabs - kept apart from the page for its size.
+const STUDIO: &str = include_str!("phone_transfer_studio.js");
 const ICON_192: &[u8] = include_bytes!("phone_transfer_icons/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("phone_transfer_icons/icon-512.png");
 const ICON_MASKABLE: &[u8] = include_bytes!("phone_transfer_icons/maskable-512.png");
@@ -95,6 +97,10 @@ const CLOSE_SENTINEL: &str = "\u{0}close";
 // Where files sent from a phone land, inside the Briefcast folder - so the file watcher puts them
 // straight into the sidebar like any other library file.
 pub(crate) const INBOX_FOLDER: &str = "From phone";
+
+// How long a handoff code stays good for (see Hub::handoffs) - long enough to get round to adding
+// the app to the home screen, and it works only once.
+const HANDOFF_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 // How long a QR code's pairing key works, and how long a new phone waits for someone to approve it.
 const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
@@ -279,6 +285,14 @@ struct Hub {
     tls_attempt: Mutex<Option<Instant>>,
     // The video open in the editor, if any - phones offer "Add to timeline" while there is one.
     timeline: Mutex<Option<String>>,
+    // The latest of each state the desktop broadcasts (Remote, Voice-over), by kind - replayed to
+    // a phone the moment it connects, so it never shows stale controls.
+    broadcasts: Mutex<HashMap<String, String>>,
+    // iPhone/iPad: a home-screen app gets its own storage, apart from Safari's, so it would open
+    // unpaired. A paired page asks for a one-time code that "Add to Home Screen" carries into the
+    // app's start address; the app trades it for the phone's pairing on first launch. Code ->
+    // (device id, when issued).
+    handoffs: Mutex<HashMap<String, (String, Instant)>>,
     seq: AtomicU64,
 }
 
@@ -660,12 +674,51 @@ fn static_file(content_type: &'static str, body: &'static [u8]) -> Response {
     ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
-async fn manifest() -> Response {
-    static_file("application/manifest+json", MANIFEST.as_bytes())
+#[derive(Deserialize)]
+struct HandoffQuery {
+    #[serde(default)]
+    h: String,
+}
+
+// A handoff code is only ever hex (token()), which keeps it safe to splice into the JSON.
+fn handoff_code(h: &str) -> Option<&str> {
+    (h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(h)
+}
+
+async fn manifest(Query(q): Query<HandoffQuery>) -> Response {
+    match handoff_code(&q.h) {
+        // Same app (same "id"), started at an address carrying the code.
+        Some(code) => {
+            let body = MANIFEST.replacen("\"start_url\": \"/\"", &format!("\"start_url\": \"/?h={code}\""), 1);
+            ([(header::CONTENT_TYPE, "application/manifest+json"), (header::CACHE_CONTROL, "no-store")], body).into_response()
+        }
+        None => static_file("application/manifest+json", MANIFEST.as_bytes()),
+    }
+}
+
+// The home-screen app's first launch: the code becomes the phone's pairing - once.
+async fn redeem_handoff(Query(q): Query<HandoffQuery>, State(ctx): State<Ctx>) -> Response {
+    let Some(code) = handoff_code(&q.h) else { return StatusCode::NOT_FOUND.into_response() };
+    let entry = ctx.hub.handoffs.lock().unwrap().remove(code);
+    let device = entry
+        .filter(|(_, issued)| issued.elapsed() < HANDOFF_TTL)
+        .and_then(|(id, _)| ctx.hub.devices.lock().unwrap().iter().find(|d| d.id == id).cloned());
+    match device {
+        Some(d) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::Json(json!({ "d": d.id, "t": d.token, "n": d.name })),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn service_worker() -> Response {
     static_file("text/javascript; charset=utf-8", SERVICE_WORKER.as_bytes())
+}
+
+async fn studio() -> Response {
+    static_file("text/javascript; charset=utf-8", STUDIO.as_bytes())
 }
 
 async fn icon(Path(name): Path<String>) -> Response {
@@ -1013,6 +1066,10 @@ async fn handle_socket(socket: WebSocket, ctx: Ctx, auth: Auth, ua: String, name
         let _ = old.tx.send(CLOSE_SENTINEL.to_string());
     }
 
+    for msg in ctx.hub.broadcasts.lock().unwrap().values() {
+        let _ = tx.send(msg.clone());
+    }
+
     for (offer_id, fresh) in pending {
         if fresh {
             let status = ctx.hub.offers.lock().unwrap().get(&offer_id).map(|o| o.status(&offer_id));
@@ -1032,6 +1089,10 @@ async fn handle_socket(socket: WebSocket, ctx: Ctx, auth: Auth, ua: String, name
     }) {
         let _ = ctx.app.emit("phone-transfer-connected", public);
     }
+
+    // Set while this phone is the camera (the Remote tab's "This phone") - the sender the camera
+    // relay writes the desktop's half of the WebRTC signalling to (phone_camera.rs).
+    let mut camera: Option<mpsc::UnboundedSender<String>> = None;
 
     loop {
         let msg = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
@@ -1060,10 +1121,99 @@ async fn handle_socket(socket: WebSocket, ctx: Ctx, auth: Auth, ua: String, name
                 let _ = tx.send(json!({ "type": "renamed", "name": name }).to_string());
                 emit_devices(&ctx);
             }
+            // Remote, Voice-over and Prompter buttons - the desktop UI acts on them (Dashboard).
+            Some("remote") => {
+                let _ = ctx.app.emit(
+                    "phone-remote",
+                    json!({
+                        "device_id": device.id,
+                        "device_name": ctx.hub.device_name(&device.id),
+                        "action": value.get("action"),
+                        "value": value.get("value"),
+                    }),
+                );
+            }
+            // Beam: the phone's text onto this computer's clipboard - and a web link, if asked,
+            // opened in its browser. Handled here rather than by the UI, so it works mid-recording.
+            Some("clip.push") => {
+                let text: String = value.get("text").and_then(|t| t.as_str()).unwrap_or("").chars().take(200_000).collect();
+                let open = value.get("open").and_then(|o| o.as_bool()).unwrap_or(false);
+                let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let (copied, opened) = {
+                    let text = text.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let copied = super::share::set_clipboard_text(&text);
+                        let opened = open.then(|| super::share::open_web_link(text.trim()));
+                        (copied, opened)
+                    })
+                    .await
+                    .unwrap_or((Err("Couldn't reach the clipboard".into()), None))
+                };
+                let error = copied.as_ref().err().cloned().or_else(|| opened.as_ref().and_then(|o| o.as_ref().err().cloned()));
+                let _ = tx.send(
+                    json!({ "type": "clip.pushed", "id": id, "ok": error.is_none(), "opened": matches!(opened, Some(Ok(()))), "error": error })
+                        .to_string(),
+                );
+                if copied.is_ok() {
+                    let _ = ctx.app.emit(
+                        "phone-clip",
+                        json!({ "device_name": ctx.hub.device_name(&device.id), "text": text, "opened": matches!(opened, Some(Ok(()))) }),
+                    );
+                }
+            }
+            // This phone as the camera: WebRTC signalling relayed opaquely, as phone_camera.rs
+            // does for its own page; the video then flows phone -> desktop WebView directly.
+            Some("cam.hello") => {
+                if let Some(old) = camera.take() {
+                    super::phone_camera::detach_external_phone(&ctx.app, &old).await;
+                }
+                let (cam_tx, mut cam_rx) = mpsc::unbounded_channel::<String>();
+                let session = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(signal) = cam_rx.recv().await {
+                        if session.send(json!({ "type": "cam.signal", "data": signal }).to_string()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                super::phone_camera::attach_external_phone(&ctx.app, cam_tx.clone()).await;
+                camera = Some(cam_tx);
+            }
+            Some("cam.signal") => {
+                if camera.is_some() {
+                    if let Some(signal) = value.get("data").and_then(|d| d.as_str()) {
+                        super::phone_camera::relay_from_external_phone(&ctx.app, signal.to_string());
+                    }
+                }
+            }
+            Some("cam.bye") => {
+                if let Some(old) = camera.take() {
+                    super::phone_camera::relay_from_external_phone(&ctx.app, json!({ "type": "bye" }).to_string());
+                    super::phone_camera::detach_external_phone(&ctx.app, &old).await;
+                }
+            }
+            Some("handoff.create") => {
+                let code = token();
+                {
+                    let mut handoffs = ctx.hub.handoffs.lock().unwrap();
+                    handoffs.retain(|_, (_, issued)| issued.elapsed() < HANDOFF_TTL);
+                    // One live code per phone - asking again replaces it.
+                    handoffs.retain(|_, (id, _)| *id != device.id);
+                    handoffs.insert(code.clone(), (device.id.clone(), Instant::now()));
+                }
+                let _ = tx.send(json!({ "type": "handoff", "code": code }).to_string());
+            }
+            Some("clip.pull") => {
+                let text = tauri::async_runtime::spawn_blocking(super::share::clipboard_text).await.ok().flatten();
+                let _ = tx.send(json!({ "type": "clip.pulled", "id": value.get("id"), "text": text }).to_string());
+            }
             _ => {}
         }
     }
 
+    if let Some(old) = camera.take() {
+        super::phone_camera::detach_external_phone(&ctx.app, &old).await;
+    }
     writer.abort();
     let still_mine = {
         let mut sessions = ctx.hub.sessions.lock().unwrap();
@@ -1257,9 +1407,12 @@ pub struct IncomingStatus {
     pub state: &'static str,
     pub path: Option<String>,
     pub error: Option<String>,
-    // "timeline" | "library"
+    // "timeline" | "voiceover" | "library"
     pub target: &'static str,
     pub batch: Option<String>,
+    pub at: Option<f64>,
+    pub duration: Option<f64>,
+    pub replaces: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1278,6 +1431,14 @@ struct UploadQuery {
     // Files picked or shared together, so the desktop keeps them together and in order.
     #[serde(default)]
     batch: String,
+    // A voice-over take: where on the timeline it starts and how long it runs (the phone timed
+    // it - recorded audio often carries no reliable length of its own), and the take it replaces.
+    #[serde(default)]
+    at: Option<f64>,
+    #[serde(default)]
+    dur: Option<f64>,
+    #[serde(default)]
+    replaces: String,
 }
 
 // A phone's idea of a file name, made safe to create on Windows: no directories, no characters
@@ -1370,8 +1531,15 @@ async fn receive_upload(
         state: "receiving",
         path: None,
         error: None,
-        target: if q.to == "timeline" { "timeline" } else { "library" },
+        target: match q.to.as_str() {
+            "timeline" => "timeline",
+            "voiceover" => "voiceover",
+            _ => "library",
+        },
         batch: Some(q.batch.chars().take(40).collect::<String>()).filter(|b| !b.is_empty()),
+        at: q.at.filter(|t| t.is_finite() && *t >= 0.0),
+        duration: q.dur.filter(|d| d.is_finite() && *d > 0.0),
+        replaces: Some(q.replaces.chars().take(40).collect::<String>()).filter(|r| !r.is_empty()),
     };
 
     let dir = match tauri::async_runtime::spawn_blocking(super::utility::briefcast_dir).await {
@@ -1495,8 +1663,10 @@ async fn ensure_server(app: &AppHandle, state: &PhoneTransferState) -> Result<Ph
         .route("/hello", get(hello))
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
+        .route("/studio.js", get(studio))
         .route("/icons/:name", get(icon))
         .route("/share", post(share_without_worker))
+        .route("/handoff", get(redeem_handoff))
         .route("/tls", get(tls_target))
         .route("/ws", get(ws_upgrade))
         .route("/f/:id", get(serve_file))
@@ -1630,6 +1800,25 @@ pub async fn phone_transfer_set_timeline(
     Ok(())
 }
 
+// Desktop state every phone mirrors - "remote_state" (recording, playback) and "voiceover" (a take
+// rolling). The latest of each is kept and replayed to phones as they connect.
+#[tauri::command]
+pub async fn phone_transfer_broadcast(
+    state: tauri::State<'_, PhoneTransferState>,
+    kind: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    if !matches!(kind.as_str(), "remote_state" | "voiceover") {
+        return Err(format!("Unknown broadcast {kind}"));
+    }
+    let msg = json!({ "type": kind, "state": payload }).to_string();
+    state.hub.broadcasts.lock().unwrap().insert(kind, msg.clone());
+    for session in state.hub.sessions.lock().unwrap().values() {
+        let _ = session.tx.send(msg.clone());
+    }
+    Ok(())
+}
+
 // Where a file sent with "Add to timeline" ended up, told to the phone that sent it.
 #[tauri::command]
 pub async fn phone_transfer_placed(
@@ -1682,6 +1871,36 @@ pub async fn phone_transfer_history(
 #[tauri::command]
 pub async fn phone_transfer_devices(state: tauri::State<'_, PhoneTransferState>) -> Result<Vec<PhoneDevice>, String> {
     Ok(state.hub.device_list())
+}
+
+// Renames a phone from the computer (the Phones panel) - saved, and the phone's own page shows the
+// new name at once if it's open.
+#[tauri::command]
+pub async fn phone_transfer_rename(
+    app_handle: AppHandle,
+    state: tauri::State<'_, PhoneTransferState>,
+    device_id: String,
+    name: String,
+) -> Result<String, String> {
+    let name = clean_name(&name);
+    if name.is_empty() {
+        return Err("Give the phone a name.".to_string());
+    }
+    let hub = state.hub.clone();
+    let found = match hub.devices.lock().unwrap().iter_mut().find(|d| d.id == device_id) {
+        Some(d) => {
+            d.name = name.clone();
+            true
+        }
+        None => false,
+    };
+    if !found {
+        return Err("That phone is no longer paired with Briefcast.".to_string());
+    }
+    hub.persist().await;
+    hub.send_to(&device_id, json!({ "type": "renamed", "name": name }).to_string());
+    emit_devices(&Ctx { hub, app: app_handle });
+    Ok(name)
 }
 
 // Unpairs a phone: its token stops working, its page is told to forget it, and anything still

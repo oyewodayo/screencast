@@ -82,10 +82,31 @@ export interface IncomingStatus {
     state: "receiving" | "done" | "failed";
     path: string | null;
     error: string | null;
-    // "timeline" when the phone chose "Add to timeline" - see onPhoneTimelineFile.
-    target: "timeline" | "library";
+    // "timeline" when the phone chose "Add to timeline", "voiceover" for a take recorded on the
+    // phone - see onPhoneTimelineFile.
+    target: "timeline" | "voiceover" | "library";
     // Files picked or shared together; they go on the timeline together, in order.
     batch: string | null;
+    // Voice-over takes: timeline time the take starts at, its length (timed on the phone), and the
+    // upload id of the take it replaces (Retake).
+    at: number | null;
+    duration: number | null;
+    replaces: string | null;
+}
+
+// A button pressed in the phone app's Remote, Voice-over or Prompter tab.
+export interface PhoneRemoteCommand {
+    device_id: string;
+    device_name: string;
+    action: string;
+    value?: unknown;
+}
+
+// Text a phone beamed onto this computer's clipboard (opened, when it was a link it asked to open).
+export interface PhoneClip {
+    device_name: string;
+    text: string;
+    opened: boolean;
 }
 
 export interface PhoneTransferStore {
@@ -101,6 +122,8 @@ export interface PhoneTransferStore {
     pairRequests: PairRequest[];
     // Loaded on demand by the dialog's History view; null until then.
     history: HistoryEntry[] | null;
+    // The Phones panel (PhonesHub.tsx) - every paired phone, in one place.
+    hubOpen: boolean;
     error: string;
 }
 
@@ -115,12 +138,15 @@ let state: PhoneTransferStore = {
     incoming: [],
     pairRequests: [],
     history: null,
+    hubOpen: false,
     error: "",
 };
 const listeners = new Set<Listener>();
 const connectListeners = new Set<ConnectListener>();
 const timelineListeners = new Set<(file: IncomingStatus) => void>();
 const arrivalListeners = new Set<(file: IncomingStatus) => void>();
+const remoteListeners = new Set<(command: PhoneRemoteCommand) => void>();
+const clipListeners = new Set<(clip: PhoneClip) => void>();
 const arrived = new Set<string>();
 const handedToTimeline = new Set<string>();
 let listening = false;
@@ -164,7 +190,7 @@ const ensureListening = () => {
             arrived.add(file.id);
             arrivalListeners.forEach((l) => l(file));
         }
-        if (file.state === "done" && file.target === "timeline" && !handedToTimeline.has(file.id)) {
+        if (file.state === "done" && (file.target === "timeline" || file.target === "voiceover") && !handedToTimeline.has(file.id)) {
             handedToTimeline.add(file.id);
             // No editor listening means no video is open - the file is safe in the library either way.
             if (timelineListeners.size) timelineListeners.forEach((l) => l(file));
@@ -172,6 +198,8 @@ const ensureListening = () => {
         }
     });
     void listen<PhoneDevice>("phone-transfer-connected", (e) => connectListeners.forEach((l) => l(e.payload)));
+    void listen<PhoneRemoteCommand>("phone-remote", (e) => remoteListeners.forEach((l) => l(e.payload)));
+    void listen<PhoneClip>("phone-clip", (e) => clipListeners.forEach((l) => l(e.payload)));
     void listen<PairRequest>("phone-transfer-pair-request", (e) =>
         setState({ pairRequests: [...state.pairRequests.filter((r) => r.id !== e.payload.id), e.payload] })
     );
@@ -183,7 +211,7 @@ const ensureListening = () => {
     });
     // A pairing key was spent or encryption became ready: the QR on screen is stale.
     void listen("phone-transfer-info-changed", () => {
-        if (state.request) void startPhoneTransfer().catch(() => {});
+        if (state.request || state.hubOpen) void startPhoneTransfer().catch(() => {});
     });
 };
 
@@ -276,12 +304,70 @@ export const onPhoneFileArrived = (listener: (file: IncomingStatus) => void) => 
     };
 };
 
+// Remote / Voice-over / Prompter buttons pressed on a phone.
+export const onPhoneRemote = (listener: (command: PhoneRemoteCommand) => void) => {
+    ensureListening();
+    remoteListeners.add(listener);
+    return () => {
+        remoteListeners.delete(listener);
+    };
+};
+
+export const onPhoneClip = (listener: (clip: PhoneClip) => void) => {
+    ensureListening();
+    clipListeners.add(listener);
+    return () => {
+        clipListeners.delete(listener);
+    };
+};
+
+// State every phone mirrors: "remote_state" (recording, playback) and "voiceover" (a take rolling).
+export const broadcastToPhones = (kind: "remote_state" | "voiceover", payload: unknown) =>
+    invoke("phone_transfer_broadcast", { kind, payload }).catch(() => {});
+
 // Which video is open in the editor (null: none) - phones offer "Add to timeline" while there is one.
 export const setPhoneTimeline = (name: string | null) => invoke("phone_transfer_set_timeline", { name }).catch(() => {});
 
 // Tells the phone that sent `file` where it ended up.
 export const reportPhonePlacement = (file: IncomingStatus, placed: boolean, note?: string) =>
     invoke("phone_transfer_placed", { deviceId: file.device_id, uploadId: file.id, placed, note: note ?? null }).catch(() => {});
+
+// The Phones panel. Opening it starts the transfer server (so phones can reconnect and the pairing
+// code is ready) and loads the current list.
+export const openPhonesHub = () => {
+    setState({ hubOpen: true, error: "" });
+    void startPhoneTransfer().catch(() => {
+        /* surfaced through state.error */
+    });
+};
+export const closePhonesHub = () => setState({ hubOpen: false });
+
+// The paired phones without starting anything - for the dock badge and the drag shelf.
+export const refreshPhoneDevices = async () => {
+    ensureListening();
+    try {
+        setState({ devices: await invoke<PhoneDevice[]>("phone_transfer_devices") });
+    } catch {
+        /* the list stays as it was */
+    }
+};
+
+export const renamePhone = async (deviceId: string, name: string) => {
+    try {
+        await invoke<string>("phone_transfer_rename", { deviceId, name });
+        setState({ error: "" });
+    } catch (e) {
+        setState({ error: errorText(e) });
+        throw e;
+    }
+};
+
+// Files from anywhere (the library, Explorer) straight to one phone - the Phones panel's drop
+// targets and the drag shelf.
+export const sendPathsToPhone = async (deviceId: string, paths: string[]) => {
+    await startPhoneTransfer();
+    return sendToPhone(deviceId, paths.map((path) => ({ path, name: path.split(/[\\/]/).pop() ?? path })));
+};
 
 export const forgetPhone = async (deviceId: string) => {
     await invoke("phone_transfer_forget", { deviceId });

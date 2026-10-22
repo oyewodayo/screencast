@@ -61,7 +61,7 @@ import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
 import { useGradeLut } from "../utils/gradeLuts";
-import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
+import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
 import ClipFxLayer from "../components/video/ClipFxLayer";
@@ -81,9 +81,13 @@ import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import { PhoneTransferHost } from "../components/Modals/PhoneTransferModal";
 import {
+  broadcastToPhones,
   IncomingStatus,
+  onPhoneClip,
   onPhoneFileArrived,
+  onPhoneRemote,
   onPhoneTimelineFile,
+  PhoneRemoteCommand,
   openPhoneReceive,
   openPhoneTransfer,
   reportPhonePlacement,
@@ -102,6 +106,8 @@ import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
 const CAMERA_ONLY_RECORD_TYPES = ["va", "v"];
 import {
+  getPhoneCameraState,
+  listenForPhoneCamera,
   PHONE_CAMERA_DEVICE,
   startPhoneCapture,
   subscribePhoneCamera,
@@ -1201,10 +1207,31 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     void setPhoneTimeline(phoneTimelineName);
   }, [phoneTimelineName]);
   const phoneBatchRef = useRef<{ batch: string; index: number; audioAt: number; added: number } | null>(null);
+  // Voice-over takes on the timeline, by the upload that brought them - a Retake swaps one out.
+  const voiceTakesRef = useRef(new Map<string, string>());
   const placeFromPhoneRef = useRef<(file: IncomingStatus) => Promise<void>>(async () => {});
   placeFromPhoneRef.current = async (file) => {
     const keep = (why: string) => void reportPhonePlacement(file, false, why);
     if (!editingVideoRef.current || !file.path) return keep("No video is open in Briefcast — saved to your library");
+    if (file.target === "voiceover") {
+      let d = file.duration ?? NaN;
+      if (!Number.isFinite(d) || d <= 0) {
+        const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: file.path }).catch(() => ({} as Record<string, string>));
+        d = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+      }
+      if (!Number.isFinite(d) || d <= 0) return keep("Briefcast couldn't read this take — saved to your library");
+      const at = Math.max(0, Math.min(file.at ?? currentOutputTime, totalOutputDuration));
+      const replaced = file.replaces ? voiceTakesRef.current.get(file.replaces) : undefined;
+      if (replaced) {
+        editStore.deleteAudioOverlay(replaced);
+        voiceTakesRef.current.delete(file.replaces!);
+      }
+      const end = Math.max(at + 0.1, Math.min(totalOutputDuration, at + d));
+      voiceTakesRef.current.set(file.id, editStore.addAudioOverlay(file.path, d, at, end));
+      setMessage(`${replaced ? "Retake" : "Voice-over"} from ${file.device_name} placed on its own track`);
+      void reportPhonePlacement(file, true);
+      return;
+    }
     const category = getFileCategory(file.name);
     if (category !== "video" && category !== "image" && category !== "audio") {
       return keep("Not a picture, video or sound — saved to your library");
@@ -2752,6 +2779,169 @@ const setScreen = () => {
 			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
 		};
 	}, [handleRecordingToggleHotkey]);
+
+	// ---- The phone app's Remote, Voice-over and Beam (phone_transfer_page.html). Phones mirror this
+	// window's state: recording (with a pause-aware elapsed snapshot the phone ticks on from, so the
+	// two clocks never have to agree), the screen/camera view, and the open video's playback. It goes
+	// out when something meaningful changes - checked twice a second, a few bytes each time.
+	const remoteSnapshotRef = useRef<() => Record<string, unknown>>(() => ({}));
+	remoteSnapshotRef.current = () => {
+		const now = Date.now();
+		const elapsedMs =
+			isRecording && recordingStartTime
+				? Math.max(0, (isPaused && pauseStartedAt ? pauseStartedAt : now) - recordingStartTime - pausedAccumulatedMs)
+				: 0;
+		const playback = phoneTimelineName ? videoPlayerRef.current?.getPlaybackState() : null;
+		return {
+			recording: isRecording,
+			paused: isPaused,
+			elapsedMs,
+			canSwitchView: isRecording && canSwitchView,
+			view: viewMode,
+			editing: phoneTimelineName,
+			playing: !!playback && !playback.paused,
+			time: Math.round(currentOutputTime * 10) / 10,
+			duration: Math.round(totalOutputDuration * 10) / 10,
+			canUndo: !!phoneTimelineName && editStore.canUndo,
+			canRedo: !!phoneTimelineName && editStore.canRedo,
+			// What a Record press will capture, and with which camera - the phone's Remote picks both.
+			mode: recordType,
+			cameraSource: videoDevices.includes(PHONE_CAMERA_DEVICE) ? "phone" : videoDevices.length ? "pc" : "none",
+			phoneCam: getPhoneCameraState().status,
+		};
+	};
+	useEffect(() => {
+		let last = "";
+		const send = () => {
+			const state = remoteSnapshotRef.current();
+			// The elapsed time ticks on by itself on the phone - only a change of state is news.
+			const key = JSON.stringify({ ...state, elapsedMs: 0 });
+			if (key === last) return;
+			last = key;
+			void broadcastToPhones("remote_state", state);
+		};
+		send();
+		const timer = window.setInterval(send, 500);
+		return () => window.clearInterval(timer);
+	}, []);
+
+	// Timeline time -> the clip and source time under it, for the remote's Retake (which goes back to
+	// where the take it replaces began).
+	const seekOutputTime = (t: number) => {
+		let acc = 0;
+		for (const clip of editStore.clips) {
+			const d = clipOutputDuration(clip);
+			if (acc + d > t + 1e-3) {
+				handleSeekActiveFile(clip.sourcePath, outputOffsetToSource(clip, t - acc));
+				return;
+			}
+			acc += d;
+		}
+	};
+
+	// Studio Silence: while a voice-over take rolls, everything this window plays is muted, so the
+	// phone's mic hears only the voice - then each element goes back to exactly how it was. If the
+	// phone vanishes mid-take, a failsafe brings the sound back.
+	const studioSilenceRef = useRef<{ muted: Map<HTMLMediaElement, boolean>; failsafe: number } | null>(null);
+	const endStudioSilence = () => {
+		const s = studioSilenceRef.current;
+		if (!s) return;
+		studioSilenceRef.current = null;
+		window.clearTimeout(s.failsafe);
+		s.muted.forEach((was, el) => {
+			el.muted = was;
+		});
+		const playback = videoPlayerRef.current?.getPlaybackState();
+		if (playback && !playback.paused) videoPlayerRef.current?.togglePlay();
+		void broadcastToPhones("voiceover", { state: "idle" });
+	};
+	const startStudioSilence = async (requestedAt: unknown) => {
+		if (!editingVideoRef.current) {
+			void broadcastToPhones("voiceover", { state: "unavailable" });
+			return;
+		}
+		endStudioSilence();
+		const retakeAt = typeof requestedAt === "number" && Number.isFinite(requestedAt) ? requestedAt : null;
+		if (retakeAt !== null) {
+			seekOutputTime(retakeAt);
+			await new Promise((r) => window.setTimeout(r, 300));
+		}
+		const at = retakeAt ?? Math.max(0, Math.min(currentOutputTime, totalOutputDuration));
+		const muted = new Map<HTMLMediaElement, boolean>();
+		document.querySelectorAll<HTMLMediaElement>("video, audio").forEach((el) => {
+			muted.set(el, el.muted);
+			el.muted = true;
+		});
+		studioSilenceRef.current = { muted, failsafe: window.setTimeout(endStudioSilence, 15 * 60_000) };
+		videoPlayerRef.current?.play();
+		void broadcastToPhones("voiceover", { state: "rolling", at, startedAt: Date.now() });
+	};
+
+	// The computer cameras that were picked before the phone took over, so "Computer camera" on the
+	// Remote goes back to exactly those.
+	const pcCamerasRef = useRef<string[]>([]);
+	const remoteActionRef = useRef<(command: PhoneRemoteCommand) => void>(() => {});
+	remoteActionRef.current = (command) => {
+		const editing = editingVideoRef.current;
+		switch (command.action) {
+			case "record.mode":
+				if (!isRecording && ["sva", "sa", "s", "va", "v", "a"].includes(String(command.value))) setRecordType(String(command.value));
+				break;
+			case "camera.source":
+				if (isRecording) break;
+				if (command.value === "phone") {
+					// The phone app is about to offer its camera over its own connection.
+					void listenForPhoneCamera();
+					const pc = videoDevices.filter((d) => d !== PHONE_CAMERA_DEVICE);
+					if (pc.length) pcCamerasRef.current = pc;
+					setVideoDevices([PHONE_CAMERA_DEVICE]);
+				} else {
+					setVideoDevices((prev) => {
+						const pc = prev.filter((d) => d !== PHONE_CAMERA_DEVICE);
+						return pc.length ? pc : pcCamerasRef.current;
+					});
+				}
+				break;
+			case "record.toggle":
+				handleRecordingToggleHotkey();
+				break;
+			case "record.pause":
+				if (isRecording) void (isPaused ? handleResumeRecording() : handlePauseRecording());
+				break;
+			case "view.toggle":
+				void switchViewRef.current("toggle");
+				break;
+			case "play.toggle":
+				if (editing) videoPlayerRef.current?.togglePlay();
+				break;
+			case "seek":
+				// The same arrow keys the keyboard uses, so it behaves exactly as they do in every mode.
+				if (editing) document.dispatchEvent(new KeyboardEvent("keydown", { key: Number(command.value) < 0 ? "ArrowLeft" : "ArrowRight", bubbles: true }));
+				break;
+			case "undo":
+				if (editing && editStore.canUndo) editStore.undo();
+				break;
+			case "redo":
+				if (editing && editStore.canRedo) editStore.redo();
+				break;
+			case "voiceover.start":
+				void startStudioSilence(command.value);
+				break;
+			case "voiceover.stop":
+				endStudioSilence();
+				break;
+		}
+	};
+	useEffect(() => {
+		const stopRemote = onPhoneRemote((command) => remoteActionRef.current(command));
+		const stopClip = onPhoneClip((clip) =>
+			setMessage(clip.opened ? `Opened a link from ${clip.device_name}` : `Copied from ${clip.device_name}: “${clip.text.slice(0, 60)}${clip.text.length > 60 ? "…" : ""}”`)
+		);
+		return () => {
+			stopRemote();
+			stopClip();
+		};
+	}, []);
 
 	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
 	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).

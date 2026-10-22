@@ -36,6 +36,8 @@
       --accent: #3b82f6; --ok: #22c55e; --warn: #f59e0b; --bad: #f87171; }
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* Form controls don't inherit the page's font on their own - Safari shows its serif default. */
+  button, input, textarea, select { font-family: inherit; }
   /* Elements toggled with `hidden` also get a display of their own below, which would win. */
   [hidden] { display: none !important; }
   html, body { margin: 0; background: var(--bg); color: var(--text);
@@ -149,9 +151,217 @@
     background: linear-gradient(120deg, rgba(245,133,41,.16), rgba(221,42,123,.18), rgba(81,91,212,.16)); }
   .btn.sharebtn.ready { animation: share-ready 1.5s ease-in-out infinite; }
   @keyframes share-ready { 50% { box-shadow: 0 0 0 5px rgba(221,42,123,.16); } }
+  /* ---- Studio tabs (phone_transfer_studio.js): Remote, Voice-over, Prompter, Beam. ---- */
+  main { padding-bottom: calc(env(safe-area-inset-bottom) + 92px); }
+  @media (min-width: 820px) { main { max-width: 720px; } nav.tabs { left: 50%; right: auto; width: min(720px, 100%); transform: translateX(-50%);
+    border: 1px solid var(--line); border-bottom: 0; border-radius: 18px 18px 0 0; } }
+  /* The home-screen nudge belongs with the files, not on top of the remote. */
+  body:not([data-tab="files"]) #install { display: none !important; }
+  .tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; display: grid; grid-template-columns: repeat(5, 1fr);
+    padding: 6px 6px calc(env(safe-area-inset-bottom) + 6px); background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-top: 1px solid var(--line); }
+  .tabs button { background: none; border: 0; color: var(--muted); font: inherit; font-size: 11px; font-weight: 600;
+    display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 6px 0; border-radius: 12px; }
+  .tabs button svg { width: 23px; height: 23px; }
+  .tabs button.on { color: var(--accent); }
+  .tabs button.on svg { transform: translateY(-1px); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 16px; margin-bottom: 12px; }
+  .eyebrow { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .note { color: var(--muted); font-size: 13.5px; text-align: center; margin: 18px 8px; }
+  .chip { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 999px; padding: 7px 13px;
+    font: inherit; font-size: 13.5px; font-weight: 600; }
+  .chip:disabled, .btn:disabled, .round:disabled { opacity: .4; }
+
+  /* The cast arcs - Briefcast's mark, used as the motion language. */
+  .arcs { width: 100%; height: 100%; display: block; overflow: visible; }
+  .arcs circle { fill: currentColor; }
+  .arcs path { fill: none; stroke: currentColor; stroke-width: 4.6; stroke-linecap: round; opacity: .22; transition: opacity .12s; }
+  .arcs path.lit { opacity: 1; }
+
+  /* Tally: the computer is recording - the phone's edges glow like a camera's tally light. */
+  #tally { position: fixed; inset: 0; pointer-events: none; z-index: 60; opacity: 0; transition: opacity .35s;
+    box-shadow: inset 0 0 0 3px rgba(239, 68, 68, .95), inset 0 0 34px rgba(239, 68, 68, .45); }
+  body.onair #tally { opacity: 1; animation: tally 2.4s ease-in-out infinite; }
+  body.onair-paused #tally { opacity: 1; box-shadow: inset 0 0 0 3px rgba(245, 158, 11, .95), inset 0 0 30px rgba(245, 158, 11, .35); }
+  @keyframes tally { 50% { box-shadow: inset 0 0 0 3px rgba(239, 68, 68, .95), inset 0 0 52px rgba(239, 68, 68, .6); } }
+  .onair-pill { flex: none; display: inline-flex; align-items: center; gap: 6px; background: #ef4444; color: #fff; border-radius: 999px;
+    padding: 5px 10px 5px 8px; font-size: 12px; font-weight: 700; letter-spacing: .04em; }
+  .onair-pill .ai { width: 15px; height: 15px; }
+  .onair-pill b { font-variant-numeric: tabular-nums; font-weight: 700; }
+  body.onair .onair-pill .arcs path { animation: castpulse 1.5s infinite; }
+  body.onair .onair-pill .arcs path.a2 { animation-delay: .18s; }
+  body.onair .onair-pill .arcs path.a3 { animation-delay: .36s; }
+  body.onair-paused .onair-pill { background: #f59e0b; }
+  @keyframes castpulse { 0%, 100% { opacity: .25; } 35% { opacity: 1; } }
+
+  /* Count-in: three arcs fill, one a second. */
+  #countin { position: fixed; inset: 0; z-index: 70; background: rgba(8, 8, 10, .86); backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px); color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+  #countin .ci-arcs { width: 168px; height: 168px; color: #ef4444; }
+  #countin .arcs path.lit { animation: arcin .35s ease-out; }
+  @keyframes arcin { from { opacity: .22; transform-origin: 23% 77%; transform: scale(.92); } }
+  #countin-num { font-size: 84px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+  #countin-label { font-size: 15px; opacity: .8; }
+  #countin small { opacity: .5; font-size: 12.5px; }
+
+  /* Remote */
+  .rec-card { text-align: center; padding: 20px 16px; }
+  .rec-time { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; margin: 2px 0 16px; }
+  .rec-row { display: flex; align-items: center; justify-content: center; gap: 26px; }
+  .round { width: 54px; height: 54px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--text);
+    display: grid; place-items: center; padding: 0; font: inherit; }
+  .round.on { background: #f59e0b; color: #fff; border-color: transparent; }
+  .round small { display: block; font-size: 10px; font-weight: 600; margin-top: -2px; }
+  .rec-btn { position: relative; width: 92px; height: 92px; border-radius: 50%; border: 0; padding: 0; background: none;
+    display: grid; place-items: center; touch-action: none; -webkit-user-select: none; user-select: none; }
+  .rec-btn::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 4px solid var(--text); opacity: .9; }
+  .rec-core { width: 70px; height: 70px; border-radius: 50%; background: #ef4444; transition: all .25s cubic-bezier(.3, 1.4, .6, 1); }
+  .rec-btn.live .rec-core { width: 34px; height: 34px; border-radius: 9px; }
+  .rec-btn:active .rec-core { transform: scale(.92); }
+  .rec-btn .ring { position: absolute; inset: -6px; width: calc(100% + 12px); height: calc(100% + 12px); transform: rotate(-90deg); }
+  .rec-btn .ring circle { fill: none; stroke: #ef4444; stroke-width: 5; stroke-linecap: round; stroke-dasharray: 302; stroke-dashoffset: 302; }
+  .rec-btn.holding .ring circle { stroke-dashoffset: 0; transition: stroke-dashoffset .75s linear; }
+  .rec-hint { color: var(--muted); font-size: 13px; margin: 14px 0 0; }
+  .pad-head { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
+  .pad-head span:first-child { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pad-head span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  .progress { height: 4px; background: var(--line); border-radius: 4px; margin: 10px 0 12px; overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .pad { position: relative; height: 176px; border-radius: 16px; touch-action: none; -webkit-user-select: none; user-select: none;
+    background: radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--accent) 12%, var(--card)), var(--card));
+    border: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+  .pad:active { background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
+  .pad .pi-play, .pad.playing .pi-pause { display: block; }
+  .pad .pi-pause, .pad.playing .pi-play { display: none; }
+  .pad-hint { font-size: 12.5px; color: var(--muted); }
+  #pad-ghost { position: absolute; top: 12px; font-size: 20px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .pad-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .pad-row .btn { display: flex; align-items: center; justify-content: center; gap: 6px; font: inherit; font-weight: 600; height: 44px; padding: 0; }
+
+  /* Voice-over */
+  .vo-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent); border-radius: 999px; padding: 4px 10px; }
+  #vo-where { color: var(--muted); font-size: 13.5px; margin: 10px 0 6px; }
+  #vo-wave { width: 100%; height: 76px; display: block; margin: 8px 0; }
+  .vo-row { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 6px; }
+  #vo-arcs { width: 40px; height: 40px; color: #dd2a7b; }
+  #vo-time { width: 64px; font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: left; }
+  #vo-mic { width: 78px; height: 78px; border-radius: 50%; border: 0; color: #fff; font: inherit; font-size: 12px; font-weight: 700;
+    background: linear-gradient(135deg, #f58529, #dd2a7b 55%, #8134af); display: grid; place-items: center; padding: 0;
+    box-shadow: 0 8px 24px rgba(221, 42, 123, .3); }
+  #vo-mic svg { width: 28px; height: 28px; }
+  #vo-mic.live { background: #ef4444; box-shadow: 0 0 0 0 rgba(239, 68, 68, .5); animation: micpulse 1.6s infinite; }
+  @keyframes micpulse { 70% { box-shadow: 0 0 0 16px rgba(239, 68, 68, 0); } }
+  .take { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 2px; border-top: 1px solid var(--line); }
+  .take-title { font-weight: 600; font-size: 14px; font-variant-numeric: tabular-nums; }
+  .take-state { font-size: 12.5px; color: var(--muted); }
+  .take-state.placed { color: var(--ok); } .take-state.failed { color: var(--bad); }
+
+  /* Prompter */
+  #pr-script { width: 100%; min-height: 190px; resize: vertical; border: 1px solid var(--line); border-radius: 14px; padding: 12px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 15px; line-height: 1.5; box-sizing: border-box; }
+  .pr-actions { display: grid; grid-template-columns: 1fr 1.4fr; gap: 8px; margin-top: 10px; }
+  .pr-actions .btn { display: flex; align-items: center; justify-content: center; height: 46px; padding: 0; font: inherit; font-weight: 600; }
+  .set { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .set:first-of-type { border-top: 0; }
+  .set small { display: block; color: var(--muted); font-size: 12px; }
+  .set input[type=range] { width: 46%; accent-color: var(--accent); }
+  .set output { width: 42px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+  .switch { position: relative; width: 46px; height: 28px; flex: none; }
+  .switch input { opacity: 0; position: absolute; inset: 0; margin: 0; }
+  .switch i { position: absolute; inset: 0; border-radius: 999px; background: var(--line); transition: .2s; pointer-events: none; }
+  .switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3); transition: .2s; }
+  .switch input:checked + i { background: var(--accent); }
+  .switch input:checked + i::after { transform: translateX(18px); }
+  #prompter { position: fixed; inset: 0; z-index: 65; background: #000; color: #fff; overflow: hidden; touch-action: none; }
+  #pr-text { padding: 32vh 7vw 80vh; font-weight: 650; line-height: 1.42; white-space: pre-wrap; will-change: transform; }
+  #prompter::before, #prompter::after { content: ""; position: absolute; left: 0; right: 0; z-index: 2; pointer-events: none; }
+  #prompter::before { top: 0; height: 30vh; background: linear-gradient(#000 20%, rgba(0, 0, 0, .55) 75%, transparent); }
+  #prompter::after { bottom: 0; height: 42vh; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 60%, #000); }
+  .pr-mark { position: absolute; left: 0; top: 32vh; z-index: 3; width: 0; height: 0; border: 9px solid transparent; border-left: 13px solid #dd2a7b; transform: translateY(-50%); }
+  .pr-bar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px calc(env(safe-area-inset-bottom) + 14px); }
+  .pr-bar .round { background: rgba(255, 255, 255, .1); color: #fff; border-color: rgba(255, 255, 255, .18); width: 46px; height: 46px; }
+  #pr-arcs { width: 30px; height: 30px; color: #dd2a7b; margin-left: auto; }
+  #pr-status { font-size: 13px; opacity: .75; }
+  #prompter.paused #pr-text { opacity: .55; }
+  #pr-text.mirror { transform-origin: center; }
+
+  /* Beam */
+  #beam-text { width: 100%; min-height: 110px; resize: vertical; border: 1px solid var(--line); border-radius: 14px; padding: 12px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 15px; line-height: 1.45; box-sizing: border-box; }
+  .beam-actions { display: grid; grid-template-columns: auto 1fr; gap: 8px; margin-top: 10px; }
+  .beam-actions .btn { display: flex; align-items: center; justify-content: center; height: 46px; padding: 0 16px; font: inherit; font-weight: 600; }
+  .beam-actions #beam-open { grid-column: 1 / -1; }
+  .beam-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .beam-head .ai { width: 26px; height: 26px; color: var(--accent); flex: none; }
+  .beam-head h2 { font-size: 16px; margin: 0; }
+  #beam-card.beaming .beam-head .arcs path { animation: radiate .7s ease-out; }
+  #beam-card.beaming .beam-head .arcs path.a2 { animation-delay: .1s; }
+  #beam-card.beaming .beam-head .arcs path.a3 { animation-delay: .2s; }
+  @keyframes radiate { 0% { opacity: .2; } 40% { opacity: 1; } 100% { opacity: .22; } }
+  .clip { display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left; background: var(--card); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; font: inherit; font-size: 14px; }
+  .clip-dir { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700;
+    background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+  .clip-dir.in { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  /* Recording mode and camera, picked from the phone. */
+  .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 0 0 14px; }
+  .mode { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 12px; padding: 8px 4px;
+    font: inherit; font-size: 11.5px; font-weight: 600; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .mode .mi { display: flex; gap: 3px; color: var(--muted); }
+  .mode .mi svg { width: 15px; height: 15px; }
+  .mode.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
+  .mode.on .mi { color: var(--accent); }
+  .mode:disabled { opacity: .45; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border-radius: 12px; background: var(--line); margin-bottom: 14px; }
+  .seg button { border: 0; background: none; color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; padding: 8px 4px; border-radius: 9px; }
+  .seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+  .seg button:disabled { opacity: .45; }
+  /* The viewfinder: this phone as the camera, framed by the tally when on air. */
+  .vf { position: relative; border-radius: 16px; overflow: hidden; background: #000; margin-bottom: 14px;
+    aspect-ratio: 3 / 4; max-height: 38vh; width: 100%; box-shadow: 0 0 0 2px transparent; transition: box-shadow .3s; }
+  .vf video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .vf video.selfie { transform: scaleX(-1); }
+  .vf .thirds { position: absolute; inset: 0; pointer-events: none; opacity: .28;
+    background: linear-gradient(90deg, transparent calc(33.33% - .5px), #fff calc(33.33% - .5px), #fff calc(33.33% + .5px), transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), #fff calc(66.66% - .5px), #fff calc(66.66% + .5px), transparent calc(66.66% + .5px)),
+      linear-gradient(0deg, transparent calc(33.33% - .5px), #fff calc(33.33% - .5px), #fff calc(33.33% + .5px), transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), #fff calc(66.66% - .5px), #fff calc(66.66% + .5px), transparent calc(66.66% + .5px)); }
+  body.onair .vf { box-shadow: 0 0 0 3px #ef4444, 0 0 26px rgba(239, 68, 68, .55); }
+  .vf-badge { position: absolute; left: 10px; top: 10px; display: inline-flex; align-items: center; gap: 6px; background: rgba(0, 0, 0, .55);
+    color: #fff; border-radius: 999px; padding: 5px 10px; font-size: 11.5px; font-weight: 700; letter-spacing: .03em; backdrop-filter: blur(6px); }
+  .vf-badge i { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; }
+  .vf-badge.live i { background: #22c55e; }
+  .vf { touch-action: none; -webkit-user-select: none; user-select: none; }
+  .vf.nogrid .thirds { display: none; }
+  .vf video { transition: filter .2s, transform .2s; }
+  .vf.flipping video { filter: blur(14px) brightness(.7); }
+  .vf-flip { position: absolute; right: 10px; bottom: 10px; width: 42px; height: 42px; border-radius: 50%; border: 0;
+    background: rgba(0, 0, 0, .5); color: #fff; display: grid; place-items: center; backdrop-filter: blur(6px); }
+  .vf-tools { position: absolute; right: 10px; top: 10px; display: flex; gap: 6px; }
+  .vf-tools button { height: 32px; min-width: 32px; padding: 0 9px; border-radius: 999px; border: 0; background: rgba(0, 0, 0, .5);
+    color: #fff; font: inherit; font-size: 11.5px; font-weight: 700; display: grid; place-items: center; backdrop-filter: blur(6px); }
+  .vf-tools button.on { color: #facc15; }
+  .vf-tools button:disabled { opacity: .5; }
+  .vf-zoom { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; gap: 4px; padding: 4px;
+    border-radius: 999px; background: rgba(0, 0, 0, .4); backdrop-filter: blur(6px); }
+  .vf-zoom button { min-width: 34px; height: 34px; border-radius: 50%; border: 0; background: rgba(0, 0, 0, .35); color: #fff;
+    font: inherit; font-size: 11.5px; font-weight: 700; padding: 0 4px; }
+  .vf-zoom button.on { color: #facc15; background: rgba(0, 0, 0, .6); transform: scale(1.08); }
+  .vf-zoomtip { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); background: rgba(0, 0, 0, .55); color: #facc15;
+    font-weight: 800; font-size: 18px; padding: 6px 12px; border-radius: 999px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .vf-zoomtip.show { opacity: 1; }
+  .vf-focus { position: absolute; width: 66px; height: 66px; margin: -33px 0 0 -33px; border: 1.5px solid #facc15; border-radius: 6px;
+    opacity: 0; pointer-events: none; }
+  .vf-focus.on { animation: focus .9s ease-out; }
+  @keyframes focus { 0% { opacity: 1; transform: scale(1.35); } 30% { opacity: 1; transform: scale(1); } 75% { opacity: 1; } 100% { opacity: 0; } }
+  .vf-controls { margin: -4px 0 14px; }
+  .vf-exp { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .vf-exp input { flex: 1; accent-color: #facc15; }
+  .clip-text { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
 </style>
 </head>
-<body>
+<body data-tab="files">
 <main>
   <header>
     <img class="logo" src="/icons/logo-96.png" alt="" width="32" height="32">
@@ -159,6 +369,7 @@
       <h1>Briefcast Transfer</h1>
       <div class="sub"><span id="dot" class="dot wait"></span><span id="status">Connecting…</span></div>
     </div>
+    <span id="onair" class="onair-pill" hidden><span class="ai" data-arcs></span>ON AIR <b id="onair-time">0:00</b></span>
     <button id="retry" class="retry" type="button" aria-label="Reconnect" title="Reconnect" hidden>
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
     </button>
@@ -173,6 +384,7 @@
       <button id="install-later" class="btn" type="button">Not now</button>
     </div>
   </div>
+  <section id="tab-files" class="tab">
   <div id="share" class="share" hidden>
     <div class="share-head">
       <h2 id="share-title"></h2>
@@ -194,14 +406,150 @@
     <input id="pick-tl" type="file" multiple accept="image/*,video/*,audio/*" hidden>
     <label id="send-lib" class="btn primary" for="pick">Send to computer</label>
     <input id="pick" type="file" multiple hidden>
+    <input id="pick-media" type="file" multiple accept="image/*,video/*" hidden>
     <div id="uploads"></div>
     <div class="who">This phone appears as <button id="me" type="button" title="Rename this phone" hidden></button></div>
   </div>
   <div id="received-title" class="section" hidden>Received</div>
   <div id="list" class="list"></div>
   <footer id="footer">Keep this page on your home screen to move files either way. Everything travels over your Wi-Fi in full original quality — no mobile data, no upload to the internet.</footer>
+  </section>
+  <section id="tab-remote" class="tab" hidden>
+    <div class="card rec-card">
+      <div class="modes" id="rec-modes" role="radiogroup" aria-label="What to record">
+        <button type="button" class="mode" data-mode="sva"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><path d="m17 10 5-3v10l-5-3"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>Screen + Cam</button>
+        <button type="button" class="mode" data-mode="sa"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>Screen + Mic</button>
+        <button type="button" class="mode" data-mode="va"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><path d="m17 10 5-3v10l-5-3"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>Camera + Mic</button>
+        <button type="button" class="mode" data-mode="s"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span>Screen</button>
+        <button type="button" class="mode" data-mode="v"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><path d="m17 10 5-3v10l-5-3"/></svg></span>Camera</button>
+        <button type="button" class="mode" data-mode="a"><span class="mi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>Audio</button>
+      </div>
+      <div class="seg" id="cam-src" hidden role="radiogroup" aria-label="Camera">
+        <button type="button" data-src="pc">Computer camera</button>
+        <button type="button" data-src="phone">This phone</button>
+      </div>
+      <div class="vf" id="vf" hidden>
+        <video id="vf-video" autoplay muted playsinline></video>
+        <span class="thirds"></span>
+        <span class="vf-badge" id="vf-badge"><i></i><span id="vf-status">Connecting…</span></span>
+        <span class="vf-focus" id="vf-focus"></span>
+        <span class="vf-zoomtip" id="vf-zoomtip"></span>
+        <div class="vf-tools">
+          <button type="button" id="vf-torch" aria-label="Light" hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg></button>
+          <button type="button" id="vf-grid" aria-label="Grid"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg></button>
+          <button type="button" id="vf-quality" aria-label="Video quality">HD</button>
+        </div>
+        <div class="vf-zoom" id="vf-zoom" hidden></div>
+        <button type="button" class="vf-flip" id="vf-flip" aria-label="Switch camera"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-3l-2-3H9L7 7H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1Z"/><path d="M9 13a3 3 0 0 1 5.2-2M15 13a3 3 0 0 1-5.2 2"/><path d="M14 9.5V11h-1.5M10 16.5V15h1.5"/></svg></button>
+      </div>
+      <div class="vf-controls" id="vf-controls" hidden>
+        <label class="vf-exp" id="vf-exp-row" hidden><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><input id="vf-exp" type="range" aria-label="Brightness"></label>
+      </div>
+      <div class="eyebrow" id="rec-label">Ready</div>
+      <div class="rec-time" id="rec-time">0:00</div>
+      <div class="rec-row">
+        <button id="rec-pause" class="round" type="button" aria-label="Pause" hidden>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>
+        </button>
+        <button id="rec-main" class="rec-btn" type="button" aria-label="Record">
+          <svg class="ring" viewBox="0 0 104 104" aria-hidden="true"><circle cx="52" cy="52" r="48"/></svg>
+          <span class="rec-core"></span>
+        </button>
+        <button id="rec-view" class="round" type="button" aria-label="Switch between screen and camera" hidden>
+          <span><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><path d="m17 10 5-3v10l-5-3"/></svg><small id="rec-view-label">Screen</small></span>
+        </button>
+      </div>
+      <p class="rec-hint" id="rec-hint"></p>
+    </div>
+    <div class="card" id="pad-card" hidden>
+      <div class="pad-head"><span id="pad-name"></span><span id="pad-time">0:00 / 0:00</span></div>
+      <div class="progress"><i id="pad-progress"></i></div>
+      <div id="pad" class="pad" role="button" aria-label="Play or pause; swipe to scrub">
+        <span id="pad-ghost"></span>
+        <svg class="pi-play" width="44" height="44" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.4-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z"/></svg>
+        <svg class="pi-pause" width="44" height="44" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>
+        <span class="pad-hint">Tap to play · swipe to scrub 5s</span>
+      </div>
+      <div class="pad-row">
+        <button id="undo" class="btn" type="button"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>Undo</button>
+        <button id="redo" class="btn" type="button">Redo<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+      </div>
+    </div>
+    <p class="note" id="pad-empty">Open a video in Briefcast and it plays from here - tap to play, swipe to scrub.</p>
+  </section>
+
+  <section id="tab-voice" class="tab" hidden>
+    <div class="card">
+      <span class="vo-badge"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="m23 9-6 6M17 9l6 6"/></svg>Studio Silence</span>
+      <p id="vo-where"></p>
+      <canvas id="vo-wave"></canvas>
+      <div class="vo-row">
+        <span id="vo-arcs" data-arcs></span>
+        <button id="vo-mic" type="button"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><br><span id="vo-mic-label">Record</span></span></button>
+        <span id="vo-time">0:00</span>
+      </div>
+      <p class="note" style="margin-bottom:4px">Your computer mutes itself while you talk, so only your voice is recorded. The take lands on its own track, right where it started.</p>
+      <div id="vo-takes"></div>
+    </div>
+  </section>
+
+  <section id="tab-prompter" class="tab" hidden>
+    <div class="card">
+      <textarea id="pr-script" placeholder="Write or paste your script…" aria-label="Script"></textarea>
+      <div class="pr-actions">
+        <button id="pr-from-pc" class="btn" type="button">From computer</button>
+        <button id="pr-start" class="btn primary" type="button">Start prompter</button>
+      </div>
+    </div>
+    <div class="card">
+      <label class="set"><span>VoicePace<small>Scrolls while you speak, waits while you pause</small></span><span class="switch"><input id="pr-voice" type="checkbox"><i></i></span></label>
+      <label class="set"><span>Start with recording<small>Rolls when Briefcast starts recording</small></span><span class="switch"><input id="pr-withrec" type="checkbox"><i></i></span></label>
+      <label class="set"><span>Mirror<small>For beam-splitter glass</small></span><span class="switch"><input id="pr-mirror" type="checkbox"><i></i></span></label>
+      <label class="set"><span>Speed</span><input id="pr-speed" type="range" min="10" max="200" step="5"><output id="pr-speed-v"></output></label>
+      <label class="set"><span>Text size</span><input id="pr-size" type="range" min="22" max="64" step="2"><output id="pr-size-v"></output></label>
+    </div>
+  </section>
+
+  <section id="tab-beam" class="tab" hidden>
+    <div class="card" id="beam-card">
+      <div class="beam-head"><span class="ai" data-arcs></span><h2>Beam to your computer</h2></div>
+      <textarea id="beam-text" placeholder="Text or a link…" aria-label="Text to beam"></textarea>
+      <div class="beam-actions">
+        <button id="beam-paste" class="btn" type="button">Paste</button>
+        <button id="beam-send" class="btn primary" type="button">Beam to clipboard</button>
+        <button id="beam-open" class="btn primary" type="button" hidden>Open on computer</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="beam-head"><h2>From your computer</h2></div>
+      <button id="beam-pull" class="btn" type="button" style="width:100%;height:46px;font:inherit;font-weight:600">Get its clipboard</button>
+    </div>
+    <div id="beam-history-title" class="section" hidden>Recent</div>
+    <div id="beam-history"></div>
+  </section>
 </main>
+<nav id="tabs" class="tabs" hidden aria-label="Briefcast">
+  <button type="button" data-tab="files" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>Files</button>
+  <button type="button" data-tab="remote"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></svg>Remote</button>
+  <button type="button" data-tab="voice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Voice</button>
+  <button type="button" data-tab="prompter"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 6h14M5 10h14M5 14h9M5 18h6"/></svg>Prompter</button>
+  <button type="button" data-tab="beam"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="4.4" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="37" r="4" fill="currentColor" stroke="none"/><path d="M11 26a11 11 0 0 1 11 11M11 17a20 20 0 0 1 20 20M11 8a29 29 0 0 1 29 29"/></svg>Beam</button>
+</nav>
+<div id="tally"></div>
+<div id="countin" hidden><span class="ci-arcs" data-arcs></span><div id="countin-num"></div><div id="countin-label"></div><small>Tap to cancel</small></div>
+<div id="prompter" hidden>
+  <div id="pr-text"></div>
+  <span class="pr-mark"></span>
+  <div class="pr-bar">
+    <button id="pr-close" class="round" type="button" aria-label="Close"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <button id="pr-slower" class="round" type="button" aria-label="Slower">−</button>
+    <button id="pr-faster" class="round" type="button" aria-label="Faster">+</button>
+    <span id="pr-status"></span>
+    <span id="pr-arcs" data-arcs></span>
+  </div>
+</div>
 <div id="toast" class="toast"></div>
+<script src="/studio.js" defer></script>
 <script>
 (() => {
   const STORE = "briefcast-transfer";
@@ -225,6 +573,8 @@
   }
   // Set by sw.js after Android's share sheet handed files over (or by the server, when it couldn't).
   const shareParam = new URLSearchParams(location.search).get("share");
+  // iPhone/iPad home-screen app, first launch: the one-time code "Add to Home Screen" carried in.
+  const handoffCode = new URLSearchParams(location.search).get("h");
   if (location.hash || location.search) history.replaceState(null, "", location.pathname);
   const secure = location.protocol === "https:";
 
@@ -241,6 +591,22 @@
   const earlyPlaced = new Map();
   const isMedia = (f) => /^(image|video|audio)\//.test(f.type) ||
     /\.(jpe?g|png|gif|webp|heic|heif|avif|mp4|m4v|mov|webm|mkv|3gp|mp3|m4a|aac|wav|ogg|opus|flac)$/i.test(f.name);
+
+  // Messages and moments studio.js (Remote, Voice-over, Prompter, Beam) listens to - every socket
+  // message by its type, plus "connected", "disconnected" and "tab".
+  const bus = new Map();
+  const emit = (type, m) => (bus.get(type) || []).forEach((f) => { try { f(m); } catch (e) { console.error(e); } });
+  let tab = "files";
+  function showTab(name) {
+    tab = name;
+    document.body.dataset.tab = name;
+    document.querySelectorAll(".tab").forEach((el) => (el.hidden = el.id !== "tab-" + name));
+    document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
+    try { localStorage.setItem(STORE + "-tab", name); } catch (_) {}
+    window.scrollTo(0, 0);
+    emit("tab", name);
+  }
+  document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => { if (b.dataset.tab !== tab) { showTab(b.dataset.tab); if (navigator.vibrate) navigator.vibrate(8); } }));
 
   // The reconnect button shows whenever a paired phone isn't connected, and spins while it tries.
   const setStatus = (text, kind) => {
@@ -292,11 +658,11 @@
       const row = document.createElement("div");
       const top = document.createElement("div"); top.className = "row";
       const n = document.createElement("span"); n.className = "n"; n.textContent = u.file.name;
-      if (u.target === "timeline") { const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = "🎬"; n.prepend(tag); }
+      if (u.target !== "library") { const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = u.target === "voiceover" ? "🎙" : "🎬"; n.prepend(tag); }
       const st = document.createElement("span");
-      if (u.state === "done" && u.target === "timeline" && u.placed === undefined) st.textContent = "Adding…";
-      else if (u.state === "done" && u.target === "timeline" && u.placed === false) { st.style.color = "var(--muted)"; st.textContent = "✓ In library"; }
-      else if (u.state === "done") { st.style.color = "var(--ok)"; st.textContent = u.target === "timeline" ? "✓ On the timeline" : "✓ Sent"; }
+      if (u.state === "done" && u.target !== "library" && u.placed === undefined) st.textContent = "Adding…";
+      else if (u.state === "done" && u.target !== "library" && u.placed === false) { st.style.color = "var(--muted)"; st.textContent = "✓ In library"; }
+      else if (u.state === "done") { st.style.color = "var(--ok)"; st.textContent = u.target !== "library" ? "✓ On the timeline" : "✓ Sent"; }
       else if (u.state === "failed") { st.style.color = "var(--bad)"; st.textContent = u.error || "Failed"; }
       else if (u.state === "sending") {
         const pct = u.file.size ? Math.floor((u.sent / u.file.size) * 100) : 0;
@@ -323,6 +689,9 @@
     const started = Date.now();
     const xhr = new XMLHttpRequest();
     const q = new URLSearchParams({ d: creds.d, t: creds.t, name: u.file.name, size: String(u.file.size), to: u.target, batch: u.batch });
+    if (u.at != null) q.set("at", String(u.at));
+    if (u.dur != null) q.set("dur", String(u.dur));
+    if (u.replaces) q.set("replaces", u.replaces);
     xhr.open("POST", `/u?${q}`);
     // XHR rather than fetch: only XHR reports upload progress. A File body is streamed from
     // storage by the browser, never read into memory whole.
@@ -338,9 +707,10 @@
       if (ok && navigator.vibrate) navigator.vibrate(20);
       renderUploads();
       if (u.share) shareSettled(u);
+      if (u.onUpdate) u.onUpdate(u);
       // Timeline files are announced once Briefcast says where they landed (batchSettled).
       if (!uploads.some((x) => x.state === "waiting")) {
-        const done = uploads.filter((x) => x.state === "done" && x.target !== "timeline" && !x.toasted);
+        const done = uploads.filter((x) => x.state === "done" && x.target === "library" && !x.toasted);
         done.forEach((x) => (x.toasted = true));
         if (done.length) toast(done.length === 1 ? `✓ Sent ${done[0].file.name}` : `✓ Sent ${done.length} files`);
       }
@@ -362,14 +732,15 @@
   }
 
   // Files picked or shared together go as one batch, so Briefcast keeps them together, in order.
-  function queue(files, target, share) {
+  function queue(files, target, share, extra) {
     const batch = Math.random().toString(36).slice(2, 10);
-    for (const file of files) uploads.push({ file, state: "waiting", sent: 0, target, batch, share });
+    for (const file of files) uploads.push({ file, state: "waiting", sent: 0, target, batch, share, ...(extra || {}) });
     renderUploads();
     pump();
   }
   $("pick").addEventListener("change", (e) => { queue([...e.target.files], "library"); e.target.value = ""; });
   $("pick-tl").addEventListener("change", (e) => { queue([...e.target.files], "timeline"); e.target.value = ""; });
+  $("pick-media").addEventListener("change", (e) => { queue([...e.target.files], "library"); e.target.value = ""; });
 
   // Briefcast's word on a timeline file: on the timeline, or (with why) kept in the library.
   function applyPlaced(id, placed, note) {
@@ -377,6 +748,7 @@
     if (!u) { earlyPlaced.set(id, { placed, note }); return; }
     u.placed = placed; u.note = note || "";
     renderUploads();
+    if (u.onUpdate) u.onUpdate(u);
     batchSettled(u.batch);
   }
 
@@ -408,6 +780,10 @@
   // ---- Android's share sheet -> sw.js -> IndexedDB -> here. A share stays stored until it's
   // been sent (or discarded), so one made while the computer is asleep is still waiting later.
   let shares = [];
+  // What the share card's two buttons do: "files" send what was shared; "text" Beams a shared link
+  // or text; "withheld" picks the file here, because Android didn't let the shared one through.
+  let shareMode = "files";
+  let shareText = "";
   let shareInfo = null;
   let shareGridKey = "";
   let shareUrls = [];
@@ -503,8 +879,46 @@
     if (!pending.length && !shareInfo) { box.hidden = true; return; }
     box.hidden = false;
     const grid = $("share-grid");
+    shareText = "";
+    shareMode = "files";
     if (!files.length) {
       const texts = pending.map((x) => x.text).filter(Boolean);
+      const joined = texts.join("\n").trim();
+      // A page shared from a browser arrives as its title plus its address - the address is the point.
+      const link = (joined.match(/https?:\/\/\S+/) || [])[0];
+      // Shared from Gallery, WhatsApp... but no file arrived: some Android builds refuse to pass a
+      // shared file on to an installed web app (Chrome logs "Caller does not have read permission
+      // for share URI"). Say so, and pick it here in one tap - that path always works.
+      if (pending.length && !link && !shareInfo) {
+        shareMode = "withheld";
+        shareText = joined;
+        $("share-title").textContent = "Your phone held the file back";
+        $("share-meta").textContent = "Some Android versions block shared files from reaching installed web apps - there's no setting to change, so pick it here instead: one tap, same result. A system update for your phone may fix sharing.";
+        grid.hidden = true;
+        $("share-tl").hidden = false;
+        $("share-tl").className = "btn primary";
+        $("share-tl").textContent = timeline ? `Choose for timeline · ${timeline}` : "Choose photos & videos";
+        $("share-lib").hidden = false;
+        $("share-lib").className = "btn";
+        $("share-lib").textContent = joined && window.BCBeam ? `Beam the text to ${host}` : "Choose any file";
+        $("share-tl").disabled = $("share-lib").disabled = !welcomed;
+        return;
+      }
+      if (link && window.BCBeam) {
+        shareMode = "text";
+        shareText = link;
+        $("share-title").textContent = "Send this link to your computer";
+        $("share-meta").textContent = shareText.length > 160 ? shareText.slice(0, 160) + "…" : shareText;
+        grid.hidden = true;
+        $("share-tl").hidden = false;
+        $("share-tl").textContent = `Open on ${host}`;
+        $("share-tl").className = "btn primary";
+        $("share-lib").hidden = false;
+        $("share-lib").className = "btn";
+        $("share-lib").textContent = `Beam to ${host}'s clipboard`;
+        $("share-tl").disabled = $("share-lib").disabled = !welcomed;
+        return;
+      }
       const fields = [...new Set(pending.flatMap((x) => x.fields || []))];
       const info = shareInfo || {
         title: "Nothing to send",
@@ -544,8 +958,21 @@
     tl.disabled = lib.disabled = !welcomed;
   }
 
-  $("share-tl").addEventListener("click", () => sendShares("timeline"));
-  $("share-lib").addEventListener("click", () => sendShares("library"));
+  const beamShared = async (open) => {
+    if (await window.BCBeam(shareText, open)) $("share-discard").click();
+  };
+  // Picking stands in for the file Android held back; the empty share is done with either way.
+  const pickInstead = (input) => { input.click(); $("share-discard").click(); };
+  $("share-tl").addEventListener("click", () => {
+    if (shareMode === "text") beamShared(true);
+    else if (shareMode === "withheld") pickInstead(timeline ? $("pick-tl") : $("pick-media"));
+    else sendShares("timeline");
+  });
+  $("share-lib").addEventListener("click", () => {
+    if (shareMode === "text") beamShared(false);
+    else if (shareMode === "withheld") { if (shareText && window.BCBeam) beamShared(false); else pickInstead($("pick")); }
+    else sendShares("library");
+  });
   $("share-discard").addEventListener("click", () => {
     for (const x of shares.filter((y) => !y.queued)) dropShare(x.id);
     shares = shares.filter((y) => y.queued);
@@ -618,7 +1045,9 @@
       // iOS saves downloads to Files, not Photos - say how to get a picture or video into Photos.
       if (isIOS && (kind === "image" || kind === "video")) {
         const hint = document.createElement("div"); hint.className = "hint";
-        hint.textContent = kind === "image"
+        hint.textContent = canShareFile(o)
+          ? `Tip: tap Share, then ${kind === "image" ? "Save Image" : "Save Video"} to put it in Photos.`
+          : kind === "image"
           ? "Tip: tap Open, then press and hold the picture to save it to Photos."
           : "Tip: Save puts it in Files › Downloads. To add it to Photos, open it there and tap Share › Save Video.";
         el.appendChild(hint);
@@ -706,6 +1135,8 @@
 
   function unpaired() {
     setStatus("Not connected", "");
+    $("tabs").hidden = true;
+    if (tab !== "files") showTab("files");
     $("me").hidden = true; $("sender").hidden = true; $("install").hidden = true;
   }
 
@@ -736,6 +1167,7 @@
     socket.onmessage = (ev) => {
       lastHeard = Date.now();
       let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      setTimeout(() => emit(m.type, m), 0);
       if (m.type === "welcome") {
         welcomed = true; attempt = 0; pairKey = "";
         creds = { d: m.device.id, t: m.device.token, name: m.device.name, host: m.host };
@@ -745,6 +1177,9 @@
         $("sender").hidden = false;
         host = m.host;
         setTimeline(m.timeline);
+        $("tabs").hidden = false;
+        setTimeout(() => emit("connected"), 0);
+        if (isIOS && secure && !standalone) socket.send('{"type":"handoff.create"}');
         notice("", "");
         // Unencrypted is allowed (the desktop offers it only on purpose) but never invisible.
         $("security").innerHTML = secure ? "" : `<div class="warn"><b>Unencrypted connection.</b> Anyone on this network could see the files you send or receive here.</div>`;
@@ -783,6 +1218,12 @@
       } else if (m.type === "status") {
         const o = offers.get(m.id);
         if (o) { o.state = m.state; render(); if (m.state === "done") toast(`✓ ${o.name}`); }
+      } else if (m.type === "handoff") {
+        // Both places iOS may take the home-screen app's start address from: the manifest, and
+        // (older iOS) the page's own address at the moment it's added.
+        const link = document.querySelector('link[rel="manifest"]');
+        if (link) link.href = `/manifest.webmanifest?h=${m.code}`;
+        history.replaceState(null, "", `/?h=${m.code}`);
       } else if (m.type === "context") {
         setTimeline(m.timeline);
       } else if (m.type === "placed") {
@@ -806,6 +1247,7 @@
     clearInterval(pingTimer);
     if (ws !== socket) return;
     ws = null;
+    emit("disconnected");
     if (stopped) return;
     if (welcomed) { setStatus("Reconnecting…", "wait"); scheduleReconnect(); return; }
     // Closed before we were welcomed. A WebSocket close can't say why, so ask: only a definite
@@ -849,8 +1291,16 @@
 
   function showInstall() {
     const box = $("install");
-    if (standalone || !welcomed || installDismissed() || (!installPrompt && !/Android/.test(ua))) { box.hidden = true; return; }
+    const iosAdd = isIOS && secure && !installPrompt;
+    if (standalone || !welcomed || installDismissed() || (!installPrompt && !/Android/.test(ua) && !iosAdd)) { box.hidden = true; return; }
     $("install-title").textContent = "Add Briefcast to your home screen";
+    if (iosAdd) {
+      // The pairing travels with it (see requestHandoff) - the app opens already connected.
+      $("install-body").textContent = "In Safari, tap the Share button (the square with an arrow), then Add to Home Screen. Briefcast opens like an app and stays connected to your computer.";
+      $("install-go").textContent = "OK";
+      box.hidden = false;
+      return;
+    }
     $("install-body").textContent = installPrompt
       ? "It opens like an app — no browser bar — and reconnects to your computer by itself."
       : "This card can't add it for you. In Chrome's ⋮ menu (top right) tap Install and create shortcut › Create shortcut (older Chrome: Add to Home screen), then confirm. The icon may land on a later home-screen page.";
@@ -916,9 +1366,40 @@
     }
   }
 
+  window.BC = {
+    send: (msg) => { if (ws && ws.readyState === 1 && welcomed) { ws.send(JSON.stringify(msg)); return true; } return false; },
+    on: (type, fn) => { if (!bus.has(type)) bus.set(type, []); bus.get(type).push(fn); },
+    connected: () => !!(ws && ws.readyState === 1 && welcomed),
+    host: () => host,
+    tab: () => tab,
+    toast,
+    haptic: (pattern) => { if (navigator.vibrate) navigator.vibrate(pattern); },
+    queue: (files, target, extra) => queue(files, target, null, extra),
+    // studio.js loads after this script: a share card drawn before it arrived gets its Beam buttons.
+    ready: () => renderShare(),
+  };
+  if (creds) {
+    $("tabs").hidden = false;
+    let saved = "files";
+    try { saved = localStorage.getItem(STORE + "-tab") || "files"; } catch (_) {}
+    if (!shareParam && document.getElementById("tab-" + saved)) showTab(saved);
+  }
+
+  async function redeemHandoff() {
+    if (creds || !handoffCode) return;
+    try {
+      const r = await fetch(`/handoff?h=${encodeURIComponent(handoffCode)}`, { cache: "no-store" });
+      if (!r.ok) return;
+      const p = await r.json();
+      creds = { d: p.d, t: p.t, name: p.n || undefined };
+      saveCreds();
+      $("tabs").hidden = false;
+    } catch (_) {}
+  }
+
   setStatus("Connecting…", "wait");
   loadShares();
-  upgradeToHttps().then((moved) => { if (!moved) connect(); });
+  redeemHandoff().then(() => upgradeToHttps()).then((moved) => { if (!moved) connect(); });
 })();
 </script>
 </body>

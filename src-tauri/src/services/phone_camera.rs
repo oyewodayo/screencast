@@ -422,6 +422,33 @@ pub async fn phone_camera_status(
     }
 }
 
+// The Briefcast phone app (phone_transfer.rs) can be the phone camera too, over the connection it
+// already has instead of this module's own server - no second QR code, no certificate warning. It
+// hands over a sender for what this side writes, and passes on what the phone writes, exactly as
+// handle_phone_socket does for this module's own page; everything downstream sees one phone.
+pub(crate) async fn attach_external_phone(app: &AppHandle, tx: mpsc::UnboundedSender<String>) {
+    use tauri::Manager;
+    *app.state::<PhoneCameraState>().phone_tx.lock().await = Some(tx);
+    let _ = app.emit("phone-camera-state", "connected");
+    log::info!("Phone camera: the Briefcast phone app connected as the camera");
+}
+
+// Only if `tx` is still the current phone - a newer one must not be torn down by this one leaving.
+pub(crate) async fn detach_external_phone(app: &AppHandle, tx: &mpsc::UnboundedSender<String>) {
+    use tauri::Manager;
+    let state = app.state::<PhoneCameraState>();
+    let mut guard = state.phone_tx.lock().await;
+    if guard.as_ref().map(|s| s.same_channel(tx)).unwrap_or(false) {
+        *guard = None;
+        drop(guard);
+        let _ = app.emit("phone-camera-state", "disconnected");
+    }
+}
+
+pub(crate) fn relay_from_external_phone(app: &AppHandle, signal: String) {
+    let _ = app.emit("phone-camera-signal", signal);
+}
+
 // Desktop -> phone half of the signalling relay. `payload` is an already-serialised JSON string
 // (an answer or an ICE candidate); this module doesn't inspect it, same as the phone -> desktop
 // direction in handle_phone_socket.

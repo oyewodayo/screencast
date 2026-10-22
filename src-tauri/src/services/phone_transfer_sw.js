@@ -9,8 +9,8 @@
 // - Android's share sheet ("Share > Briefcast" in Gallery, WhatsApp, Files...) posts the shared
 //   files to /share. They're kept on the phone (IndexedDB) and the page is opened to send them, so
 //   a share made while the computer is asleep isn't lost - it waits until it's sent.
-const CACHE = "briefcast-transfer-v5";
-const SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png", "/icons/logo-96.png"];
+const CACHE = "briefcast-transfer-v6";
+const SHELL = ["/", "/studio.js", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png", "/icons/logo-96.png"];
 
 // The same tiny store the page reads (phone_transfer_page.html, openShares).
 const DB = "briefcast-transfer", SHARES = "shares";
