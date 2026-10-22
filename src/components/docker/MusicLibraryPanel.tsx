@@ -413,7 +413,7 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
     tabTracks.forEach((t) => t.moods.forEach((m) => counts.set(m, (counts.get(m) ?? 0) + 1)));
     return [...counts.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
+      .slice(0, 10)
       .map(([m]) => m);
   }, [tabTracks]);
 

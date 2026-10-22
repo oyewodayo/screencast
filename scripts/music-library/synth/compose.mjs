@@ -4,7 +4,12 @@
 // (EQ, level-matching, sidechain, reverb/delay sends) and a master chain.
 import { SR, Stereo, chorus, clamp, compress, dbToGain, eq, hashSeed, limit, normalizeTo, activeRmsDb, pingPong, placeMono, reverb, rng, saturate, sweep, wow } from "./dsp.mjs";
 import * as I from "./instruments.mjs";
+import * as J from "./jazz-instruments.mjs";
+import * as A from "./afro-instruments.mjs";
 import { kit, noiseRiser, vinyl } from "./drums.mjs";
+import { leslie } from "./jazz.mjs";
+
+const INSTR = { ...I, ...J, ...A };
 
 export const SCALES = {
   major: [0, 2, 4, 5, 7, 9, 11],
@@ -20,11 +25,12 @@ const degMidi = (key, sc, d) => key + 12 * Math.floor(d / sc.length) + sc[((d % 
 // can nudge with `level`.
 const TARGETS = {
   kick: -13.5, snare: -17.5, clap: -18.5, snap: -22, rim: -24, hat: -27, openHat: -28.5, shaker: -28, tom: -20, taiko: -16.5, crash: -27,
+  conga: -24, congaLo: -24, bongo: -26.5, talk: -23, talkDown: -23, bell: -27, wood: -28,
   chords: -20, pad: -23.5, strings: -21.5, bass: -16, lead: -18.5, arp: -23, counter: -23.5, bells: -24.5, riser: -27, vinyl: -39,
 };
 const HIGHPASS = { chords: 140, pad: 180, strings: 200, lead: 220, arp: 260, counter: 220, bells: 320 };
-const DRUM_PAN = { hat: 0.22, openHat: 0.25, shaker: -0.3, rim: -0.15, snap: 0.1, crash: 0.12, tom: -0.1 };
-const DRUM_SEND = { snare: 0.2, clap: 0.22, snap: 0.25, rim: 0.2, tom: 0.35, taiko: 0.4, crash: 0.2, hat: 0.04, openHat: 0.08, shaker: 0.06, kick: 0.03 };
+const DRUM_PAN = { hat: 0.22, openHat: 0.25, shaker: -0.3, rim: -0.15, snap: 0.1, crash: 0.12, tom: -0.1, conga: 0.35, congaLo: 0.2, bongo: -0.38, talk: -0.25, talkDown: -0.25, bell: 0.3, wood: -0.32 };
+const DRUM_SEND = { conga: 0.12, congaLo: 0.12, bongo: 0.12, talk: 0.2, talkDown: 0.2, bell: 0.15, wood: 0.15, snare: 0.2, clap: 0.22, snap: 0.25, rim: 0.2, tom: 0.35, taiko: 0.4, crash: 0.2, hat: 0.04, openHat: 0.08, shaker: 0.06, kick: 0.03 };
 
 export const GROOVES = {
   pop: { kick: "X.....x.X.x.....", snare: "....X.......X...", hat: "x.x.x.x.x.x.x.x." },
@@ -48,6 +54,19 @@ export const GROOVES = {
   pulseFull: { kick: "X.......X.x.....", rim: "xoxoxoxoxoxoxoxo", snare: "....X.......X..." },
   chill: { kick: "X.......X.x.....", snare: "........X.......", hat: "x.x.x.x.x.x.x.x." },
   chillFull: { kick: "X.....x.X.x.....", snare: "....X.......X...", hat: "xoxoxoxoxoxoxoxo" },
+  // Amapiano: four on the floor, the 16th shaker carrying the swing, syncopated rims and hand drums;
+  // the "drop" takes the kick out and leaves the log drum on its own.
+  amapiano: { kick: "X...X...X...X...", clap: "....x.......x...", shaker: "xoxxxoxxxoxxxoxx", hat: "..o...o...o...o.", conga: "...x..x....x.x..", wood: "..........o....." },
+  amapianoFull: { kick: "X...X...X...X...", clap: "....x.......x...", rim: "..x....x..x...x.", shaker: "xoxxxoxxxoxxxoxx", openHat: "..x...x...x...x.", conga: "...x..x....x.x..", congaLo: "x.......x.....x.", bongo: ".......x.......x" },
+  amapianoLight: { shaker: "xoxxxoxxxoxxxoxx", hat: "..o...o...o...o.", rim: "....x.......x..." },
+  amapianoDrop: { shaker: "xoxxxoxxxoxxxoxx", clap: "....x.......x...", conga: "...x..x....x.x..", rim: "..x....x..x...x." },
+  // Afrobeats: the 3-3-2 kick, rim on the off-beats, shaker 16ths, congas talking back.
+  afrobeats: { kick: "X..X..X.X..X..X.", rim: "...x..x....x..x.", hat: "x.x.x.x.x.x.x.x.", shaker: "xoxoxoxoxoxoxoxo", conga: "..x.x..x..x.x..x" },
+  afrobeatsFull: { kick: "X..X..X.X..X..X.", clap: "....X.......X...", rim: "...x..x....x..x.", hat: "x.x.x.x.x.x.x.x.", openHat: "...............x", shaker: "xoxoxoxoxoxoxoxo", conga: "..x.x..x..x.x..x", congaLo: "x.....x.......x.", talk: "................................x...........x..x" },
+  afrobeatsLight: { shaker: "xoxoxoxoxoxoxoxo", rim: "...x..x....x..x.", conga: "..x.x..x..x.x..x" },
+  // 70s Afrobeat: busy 16th hats with open accents, the bell pattern, shekere, a talking kick.
+  afrobeat: { kick: "X......X..X.....", snare: "....x.......x..o", hat: "xoxxxoxxxoxxxoxx", openHat: "..x.......x.....", bell: "x.x.x..x.x.x..x.", shaker: "xoxoxoxoxoxoxoxo", conga: "..x..x.x..x..x.x", congaLo: "x.......x......." },
+  afrobeatLight: { hat: "xoxxxoxxxoxxxoxx", bell: "x.x.x..x.x.x..x.", shaker: "xoxoxoxoxoxoxoxo", kick: "X.........X....." },
 };
 
 const VEL = { X: 1, x: 0.72, o: 0.42 };
@@ -331,17 +350,19 @@ function composeMelody(ctx, layer, section, r) {
   return out;
 }
 
+// `unison`: play another layer's melody (horn sections in unison or octaves, `transpose`).
 function melodyNotes(ctx, layer, section, r) {
-  layer._melodies ??= new Map();
+  const src = layer.unison != null ? ctx.song.layers[layer.unison] : layer;
+  src._melodies ??= new Map();
   const key = `${section.type}:${section.prog}:${section.bars}`;
-  if (!layer._melodies.has(key)) layer._melodies.set(key, composeMelody(ctx, layer, section, r));
-  return layer._melodies.get(key).map((nt) => ({ ...nt, t: section.t + nt.t }));
+  if (!src._melodies.has(key)) src._melodies.set(key, composeMelody(ctx, src, section, r));
+  return src._melodies.get(key).map((nt) => ({ ...nt, t: section.t + nt.t, midi: nt.midi + (layer.transpose ?? 0), pan: layer.pan ?? nt.pan }));
 }
 
 // ---- Rendering -------------------------------------------------------------------------------
 
 function renderLayer(ctx, layer, bus, r) {
-  const play = I[layer.inst];
+  const play = INSTR[layer.inst];
   if (!play) throw new Error(`Unknown instrument ${layer.inst}`);
   for (const section of ctx.tl.sections) {
     let notes = [];
@@ -408,7 +429,7 @@ function renderDrums(ctx, r) {
         const inst = k.snare ? "snare" : "taiko";
         for (let step = 0; step < 16; step++) hit(inst, section.t + (bar * 16 + step) * s16, 0.25 + 0.75 * (step / 15) ** 1.5);
       } else if (lastBar && intoChorus) {
-        const inst = k.tom ? "tom" : "snare";
+        const inst = k.talk ? "talk" : k.tom ? "tom" : "snare";
         [12, 13, 14, 15].forEach((step, j) => hit(inst, section.t + (bar * 16 + step) * s16, 0.6 + j * 0.12));
       }
     }
@@ -452,6 +473,7 @@ export function renderSong(song) {
     if (layer.lp) eq(bus, "lowpass", layer.lp);
     for (const [type, f, q, g] of layer.eq ?? []) eq(bus, type, f, q, g);
     if (layer.chorus) chorus(bus, layer.chorus === true ? {} : layer.chorus);
+    if (layer.leslie) leslie(bus, { rate: () => layer.leslie });
     normalizeTo(bus, (TARGETS[layer.role] ?? -22) + (layer.level ?? 0));
     if (layer.duck && drums.kickTimes.length) sidechain(bus, drums.kickTimes, mix.sidechain ?? 0.45);
     music.mixIn(bus);

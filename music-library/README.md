@@ -19,10 +19,19 @@ npm run music:originals   # render the Briefcast Originals (~6 min), only when t
 npm run music:build       # encode + measure everything into dist/
 ```
 
-The **Briefcast Originals** are 16 songs and 69 sound effects composed and mixed entirely in code
+The **Briefcast Originals** are 34 songs and 96 sound effects composed and mixed entirely in code
 (`scripts/music-library/synth/`: instruments, drum kits, a composer and a mix engine). They're
-ours outright and published as CC0. To change a song, edit its entry in `synth/songs.mjs`, then run
-`node scripts/music-library/make-originals.mjs --only <id>` and `npm run music:build`.
+ours outright and published as CC0. To change a song, edit its entry in `synth/songs.mjs` (or
+`afro-songs.mjs`, `jazz-songs.mjs`), then run `node scripts/music-library/make-originals.mjs --only <id>`
+and `npm run music:build`.
+
+- **Jazz** (`jazz-songs.mjs`, played by `jazz.mjs`): lead sheets with real chord symbols, a band
+  and an arrangement plan. The engine walks the bass, comps in rootless/quartal voicings, builds
+  heads from motifs and solos in bebop lines, swings the ride, and slows into a held final chord.
+  Instruments are in `jazz-instruments.mjs`, sounds and seamless loops in `sfx-jazz.mjs`.
+- **Afro** (`afro-songs.mjs`, played by `compose.mjs`): amapiano on the log drum
+  (`afro-instruments.mjs`), afrobeats, highlife and 70s Afrobeat. Kits and grooves are in
+  `drums.mjs` and `compose.mjs`, sounds and loops in `sfx-afro.mjs`.
 
 Debug builds load `music-library/dist/catalog.json` automatically. Open a video, click the
 music-notes button, and the library is there.

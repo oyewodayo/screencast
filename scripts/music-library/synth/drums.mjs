@@ -133,8 +133,77 @@ function cymbal({ decay = 1.6, length = 3, seed = 31 } = {}) {
   return out;
 }
 
+// Hand drum: a membrane mode with a little pitch drop, its first overtone, and the palm/slap noise.
+function conga({ freq = 330, decay = 0.17, slap = 0.25, length = 0.6, seed = 47 } = {}) {
+  const out = len(length);
+  const r = rng(seed);
+  const bp = new Biquad("bandpass", freq * 6, 1.2);
+  let ph = 0;
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SR;
+    ph += (freq * (1 + 0.06 * Math.exp(-t / 0.02))) / SR;
+    out[i] = Math.sin(TAU * ph) * Math.exp(-t / decay) + Math.sin(TAU * ph * 1.48) * 0.3 * Math.exp(-t / (decay * 0.4)) + bp.process(r.bi()) * slap * Math.exp(-t / 0.012);
+  }
+  return out;
+}
+
+// Talking drum: the player squeezes the cords mid-stroke, so the pitch bends up (or lets go, down).
+function talkingDrum({ from = 175, to = 265, bend = 0.11, decay = 0.32, seed = 53 } = {}) {
+  const out = len(0.9);
+  const r = rng(seed);
+  const bp = new Biquad("bandpass", 1200, 1.5);
+  let ph = 0;
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SR;
+    const u = Math.min(1, t / bend);
+    ph += (from + (to - from) * (1 - (1 - u) ** 2)) / SR;
+    out[i] = (Math.sin(TAU * ph) + 0.25 * Math.sin(2 * TAU * ph)) * Math.min(1, t / 0.003) * Math.exp(-t / decay) + bp.process(r.bi()) * 0.3 * Math.exp(-t / 0.01);
+  }
+  return out;
+}
+
+// Agogo-style bell: two inharmonic square-ish tones through a band-pass.
+function bell({ f = 820, decay = 0.13 } = {}) {
+  const out = len(0.5);
+  const bp = new Biquad("bandpass", f * 1.6, 1.4);
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SR;
+    const s = Math.sign(Math.sin(TAU * f * t)) * 0.5 + Math.sign(Math.sin(TAU * f * 1.504 * t)) * 0.35;
+    out[i] = bp.process(s) * Math.exp(-t / decay) * 2;
+  }
+  return out;
+}
+
+function woodblock() {
+  const out = len(0.1);
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SR;
+    out[i] = (Math.sin(TAU * 960 * t) + 0.4 * Math.sin(TAU * 2310 * t)) * Math.exp(-t / 0.025);
+  }
+  return out;
+}
+
+// Shekere: a gourd in a net of beads - grainy, a touch longer than a shaker.
+function shekere({ seed = 59 } = {}) {
+  const out = len(0.2);
+  const r = rng(seed);
+  const bp = new Biquad("bandpass", 5200, 1);
+  let g = 0;
+  for (let i = 0; i < out.length; i++) {
+    const t = i / SR;
+    if ((i & 15) === 0) g = 0.4 + 0.6 * r();
+    out[i] = bp.process(r.bi()) * g * Math.min(1, t / 0.008) * Math.exp(-Math.max(0, t - 0.008) / 0.06) * 1.6;
+  }
+  return out;
+}
+
+const AFRO_HANDS = () => ({ conga: conga(), congaLo: conga({ freq: 215, decay: 0.22, slap: 0.15, seed: 48 }), bongo: conga({ freq: 520, decay: 0.07, slap: 0.35, length: 0.3, seed: 49 }) });
+
 // Tuned to the feel of each genre.
 const KITS = {
+  amapiano: () => ({ kick: kick({ start: 105, end: 47, ampDecay: 0.3, click: 0.1, drive: 1.3, length: 0.7 }), snare: rim(), rim: rim(), clap: clap({ decay: 0.12, freq: 1300 }), hat: hat({ decay: 0.028, tone: 1.1 }), openHat: hat({ decay: 0.15, tone: 1.1, seed: 14 }), shaker: shaker(), ...AFRO_HANDS(), wood: woodblock(), crash: cymbal({ decay: 1.3 }), tom: conga({ freq: 150, decay: 0.3, slap: 0.1 }), talk: talkingDrum() }),
+  afrobeats: () => ({ kick: kick({ start: 130, end: 50, ampDecay: 0.3, click: 0.22, drive: 1.6 }), snare: snare({ tone: 230, noiseDecay: 0.1, bright: 6500 }), rim: rim(), clap: clap({ decay: 0.14 }), hat: hat({ decay: 0.03 }), openHat: hat({ decay: 0.18, seed: 14 }), shaker: shaker(), ...AFRO_HANDS(), talk: talkingDrum(), talkDown: talkingDrum({ from: 270, to: 170, bend: 0.09, seed: 54 }), crash: cymbal({ decay: 1.4 }), tom: conga({ freq: 160, decay: 0.3, slap: 0.1 }) }),
+  afrobeat: () => ({ kick: kick({ start: 115, end: 54, ampDecay: 0.22, click: 0.25, drive: 1.3 }), snare: snare({ tone: 210, noiseDecay: 0.12, bright: 6000, toneAmt: 0.6 }), rim: rim(), hat: hat({ decay: 0.032, tone: 0.95 }), openHat: hat({ decay: 0.2, seed: 14 }), shaker: shekere(), bell: bell(), ...AFRO_HANDS(), crash: cymbal({ decay: 1.6 }), tom: tom({ freq: 130, decay: 0.3 }), talk: talkingDrum() }),
   pop: () => ({ kick: kick({ start: 160, end: 50, ampDecay: 0.3 }), snare: snare({ tone: 200, noiseDecay: 0.17 }), clap: clap(), hat: hat(), openHat: hat({ decay: 0.28, seed: 14 }), shaker: shaker(), crash: cymbal(), tom: tom({ freq: 120 }) }),
   house: () => ({ kick: kick({ start: 170, end: 47, ampDecay: 0.26, drive: 2.2, click: 0.45 }), snare: snare({ tone: 210, noiseDecay: 0.12 }), clap: clap({ decay: 0.16 }), hat: hat({ decay: 0.035 }), openHat: hat({ decay: 0.22, seed: 14 }), shaker: shaker(), crash: cymbal(), tom: tom() }),
   lofi: () => ({ kick: kick({ start: 120, end: 52, ampDecay: 0.24, click: 0.15, drive: 1.3 }), snare: snare({ tone: 175, noiseDecay: 0.14, bright: 3800, toneAmt: 0.7 }), clap: snap(), hat: hat({ decay: 0.03, tone: 0.8 }), openHat: hat({ decay: 0.18, tone: 0.8, seed: 14 }), shaker: shaker(), crash: cymbal({ decay: 1.2 }), tom: tom({ freq: 100 }), rim: rim() }),

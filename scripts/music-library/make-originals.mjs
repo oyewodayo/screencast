@@ -1,5 +1,6 @@
-// Renders the Briefcast Originals - 16 songs and 22 sound effects, composed and mixed entirely in
-// code (scripts/music-library/synth), so they're ours outright and published as CC0 - into
+// Renders the Briefcast Originals - songs (songs.mjs, afro-songs.mjs, and the jazz set in
+// jazz-songs.mjs, played by jazz.mjs) and sound effects, composed and mixed entirely in code
+// (scripts/music-library/synth), so they're ours outright and published as CC0 - into
 // music-library/originals/, plus the sources.json build-catalog.mjs reads.
 //
 //   node scripts/music-library/make-originals.mjs              everything
@@ -10,9 +11,14 @@ import path from "node:path";
 import { ffmpeg, REPO_ROOT } from "./ffmpeg.mjs";
 import { activeRmsDb, peakOf, SR, wavBytes } from "./synth/dsp.mjs";
 import { renderSong } from "./synth/compose.mjs";
+import { renderJazz } from "./synth/jazz.mjs";
 import { SONGS } from "./synth/songs.mjs";
+import { JAZZ_SONGS } from "./synth/jazz-songs.mjs";
+import { AFRO_SONGS } from "./synth/afro-songs.mjs";
 import { SFX } from "./synth/sfx.mjs";
 import { MORE_SFX } from "./synth/sfx-more.mjs";
+import { JAZZ_SFX } from "./synth/sfx-jazz.mjs";
+import { AFRO_SFX } from "./synth/sfx-afro.mjs";
 
 const OUT = path.join(REPO_ROOT, "music-library", "originals");
 const AUDIO = path.join(OUT, "audio");
@@ -32,7 +38,7 @@ const FIRST_WAVE_CATEGORY = {
   "sfx-ding": "notifications", "sfx-success": "notifications", "sfx-notification": "notifications",
   "sfx-coin": "creator", "sfx-sparkle": "creator", "sfx-impact": "cinematic", "sfx-tick-tock": "cinematic",
 };
-const ALL_SFX = [...SFX.map((fx) => ({ ...fx, category: FIRST_WAVE_CATEGORY[fx.id] ?? "interface" })), ...MORE_SFX];
+const ALL_SFX = [...SFX.map((fx) => ({ ...fx, category: FIRST_WAVE_CATEGORY[fx.id] ?? "interface" })), ...MORE_SFX, ...JAZZ_SFX, ...AFRO_SFX];
 
 fs.mkdirSync(AUDIO, { recursive: true });
 
@@ -44,19 +50,21 @@ async function save(id, buffer) {
 }
 
 const tracks = [];
-for (const song of SONGS) {
+const ALL_SONGS = [...SONGS, ...AFRO_SONGS, ...JAZZ_SONGS];
+for (const song of ALL_SONGS) {
   const entry = {
     id: song.id, title: song.title, artist: ARTIST, kind: "music", genre: song.genre, moods: song.moods, tags: song.tags, energy: song.energy,
     file: `audio/${song.id}.flac`, bpm: song.bpm, firstBeat: 0, license: LICENSE, generated: true,
   };
   if (wanted(song.id)) {
     const t0 = Date.now();
-    const { buffer, highlightStart, duration } = renderSong(song);
+    const { buffer, highlightStart, duration, firstBeat = 0 } = song.engine === "jazz" ? renderJazz(song) : renderSong(song);
     const peak = peakOf(buffer);
     const loud = activeRmsDb(buffer);
     if (!Number.isFinite(loud) || !(peak > 0.1) || peak > 1) throw new Error(`${song.id}: bad render (peak ${peak}, level ${loud})`);
     await save(song.id, buffer);
     entry.highlightStart = highlightStart;
+    entry.firstBeat = firstBeat;
     console.log(`  ♪ ${song.title.padEnd(18)} ${song.genre.padEnd(16)} ${Math.floor(duration / 60)}:${String(Math.round(duration % 60)).padStart(2, "0")}  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
   tracks.push(entry);
@@ -76,7 +84,11 @@ for (const fx of ALL_SFX) {
 const sourcesPath = path.join(OUT, "sources.json");
 if ((only || sfxOnly) && fs.existsSync(sourcesPath)) {
   const prev = new Map(JSON.parse(fs.readFileSync(sourcesPath, "utf8")).tracks.map((t) => [t.id, t]));
-  for (const t of tracks) if (t.highlightStart == null && prev.get(t.id)?.highlightStart != null) t.highlightStart = prev.get(t.id).highlightStart;
+  for (const t of tracks) {
+    const p = prev.get(t.id);
+    if (t.highlightStart == null && p?.highlightStart != null) t.highlightStart = p.highlightStart;
+    if (t.kind === "music" && !wanted(t.id) && p?.firstBeat != null) t.firstBeat = p.firstBeat;
+  }
 }
 fs.writeFileSync(sourcesPath, JSON.stringify({ tracks }, null, 2) + "\n");
-console.log(`\nBriefcast Originals: ${SONGS.length} songs, ${ALL_SFX.length} effects -> ${path.relative(REPO_ROOT, OUT)}`);
+console.log(`\nBriefcast Originals: ${ALL_SONGS.length} songs, ${ALL_SFX.length} effects -> ${path.relative(REPO_ROOT, OUT)}`);
