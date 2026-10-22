@@ -4,8 +4,10 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import { IoDocumentTextOutline } from "react-icons/io5";
 import { IoIosArrowForward } from "react-icons/io";
 import PdfThumbnail from "./PdfThumbnail";
+import CommentsPanel from "./CommentsPanel";
+import { CommentObject } from "../../utils/pdfAnnotationTypes";
 
-export type PdfSidebarView = "thumbnails" | "outline";
+export type PdfSidebarView = "thumbnails" | "outline" | "comments";
 
 interface OutlineNode {
   title: string;
@@ -92,13 +94,16 @@ interface PdfSidebarProps {
   currentPageIndex: number;
   onPageChange: (pageIndex: number) => void;
   view: PdfSidebarView;
+  comments: CommentObject[];
+  visiblePageIndices: number[];
+  onOpenComment: (comment: CommentObject) => void;
 }
 
 // Left-docked panel for the two "find my way around a long document" views: a scrollable grid of
 // page thumbnails, and the PDF's own table of contents (its "outline", in pdf.js terms) if it has
 // one. Scoped to the PdfAnnotator instance currently mounted for `pdfDoc` — Dashboard remounts
 // PdfAnnotator wholesale on file switch, so this never needs to invalidate its own outline cache.
-const PdfSidebar: React.FC<PdfSidebarProps> = ({ pdfDoc, numPages, currentPageIndex, onPageChange, view }) => {
+const PdfSidebar: React.FC<PdfSidebarProps> = ({ pdfDoc, numPages, currentPageIndex, onPageChange, view, comments, visiblePageIndices, onOpenComment }) => {
   const [outline, setOutline] = useState<OutlineNode[] | null>(null);
   const [outlineLoading, setOutlineLoading] = useState(false);
 
@@ -126,7 +131,9 @@ const PdfSidebar: React.FC<PdfSidebarProps> = ({ pdfDoc, numPages, currentPageIn
 
   return (
     <div className="w-56 shrink-0 h-full flex flex-col bg-white/70 dark:bg-neutral-900/70 backdrop-blur-xl border-r border-black/[0.06] dark:border-white/[0.08]">
-      {view === "thumbnails" ? (
+      {view === "comments" ? (
+        <CommentsPanel comments={comments} currentPageIndices={visiblePageIndices} onOpen={onOpenComment} />
+      ) : view === "thumbnails" ? (
         <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col items-center gap-1">
           {Array.from({ length: numPages }, (_, i) => (
             <PdfThumbnail key={i} pdfDoc={pdfDoc} pageIndex={i} isActive={i === currentPageIndex} onSelect={onPageChange} />

@@ -8,9 +8,11 @@ import type { PDFPageProxy } from "pdfjs-dist";
 import {
   AnnotationCommand,
   AnnotationObject,
+  CommentObject,
   HighlightObject,
   ImageObject,
   PdfAnnotationDocument,
+  PdfRect,
   Pt,
   StrokeObject,
   TextColorRun,
@@ -104,6 +106,12 @@ export function renderObject(
     return;
   }
 
+  if (object.type === "comment") {
+    renderCommentObject(ctx, object, viewport, scale);
+    ctx.restore();
+    return;
+  }
+
   const devicePoints = object.points.map((p) => pdfPointToDevicePoint(viewport, p));
   ctx.globalAlpha = object.opacity;
 
@@ -180,6 +188,76 @@ export function renderPageObjects(
   for (const object of objects) {
     renderObject(ctx, object, viewport, scale);
   }
+}
+
+// ---- Comments -----------------------------------------------------------------------------------
+
+export const COMMENT_COLOR = "#ffb020";
+
+// A comment's anchor text: a soft multiply-blended tint (reads like a highlighter, never hides the
+// glyphs) with a thin underline along each line's baseline-side edge. Each rect's four corners go
+// through the viewport individually, so rotated pages still land on the right glyphs.
+function renderCommentObject(
+  ctx: CanvasRenderingContext2D,
+  object: CommentObject,
+  viewport: { convertToViewportPoint: (x: number, y: number) => number[] },
+  scale: number
+): void {
+  ctx.fillStyle = object.color;
+  ctx.strokeStyle = object.color;
+  ctx.lineWidth = Math.max(1, 1.25 * scale);
+  for (const rect of object.rects) {
+    const bl = viewport.convertToViewportPoint(rect.x1, rect.y1);
+    const br = viewport.convertToViewportPoint(rect.x2, rect.y1);
+    const tr = viewport.convertToViewportPoint(rect.x2, rect.y2);
+    const tl = viewport.convertToViewportPoint(rect.x1, rect.y2);
+    ctx.globalCompositeOperation = "multiply";
+    ctx.globalAlpha = 0.3;
+    ctx.beginPath();
+    ctx.moveTo(bl[0], bl[1]);
+    ctx.lineTo(br[0], br[1]);
+    ctx.lineTo(tr[0], tr[1]);
+    ctx.lineTo(tl[0], tl[1]);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath();
+    ctx.moveTo(bl[0], bl[1]);
+    ctx.lineTo(br[0], br[1]);
+    ctx.stroke();
+  }
+}
+
+function rectContainsPoint(rect: PdfRect, point: Pt, padding: number): boolean {
+  return point.x >= rect.x1 - padding && point.x <= rect.x2 + padding && point.y >= rect.y1 - padding && point.y <= rect.y2 + padding;
+}
+
+// Topmost comment whose anchor text covers the point.
+export function findCommentObjectAt(objects: AnnotationObject[], point: Pt): CommentObject | null {
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const object = objects[i];
+    if (object.type === "comment" && object.rects.some((r) => rectContainsPoint(r, point, 0))) return object;
+  }
+  return null;
+}
+
+export function makeCommentObject(pageIndex: number, rects: PdfRect[], quote: string, text: string): CommentObject {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), type: "comment", pageIndex, rects, quote, text, color: COMMENT_COLOR, createdAt: now, updatedAt: now };
+}
+
+// What a reader actually wants on the clipboard from a PDF: the text layer emits a hard line break
+// at the end of every visual line (and keeps the typesetter's end-of-line hyphens), which pastes as
+// ragged, broken-up prose. Rejoins hyphenated words split across lines, folds line breaks into
+// spaces, and collapses the layer's duplicated whitespace.
+export function cleanSelectedPdfText(raw: string): string {
+  return raw
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u0000/g, "")
+    .replace(/(\p{L})[-\u00AD\u2010][ \t]*\n[ \t]*(?=\p{Ll})/gu, "$1")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/[ \t\u00A0]{2,}/g, " ")
+    .trim();
 }
 
 // ---- Images -------------------------------------------------------------------------------------
@@ -287,6 +365,10 @@ function objectIntersectsPoint(object: AnnotationObject, pdfPoint: Pt, radiusInP
 
   if (object.type === "image") {
     return imageIntersectsPoint(object, pdfPoint, radiusInPdfUnits);
+  }
+
+  if (object.type === "comment") {
+    return object.rects.some((r) => rectContainsPoint(r, pdfPoint, radiusInPdfUnits));
   }
 
   const hitRadius = radiusInPdfUnits + object.width / 2;

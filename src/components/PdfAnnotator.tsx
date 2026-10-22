@@ -5,12 +5,12 @@ import { invoke } from "@tauri-apps/api/core";
 import usePdfDocument from "../hooks/usePdfDocument";
 import useAnnotationStore from "../hooks/useAnnotationStore";
 import usePageRenderCache from "../hooks/usePageRenderCache";
-import { AnnotationObject, AnnotationTool } from "../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, CommentObject } from "../utils/pdfAnnotationTypes";
 import { makeImageObject } from "../handlers/pdfAnnotationHandlers";
 import { exportAnnotatedPdf } from "../handlers/pdfExportHandlers";
 import { fileToDataUrl } from "../utils/imageObjectCache";
 import AnnotationToolbar from "./pdf/AnnotationToolbar";
-import { EditButton, PageNavigator, SaveIndicator, ZoomControl } from "./pdf/PdfViewerControls";
+import { CommentsChip, EditButton, PageNavigator, SaveIndicator, ZoomControl } from "./pdf/PdfViewerControls";
 import PageFlipOverlay, { FlipRect, PageFlip } from "./pdf/PageFlipOverlay";
 import PdfPage from "./pdf/PdfPage";
 import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
@@ -339,6 +339,16 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
 
   const handleSidebarViewChange = (view: PdfSidebarView): void => {
     setSidebarView((prev) => (prev === view ? null : view));
+  };
+
+  // Comments panel -> the comment in place: go to its page (snapped to its spread in two-page
+  // mode), switch to Select so its card is interactive, and let the PdfPage holding it open it.
+  const [focusComment, setFocusComment] = useState<{ id: string; nonce: number } | null>(null);
+  const handleOpenComment = (comment: CommentObject): void => {
+    handleDeselectTool();
+    setSelectedObjectId(null);
+    handlePageChange(comment.pageIndex);
+    setFocusComment((prev) => ({ id: comment.id, nonce: (prev?.nonce ?? 0) + 1 }));
   };
 
   const handleToggleTwoPageMode = (): void => {
@@ -770,6 +780,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
       onEraseBegin={store.beginErase}
       onEraseAt={store.eraseAt}
       onEraseEnd={store.endErase}
+      focusComment={focusComment}
     />
   );
 
@@ -811,7 +822,16 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
           page) blows out this container's own flex-item width upstream in Dashboard.tsx. */}
       <div className="flex-1 min-h-0 flex items-stretch overflow-hidden">
         {!isFullscreen && sidebarView && pdfDoc && (
-          <PdfSidebar pdfDoc={pdfDoc} numPages={numPages} currentPageIndex={clampedPageIndex} onPageChange={handlePageChange} view={sidebarView} />
+          <PdfSidebar
+            pdfDoc={pdfDoc}
+            numPages={numPages}
+            currentPageIndex={clampedPageIndex}
+            onPageChange={handlePageChange}
+            view={sidebarView}
+            comments={store.comments}
+            visiblePageIndices={hasRightPage ? [clampedPageIndex, rightPageIndex] : [clampedPageIndex]}
+            onOpenComment={handleOpenComment}
+          />
         )}
         {/* align-items: safe center - centered when the page fits, start-aligned the moment it
             doesn't (plain centering an overflowing flex item pushes its top past the scrollable
@@ -851,6 +871,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
                 open={toolsOpen}
                 sidebarView={sidebarView}
                 onSidebarViewChange={handleSidebarViewChange}
+                commentCount={store.comments.length}
                 tool={tool}
                 onToolChange={handleToolChange}
                 onDeselectTool={handleDeselectTool}
@@ -869,6 +890,14 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
                 isExporting={isExporting}
                 onExport={handleExport}
               />
+              {/* With the dock closed (the default when reopening a document), this is what tells
+                  you the PDF already carries comments - the dock's own Comments entry takes over
+                  once it's open. */}
+              {!toolsOpen && store.comments.length > 0 && (
+                <div className="shrink-0 pointer-events-auto">
+                  <CommentsChip count={store.comments.length} active={sidebarView === "comments"} onClick={() => handleSidebarViewChange("comments")} />
+                </div>
+              )}
               <div className="shrink-0 pointer-events-auto">
                 <EditButton open={toolsOpen} onToggle={handleToggleTools} />
               </div>

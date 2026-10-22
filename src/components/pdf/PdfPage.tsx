@@ -1,13 +1,15 @@
 // components/pdf/PdfPage.tsx
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
-import { AnnotationObject, AnnotationTool, HighlightObject, Pt, StrokeObject, TextAlign, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
+import { AnnotationObject, AnnotationTool, CommentObject, HighlightObject, Pt, StrokeObject, TextAlign, TextColorRun, TextObject, TextRange } from "../../utils/pdfAnnotationTypes";
 import {
   clearCanvas,
   devicePointToPdfPoint,
+  findCommentObjectAt,
   findImageObjectAt,
   findInkObjectAt,
   findTextObjectAt,
+  makeCommentObject,
   makeTextObject,
   measureTextBlock,
   pdfPointToDevicePoint,
@@ -23,6 +25,9 @@ import TextNoteEditor from "./TextNoteEditor";
 import ImageAnnotationEditor from "./ImageAnnotationEditor";
 import InkSelectionEditor from "./InkSelectionEditor";
 import PdfTextLayer from "./PdfTextLayer";
+import CommentLayer from "./CommentLayer";
+import { CommentComposer, SelectionMenu } from "./TextSelectionActions";
+import usePdfTextSelection, { PageTextSelection } from "../../hooks/usePdfTextSelection";
 import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const TEXT_NOTE_DEFAULT_WIDTH_PDF = 160;
@@ -51,6 +56,8 @@ interface PdfPageProps {
   onEraseBegin: (pageIndex: number) => void;
   onEraseAt: (pageIndex: number, point: Pt, radiusInPdfUnits: number) => void;
   onEraseEnd: () => void;
+  // A comment picked from the Comments panel. Whichever page holds it opens it once rendered.
+  focusComment?: { id: string; nonce: number } | null;
 }
 
 // Local, not-yet-persisted state for the text note currently being typed/edited on this page.
@@ -96,6 +103,7 @@ const PdfPage: React.FC<PdfPageProps> = ({
   onEraseBegin,
   onEraseAt,
   onEraseEnd,
+  focusComment,
 }) => {
   const pageWrapperRef = useRef<HTMLDivElement>(null);
   const pageCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -142,6 +150,14 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const liveItalicRunsRef = useRef<TextRange[]>([]);
   const liveTextAlignRef = useRef<TextAlign>("left");
   const canvasRestoreTick = useCanvasRestoreTick();
+
+  // Text selection -> comment flow (Select mode only). `textSelection` is the live native selection
+  // on this page; `commentDraft` is a snapshot of it taken when "Comment" is pressed, since the
+  // native selection itself is cleared the moment focus moves into the composer.
+  const [textSelection, clearTextSelection] = usePdfTextSelection(pageWrapperRef, viewport, interactive && tool === null);
+  const [commentDraft, setCommentDraft] = useState<PageTextSelection | null>(null);
+  const [openCommentId, setOpenCommentId] = useState<string | null>(null);
+  const comments = useMemo(() => objects.filter((o): o is CommentObject => o.type === "comment"), [objects]);
 
   useEffect(() => {
     let cancelled = false;
@@ -553,6 +569,63 @@ const PdfPage: React.FC<PdfPageProps> = ({
     };
   }, [tool, interactive, viewport, pageIndex, color, textFontSize, commitEditingText, onObjectEdit]);
 
+  const handleStartComment = useCallback((): void => {
+    if (!textSelection) return;
+    setCommentDraft(textSelection);
+    setOpenCommentId(null);
+    clearTextSelection();
+  }, [textSelection, clearTextSelection]);
+
+  const handleSubmitComment = useCallback(
+    (text: string): void => {
+      if (!commentDraft) return;
+      onStrokeComplete(makeCommentObject(pageIndex, commentDraft.pdfRects, commentDraft.text, text));
+      setCommentDraft(null);
+    },
+    [commentDraft, pageIndex, onStrokeComplete]
+  );
+
+  const handleCancelComment = useCallback((): void => setCommentDraft(null), []);
+
+  const handleCommentEdit = useCallback((before: CommentObject, after: CommentObject): void => onObjectEdit(before, after), [onObjectEdit]);
+  const handleCommentDelete = useCallback((comment: CommentObject): void => onObjectDelete(comment), [onObjectDelete]);
+
+  // Comment UI is per page: drop any open card / unfinished draft when navigating or leaving Select.
+  useEffect(() => {
+    setCommentDraft(null);
+    setOpenCommentId(null);
+  }, [pageIndex, tool]);
+
+  // Arriving from the Comments panel. Waits for this page's viewport (the page may have only just
+  // been navigated to) and only claims requests for comments it actually holds; each request
+  // (nonce) is handled once, so later zooms/re-renders don't reopen a card the user has closed.
+  const [commentArrival, setCommentArrival] = useState<{ id: string; nonce: number } | null>(null);
+  const handledArrivalRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!focusComment || !viewport || handledArrivalRef.current === focusComment.nonce) return;
+    if (!comments.some((c) => c.id === focusComment.id)) return;
+    handledArrivalRef.current = focusComment.nonce;
+    setCommentDraft(null);
+    setOpenCommentId(focusComment.id);
+    setCommentArrival(focusComment);
+  }, [focusComment, viewport, comments]);
+
+  // A plain click (not a drag-select) on a comment's anchor text opens that comment, so the text
+  // itself is as much a way in as its margin pin.
+  useEffect(() => {
+    const wrapper = pageWrapperRef.current;
+    if (!wrapper || tool !== null || !interactive || !viewport) return;
+    const handleClick = (e: MouseEvent): void => {
+      if (e.button !== 0 || (e.target instanceof Element && e.target.closest("[data-annotation-editor]"))) return;
+      if (!(window.getSelection()?.isCollapsed ?? true)) return;
+      const rect = wrapper.getBoundingClientRect();
+      const hit = findCommentObjectAt(objectsRef.current, devicePointToPdfPoint(viewport, e.clientX - rect.left, e.clientY - rect.top, 1));
+      if (hit) setOpenCommentId(hit.id);
+    };
+    wrapper.addEventListener("click", handleClick);
+    return () => wrapper.removeEventListener("click", handleClick);
+  }, [tool, interactive, viewport]);
+
   // Leaving the text tool (or the page) with a session still open commits it rather than
   // silently dropping whatever was typed.
   useEffect(() => {
@@ -709,6 +782,22 @@ const PdfPage: React.FC<PdfPageProps> = ({
           pointerEvents: tool === null ? "none" : "auto",
         }}
       />
+      {viewport && comments.length > 0 && (
+        <CommentLayer
+          comments={comments}
+          viewport={viewport}
+          interactive={interactive && tool === null}
+          openId={openCommentId}
+          onOpen={setOpenCommentId}
+          onEdit={handleCommentEdit}
+          onDelete={handleCommentDelete}
+          arrival={commentArrival}
+        />
+      )}
+      {viewport && textSelection && !commentDraft && <SelectionMenu selection={textSelection} pageWidth={viewport.width} onComment={handleStartComment} onDismiss={clearTextSelection} />}
+      {viewport && commentDraft && (
+        <CommentComposer draft={commentDraft} pageWidth={viewport.width} pageHeight={viewport.height} onSubmit={handleSubmitComment} onCancel={handleCancelComment} />
+      )}
       {editingText && editorPosition && viewport && (
         <TextNoteEditor
           key={editingText.id}
