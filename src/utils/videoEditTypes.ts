@@ -328,7 +328,8 @@ export type OverlayAnimation =
   | "mask"
   | "zoomin"
   | "flicker"
-  | "bounce";
+  | "bounce"
+  | "roll";
 
 // How an overlay mixes with the picture under it - CSS mix-blend-mode names (the preview sets them
 // on the overlay's element). Export composites the same formula (blend_composite, conversion.rs);
@@ -406,6 +407,8 @@ export interface TextOverlay {
   glow?: { color: string; size: number };
   // A drop shadow; offsets and blur are fractions of the font size.
   shadow?: { color: string; x: number; y: number; blur: number };
+  // Degrees clockwise about the box's centre (-90 = reading bottom to top, a vertical title).
+  rotation?: number;
   // Normalized 0..1 fractions of the letterboxed VIDEO FRAME (not the player container) - stays
   // pixel-stable relative to the actual picture regardless of window size/fullscreen, since
   // object-fit:contain preserves the frame's own aspect ratio. y-down (top edge), unlike

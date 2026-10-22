@@ -101,7 +101,7 @@ export const textStrokePx = (strokeWidth: number, frameHeightPx: number): number
 // Whether the live preview draws this overlay with drawTextOverlay rather than as DOM text: its
 // face, tracking, gradient, glow, shadow or a scaling/masking reveal only exist there.
 export const usesCanvasText = (o: TextOverlay): boolean =>
-  !!(o.fontFamily || o.letterSpacing || o.fill || o.glow || o.shadow) || (!!o.animation && CANVAS_TEXT_REVEALS.has(o.animation));
+  !!(o.fontFamily || o.letterSpacing || o.fill || o.glow || o.shadow || o.rotation) || (!!o.animation && CANVAS_TEXT_REVEALS.has(o.animation));
 
 export interface DrawnTextOverlay {
   canvas: HTMLCanvasElement;
@@ -115,9 +115,52 @@ export interface DrawnTextOverlay {
 // italic, alignment - onto a canvas sized to just its box plus room for effects that spill past it.
 // `reveal` draws one moment of a letter-by-letter title reveal (textReveal.ts) - letters at their
 // own opacity/offset/scale/turn/mask, plus the typewriter caret - instead of the finished text.
-// `into` reuses a canvas (the live preview redraws every frame). "justify" falls back to left, as
-// pdfAnnotationHandlers.ts's renderTextObject does.
-export function drawTextOverlay(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number, reveal?: TextRevealState, into?: HTMLCanvasElement): DrawnTextOverlay | null {
+// `into` reuses a canvas (the live preview redraws every frame). A rotated title comes back turned
+// about its box's centre, on a canvas big enough for it - unless `level`, for a preview that turns
+// the box itself. "justify" falls back to left, as pdfAnnotationHandlers.ts's renderTextObject does.
+export function drawTextOverlay(
+  overlay: TextOverlay,
+  framePixelWidth: number,
+  framePixelHeight: number,
+  reveal?: TextRevealState,
+  into?: HTMLCanvasElement,
+  level = false
+): DrawnTextOverlay | null {
+  const turn = level ? 0 : ((overlay.rotation ?? 0) % 360) * (Math.PI / 180);
+  const drawn = drawLevelText(overlay, framePixelWidth, framePixelHeight, reveal, turn ? levelCanvasFor(into) : into);
+  if (!drawn || !turn) return drawn;
+  // Turned about the centre of what was drawn (the box, with room round it on every side).
+  const src = drawn.canvas;
+  const cos = Math.abs(Math.cos(turn));
+  const sin = Math.abs(Math.sin(turn));
+  const bw = Math.ceil(src.width * cos + src.height * sin);
+  const bh = Math.ceil(src.width * sin + src.height * cos);
+  const out = into ?? document.createElement("canvas");
+  if (out.width !== bw || out.height !== bh) {
+    out.width = bw;
+    out.height = bh;
+  }
+  const ctx = out.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, bw, bh);
+  ctx.translate(bw / 2, bh / 2);
+  ctx.rotate(turn);
+  ctx.drawImage(src, -src.width / 2, -src.height / 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return { canvas: out, xPx: Math.round(drawn.xPx + src.width / 2 - bw / 2), yPx: Math.round(drawn.yPx + src.height / 2 - bh / 2) };
+}
+
+// The level drawing a turned title is made from - one per reused output canvas.
+const levelCanvases = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
+function levelCanvasFor(into: HTMLCanvasElement | undefined): HTMLCanvasElement | undefined {
+  if (!into) return undefined;
+  let c = levelCanvases.get(into);
+  if (!c) levelCanvases.set(into, (c = document.createElement("canvas")));
+  return c;
+}
+
+function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number, reveal?: TextRevealState, into?: HTMLCanvasElement): DrawnTextOverlay | null {
   const text = overlay.text.trim();
   if (!text) return null;
 
@@ -246,7 +289,7 @@ export function drawTextOverlay(overlay: TextOverlay, framePixelWidth: number, f
       if (reveal.caretAt === absStart + j) drawCaret(cx, y, fillColor);
       const ch = segment[j];
       const w = ctx.measureText(ch).width;
-      const { opacity, dy, dx = 0, blur = 0, scale = 1, rotate = 0, clip = false } = reveal.char(absStart + j);
+      const { opacity, dy, dx = 0, blur = 0, scale = 1, rotate = 0, clip = false, glyph } = reveal.char(absStart + j);
       if (opacity > 0 && scale > 0.001) {
         ctx.save();
         ctx.globalAlpha = fade * opacity;
@@ -265,7 +308,10 @@ export function drawTextOverlay(overlay: TextOverlay, framePixelWidth: number, f
           ctx.scale(scale, scale);
           ctx.translate(-ox, -oy);
         }
-        drawPlain(ch, cx + dx * fontSizePx, y + dy * fontSizePx, fillColor);
+        // A rolling stand-in is centred in the real letter's room.
+        const shown = glyph ?? ch;
+        const off = glyph ? (w - ctx.measureText(glyph).width) / 2 : 0;
+        drawPlain(shown, cx + off + dx * fontSizePx, y + dy * fontSizePx, fillColor);
         ctx.restore();
       }
       cx += w;

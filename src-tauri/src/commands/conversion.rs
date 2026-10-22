@@ -5568,6 +5568,11 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         // speed.
         extra.push_str(&ken_burns_chain(kb, seg.end - seg.start, w, h, seg.source_fps.unwrap_or(30.0)));
     }
+    // A crop rescaled back to the frame stretches its pixels unless its shape was the frame's -
+    // square them again, or concat refuses to join this clip to the next (SAR mismatch).
+    if seg.crop.is_some() && out_w.is_some() && out_h.is_some() {
+        extra.push_str(",setsar=1");
+    }
     extra
 }
 
@@ -8227,6 +8232,12 @@ pub async fn export_trimmed_video(
         }
         log::warn!("Hardware export encode failed, re-running in software: {:?}", result.as_ref().err());
     }
+    if let Err(e) = &result {
+        // The whole command, for working out why ffmpeg refused it - its own message names only the
+        // stream that gave up, not the filter that caused it.
+        let input_list: Vec<String> = inputs.iter().map(|i| format!("{} {}", i.pre_args.join(" "), i.path)).collect();
+        log::warn!("Export failed: {e}\n  inputs: {:?}\n  args: {}", input_list, owned_args.join(" "));
+    }
 
     for temp_path in &temp_overlay_paths {
         let _ = std::fs::remove_file(temp_path);
@@ -9690,6 +9701,21 @@ mod tests {
         let chain = segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None, None);
         // Exactly one scale=1920:1080 (Ken Burns' own trailing one), not two.
         assert_eq!(chain.matches("scale=1920:1080").count(), 1);
+    }
+
+    #[test]
+    fn a_cropped_clip_comes_out_with_square_pixels() {
+        // A narrow crop stretched back to the frame would carry a 19:60 SAR into concat, which then
+        // refuses the next clip - the crop chain ends by squaring the pixels.
+        let mut seg = base_segment();
+        seg.crop = Some(ClipCrop {
+            x: 0.34,
+            y: 0.0,
+            width: 0.32,
+            height: 1.0,
+        });
+        let chain = segment_effect_chain(&seg, Some(1080), Some(1920), false, None, None, None);
+        assert!(chain.ends_with(",setsar=1"), "{chain}");
     }
 
     #[test]

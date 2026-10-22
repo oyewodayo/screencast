@@ -91,6 +91,17 @@ describe("buildStyledProject", () => {
     expect(finale.endTime).toBe(6);
   });
 
+  it("runs a vertical title up the frame's edge, centred where the card says", () => {
+    const t = styleTemplate("new-collection")!;
+    const state = buildStyledProject(photos(4), { width: 1920, height: 1080 }, { ...templateOptions(t), scenes: false, music: null });
+    const title = state.textOverlays.find((o) => o.text === "New Collection")!;
+    expect(title.rotation).toBe(-90);
+    expect((title.x + title.width / 2) * 1920).toBeCloseTo(0.13 * 1920, 0);
+    expect((title.y + title.height / 2) * 1080).toBeCloseTo(0.5 * 1080, 0);
+    // Laid along the frame's height: the box is longer than the frame is wide would allow at the edge.
+    expect(title.width * 1920).toBeCloseTo(0.9 * 1080, 0);
+  });
+
   it("never lays a caption over a collage", () => {
     const t = styleTemplate("new-collection")!; // the title card spans two shots; a framed trio is shot 1
     const state = buildStyledProject(photos(12), frame, { ...templateOptions(t), music: song });
@@ -138,6 +149,65 @@ describe("buildStyledProject", () => {
     const h = (s: typeof wide) => s.textOverlays[0];
     expect(h(tall).fontSize * 1920).toBeLessThan(0.15 * 1080);
     expect(h(wide).fontSize * 1080).toBeCloseTo(0.15 * 1080);
+  });
+});
+
+describe("brand cards", () => {
+  const brand = { name: "Briefcast", tagline: "Record. Edit. Share.", website: "withbriefs.com", logo: { path: "logo.png", aspect: 2 }, intro: "neon" as const, outro: true, bar: false };
+  it("opens on a brand card and closes on another, the script's captions on the shots in between", () => {
+    const t = styleTemplate("event-recap")!;
+    const state = buildStyledProject(photos(6), frame, { ...templateOptions(t), music: song, brand });
+    // 6 photos + intro + outro; each brand card at least 2.8s on whole beats.
+    expect(state.clips).toHaveLength(8);
+    const intro = state.clips[0].end - state.clips[0].start;
+    expect(intro).toBeGreaterThanOrEqual(2.8);
+    const logo = state.imageOverlays.find((o) => o.src === "logo.png")!;
+    expect(logo.startTime).toBeGreaterThan(0);
+    expect(logo.endTime).toBeCloseTo(intro);
+    expect(logo.reveal?.style).toBe("glare");
+    expect(state.imageOverlays.some((o) => o.asset?.kind === "neon")).toBe(true);
+    expect(state.adjustmentLayers[0]).toMatchObject({ startTime: 0, blur: 0.035 });
+    // The opening caption waits for the first real shot; the finale lands on the last one, not the outro.
+    const opening = state.textOverlays.find((o) => o.text === "EVERY YEAR")!;
+    expect(opening.startTime).toBeCloseTo(intro);
+    const finale = state.textOverlays.find((o) => o.text === "ARE YOU READY?")!;
+    const outroStart = state.clips.slice(0, 7).reduce((sum, c) => sum + c.end - c.start, 0);
+    expect(finale.endTime).toBeCloseTo(outroStart);
+    expect(state.textOverlays.filter((o) => o.text === "withbriefs.com")).toHaveLength(2);
+  });
+  it("lets the name stand in for a missing logo, and runs a brand bar through the middle", () => {
+    const state = buildStyledProject(photos(3), frame, { ...templateOptions(styleTemplate("promo")!), music: null, brand: { ...brand, logo: null, intro: "lines", outro: false, bar: true } });
+    expect(state.imageOverlays.some((o) => o.asset?.kind === "guides")).toBe(true);
+    expect(state.textOverlays.some((o) => o.text === "Briefcast")).toBe(true);
+    const bar = state.textOverlays.find((o) => o.text === "BRIEFCAST")!;
+    expect(bar.startTime).toBeCloseTo(state.clips[0].end - state.clips[0].start);
+  });
+});
+
+describe("videos in a template", () => {
+  const vids: Record<string, { duration: number; aspect: number }> = { "v1.mp4": { duration: 20, aspect: 16 / 9 }, "v2.mp4": { duration: 1.2, aspect: 9 / 16 } };
+  const videoOf = (p: string) => vids[p];
+  it("plays a moment from each video, cut on the beat, muted under the song and cropped to fill", () => {
+    const state = buildStyledProject(["p0.jpg", "v1.mp4", "v2.mp4", "p1.jpg"], frame, { ...templateOptions(styleTemplate("film-strip")!), music: song }, { videoOf, fillVideos: true });
+    const [, a, b] = state.clips;
+    expect(a.sourcePath).toBe("v1.mp4");
+    // Two cuts of four beats at 120 BPM, from a third of the way in.
+    expect(a.end - a.start).toBeCloseTo(4);
+    expect(a.start).toBeCloseTo(6);
+    expect(a.muted).toBe(true);
+    // A wide video in a tall frame: the frame-shaped middle of its band (crops are of the fitted frame).
+    expect(a.crop?.width).toBeCloseTo((9 / 16) / (16 / 9));
+    expect(a.crop?.height).toBeCloseTo((9 / 16) / (16 / 9));
+    expect(a.crop?.x).toBeCloseTo((1 - (9 / 16) / (16 / 9)) / 2);
+    expect(a.kenBurns).toBeUndefined();
+    // A short video gets only the beats it has.
+    expect(b.end - b.start).toBeCloseTo(1);
+    expect(b.end).toBeLessThanOrEqual(1.2);
+  });
+  it("never puts a video into a collage", () => {
+    const media = ["p0.jpg", "p1.jpg", "p2.jpg", "p3.jpg", "p4.jpg", "v1.mp4", "p5.jpg", "p6.jpg", "p7.jpg", "p8.jpg"];
+    const shots = planShots(media, styleTemplate("event-recap")!, true, 2, videoOf);
+    expect(shots.find((s) => s.scene)).toBeUndefined();
   });
 });
 

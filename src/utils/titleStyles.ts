@@ -50,8 +50,14 @@ export const TITLE_STYLES: TitleStyle[] = [
   { id: "sticker", label: "Sticker", sample: "READY?", look: { fontFamily: "luckiest", color: "#111111", strokeColor: "#ffffff", strokeWidth: 22, shadow: hard("rgba(0,0,0,0.45)", 0.07), letterSpacing: 0.02 } },
   { id: "comic", label: "Comic pop", sample: "BOOM!", look: { fontFamily: "bangers", color: "#facc15", fill: { from: "#fff176", to: "#f97316" }, strokeColor: "#111111", strokeWidth: 14, shadow: hard("#111111", 0.08), letterSpacing: 0.04 } },
   { id: "luxe-serif", label: "Luxe serif", sample: "New Collection", look: { fontFamily: "playfair", color: "#ffffff", shadow: soft } },
+  { id: "playfair-italic-title", label: "Serif italic", sample: "Get the look", look: { fontFamily: "playfair-italic", color: "#ffffff", shadow: { color: "rgba(0,0,0,0.5)", x: 0, y: 0.03, blur: 0.1 } } },
   { id: "fashion-italic", label: "Editorial", sample: "Elegant", look: { fontFamily: "dm-serif-italic", color: "#ffffff", shadow: soft } },
   { id: "tracked-caps", label: "Tracked caps", sample: "CONFIDENT", look: { fontFamily: "cinzel", color: "#ffffff", letterSpacing: 0.28, shadow: { color: "rgba(0,0,0,0.45)", x: 0, y: 0.02, blur: 0.08 } } },
+  // The shop-opening reference's headline: heavy condensed yellow.
+  { id: "bold-yellow", label: "Bold yellow", sample: "OPEN", look: { fontFamily: "anton", color: "#facc15", shadow: { color: "rgba(0,0,0,0.5)", x: 0, y: 0.04, blur: 0.1 }, letterSpacing: 0.01 } },
+  { id: "script-white", label: "Script", sample: "Now", look: { fontFamily: "pacifico", color: "#ffffff", shadow: { color: "rgba(0,0,0,0.45)", x: 0, y: 0.03, blur: 0.08 } } },
+  // The jewelry reference's wordmark: huge serif melting away towards its foot.
+  { id: "fade-serif", label: "Fade serif", sample: "VÉRA", look: { fontFamily: "playfair", color: "#ffffff", fill: { from: "#ffffff", to: "rgba(255,255,255,0.05)" }, letterSpacing: 0.04 } },
   { id: "fatface", label: "Fatface", sample: "Shop Now!", look: { fontFamily: "abril", color: "#ffffff", fill: { from: "#ffffff", to: "#f3e3c3" }, shadow: { color: "rgba(60,30,0,0.55)", x: 0, y: 0.04, blur: 0.06 } } },
   { id: "paper-marker", label: "Paper strip", sample: "Take a journey", look: { fontFamily: "marker", color: "#151515", backgroundColor: "#f4f2ea", padding: 0.016, cornerStyle: "square" } },
   { id: "typewriter", label: "Typewriter", sample: "Chapter one", look: { fontFamily: "typewriter", color: "#f5f5f4", backgroundColor: "rgba(10,10,10,0.78)", padding: 0.012 } },

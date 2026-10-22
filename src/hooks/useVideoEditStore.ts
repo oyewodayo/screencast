@@ -173,7 +173,7 @@ function exportOverlayAnimation(animation: OverlayAnimation | undefined): string
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track" | "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "padding">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track" | "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "padding" | "rotation">
 >;
 type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal" | "blendMode" | "track">

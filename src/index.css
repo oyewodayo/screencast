@@ -79,3 +79,11 @@ body {
     transform: none;
   }
 }
+
+/* While the video plays, panels and popovers floating over it drop their backdrop blur (their
+   translucent fill stays): the compositor re-blurs under every changing frame, measured at ~30ms
+   a frame in WebView2 - playback would stutter. Back on pause. Toggled by Dashboard. */
+body.media-playing [class*="backdrop-blur"] {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}

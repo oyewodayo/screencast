@@ -116,6 +116,7 @@ type TextOverlayContentPatch = Partial<
     | "fill"
     | "glow"
     | "shadow"
+    | "rotation"
   >
 >;
 type ImageOverlayContentPatch = Partial<
@@ -1344,7 +1345,14 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     [onUpdateImageOverlayContent]
   );
 
-  const activeOverlays = overlaysActiveAt(overlays, currentOutputTime);
+  // Parked on the timeline's very end, the player still shows the last frame - so whatever runs to
+  // the end is on screen there too (end times are otherwise exclusive). Without this, text placed
+  // with the playhead at the end (backed up to fit, ending at the end) wasn't "on screen", so its
+  // editor never opened and the empty overlay was committed - deleted - the moment it was made.
+  const atEnd = totalOutputDuration > 0 && currentOutputTime >= totalOutputDuration - 1e-3;
+  const onScreen = <T extends { startTime: number; endTime: number }>(list: T[]): T[] =>
+    atEnd ? list.filter((o) => currentOutputTime >= o.startTime && (currentOutputTime < o.endTime || o.endTime >= totalOutputDuration - 1e-3)) : overlaysActiveAt(list, currentOutputTime);
+  const activeOverlays = onScreen(overlays);
   const editingSession = editingOverlay && activeOverlays.some((o) => o.id === editingOverlay.id) ? editingOverlay : null;
   const editingOverlayData = editingSession ? overlays.find((o) => o.id === editingSession.id) : undefined;
 
@@ -1420,7 +1428,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       picture
     );
 
-  const activeImageOverlays = overlaysActiveAt(imageOverlays, currentOutputTime).map((o) => {
+  const activeImageOverlays = onScreen(imageOverlays).map((o) => {
     if (imageDrag && o.id === imageDrag.id) return { ...o, x: imageDrag.liveX, y: imageDrag.liveY };
     if (imageResizeDrag && o.id === imageResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
       const b = imageResizeDrag.live;
@@ -1431,7 +1439,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   });
   const selectedImageOverlayData = selectedImageOverlayId ? activeImageOverlays.find((o) => o.id === selectedImageOverlayId) : undefined;
 
-  const activeBlurOverlays = overlaysActiveAt(blurOverlays, currentOutputTime).map((o) => {
+  const activeBlurOverlays = onScreen(blurOverlays).map((o) => {
     if (blurDrag && o.id === blurDrag.id) return { ...o, x: blurDrag.liveX, y: blurDrag.liveY };
     if (blurResizeDrag && o.id === blurResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
       const b = blurResizeDrag.live;
@@ -1887,8 +1895,14 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 pointerEvents: placingAnything ? "none" : "auto",
                 // --reveal-fade: a title reveal's exit fade, set by RevealText.
                 opacity: o.keyframes?.length || isTextReveal(o.animation) ? `calc(${anim.opacity} * var(--kf-opacity, 1) * var(--reveal-fade, 1))` : anim.opacity,
+                // Turned about its own centre after any slide/scale, as pictures are; the canvas
+                // inside draws it level (CanvasTextOverlay) and this turns both together.
                 transform:
-                  [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null]
+                  [
+                    anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+                    anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
+                    o.rotation ? `rotate(${o.rotation}deg)` : null,
+                  ]
                     .filter(Boolean)
                     .join(" ") || undefined,
                 background: onCanvas ? "transparent" : o.backgroundColor ?? "transparent",

@@ -21,6 +21,7 @@ import {
   IoFolderOpenOutline,
   IoImageOutline,
   IoMusicalNotes,
+  IoVideocam,
   IoPause,
   IoPlay,
   IoShuffle,
@@ -55,6 +56,8 @@ import {
 import ProjectStage, { StagePicture } from "./ProjectStage";
 import TitleLookTile from "./TitleLookTile";
 import { photoFillPath } from "../../utils/photoFill";
+import { BRAND_INTROS, BrandIntroStyle, BrandOptions, VideoInfo } from "../../utils/videoStyleTemplates";
+import { getFileCategory } from "../../utils/fileCategory";
 
 export interface NewVideoProjectRequest {
   name: string;
@@ -66,10 +69,13 @@ export interface NewVideoProjectRequest {
 }
 
 interface NewVideoProjectDialogProps {
-  // Every still image in the library that can become a clip (isImageClipPath).
+  // Every still image in the library that can become a clip (isImageClipPath), and every video.
   libraryImages: { name: string; path: string }[];
-  // Dashboard's resolveImageThumbnailUrl - small cached thumbnails, works for any path on disk.
+  libraryVideos: { name: string; path: string }[];
+  // Dashboard's resolveImageThumbnailUrl / resolveVideoThumbnailUrl - small cached thumbnails,
+  // work for any path on disk.
   resolveThumbnailUrl: (file: { name: string; path: string }) => Promise<string>;
+  resolveVideoThumbnailUrl: (file: { name: string; path: string }) => Promise<string>;
   // Rejects with a message to show in place (the dialog stays open on failure).
   onCreate: (request: NewVideoProjectRequest) => Promise<void>;
   onClose: () => void;
@@ -126,6 +132,27 @@ interface TrackBeats {
 }
 
 const baseName = (path: string): string => path.split(/[\\/]/).pop() ?? path;
+const isVideoPath = (path: string): boolean => getFileCategory(baseName(path)) === "video";
+const VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "mkv", "webm", "wmv"];
+
+// The brand kit is remembered on this computer between videos (a convenience - nothing depends on it).
+const BRAND_KEY = "briefcast.brandKit";
+const EMPTY_BRAND: BrandOptions = { name: "", tagline: "", website: "", logo: null, intro: null, outro: false, bar: false };
+function readBrand(): BrandOptions {
+  try {
+    const saved = JSON.parse(localStorage.getItem(BRAND_KEY) ?? "null");
+    return saved && typeof saved === "object" ? { ...EMPTY_BRAND, ...saved, intro: null, outro: false, bar: false } : EMPTY_BRAND;
+  } catch {
+    return EMPTY_BRAND;
+  }
+}
+function saveBrand(b: BrandOptions) {
+  try {
+    localStorage.setItem(BRAND_KEY, JSON.stringify({ name: b.name, tagline: b.tagline, website: b.website, logo: b.logo }));
+  } catch {
+    // Private window / storage off: the kit just isn't remembered.
+  }
+}
 const formatLength = (seconds: number) => {
   const s = Math.round(seconds);
   return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
@@ -140,8 +167,9 @@ function transitionCycle(style: StyleId, template: StyleTemplate | null): Transi
 }
 
 // Decodes a picture for the stage, scaled down to STAGE_PICTURE_PX on its long side (readable
-// back, so the look can apply). Falls back to the thumbnail where the full file won't decode here.
-function loadStagePicture(path: string, thumbUrl: string | undefined): Promise<StagePicture | null> {
+// back, so the look can apply). Falls back to the thumbnail where the full file won't decode here -
+// and a null path loads just the thumbnail (a video's poster).
+function loadStagePicture(path: string | null, thumbUrl: string | undefined): Promise<StagePicture | null> {
   const load = (src: string) =>
     new Promise<HTMLImageElement | null>((resolve) => {
       const img = new Image();
@@ -150,7 +178,7 @@ function loadStagePicture(path: string, thumbUrl: string | undefined): Promise<S
       img.onerror = () => resolve(null);
       img.src = src;
     });
-  return load(convertFileSrc(path))
+  return (path ? load(convertFileSrc(path)) : Promise.resolve(null))
     .then((img) => img ?? (thumbUrl ? load(thumbUrl) : null))
     .then((img) => {
       if (!img || !img.naturalWidth) return null;
@@ -263,9 +291,10 @@ const TemplateCard: React.FC<{ template: StyleTemplate | null; active: boolean; 
 
 // ---------- the dialog ----------
 
-const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryImages, resolveThumbnailUrl, onCreate, onClose }) => {
+const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryImages, libraryVideos, resolveThumbnailUrl, resolveVideoThumbnailUrl, onCreate, onClose }) => {
   const [name, setName] = useState("Untitled video");
-  const [frameId, setFrameId] = useState(FRAME_PRESETS[0].id);
+  // "auto": the shape most of the picked media are (autoFrameId).
+  const [frameId, setFrameId] = useState("auto");
   // In clip order - the order images were picked in, rearranged by dragging in the sequence strip.
   const [picked, setPicked] = useState<string[]>([]);
   const [templateId, setTemplateId] = useState<string | null>(null);
@@ -299,6 +328,16 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [stagePictures, setStagePictures] = useState<Map<string, StagePicture>>(new Map());
   const [aspects, setAspects] = useState<Record<string, number>>({});
+  // Picked videos' length and shape (get_conversion_info) - a video takes part once it's known.
+  const [videoInfo, setVideoInfo] = useState<Record<string, VideoInfo>>({});
+  const [mediaFilter, setMediaFilter] = useState<"all" | "photos" | "videos">("all");
+  const [brand, setBrandState] = useState<BrandOptions>(readBrand);
+  const setBrand = (patch: Partial<BrandOptions>) =>
+    setBrandState((prev) => {
+      const next = { ...prev, ...patch };
+      saveBrand(next);
+      return next;
+    });
   const [fontsReady, setFontsReady] = useState(false);
   const [draggingPath, setDraggingPath] = useState<string | null>(null);
   const dragRef = useRef<{ path: string; startX: number; moved: boolean } | null>(null);
@@ -324,13 +363,17 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   }, []);
 
   // Library images plus anything picked from disk, de-duplicated - every tile either list shows.
-  const thumbnailPaths = useMemo(() => Array.from(new Set([...picked, ...libraryImages.map((image) => image.path)])), [picked, libraryImages]);
+  // Thumbnails are asked for as tiles come near view (a library can hold thousands), plus whatever
+  // is picked and the logo.
+  const [nearView, setNearView] = useState<Set<string>>(() => new Set());
+  const gridScrollRef = useRef<HTMLDivElement>(null);
+  const thumbnailPaths = useMemo(() => Array.from(new Set([...picked, ...nearView, ...(brand.logo ? [brand.logo.path] : [])])), [picked, nearView, brand.logo]);
   useEffect(() => {
     let cancelled = false;
     thumbnailPaths
       .filter((path) => !thumbUrls[path])
       .forEach((path) => {
-        thumbnailLimiter(() => resolveThumbnailUrl({ name: baseName(path), path }))
+        thumbnailLimiter(() => (isVideoPath(path) ? resolveVideoThumbnailUrl : resolveThumbnailUrl)({ name: baseName(path), path }))
           .then((url) => !cancelled && setThumbUrls((prev) => (prev[path] ? prev : { ...prev, [path]: url })))
           .catch((err) => console.error("Failed to resolve thumbnail for", path, err));
       });
@@ -339,13 +382,36 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     };
     // thumbUrls deliberately left out - same reasoning as VideoEditorHome's own thumbnail effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thumbnailPaths, resolveThumbnailUrl]);
+  }, [thumbnailPaths, resolveThumbnailUrl, resolveVideoThumbnailUrl]);
+
+  // A picked video's length and shape, asked for once.
+  useEffect(() => {
+    picked
+      .filter((p) => isVideoPath(p) && !videoInfo[p])
+      .forEach((p) => {
+        invoke<Record<string, string>>("get_conversion_info", { inputPath: p })
+          .then((info) => {
+            const duration = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+            const res = info.resolution?.match(/^(\d+)x(\d+)$/);
+            if (!Number.isFinite(duration) || duration <= 0) throw new Error("no duration");
+            setVideoInfo((prev) => ({ ...prev, [p]: { duration, aspect: res ? Number(res[1]) / Number(res[2]) : 16 / 9 } }));
+          })
+          .catch((err) => {
+            console.warn("Couldn't read video", p, err);
+            setPicked((prev) => prev.filter((x) => x !== p));
+            setError(`Couldn't read ${baseName(p)} - left it out.`);
+          });
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [picked]);
+  const videoOf = useCallback((p: string) => videoInfo[p], [videoInfo]);
+  const pickedVideos = useMemo(() => new Set(picked.filter(isVideoPath)), [picked]);
 
   // Each picked photo's shape (from its thumbnail) - collage cells crop to fill with it.
   useEffect(() => {
     let cancelled = false;
     picked
-      .filter((p) => thumbUrls[p] && aspects[p] === undefined)
+      .filter((p) => thumbUrls[p] && aspects[p] === undefined && !isVideoPath(p))
       .forEach((p) => {
         const img = new Image();
         img.onload = () => !cancelled && img.naturalHeight && setAspects((prev) => ({ ...prev, [p]: img.naturalWidth / img.naturalHeight }));
@@ -401,13 +467,30 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   };
 
   const handleBrowse = async () => {
-    const selected = await openFileDialog({ multiple: true, filters: [{ name: "Images", extensions: IMAGE_CLIP_EXTENSIONS }] });
+    const selected = await openFileDialog({
+      multiple: true,
+      filters: [
+        { name: "Photos and videos", extensions: [...IMAGE_CLIP_EXTENSIONS, ...VIDEO_EXTENSIONS] },
+        { name: "Photos", extensions: IMAGE_CLIP_EXTENSIONS },
+        { name: "Videos", extensions: VIDEO_EXTENSIONS },
+      ],
+    });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
     setPicked((prev) => [...prev, ...paths.filter((path) => !prev.includes(path))]);
   };
 
-  const frame = FRAME_PRESETS.find((preset) => preset.id === frameId)?.frame ?? FRAME_PRESETS[0].frame;
+  // Auto picks the frame most of the media already fill: tall, square or wide.
+  const autoFrameId = useMemo(() => {
+    const shapes = picked.map((p) => (isVideoPath(p) ? videoInfo[p]?.aspect : aspects[p])).filter((a): a is number => !!a);
+    if (!shapes.length) return "landscape";
+    const tall = shapes.filter((a) => a < 0.85).length;
+    const square = shapes.filter((a) => a >= 0.85 && a <= 1.15).length;
+    const wide = shapes.length - tall - square;
+    return tall > wide && tall >= square ? "portrait" : square > wide && square > tall ? "square" : "landscape";
+  }, [picked, aspects, videoInfo]);
+  const resolvedFrameId = frameId === "auto" ? autoFrameId : frameId;
+  const frame = FRAME_PRESETS.find((preset) => preset.id === resolvedFrameId)?.frame ?? FRAME_PRESETS[0].frame;
 
   // ---- music ----
 
@@ -504,8 +587,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       scenes: trying || scenesOn,
       texts: t ? textsByTemplate[t.id] ?? templateTexts(t) : {},
       music: song,
+      brand: brand.intro || brand.outro || brand.bar ? brand : null,
     }),
-    [imageDuration, beatsPerPhoto, kenBurns, look, overlaysOn, captionsOn, scenesOn, textsByTemplate]
+    [imageDuration, beatsPerPhoto, kenBurns, look, overlaysOn, captionsOn, scenesOn, textsByTemplate, brand]
   );
 
   // What the stage plays: the picks (the first STAGE_MAX_PHOTOS), or a few library pictures as a
@@ -514,8 +598,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const shownTemplate = hoverTemplateId === undefined ? template : styleTemplate(hoverTemplateId);
   const trying = hoverTemplateId !== undefined && hoverTemplateId !== templateId;
   const shownStyle: StyleId = hoverStyle ?? (trying ? (shownTemplate ? "template" : "mix") : style);
+  // Recomputed when a video's poster (its thumbnail) arrives, so the stage can show it.
+  const videoPostersKey = stagePaths.filter(isVideoPath).map((p) => (thumbUrls[p] ? 1 : 0)).join("");
   const stageProject = useMemo(() => {
-    const ready = stagePaths.filter((p) => stagePictures.has(p));
+    const ready = stagePaths.filter((p) => stagePictures.has(p) && (!isVideoPath(p) || videoInfo[p]));
     if (!ready.length) return null;
     return buildStyledProject(ready, frame, optionsFor(shownTemplate, trying, shownStyle, stageMusic), {
       aspectOf: (p) => {
@@ -523,8 +609,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
         return pic ? pic.width / pic.height : 1;
       },
       measure: fontsReady ? measureText : undefined,
+      videoOf,
+      fillVideos: blurFill,
     });
-  }, [stagePaths, stagePictures, frame, optionsFor, shownTemplate, trying, shownStyle, stageMusic, fontsReady]);
+  }, [stagePaths, stagePictures, frame, optionsFor, shownTemplate, trying, shownStyle, stageMusic, fontsReady, videoInfo, videoOf, blurFill]);
 
   // Decode the stage's pictures (full files, scaled down), a few at a time.
   useEffect(() => {
@@ -532,7 +620,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     stagePaths
       .filter((p) => !stagePictures.has(p))
       .forEach((p) => {
-        void stagePictureLimiter(() => loadStagePicture(p, thumbUrls[p])).then((pic) => {
+        // A video's poster is its thumbnail - the stage plays the video itself over it.
+        if (isVideoPath(p) && !thumbUrls[p]) return;
+        void stagePictureLimiter(() => loadStagePicture(isVideoPath(p) ? null : p, thumbUrls[p])).then((pic) => {
           if (!cancelled && pic) setStagePictures((prev) => (prev.has(p) ? prev : new Map(prev).set(p, pic)));
         });
       });
@@ -540,7 +630,28 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stagePaths]);
+  }, [stagePaths, videoPostersKey]);
+
+  // The brand logo, decoded for the stage like the photos.
+  useEffect(() => {
+    const logo = brand.logo?.path;
+    if (!logo || stagePictures.has(logo)) return;
+    let cancelled = false;
+    void loadStagePicture(logo, thumbUrls[logo]).then((pic) => !cancelled && pic && setStagePictures((prev) => new Map(prev).set(logo, pic)));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brand.logo?.path]);
+
+  const handlePickLogo = async () => {
+    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Logo", extensions: ["png", "jpg", "jpeg", "webp", "svg", "gif"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    const pic = await loadStagePicture(selected, undefined);
+    if (!pic) return setError("Couldn't open that logo.");
+    setStagePictures((prev) => new Map(prev).set(selected, pic));
+    setBrand({ logo: { path: selected, aspect: pic.width / pic.height }, intro: brand.intro ?? "neon" });
+  };
 
   // The song plays alongside the stage: a library song's preview clip, or the file - from where the
   // stage's project starts in it. songClock maps where it is to seconds into the edit.
@@ -615,6 +726,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       return;
     }
     setStyle("template");
+    // The brand cards the style is made for - when there's a brand to show.
+    if (t.suggestBrand && (brand.name.trim() || brand.logo))
+      setBrand({ intro: t.suggestBrand.intro ?? brand.intro, outro: t.suggestBrand.outro ?? brand.outro, bar: t.suggestBrand.bar ?? brand.bar });
     setLook(t.look);
     setImageDuration(t.seconds);
     setBeatsPerPhoto(t.beatsPerPhoto);
@@ -655,10 +769,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       const fills = new Map<string, string>();
       if (blurFill && picked.length) {
         let done = 0;
-        const queue = [...picked];
+        const queue = picked.filter((p) => !isVideoPath(p));
         const worker = async () => {
           for (let p = queue.shift(); p; p = queue.shift()) {
-            setCreatingStep(`Fitting photos to the frame… ${++done}/${picked.length}`);
+            setCreatingStep(`Fitting photos to the frame… ${++done}/${queue.length + done}`);
             fills.set(p, await photoFillPath(p, frame, aspects[p]).catch(() => p));
           }
         };
@@ -670,6 +784,8 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
             aspectOf: (p) => aspects[p] ?? 1,
             measure: fontsReady ? measureText : undefined,
             clipSource: (p) => fills.get(p) ?? p,
+            videoOf,
+            fillVideos: blurFill,
           })
         : undefined;
       trackEvent("video_project_created", { style: template?.id ?? "custom", music: song ? (song.library ? "library" : "file") : "none", photos: picked.length });
@@ -695,7 +811,27 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     );
 
   const projectLength = stageProject && picked.length && picked.length <= STAGE_MAX_PHOTOS ? stageProject.clips.reduce((s, c) => s + c.end - c.start, 0) : picked.length * perPhoto;
-  const allPicked = libraryImages.length > 0 && libraryImages.every((i) => picked.includes(i.path));
+  const media = useMemo(
+    () => [
+      ...(mediaFilter !== "videos" ? libraryImages.map((m) => ({ ...m, video: false })) : []),
+      ...(mediaFilter !== "photos" ? libraryVideos.map((m) => ({ ...m, video: true })) : []),
+    ],
+    [libraryImages, libraryVideos, mediaFilter]
+  );
+  const allPicked = media.length > 0 && media.every((i) => picked.includes(i.path));
+  useEffect(() => {
+    const root = gridScrollRef.current;
+    if (!root) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const seen = entries.filter((e) => e.isIntersecting).map((e) => (e.target as HTMLElement).dataset.thumb ?? "");
+        if (seen.length) setNearView((prev) => (seen.every((p) => prev.has(p)) ? prev : new Set([...prev, ...seen])));
+      },
+      { root, rootMargin: "400px 0px" }
+    );
+    root.querySelectorAll<HTMLElement>("[data-thumb]").forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, [media]);
   const musicTitle = music ? (music.kind === "library" ? music.track.title : music.name) : null;
   const musicArtist = music?.kind === "library" ? music.track.artist : music ? "From your computer" : null;
   const shownLook = trying ? shownTemplate?.look ?? null : look;
@@ -707,8 +843,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     .join(" · ");
 
   return (
+    // No backdrop-filter here or on the stage's buttons: with the stage animating under it, the
+    // compositor re-blurs on every frame - measured at ~30ms a frame (60 -> 20 fps) in WebView2.
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-950/50 backdrop-blur-sm p-4 sm:p-6"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-950/60 p-4 sm:p-6"
       onMouseDown={(e) => e.target === e.currentTarget && !isCreating && onClose()}
     >
       <audio ref={audioRef} preload="auto" className="hidden" />
@@ -737,13 +875,32 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
           {/* Media */}
           <div className="flex-1 min-w-0 min-h-0 flex flex-col">
             <div className="flex items-center gap-2 px-6 pt-4 pb-3">
-              <h3 className="text-[13px] font-semibold text-neutral-900 dark:text-white">Your photos</h3>
-              <span className="text-[12px] text-neutral-400 tabular-nums">{libraryImages.length}</span>
+              <h3 className="text-[13px] font-semibold text-neutral-900 dark:text-white">Your media</h3>
+              <div className="flex gap-0.5 p-0.5 rounded-full bg-neutral-100 dark:bg-white/[0.06]">
+                {(
+                  [
+                    ["all", `All ${libraryImages.length + libraryVideos.length}`],
+                    ["photos", `Photos ${libraryImages.length}`],
+                    ["videos", `Videos ${libraryVideos.length}`],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setMediaFilter(id)}
+                    className={`h-7 px-2.5 rounded-full text-[11.5px] font-medium tabular-nums transition-colors ${
+                      mediaFilter === id ? "bg-white text-neutral-900 shadow-sm dark:bg-neutral-700 dark:text-white" : "text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               <span className="flex-1" />
-              {libraryImages.length > 0 && (
+              {media.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => setPicked(allPicked ? [] : [...picked, ...libraryImages.map((i) => i.path).filter((p) => !picked.includes(p))])}
+                  onClick={() => setPicked(allPicked ? picked.filter((p) => !media.some((m) => m.path === p)) : [...picked, ...media.map((i) => i.path).filter((p) => !picked.includes(p))])}
                   className="h-8 px-3 rounded-full text-[12.5px] font-medium text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-white/[0.08]"
                 >
                   {allPicked ? "Clear all" : "Select all"}
@@ -759,15 +916,16 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
               </button>
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
-              {libraryImages.length > 0 ? (
+            <div ref={gridScrollRef} className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
+              {media.length > 0 ? (
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 p-1.5 -mx-1.5">
-                  {libraryImages.map((image) => {
+                  {media.map((image) => {
                     const order = picked.indexOf(image.path);
                     const on = order >= 0;
                     return (
                       <button
                         key={image.path}
+                        data-thumb={image.path}
                         type="button"
                         onClick={() => togglePicked(image.path)}
                         title={image.name}
@@ -779,6 +937,12 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                           <span className="absolute inset-0 flex items-center justify-center">{renderThumb(image.path)}</span>
                         </span>
                         <span className={`absolute inset-0 transition-colors ${on ? "bg-blue-500/15" : "bg-black/0 group-hover:bg-black/10"}`} />
+                        {image.video && (
+                          <span className="absolute left-1.5 bottom-1.5 flex items-center gap-1 px-1.5 h-5 rounded-md bg-black/65 text-[10.5px] font-semibold text-white tabular-nums">
+                            <IoVideocam size={11} />
+                            {videoInfo[image.path] ? formatLength(videoInfo[image.path].duration) : ""}
+                          </span>
+                        )}
                         <span
                           className={`absolute top-2 right-2 min-w-[22px] h-[22px] px-1 rounded-full text-[11px] font-semibold flex items-center justify-center tabular-nums transition-all ${
                             on ? "bg-blue-500 text-white shadow" : "bg-black/25 text-transparent ring-1 ring-white/80 opacity-0 group-hover:opacity-100"
@@ -797,7 +961,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                   className="w-full h-full min-h-[220px] rounded-2xl border-2 border-dashed border-neutral-200 dark:border-white/10 flex flex-col items-center justify-center gap-2 text-neutral-500 hover:border-blue-300 hover:text-blue-600 transition-colors"
                 >
                   <IoImageOutline size={30} />
-                  <span className="text-[13px] font-medium">Choose photos from your computer</span>
+                  <span className="text-[13px] font-medium">Choose photos and videos from your computer</span>
                   <span className="text-[12px]">Or start blank and drop media on the timeline</span>
                 </button>
               )}
@@ -809,7 +973,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                 <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-500 dark:text-neutral-400">Sequence</h3>
                 {picked.length > 0 && (
                   <span className="text-[12px] text-neutral-400 tabular-nums">
-                    {picked.length} {picked.length === 1 ? "photo" : "photos"} · {formatLength(projectLength)} · drag to reorder
+                    {picked.length} {picked.length === 1 ? "clip" : "clips"} · {formatLength(projectLength)} · drag to reorder
                   </span>
                 )}
               </div>
@@ -828,7 +992,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                       }`}
                     >
                       {renderThumb(path)}
-                      <span className="absolute bottom-1 left-1 px-1.5 rounded-md bg-black/60 text-[10px] font-semibold text-white tabular-nums">{i + 1}</span>
+                      <span className="absolute bottom-1 left-1 flex items-center gap-0.5 px-1.5 rounded-md bg-black/60 text-[10px] font-semibold text-white tabular-nums">
+                        {isVideoPath(path) && <IoVideocam size={10} />}
+                        {i + 1}
+                      </span>
                       <button
                         type="button"
                         onPointerDown={(e) => e.stopPropagation()}
@@ -859,8 +1026,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                     frame={frame}
                     images={stagePictures}
                     blurFill={blurFill}
+                    videoPaths={pickedVideos}
                     playing={playing}
-                    restartKey={`${shownStyle}|${frameId}|${shownTemplate?.id ?? ""}`}
+                    restartKey={`${shownStyle}|${resolvedFrameId}|${shownTemplate?.id ?? ""}`}
                     songClock={music ? songClock : null}
                   />
                 ) : (
@@ -872,7 +1040,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                   type="button"
                   onClick={() => setPlaying((p) => !p)}
                   aria-label={playing ? "Pause preview" : "Play preview"}
-                  className="w-8 h-8 rounded-full bg-white/15 hover:bg-white/25 text-white backdrop-blur flex items-center justify-center"
+                  className="w-8 h-8 rounded-full bg-neutral-800/80 hover:bg-neutral-700/90 text-white flex items-center justify-center"
                 >
                   {playing ? <IoPause size={14} /> : <IoPlay size={14} className="translate-x-[1px]" />}
                 </button>
@@ -881,7 +1049,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                     type="button"
                     onClick={() => setMusicMuted((m) => !m)}
                     aria-label={musicMuted ? "Unmute song" : "Mute song"}
-                    className="w-8 h-8 rounded-full bg-white/15 hover:bg-white/25 text-white backdrop-blur flex items-center justify-center"
+                    className="w-8 h-8 rounded-full bg-neutral-800/80 hover:bg-neutral-700/90 text-white flex items-center justify-center"
                   >
                     {musicMuted ? <IoVolumeMuteOutline size={15} /> : <IoVolumeHighOutline size={15} />}
                   </button>
@@ -979,12 +1147,77 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                 {music && <p className="text-[11.5px] text-neutral-500 dark:text-neutral-400">Every cut lands on the beat. Change or trim the song later in the editor.</p>}
               </Section>
 
+              <Section
+                title="Brand"
+                aside={
+                  <span className="text-[11px] text-neutral-400">{brand.name || brand.logo ? "Remembered for next time" : "Logo intro & closing card"}</span>
+                }
+              >
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => void handlePickLogo()}
+                    title={brand.logo ? "Change logo" : "Add your logo"}
+                    className="relative w-16 h-16 shrink-0 rounded-xl ring-1 ring-neutral-200 dark:ring-white/10 bg-[conic-gradient(#e5e7eb_25%,#fff_0_50%,#e5e7eb_0_75%,#fff_0)] bg-[length:12px_12px] dark:bg-[conic-gradient(#262626_25%,#171717_0_50%,#262626_0_75%,#171717_0)] overflow-hidden flex items-center justify-center hover:ring-blue-400 transition"
+                  >
+                    {brand.logo && thumbUrls[brand.logo.path] ? (
+                      <img src={thumbUrls[brand.logo.path]} alt="" className="max-w-[85%] max-h-[85%] object-contain" />
+                    ) : brand.logo ? (
+                      <IoImageOutline size={18} className="text-neutral-400" />
+                    ) : (
+                      <span className="text-[10.5px] font-medium text-neutral-500 leading-tight text-center px-1">Add logo</span>
+                    )}
+                  </button>
+                  <div className="flex-1 min-w-0 flex flex-col gap-1.5">
+                    <TextField compact value={brand.name} onChange={(name) => setBrand({ name })} placeholder="Brand name" label="Brand name" />
+                    <TextField compact value={brand.tagline} onChange={(tagline) => setBrand({ tagline })} placeholder="Tagline (optional)" label="Tagline" />
+                  </div>
+                </div>
+                <TextField compact value={brand.website} onChange={(website) => setBrand({ website })} placeholder="Website or @handle (optional)" label="Website" />
+                {brand.logo && (
+                  <button type="button" onClick={() => setBrand({ logo: null })} className="self-start text-[11.5px] text-neutral-500 hover:text-red-500">
+                    Remove logo
+                  </button>
+                )}
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[11.5px] text-neutral-500 dark:text-neutral-400">Opening</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    <Pill active={!brand.intro} onClick={() => setBrand({ intro: null })}>
+                      None
+                    </Pill>
+                    {BRAND_INTROS.map((b) => (
+                      <Pill key={b.id} active={brand.intro === b.id} onClick={() => setBrand({ intro: b.id as BrandIntroStyle })} title={b.blurb}>
+                        {b.label}
+                      </Pill>
+                    ))}
+                  </div>
+                </div>
+                <Switch on={brand.outro} onChange={(outro) => setBrand({ outro })} label="Closing card" hint="Logo, name and website at the end" />
+                <Switch on={brand.bar} onChange={(bar) => setBrand({ bar })} label="Brand bar" hint="Name along the top, website along the bottom" />
+                {(brand.intro || brand.outro || brand.bar) && !brand.name.trim() && !brand.logo && (
+                  <p className="text-[11.5px] text-amber-600 dark:text-amber-400">Add a logo or a brand name to show it.</p>
+                )}
+              </Section>
+
               <Section title="Name">
                 <TextField value={name} onChange={setName} label="Video name" />
               </Section>
 
               <Section title="Format">
-                <div className="grid grid-cols-4 gap-1 p-1 rounded-xl bg-neutral-100 dark:bg-white/[0.05]">
+                <div className="grid grid-cols-5 gap-1 p-1 rounded-xl bg-neutral-100 dark:bg-white/[0.05]">
+                  <button
+                    type="button"
+                    onClick={() => setFrameId("auto")}
+                    title="Fits most of your media - tall, square or wide"
+                    className={`flex flex-col items-center gap-1 py-1.5 rounded-lg text-[11px] font-medium transition-all outline-none ${
+                      frameId === "auto" ? "bg-white dark:bg-neutral-800 text-neutral-900 dark:text-white shadow-sm" : "text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200"
+                    }`}
+                  >
+                    <span className="h-5 flex items-center">
+                      <IoSparkles size={14} className={frameId === "auto" ? "text-blue-500" : ""} />
+                    </span>
+                    {frameId === "auto" ? FRAME_PRESETS.find((p) => p.id === autoFrameId)?.hint : "Auto"}
+                  </button>
                   {FRAME_PRESETS.map((preset) => {
                     const active = preset.id === frameId;
                     const s = 16 / Math.max(preset.frame.width, preset.frame.height);

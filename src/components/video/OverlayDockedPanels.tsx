@@ -185,6 +185,7 @@ const TEXT_REVEALS: { value: OverlayAnimation; label: string; title: string }[] 
   { value: "zoomin", label: "Zoom in", title: "Letters land from big and soft" },
   { value: "bounce", label: "Bounce", title: "Letters drop in tilted and bounce upright - sticker titles" },
   { value: "flicker", label: "Flicker", title: "A neon sign warming up" },
+  { value: "roll", label: "Roll", title: "Letters and digits spin like a slot machine and land in turn" },
 ];
 
 // The animation picker's tiles play each animation on a sample title, on a loop: on screen for
@@ -610,7 +611,7 @@ export interface TextDockedPanelProps extends CommonProps {
   look: Partial<TextOverlay>;
   // A ready-made look (titleStyles.ts), and single look fields (face, tracking, gradient, glow, shadow).
   onApplyLook: (style: TitleStyle) => void;
-  onLook: (patch: Pick<Partial<TextOverlay>, "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow">) => void;
+  onLook: (patch: Pick<Partial<TextOverlay>, "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "rotation">) => void;
   backgroundColor?: string;
   strokeColor?: string;
   strokeWidth?: number;
@@ -1006,6 +1007,39 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
       </Section>
 
       <TextEffectsSection look={props.look} onLook={props.onLook} />
+      <Section title="Rotate">
+        <SliderRow
+          label="Angle"
+          value={props.look.rotation ?? 0}
+          min={-180}
+          max={180}
+          step={1}
+          marks={[0, -90, 90]}
+          format={(v) => `${Math.round(v)}°`}
+          onChange={(v) => props.onLook({ rotation: Math.abs(v) < 0.5 ? undefined : v })}
+        />
+        <div className="grid grid-cols-4 gap-1">
+          {[
+            { v: 0, label: "Level", title: "Straight" },
+            { v: -90, label: "Up ↑", title: "Vertical, reading bottom to top" },
+            { v: 90, label: "Down ↓", title: "Vertical, reading top to bottom" },
+            { v: -8, label: "Tilt", title: "A slight, lively tilt" },
+          ].map((r) => (
+            <button
+              key={r.v}
+              type="button"
+              title={r.title}
+              onMouseDown={keepFocus}
+              onClick={() => props.onLook({ rotation: r.v || undefined })}
+              className={`h-7 rounded-md text-[11px] transition-colors ${
+                (props.look.rotation ?? 0) === r.v ? "bg-blue-500/25 text-blue-200 ring-1 ring-blue-400/50" : "bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10"
+              }`}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      </Section>
 
       <Section title="Box">
         <SliderRow label="Padding" value={props.paddingPx} min={0} max={60} step={1} format={(v) => `${Math.round(v)}px`} onChange={props.onPaddingPx} />

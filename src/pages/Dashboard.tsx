@@ -892,6 +892,10 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // timeline show an accurate Play/Pause icon and toggle real playback from its own transport
   // button, the same way its playhead already tracks and drives the real player.
   const [playerIsPlaying, setPlayerIsPlaying] = useState<boolean>(false);
+  // Floating panels drop their backdrop blur while the video plays (index.css) - it costs a frame.
+  useEffect(() => {
+    document.body.classList.toggle("media-playing", playerIsPlaying);
+  }, [playerIsPlaying]);
   useEffect(() => {
     setPlayerCurrentTime(0);
     setPlayerIsPlaying(false);
@@ -4852,7 +4856,9 @@ const setScreen = () => {
           {isNewVideoProjectOpen && (
             <NewVideoProjectDialog
               libraryImages={allLibraryFiles.filter((file) => isImageClipPath(file.path))}
+              libraryVideos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path))}
               resolveThumbnailUrl={resolveImageThumbnailUrl}
+              resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
               onCreate={handleCreateVideoProject}
               onClose={() => setIsNewVideoProjectOpen(false)}
             />

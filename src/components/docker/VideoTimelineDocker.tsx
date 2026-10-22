@@ -2909,6 +2909,63 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       : 0;
   const playheadLeft = currentOutputTime * pxPerSec;
 
+  // Picking a transition, motion or effect plays it straight away on the selected clip - the
+  // moment around the cut for a transition, the clip's opening for the rest - then stops, so
+  // what was picked is seen without reaching for Play. Only discrete picks (a slider's drag
+  // would replay on every step); playing or pausing by hand drops it.
+  const previewEndRef = useRef<number | null>(null);
+  const previewSafetyRef = useRef<number | null>(null);
+  const previewOwnsPlayRef = useRef(false);
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const stopPickPreview = useCallback(() => {
+    previewEndRef.current = null;
+    if (previewSafetyRef.current) window.clearTimeout(previewSafetyRef.current);
+    previewSafetyRef.current = null;
+  }, []);
+  const playPickPreview = (from: number, to: number) => {
+    stopPickPreview();
+    seekToOutputTime(Math.max(0, from));
+    previewEndRef.current = to;
+    previewOwnsPlayRef.current = true;
+    if (!isPlayingRef.current) onTogglePlay();
+    // A safety stop, in case the playhead's reports stall (a slow clip switch).
+    previewSafetyRef.current = window.setTimeout(() => {
+      if (previewEndRef.current !== null && isPlayingRef.current) onTogglePlay();
+      stopPickPreview();
+    }, (to - from) * 1000 + 3000);
+  };
+  useEffect(() => {
+    const end = previewEndRef.current;
+    if (end === null) return;
+    if (isPlaying && currentOutputTime >= end) {
+      stopPickPreview();
+      onTogglePlay();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOutputTime]);
+  useEffect(() => {
+    // Our own play just landed - from here on, a pause (by hand, or the clip ending) ends the preview.
+    if (isPlaying) previewOwnsPlayRef.current = false;
+    else if (!previewOwnsPlayRef.current) stopPickPreview();
+  }, [isPlaying, stopPickPreview]);
+  useEffect(() => stopPickPreview, [stopPickPreview]);
+  const previewPick = (clipIndex: number, patch: StoreClipPatch) => {
+    const clip = renderClips[clipIndex];
+    if (!clip) return;
+    const start = outputStarts[clipIndex] ?? 0;
+    const length = clipDurations[clipIndex] ?? 0;
+    const newTransition = patch.transitionIn !== undefined && patch.transitionIn?.type !== clip.transitionIn?.type;
+    if (newTransition && patch.transitionIn && clipIndex > 0) {
+      const lead = Math.min(0.8, (clipDurations[clipIndex - 1] ?? 0) * 0.6);
+      playPickPreview(start - lead, Math.min(start + length, start + patch.transitionIn.duration + 0.6));
+      return;
+    }
+    const newMotion = patch.kenBurns !== undefined && patch.kenBurns?.preset !== clip.kenBurns?.preset;
+    const newEffect = patch.fx !== undefined && patch.fx?.kind !== clip.fx?.kind;
+    if ((newMotion && patch.kenBurns) || (newEffect && patch.fx)) playPickPreview(start, start + Math.min(length, 2.5));
+  };
+
   // Snap landmarks for every overlay drag/resize handler above (they're all defined earlier in
   // this component but close over this by reference, same forward-reference pattern
   // currentOutputTime's own consumers above already rely on) - the playhead plus every clip's own
@@ -4671,7 +4728,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               isOnScreen={activeClip?.id === clip.id}
               anchor={effectsPopoverAnchor}
               selectedCount={selectedCount}
-              onUpdate={updateSelectedClips}
+              onUpdate={(patch) => {
+                previewPick(clipIndex, patch);
+                updateSelectedClips(patch);
+              }}
               onAddTransitionSound={
                 clipIndex > 0
                   ? (soundId) => {

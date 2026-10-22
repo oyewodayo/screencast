@@ -10,12 +10,12 @@
 // as the line fills in.
 import type { OverlayAnimation } from "./videoEditTypes";
 
-export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave" | "popin" | "mask" | "zoomin" | "flicker" | "bounce";
+export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave" | "popin" | "mask" | "zoomin" | "flicker" | "bounce" | "roll";
 
-const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave", "popin", "mask", "zoomin", "flicker", "bounce"]);
+const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave", "popin", "mask", "zoomin", "flicker", "bounce", "roll"]);
 // Reveals that scale, turn or mask letters - the preview draws these on canvas (drawTextOverlay)
 // rather than as styled DOM letters.
-export const CANVAS_TEXT_REVEALS = new Set<string>(["popin", "mask", "zoomin", "flicker", "bounce"]);
+export const CANVAS_TEXT_REVEALS = new Set<string>(["popin", "mask", "zoomin", "flicker", "bounce", "roll"]);
 export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal => !!animation && TEXT_REVEALS.has(animation);
 
 // How a title leaves: fade out, play its reveal backwards (un-type), or just cut at its end.
@@ -102,6 +102,7 @@ function naturalSeconds(text: string, kind: TextReveal, settings?: TextRevealSet
   if (kind === "drop") return Math.max(0.7, chars * 0.04 + 0.6);
   if (kind === "mask") return Math.max(0.5, (words - 1) * 0.12 + 0.55);
   if (kind === "flicker") return 1.1;
+  if (kind === "roll") return Math.max(0.8, chars * 0.06 + 0.6);
   if (kind === "zoomin") return Math.max(0.6, chars * 0.03 + 0.5);
   if (kind === "popin" || kind === "bounce") return Math.max(0.6, chars * 0.035 + 0.5);
   return Math.max(0.5, chars * 0.03 + CHAR_IN_SEC);
@@ -137,6 +138,9 @@ export interface CharState {
   // Rises out of its own line: everything below the line's box is hidden (the letter slides up
   // from behind an invisible edge). Undefined = not clipped.
   clip?: boolean;
+  // Another character shown in this one's place for now (a slot-machine roll passing through) -
+  // laid out at the real character's width. Undefined = the character itself.
+  glyph?: string;
 }
 
 export interface TextRevealState {
@@ -238,6 +242,30 @@ function revealAt(text: string, kind: TextReveal, p: number, reveal: number, set
       char: (i) => {
         const e = easeOutQuint(clamp01((p - wordOf[i] * stagger) / inSec));
         return { opacity: e > 0 ? 1 : 0, dy: (1 - e) * 1.15 * dir, clip: e < 1 };
+      },
+      caretAt: null,
+    };
+  }
+
+  if (kind === "roll") {
+    // A slot machine: each letter spins through others of its kind (digits through digits) up
+    // out of its line, slowing until it lands - left to right, like a date or a price settling.
+    const inSec = Math.min(0.6, reveal);
+    const stagger = n > 1 ? Math.max(0, reveal - inSec) / (n - 1) : 0;
+    const DIGITS = "0123456789";
+    const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return {
+      char: (i) => {
+        const ch = text[i];
+        const local = clamp01((p - i * stagger) / inSec);
+        if (local >= 1 || /\s/.test(ch)) return { opacity: 1, dy: 0 };
+        // Spins fast, then slower: how many characters have rolled past by now.
+        const rolled = easeOutCubic(local) * 9;
+        const step = Math.floor(rolled);
+        const frac = rolled - step;
+        const pool = /\d/.test(ch) ? DIGITS : /[a-z]/.test(ch) ? LETTERS.toLowerCase() : LETTERS;
+        const glyph = step >= 8 ? ch : pool[Math.floor(hash(i * 7.7 + step * 3.1) * pool.length)];
+        return { opacity: 1, dy: (1 - frac) * 0.9, clip: true, glyph };
       },
       caretAt: null,
     };

@@ -24,6 +24,7 @@ export type AssetKind =
   | "heart"
   | "blob"
   | "neon"
+  | "guides"
   // callouts
   | "arrow"
   | "pointer"
@@ -139,6 +140,8 @@ export const ASSET_CATALOG: AssetCatalogEntry[] = [
   { kind: "heart", label: "Heart", category: "Shapes", aspect: 1.1, motion: "static", defaults: { color: "#f43f5e", color2: "#ec4899", ...fx("pop", "pulse") } },
   { kind: "blob", label: "Blob", category: "Shapes", aspect: 1, motion: "periodic", defaults: { color: "#8b5cf6", color2: "#22d3ee", ...fx("zoom") } },
   // A glowing neon-tube outline - draws itself on.
+  // Thin construction lines drawing a frame whose edges run on past its corners - layout guides.
+  { kind: "guides", label: "Guide lines", category: "Shapes", aspect: 1.6, motion: "static", defaults: { color: "#ffffff", ...fx("draw") } },
   { kind: "neon", label: "Neon frame", category: "Shapes", aspect: 1.25, motion: "static", defaults: { color: "#facc15", color2: "#ffffff", ...fx("draw", "glow") } },
 
   { kind: "subscribe", label: "Subscribe", category: "Callouts", aspect: 3.6, motion: "static", settleSec: 2.2, text: ["Button", "Clicked"], defaults: { color: "#ef4444", text: "SUBSCRIBE", subtext: "SUBSCRIBED", ...fx("pop") } },
@@ -1280,6 +1283,32 @@ function drawElement(ctx: CanvasRenderingContext2D, asset: OverlayAsset, w: numb
         ctx.fill();
         ctx.restore();
       }
+      return;
+    }
+    case "guides": {
+      // Four edges, each running on past its corners, drawn one after another.
+      const over = unit * 0.12;
+      const x0 = -w / 2 + over;
+      const y0 = -h / 2 + over;
+      const x1 = w / 2 - over;
+      const y1 = h / 2 - over;
+      const lines: [Pt, Pt][] = [
+        [[x0 - over, y0], [x1 + over * 0.4, y0]],
+        [[x1, y0 - over], [x1, y1 + over * 0.4]],
+        [[x1 + over, y1], [x0 - over * 0.4, y1]],
+        [[x0, y1 + over], [x0, y0 - over * 0.4]],
+      ];
+      ctx.strokeStyle = asset.color;
+      ctx.lineWidth = Math.max(1.5, unit * 0.007);
+      ctx.lineCap = "square";
+      lines.forEach(([[ax, ay], [bx, by]], k) => {
+        const f = clamp01(reveal * 4 - k * 0.75);
+        if (f <= 0) return;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(ax + (bx - ax) * f, ay + (by - ay) * f);
+        ctx.stroke();
+      });
       return;
     }
     case "neon": {

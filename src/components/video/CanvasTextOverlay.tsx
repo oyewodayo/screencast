@@ -37,7 +37,8 @@ const CanvasTextOverlay: React.FC<CanvasTextOverlayProps> = ({ overlay, frameWid
     let cancelled = false;
     const draw = () => {
       const state = kind ? textRevealState(overlay.text, kind, getTimeRef.current(), duration, overlay.reveal) : undefined;
-      const drawn = drawTextOverlay(overlay, frameWidth * dpr, frameHeight * dpr, state, canvas);
+      // Level - the box it sits in is what's turned.
+      const drawn = drawTextOverlay(overlay, frameWidth * dpr, frameHeight * dpr, state, canvas, true);
       if (!drawn) {
         canvas.style.display = "none";
         return;
