@@ -98,6 +98,7 @@ interface ExportKeyframe {
   easing: string;
 }
 import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
+import { loadTitleFonts } from "../utils/titleFonts";
 import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, imageOverlayAnimates, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
 const appWindow = getCurrentWebviewWindow()
@@ -172,7 +173,7 @@ function exportOverlayAnimation(animation: OverlayAnimation | undefined): string
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track" | "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "padding">
 >;
 type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal" | "blendMode" | "track">
@@ -1966,6 +1967,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           const rendered = await renderImageOverlayToPng(o, pxW, pxH);
           if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
         }
+        // A canvas draws a title in the fallback face if its own isn't loaded yet.
+        await loadTitleFonts(current.textOverlays.map((o) => o.fontFamily));
         for (const o of current.textOverlays) {
           const blendMode = exportBlendMode(o.blendMode);
           if (isTextReveal(o.animation)) {

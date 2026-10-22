@@ -2698,7 +2698,7 @@ const setScreen = () => {
 	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
 	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
 	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
-		const state = createProjectState(request.imagePaths, request.options);
+		const state = request.state ?? createProjectState(request.imagePaths, request.options);
 		const projectPath = await invoke<string>("create_video_project", {
 			name: request.name,
 			width: request.frame.width,

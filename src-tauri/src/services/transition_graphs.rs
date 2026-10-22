@@ -803,7 +803,7 @@ mod tests {
         ];
         for (tag, look) in looks {
             let body = canvas_transition("pagecurl", 1, 1.0, 30.0, (1280, 720), &look);
-            let save = std::env::var("CURL_FRAMES_DIR").map(|_| format!(",split[keep][stat];[keep]scale=480:270,format=rgb24[png];[stat]")).unwrap_or_default();
+            let save = std::env::var("CURL_FRAMES_DIR").map(|_| format!(",split[keep][stat];[keep]scale=480:270,format=rgb24[png];[stat]")).unwrap_or_else(|_| ",".into());
             let graph = format!(
                 "testsrc2=s=1280x720:r=30:d=1,format=yuv420p,settb=AVTB[old1];smptebars=s=1280x720:r=30:d=1,format=yuv420p,settb=AVTB[head1];{body}[tr1]select='eq(n,12)'{save}signalstats,metadata=print:key=lavfi.signalstats.YAVG[stats]"
             );

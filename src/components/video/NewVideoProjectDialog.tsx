@@ -2,38 +2,67 @@
 //
 // The Video Editor's "Create video" dialog - builds a new video project (services/video_edits.rs)
 // out of still images: pick photos from the library and/or anywhere on disk, put them in order,
-// choose a frame shape, pace, motion, transition style and look, and the editor opens on a timeline
-// with one clip per image. Picking nothing starts a blank timeline instead, to fill by dropping media
-// on it. Everything chosen here is only a starting point - every clip stays fully editable
-// afterwards, and music/text/overlays are added in the editor.
+// pick a style template (videoStyleTemplates.ts - Event Recap, Film Strip, New Collection...) or
+// set pace, motion, transition and look by hand, change the template's words, add a song, and the
+// editor opens on the finished edit - cut on the song's beats, with the template's captions,
+// collages and frame overlays. Picking nothing starts a blank timeline instead, to fill by dropping
+// media on it. Everything chosen here is only a starting point - every clip, caption and overlay
+// stays fully editable afterwards.
 //
-// The stage on the right plays the video as it will come out: each picture letterboxed into the
-// frame as export fits it, the same Ken Burns windows (kenBurnsWindow), transitions drawn by the
-// same renderer as the editor's preview (transitionCanvas.ts) and the look through the same
-// per-pixel function the grade LUT bakes (gradeLooks.ts).
-import React, { useEffect, useMemo, useRef, useState } from "react";
+// The stage on the right plays the very project the editor will open with (buildStyledProject,
+// drawn by ProjectStage) - in time with the song's preview when there is one.
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { IoAdd, IoCheckmark, IoClose, IoFolderOpenOutline, IoImageOutline, IoPause, IoPlay, IoSparkles } from "react-icons/io5";
-import { thumbnailLimiter } from "../../utils/concurrencyLimiter";
 import {
-  DEFAULT_IMAGE_CLIP_SECONDS,
-  GradeLookName,
-  IMAGE_CLIP_EXTENSIONS,
-  KenBurnsPreset,
-  NewProjectOptions,
-  TransitionType,
-  VideoProjectFrame,
-  projectTransitionSeconds,
-} from "../../utils/videoEditTypes";
-import { kenBurnsWindow } from "../../utils/videoColorFilters";
-import { GRADE_LOOKS, applyLook } from "../../utils/gradeLooks";
-import { drawCanvasTransition, isCanvasTransition } from "./transitionCanvas";
+  IoAdd,
+  IoCheckmark,
+  IoClose,
+  IoFolderOpenOutline,
+  IoImageOutline,
+  IoMusicalNotes,
+  IoPause,
+  IoPlay,
+  IoShuffle,
+  IoSparkles,
+  IoVolumeHighOutline,
+  IoVolumeMuteOutline,
+} from "react-icons/io5";
+import { createLimiter, thumbnailLimiter } from "../../utils/concurrencyLimiter";
+import { DEFAULT_IMAGE_CLIP_SECONDS, GradeLookName, IMAGE_CLIP_EXTENSIONS, KenBurnsPreset, NewProjectOptions, TransitionType, VideoEditState, VideoProjectFrame } from "../../utils/videoEditTypes";
+import { GRADE_LOOKS } from "../../utils/gradeLooks";
+import { assetEntry } from "../../utils/videoAssets";
+import { CLIP_FX } from "../../utils/clipFx";
+import { fetchMusicCatalog, getTrackFile, libraryInfoOf, MusicTrack } from "../../utils/musicLibrary";
+import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
+import { trackEvent } from "../../utils/telemetry";
+import { TITLE_FONTS, loadTitleFonts, titleFontCss } from "../../utils/titleFonts";
+import { titleStyle } from "../../utils/titleStyles";
+import {
+  MONTAGE_MUSIC,
+  MeasureText,
+  STYLE_TEMPLATES,
+  StyleTemplate,
+  StyledProjectMusic,
+  StyledProjectOptions,
+  buildStyledProject,
+  musicStartFor,
+  photoSecondsAt,
+  styleTemplate,
+  suggestTemplateTracks,
+  templateTexts,
+} from "../../utils/videoStyleTemplates";
+import ProjectStage, { StagePicture } from "./ProjectStage";
+import TitleLookTile from "./TitleLookTile";
+import { photoFillPath } from "../../utils/photoFill";
 
 export interface NewVideoProjectRequest {
   name: string;
   frame: VideoProjectFrame;
   imagePaths: string[];
   options: NewProjectOptions;
+  // The finished project, built here (buildStyledProject) - absent for a blank timeline.
+  state?: VideoEditState;
 }
 
 interface NewVideoProjectDialogProps {
@@ -53,12 +82,16 @@ const FRAME_PRESETS: { id: string; label: string; hint: string; frame: VideoProj
   { id: "classic", label: "Classic", hint: "4:3", frame: { width: 1440, height: 1080 } },
 ];
 
-// Transition styles offered here - each drawn exactly by the stage. "mix" cycles MIX_CYCLE.
-type StyleId = "none" | "fade" | "mix" | TransitionType;
+// Transition choices. "mix" cycles MIX_CYCLE; "template" the picked style's own cycle.
+type StyleId = "none" | "fade" | "mix" | "template" | TransitionType;
 const MIX_CYCLE: TransitionType[] = ["push", "cube", "slice", "tiles", "strips", "spin", "split", "beam"];
 const TRANSITION_STYLES: { id: StyleId; label: string }[] = [
   { id: "mix", label: "Mix" },
   { id: "fade", label: "Crossfade" },
+  { id: "zoomblur", label: "Zoom blur" },
+  { id: "whip", label: "Whip" },
+  { id: "fadewhite", label: "Flash" },
+  { id: "lightleak", label: "Light leak" },
   { id: "push", label: "Push" },
   { id: "cube", label: "Cube" },
   { id: "tiles", label: "Tile wall" },
@@ -70,13 +103,27 @@ const TRANSITION_STYLES: { id: StyleId; label: string }[] = [
   { id: "beam", label: "Light beam" },
   { id: "glitch", label: "Glitch" },
   { id: "blocks", label: "Blocks" },
+  { id: "pagecurl", label: "Page curl" },
   { id: "none", label: "Cut" },
 ];
 
 const DURATION_CHOICES = [1.5, 2.5, 3, 5, 8];
+const BEAT_CHOICES = [1, 2, 4, 8];
 const KEN_BURNS_CYCLE: KenBurnsPreset[] = ["zoom-in", "zoom-out", "pan-right", "pan-left"];
-// The stage plays at most this long per picture, so a slow slideshow still shows its style.
-const STAGE_MAX_SECONDS = 2.6;
+// The stage plays at most this many photos - enough to show every part of a style.
+const STAGE_MAX_PHOTOS = 16;
+// Stage pictures are scaled down to this on their long side once decoded - two at a time, on
+// their own queue so the photo grid's thumbnails never wait behind them.
+const STAGE_PICTURE_PX = 1280;
+const stagePictureLimiter = createLimiter(2);
+
+type MusicPick =
+  | { kind: "library"; track: MusicTrack }
+  | { kind: "file"; path: string; name: string; duration: number; bpm?: number; beats?: number[] };
+interface TrackBeats {
+  bpm: number;
+  beats: number[];
+}
 
 const baseName = (path: string): string => path.split(/[\\/]/).pop() ?? path;
 const formatLength = (seconds: number) => {
@@ -84,182 +131,57 @@ const formatLength = (seconds: number) => {
   return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
 };
 
-// ---------- the stage ----------
-
-// A picture letterboxed into a w x h frame on black (export's frame_fit_chain), through the look.
-function fittedFrame(img: HTMLImageElement, w: number, h: number, look: GradeLookName | null): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d", { willReadFrequently: !!look })!;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, w, h);
-  const s = Math.min(w / img.naturalWidth, h / img.naturalHeight);
-  const dw = img.naturalWidth * s;
-  const dh = img.naturalHeight * s;
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
-  if (look) {
-    // A picture the browser won't let us read back just plays without the look on the stage.
-    try {
-      const data = ctx.getImageData(0, 0, w, h);
-      const px = data.data;
-      for (let i = 0; i < px.length; i += 4) {
-        const [r, g, b] = applyLook(look, 0.85, px[i] / 255, px[i + 1] / 255, px[i + 2] / 255);
-        px[i] = r * 255;
-        px[i + 1] = g * 255;
-        px[i + 2] = b * 255;
-      }
-      ctx.putImageData(data, 0, 0);
-    } catch (err) {
-      console.warn("Look preview unavailable for this picture", err);
-    }
-  }
-  return canvas;
+// The transitions a choice cycles through, or null for straight cuts.
+function transitionCycle(style: StyleId, template: StyleTemplate | null): TransitionType[] | null {
+  if (style === "none") return null;
+  if (style === "mix") return MIX_CYCLE;
+  if (style === "template") return template?.transitions ?? MIX_CYCLE;
+  return [style];
 }
 
-interface StageProps {
-  urls: string[];
-  frame: VideoProjectFrame;
-  imageSeconds: number;
-  kenBurns: boolean;
-  style: StyleId;
-  look: GradeLookName | null;
-  playing: boolean;
-  // Restarts the loop just before a transition (a style being tried out).
-  restartKey: string;
-}
-
-const Stage: React.FC<StageProps> = ({ urls, frame, imageSeconds, kenBurns, style, look, playing, restartKey }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const boxRef = useRef<HTMLDivElement>(null);
-  const [images, setImages] = useState<HTMLImageElement[]>([]);
-  const [box, setBox] = useState({ w: 320, h: 320 });
-
-  useEffect(() => {
-    let cancelled = false;
-    Promise.all(
-      urls.map(
-        (url) =>
-          new Promise<HTMLImageElement | null>((resolve) => {
-            const img = new Image();
-            // Read back for the look (asset URLs serve CORS headers, as the player's frames do).
-            img.crossOrigin = "anonymous";
-            img.onload = () => resolve(img);
-            img.onerror = () => resolve(null);
-            img.src = url;
-          })
-      )
-    ).then((loaded) => !cancelled && setImages(loaded.filter((i): i is HTMLImageElement => !!i)));
-    return () => {
-      cancelled = true;
-    };
-  }, [urls]);
-
-  useEffect(() => {
-    const el = boxRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver(([entry]) => setBox({ w: entry.contentRect.width, h: entry.contentRect.height }));
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  // The frame on screen, as large as fits the stage.
-  const scale = Math.min(box.w / frame.width, box.h / frame.height);
-  const W = Math.max(2, Math.floor(frame.width * scale));
-  const H = Math.max(2, Math.floor(frame.height * scale));
-
-  const frames = useMemo(() => {
-    const dpr = window.devicePixelRatio || 1;
-    return images.map((img) => fittedFrame(img, Math.round(W * dpr), Math.round(H * dpr), look));
-  }, [images, W, H, look]);
-
-  const clockRef = useRef({ base: performance.now(), offset: 0 });
-  const per = Math.min(imageSeconds, STAGE_MAX_SECONDS);
-  const tr = projectTransitionSeconds(per);
-  useEffect(() => {
-    // Start a beat before the second picture comes in, so a new style shows straight away.
-    clockRef.current = { base: performance.now(), offset: frames.length > 1 ? Math.max(0, per - 0.6) : 0 };
-  }, [restartKey, frames.length, per]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const pics = [document.createElement("canvas"), document.createElement("canvas")];
-    pics.forEach((p) => {
-      p.width = canvas.width;
-      p.height = canvas.height;
+// Decodes a picture for the stage, scaled down to STAGE_PICTURE_PX on its long side (readable
+// back, so the look can apply). Falls back to the thumbnail where the full file won't decode here.
+function loadStagePicture(path: string, thumbUrl: string | undefined): Promise<StagePicture | null> {
+  const load = (src: string) =>
+    new Promise<HTMLImageElement | null>((resolve) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(img);
+      img.onerror = () => resolve(null);
+      img.src = src;
     });
-    // Picture i at `progress` through its own clip, with its Ken Burns window.
-    const picture = (into: HTMLCanvasElement, i: number, progress: number) => {
-      const pctx = into.getContext("2d")!;
-      const src = frames[i];
-      const win = kenBurns ? kenBurnsWindow({ preset: KEN_BURNS_CYCLE[i % KEN_BURNS_CYCLE.length], intensity: 0.5 }, progress, per) : null;
-      pctx.setTransform(1, 0, 0, 1, 0, 0);
-      if (!win) {
-        pctx.drawImage(src, 0, 0);
-        return;
-      }
-      const sw = src.width / win.zoom;
-      const sh = src.height / win.zoom;
-      pctx.drawImage(src, win.cx * src.width - sw / 2, win.cy * src.height - sh / 2, sw, sh, 0, 0, into.width, into.height);
-    };
-    const styleFor = (i: number): StyleId => (style === "mix" ? MIX_CYCLE[(i - 1) % MIX_CYCLE.length] : style);
+  return load(convertFileSrc(path))
+    .then((img) => img ?? (thumbUrl ? load(thumbUrl) : null))
+    .then((img) => {
+      if (!img || !img.naturalWidth) return null;
+      const s = Math.min(1, STAGE_PICTURE_PX / Math.max(img.naturalWidth, img.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.naturalWidth * s));
+      canvas.height = Math.max(1, Math.round(img.naturalHeight * s));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      return canvas;
+    });
+}
 
-    let raf = 0;
-    let last = performance.now();
-    const tick = (now: number) => {
-      raf = requestAnimationFrame(tick);
-      if (playing) clockRef.current.offset += (now - last) / 1000;
-      last = now;
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      if (!frames.length) return;
-      const total = frames.length * per;
-      const t = clockRef.current.offset % total;
-      const i = Math.min(frames.length - 1, Math.floor(t / per));
-      const local = t - i * per;
-      picture(pics[1], i, local / per);
-      const s = styleFor(i);
-      if (i === 0 || s === "none" || local >= tr) {
-        ctx.drawImage(pics[1], 0, 0);
-        return;
-      }
-      const p = local / tr;
-      // Stills hold their last frame through the transition, as export does.
-      picture(pics[0], i - 1, 1);
-      if (s === "fade") {
-        ctx.drawImage(pics[0], 0, 0);
-        ctx.globalAlpha = p;
-        ctx.drawImage(pics[1], 0, 0);
-        ctx.globalAlpha = 1;
-      } else if (s !== "mix" && isCanvasTransition(s)) {
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        drawCanvasTransition(ctx, s, {}, p, { old: pics[0], next: pics[1] }, W, H, dpr);
-      } else ctx.drawImage(pics[1], 0, 0);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [frames, W, H, kenBurns, style, playing, per, tr]);
-
-  return (
-    <div ref={boxRef} className="absolute inset-0 flex items-center justify-center">
-      <canvas ref={canvasRef} style={{ width: W, height: H }} className="rounded-md shadow-[0_20px_60px_-20px_rgba(0,0,0,0.8)]" />
-    </div>
-  );
+// Widths of words in a title look's face - what lets a template shrink a long line to fit.
+let measureCtx: CanvasRenderingContext2D | null = null;
+const measureText: MeasureText = (text, styleId, fontPx) => {
+  measureCtx ??= document.createElement("canvas").getContext("2d");
+  const look = titleStyle(styleId)?.look;
+  if (!measureCtx) return 0;
+  measureCtx.font = titleFontCss(look?.fontFamily, fontPx);
+  measureCtx.letterSpacing = `${(look?.letterSpacing ?? 0) * fontPx}px`;
+  return measureCtx.measureText(text).width;
 };
 
 // ---------- small controls ----------
 
 const Section: React.FC<{ title: string; aside?: React.ReactNode; children: React.ReactNode }> = ({ title, aside, children }) => (
   <section className="flex flex-col gap-2">
-    <div className="flex items-center justify-between">
+    <div className="flex items-center justify-between gap-2">
       <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-500 dark:text-neutral-400">{title}</h3>
       {aside}
     </div>
@@ -288,13 +210,56 @@ const Switch: React.FC<{ on: boolean; onChange: (on: boolean) => void; label: st
   <button type="button" role="switch" aria-checked={on} onClick={() => onChange(!on)} className="flex items-center gap-3 text-left outline-none group">
     <span className="flex-1 min-w-0">
       <span className="block text-[13px] font-medium text-neutral-800 dark:text-neutral-100">{label}</span>
-      <span className="block text-[11.5px] text-neutral-500 dark:text-neutral-400">{hint}</span>
+      <span className="block text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate">{hint}</span>
     </span>
     <span className={`relative w-9 h-5 shrink-0 rounded-full transition-colors ${on ? "bg-blue-600" : "bg-neutral-300 dark:bg-neutral-700"}`}>
       <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${on ? "translate-x-4" : ""}`} />
     </span>
   </button>
 );
+
+const TextField: React.FC<{ value: string; onChange: (v: string) => void; placeholder?: string; label: string; compact?: boolean }> = ({ value, onChange, placeholder, label, compact }) => (
+  <input
+    type="text"
+    value={value}
+    aria-label={label}
+    placeholder={placeholder}
+    onChange={(e) => onChange(e.target.value)}
+    className={`w-full ${compact ? "h-9 text-[13px]" : "h-10 text-[13.5px]"} px-3 rounded-xl bg-white dark:bg-neutral-950 ring-1 ring-neutral-200 dark:ring-white/10 text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:ring-2 focus:ring-blue-500 outline-none`}
+  />
+);
+
+// A style template's card: its colours, with its signature word drawn in its own title look.
+const TemplateCard: React.FC<{ template: StyleTemplate | null; active: boolean; onClick: () => void; onHover: (on: boolean) => void }> = ({ template, active, onClick, onHover }) => {
+  const look = template ? titleStyle(template.cardStyle)?.look : null;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => onHover(true)}
+      onMouseLeave={() => onHover(false)}
+      title={template?.blurb ?? "Set every part yourself"}
+      className={`group shrink-0 w-[112px] text-left rounded-xl p-1 outline-none transition-all focus-visible:ring-2 focus-visible:ring-blue-400 ${
+        active ? "bg-white shadow-sm ring-2 ring-blue-500 dark:bg-neutral-800" : "hover:bg-white/80 dark:hover:bg-white/[0.06]"
+      }`}
+    >
+      <span
+        className="relative block h-16 rounded-lg overflow-hidden"
+        style={{ background: template ? `radial-gradient(120% 90% at 20% 10%, ${template.swatch[1]}, ${template.swatch[0]} 70%)` : undefined }}
+      >
+        {!template && <span className="absolute inset-0 bg-neutral-200 dark:bg-neutral-700" />}
+        <span className="absolute inset-0 flex items-center justify-center transition-transform duration-300 group-hover:scale-110">
+          {template && look ? (
+            <TitleLookTile look={look} text={template.cardWord} width={104} height={64} />
+          ) : (
+            <span className="text-[12px] font-semibold text-neutral-600 dark:text-neutral-200">Your way</span>
+          )}
+        </span>
+      </span>
+      <span className="block px-0.5 pt-1 text-[12px] font-semibold text-neutral-800 dark:text-neutral-100 truncate">{template?.label ?? "Custom"}</span>
+    </button>
+  );
+};
 
 // ---------- the dialog ----------
 
@@ -303,16 +268,43 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const [frameId, setFrameId] = useState(FRAME_PRESETS[0].id);
   // In clip order - the order images were picked in, rearranged by dragging in the sequence strip.
   const [picked, setPicked] = useState<string[]>([]);
+  const [templateId, setTemplateId] = useState<string | null>(null);
+  // The card under the pointer (null = Custom), tried out on the stage; undefined = none.
+  const [hoverTemplateId, setHoverTemplateId] = useState<string | null | undefined>(undefined);
+  // The words for each template, kept per template so trying another doesn't lose them.
+  const [textsByTemplate, setTextsByTemplate] = useState<Record<string, Record<string, string>>>({});
   const [imageDuration, setImageDuration] = useState(DEFAULT_IMAGE_CLIP_SECONDS);
+  const [beatsPerPhoto, setBeatsPerPhoto] = useState(2);
   const [kenBurns, setKenBurns] = useState(true);
   const [style, setStyle] = useState<StyleId>("mix");
   const [hoverStyle, setHoverStyle] = useState<StyleId | null>(null);
   const [look, setLook] = useState<GradeLookName | null>(null);
+  const [overlaysOn, setOverlaysOn] = useState(true);
+  const [captionsOn, setCaptionsOn] = useState(true);
+  const [scenesOn, setScenesOn] = useState(true);
+  // Photos of another shape: over a blurred copy of themselves, or with black bars.
+  const [blurFill, setBlurFill] = useState(true);
+  const [music, setMusic] = useState<MusicPick | null>(null);
+  // Once the user has chosen a song (or no song) themselves, picking a style leaves it alone.
+  const musicTouchedRef = useRef(false);
+  const [catalog, setCatalog] = useState<MusicTrack[] | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  // Tempo found in a library song's preview clip, for songs the catalog has no beats for.
+  const [previewBeats, setPreviewBeats] = useState<Record<string, TrackBeats>>({});
+  const [musicMuted, setMusicMuted] = useState(false);
   const [playing, setPlaying] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
+  const [creatingStep, setCreatingStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [stagePictures, setStagePictures] = useState<Map<string, StagePicture>>(new Map());
+  const [aspects, setAspects] = useState<Record<string, number>>({});
+  const [fontsReady, setFontsReady] = useState(false);
+  const [draggingPath, setDraggingPath] = useState<string | null>(null);
+  const dragRef = useRef<{ path: string; startX: number; moved: boolean } | null>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+
+  const template = styleTemplate(templateId);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -321,6 +313,15 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose, isCreating]);
+
+  // Every title face, so captions are measured and drawn in their own faces from the first frame.
+  useEffect(() => {
+    let cancelled = false;
+    void loadTitleFonts(TITLE_FONTS.map((f) => f.id)).then(() => !cancelled && setFontsReady(true));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Library images plus anything picked from disk, de-duplicated - every tile either list shows.
   const thumbnailPaths = useMemo(() => Array.from(new Set([...picked, ...libraryImages.map((image) => image.path)])), [picked, libraryImages]);
@@ -340,15 +341,64 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thumbnailPaths, resolveThumbnailUrl]);
 
+  // Each picked photo's shape (from its thumbnail) - collage cells crop to fill with it.
+  useEffect(() => {
+    let cancelled = false;
+    picked
+      .filter((p) => thumbUrls[p] && aspects[p] === undefined)
+      .forEach((p) => {
+        const img = new Image();
+        img.onload = () => !cancelled && img.naturalHeight && setAspects((prev) => ({ ...prev, [p]: img.naturalWidth / img.naturalHeight }));
+        img.src = thumbUrls[p];
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [picked, thumbUrls]);
+
   const togglePicked = (path: string) => setPicked((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path]));
-  const moveTo = (from: number, to: number) =>
+
+  // Reordering the sequence follows the pointer (captured), not HTML drag and drop - the window's
+  // native file-drop handling swallows HTML drag events in the WebView, so those never arrive.
+  const onTilePointerDown = (e: React.PointerEvent<HTMLDivElement>, path: string) => {
+    if (e.button !== 0) return;
+    dragRef.current = { path, startX: e.clientX, moved: false };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onTilePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const strip = stripRef.current;
+    if (!drag || !strip) return;
+    if (!drag.moved && Math.abs(e.clientX - drag.startX) < 4) return;
+    if (!drag.moved) {
+      drag.moved = true;
+      setDraggingPath(drag.path);
+    }
+    // The new place: how many of the other tiles' centres are left of the pointer. Found by path,
+    // against the latest order - pointer moves can outpace renders.
+    let to = 0;
+    strip.querySelectorAll<HTMLElement>("[data-sequence-tile]").forEach((el) => {
+      if (el.dataset.sequenceTile === drag.path) return;
+      const r = el.getBoundingClientRect();
+      if (e.clientX > r.left + r.width / 2) to++;
+    });
     setPicked((prev) => {
-      if (from === to || from < 0 || to < 0 || from >= prev.length || to >= prev.length) return prev;
-      const next = [...prev];
-      const [item] = next.splice(from, 1);
-      next.splice(to, 0, item);
+      const from = prev.indexOf(drag.path);
+      if (from < 0 || from === to) return prev;
+      const next = prev.filter((p) => p !== drag.path);
+      next.splice(to, 0, drag.path);
       return next;
     });
+    // Near either end of the strip, scroll it along.
+    const r = strip.getBoundingClientRect();
+    if (e.clientX < r.left + 40) strip.scrollLeft -= 12;
+    else if (e.clientX > r.right - 40) strip.scrollLeft += 12;
+  };
+  const onTilePointerUp = () => {
+    dragRef.current = null;
+    setDraggingPath(null);
+  };
 
   const handleBrowse = async () => {
     const selected = await openFileDialog({ multiple: true, filters: [{ name: "Images", extensions: IMAGE_CLIP_EXTENSIONS }] });
@@ -359,32 +409,283 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
 
   const frame = FRAME_PRESETS.find((preset) => preset.id === frameId)?.frame ?? FRAME_PRESETS[0].frame;
 
+  // ---- music ----
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMusicCatalog(false)
+      .then((r) => {
+        if (cancelled) return;
+        setCatalog(r.catalog.tracks);
+        if (r.offline && !r.catalog.tracks.length) setCatalogError("The music library needs the internet the first time.");
+      })
+      .catch((err) => !cancelled && setCatalogError(String(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const musicBpm = music?.kind === "library" ? music.track.bpm ?? previewBeats[music.track.id]?.bpm : music?.bpm;
+  const photoCount = Math.max(1, picked.length || Math.min(4, libraryImages.length));
+  const perPhoto = music ? photoSecondsAt(musicBpm, beatsPerPhoto, imageDuration) : imageDuration;
+  const suggestions = useMemo(
+    () => (catalog ? suggestTemplateTracks(catalog, template?.music ?? MONTAGE_MUSIC, photoCount * photoSecondsAt(110, template?.beatsPerPhoto ?? 2, imageDuration), 6) : []),
+    // Only re-ranked when the style or the catalog changes - not under the cursor as photos are picked.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [catalog, template]
+  );
+
+  // A style picks its first suggested song, until the user has chosen one themselves.
+  useEffect(() => {
+    if (musicTouchedRef.current) return;
+    setMusic(template && suggestions[0] ? { kind: "library", track: suggestions[0] } : null);
+  }, [template, suggestions]);
+
+  const chooseMusic = (pick: MusicPick | null) => {
+    musicTouchedRef.current = true;
+    setMusic(pick);
+    if (pick) setPlaying(true);
+  };
+
+  const handlePickMusicFile = async () => {
+    const selected = await openFileDialog({ multiple: false, filters: [{ name: "Audio", extensions: FILE_CATEGORY_EXTENSIONS.audio }] });
+    if (!selected || Array.isArray(selected)) return;
+    try {
+      const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: selected });
+      const duration = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+      if (!Number.isFinite(duration) || duration <= 0) throw new Error("couldn't read how long it is");
+      chooseMusic({ kind: "file", path: selected, name: baseName(selected), duration });
+      const beats = await invoke<TrackBeats>("detect_beats", { sourcePath: selected }).catch(() => null);
+      if (beats) setMusic((m) => (m?.kind === "file" && m.path === selected ? { ...m, bpm: beats.bpm, beats: beats.beats } : m));
+    } catch (err) {
+      setError(`Couldn't use that song: ${err instanceof Error ? err.message : err}`);
+    }
+  };
+
+  // The song as the stage's project uses it - a library song's preview clip is all the stage can
+  // play, so its edit starts where the clip does (and Create keeps that start).
+  const musicBeats = music?.kind === "library" ? (music.track.beats?.length ? music.track.beats : previewBeats[music.track.id]?.beats) : music?.beats;
+  const stageMusic = useMemo<StyledProjectMusic | null>(() => {
+    if (!music) return null;
+    if (music.kind === "file") return { path: music.path, sourceDuration: music.duration, bpm: music.bpm, beats: music.beats, label: music.name };
+    const preview = music.track.preview;
+    return {
+      path: "",
+      sourceDuration: music.track.duration,
+      bpm: musicBpm,
+      beats: musicBeats,
+      highlightStart: preview ? preview.start ?? 0 : music.track.highlightStart,
+      label: music.track.title,
+    };
+  }, [music, musicBpm, musicBeats]);
+
+  // ---- the project ----
+
+  const texts = useMemo(() => (template ? textsByTemplate[template.id] ?? templateTexts(template) : {}), [template, textsByTemplate]);
+  const setText = (id: string, value: string) => {
+    if (!template) return;
+    setTextsByTemplate((prev) => ({ ...prev, [template.id]: { ...(prev[template.id] ?? templateTexts(template)), [id]: value } }));
+  };
+
+  // The build options for a style: the dialog's own choices, or - while a card is only being tried
+  // (`trying`) - that template's defaults, with any words already typed for it.
+  const optionsFor = useCallback(
+    (t: StyleTemplate | null, trying: boolean, transitionStyle: StyleId, song: StyledProjectMusic | null): StyledProjectOptions => ({
+      templateId: t?.id ?? null,
+      imageSeconds: trying ? t?.seconds ?? DEFAULT_IMAGE_CLIP_SECONDS : imageDuration,
+      beatsPerPhoto: trying ? t?.beatsPerPhoto ?? 2 : beatsPerPhoto,
+      motion: kenBurns || trying ? t?.motion ?? KEN_BURNS_CYCLE : null,
+      motionIntensity: t?.motionIntensity ?? 0.5,
+      transitions: transitionCycle(transitionStyle, t),
+      transitionShare: t?.transitionShare ?? 1 / 3,
+      look: trying ? t?.look ?? null : look,
+      overlays: trying || overlaysOn,
+      captions: trying || captionsOn,
+      scenes: trying || scenesOn,
+      texts: t ? textsByTemplate[t.id] ?? templateTexts(t) : {},
+      music: song,
+    }),
+    [imageDuration, beatsPerPhoto, kenBurns, look, overlaysOn, captionsOn, scenesOn, textsByTemplate]
+  );
+
+  // What the stage plays: the picks (the first STAGE_MAX_PHOTOS), or a few library pictures as a
+  // taste of the style - with a hovered card or transition tried out on top of the choices.
+  const stagePaths = useMemo(() => (picked.length ? picked.slice(0, STAGE_MAX_PHOTOS) : libraryImages.slice(0, 8).map((i) => i.path)), [picked, libraryImages]);
+  const shownTemplate = hoverTemplateId === undefined ? template : styleTemplate(hoverTemplateId);
+  const trying = hoverTemplateId !== undefined && hoverTemplateId !== templateId;
+  const shownStyle: StyleId = hoverStyle ?? (trying ? (shownTemplate ? "template" : "mix") : style);
+  const stageProject = useMemo(() => {
+    const ready = stagePaths.filter((p) => stagePictures.has(p));
+    if (!ready.length) return null;
+    return buildStyledProject(ready, frame, optionsFor(shownTemplate, trying, shownStyle, stageMusic), {
+      aspectOf: (p) => {
+        const pic = stagePictures.get(p);
+        return pic ? pic.width / pic.height : 1;
+      },
+      measure: fontsReady ? measureText : undefined,
+    });
+  }, [stagePaths, stagePictures, frame, optionsFor, shownTemplate, trying, shownStyle, stageMusic, fontsReady]);
+
+  // Decode the stage's pictures (full files, scaled down), a few at a time.
+  useEffect(() => {
+    let cancelled = false;
+    stagePaths
+      .filter((p) => !stagePictures.has(p))
+      .forEach((p) => {
+        void stagePictureLimiter(() => loadStagePicture(p, thumbUrls[p])).then((pic) => {
+          if (!cancelled && pic) setStagePictures((prev) => (prev.has(p) ? prev : new Map(prev).set(p, pic)));
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stagePaths]);
+
+  // The song plays alongside the stage: a library song's preview clip, or the file - from where the
+  // stage's project starts in it. songClock maps where it is to seconds into the edit.
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const songMapRef = useRef<{ offset: number; anchor: number; ready: boolean }>({ offset: 0, anchor: 0, ready: false });
+  const musicKey = music ? (music.kind === "library" ? music.track.id : music.path) : "";
+  const stageTrimStart = stageProject?.audioOverlays[0]?.trimStart;
+  useEffect(() => {
+    const audio = audioRef.current;
+    songMapRef.current = { offset: 0, anchor: 0, ready: false };
+    if (!audio) return;
+    audio.pause();
+    if (!music) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        let src: string;
+        let offset = 0;
+        if (music.kind === "library") {
+          const path = await getTrackFile(music.track.id, music.track.preview ? "preview" : "full");
+          src = convertFileSrc(path);
+          offset = music.track.preview ? music.track.preview.start ?? 0 : 0;
+          if (!music.track.beats?.length && !previewBeats[music.track.id]) {
+            invoke<TrackBeats>("detect_beats", { sourcePath: path })
+              .then((b) => !cancelled && setPreviewBeats((prev) => ({ ...prev, [music.track.id]: { bpm: b.bpm, beats: b.beats.map((x) => x + offset) } })))
+              .catch(() => undefined);
+          }
+        } else src = convertFileSrc(music.path);
+        if (cancelled) return;
+        const anchor = stageTrimStart ?? musicStartFor({ sourceDuration: music.kind === "file" ? music.duration : music.track.duration, beats: musicBeats }, photoCount * perPhoto);
+        if (audio.src !== src) audio.src = src;
+        audio.loop = true;
+        audio.currentTime = Math.max(0, anchor - offset);
+        songMapRef.current = { offset, anchor, ready: true };
+        if (playing) await audio.play();
+      } catch (err) {
+        if ((err as Error)?.name !== "AbortError") console.warn("Song preview unavailable", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Restarts only for a different song, or when where the edit starts in it moves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [musicKey, musicBeats, stageTrimStart]);
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !music || !songMapRef.current.ready) return;
+    if (playing) audio.play().catch(() => undefined);
+    else audio.pause();
+  }, [playing, music]);
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.muted = musicMuted;
+  }, [musicMuted]);
+  const songClock = useCallback(() => {
+    const audio = audioRef.current;
+    const map = songMapRef.current;
+    if (!audio || !map.ready || audio.readyState < 2) return null;
+    return audio.currentTime + map.offset - map.anchor;
+  }, []);
+
+  // ---- styles ----
+
+  const applyTemplate = (t: StyleTemplate | null) => {
+    setTemplateId(t?.id ?? null);
+    setHoverTemplateId(undefined);
+    if (!t) {
+      setStyle("mix");
+      setLook(null);
+      setImageDuration(DEFAULT_IMAGE_CLIP_SECONDS);
+      setBeatsPerPhoto(2);
+      return;
+    }
+    setStyle("template");
+    setLook(t.look);
+    setImageDuration(t.seconds);
+    setBeatsPerPhoto(t.beatsPerPhoto);
+    setKenBurns(true);
+    setOverlaysOn(true);
+    setCaptionsOn(true);
+    setScenesOn(true);
+  };
+
+  // ---- create ----
+
   const handleCreate = async () => {
     setIsCreating(true);
     setError(null);
     try {
+      let song: StyledProjectMusic | null = null;
+      if (music && picked.length) {
+        if (music.kind === "library") {
+          setCreatingStep("Getting the song…");
+          const path = await getTrackFile(music.track.id, "full");
+          let beats: TrackBeats | null = music.track.bpm && music.track.beats?.length ? { bpm: music.track.bpm, beats: music.track.beats } : null;
+          if (!beats) {
+            setCreatingStep("Finding the beat…");
+            beats = await invoke<TrackBeats>("detect_beats", { sourcePath: path }).catch(() => null);
+          }
+          // From where the stage played it, so the video is the one that was previewed.
+          song = { path, sourceDuration: music.track.duration, ...(beats ?? {}), highlightStart: stageMusic?.highlightStart, label: music.track.title, library: libraryInfoOf(music.track) };
+        } else {
+          let beats: TrackBeats | null = music.bpm && music.beats ? { bpm: music.bpm, beats: music.beats } : null;
+          if (!beats) {
+            setCreatingStep("Finding the beat…");
+            beats = await invoke<TrackBeats>("detect_beats", { sourcePath: music.path }).catch(() => null);
+          }
+          song = { path: music.path, sourceDuration: music.duration, ...(beats ?? {}), label: music.name.replace(/\.[^.]+$/, "") };
+        }
+      }
+      // Photos of another shape get their filled stills made (once - they're cached), a few at a time.
+      const fills = new Map<string, string>();
+      if (blurFill && picked.length) {
+        let done = 0;
+        const queue = [...picked];
+        const worker = async () => {
+          for (let p = queue.shift(); p; p = queue.shift()) {
+            setCreatingStep(`Fitting photos to the frame… ${++done}/${picked.length}`);
+            fills.set(p, await photoFillPath(p, frame, aspects[p]).catch(() => p));
+          }
+        };
+        await Promise.all([worker(), worker(), worker()]);
+      }
+      setCreatingStep(picked.length ? "Putting it together…" : null);
+      const state = picked.length
+        ? buildStyledProject(picked, frame, optionsFor(template, false, style, song), {
+            aspectOf: (p) => aspects[p] ?? 1,
+            measure: fontsReady ? measureText : undefined,
+            clipSource: (p) => fills.get(p) ?? p,
+          })
+        : undefined;
+      trackEvent("video_project_created", { style: template?.id ?? "custom", music: song ? (song.library ? "library" : "file") : "none", photos: picked.length });
       await onCreate({
         name: name.trim() || "Untitled video",
         frame,
         imagePaths: picked,
-        options: {
-          imageDuration,
-          kenBurns,
-          transition: style === "none" || style === "mix" ? null : style === "fade" ? "fade" : style,
-          ...(style === "mix" ? { transitionCycle: MIX_CYCLE } : {}),
-          ...(look ? { look } : {}),
-        },
+        options: { imageDuration, kenBurns, transition: null },
+        ...(state ? { state } : {}),
       });
     } catch (err) {
       setError(`Couldn't create the video: ${err instanceof Error ? err.message : err}`);
+      setCreatingStep(null);
       setIsCreating(false);
     }
   };
-
-  // What the stage plays: the picks, or a few library pictures as a taste of the style.
-  const stagePaths = picked.length ? picked : libraryImages.slice(0, 4).map((i) => i.path);
-  const stageUrls = useMemo(() => stagePaths.map((p) => thumbUrls[p]).filter((u): u is string => !!u), [stagePaths.join("|"), thumbUrls]); // eslint-disable-line react-hooks/exhaustive-deps
-  const shownStyle = hoverStyle ?? style;
 
   const renderThumb = (path: string) =>
     thumbUrls[path] ? (
@@ -393,18 +694,28 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       <IoImageOutline size={20} className="text-neutral-300 dark:text-neutral-600" />
     );
 
-  const totalSeconds = picked.length * imageDuration;
+  const projectLength = stageProject && picked.length && picked.length <= STAGE_MAX_PHOTOS ? stageProject.clips.reduce((s, c) => s + c.end - c.start, 0) : picked.length * perPhoto;
   const allPicked = libraryImages.length > 0 && libraryImages.every((i) => picked.includes(i.path));
+  const musicTitle = music ? (music.kind === "library" ? music.track.title : music.name) : null;
+  const musicArtist = music?.kind === "library" ? music.track.artist : music ? "From your computer" : null;
+  const shownLook = trying ? shownTemplate?.look ?? null : look;
+  const stageLabel = [
+    shownTemplate ? shownTemplate.label : TRANSITION_STYLES.find((t) => t.id === shownStyle)?.label,
+    shownLook ? GRADE_LOOKS.find((l) => l.value === shownLook)?.label : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-950/50 backdrop-blur-sm p-4 sm:p-6"
       onMouseDown={(e) => e.target === e.currentTarget && !isCreating && onClose()}
     >
+      <audio ref={audioRef} preload="auto" className="hidden" />
       <div
         role="dialog"
         aria-labelledby="new-video-project-title"
-        className="w-full max-w-6xl h-full max-h-[880px] flex flex-col overflow-hidden rounded-2xl bg-white dark:bg-neutral-900 shadow-2xl ring-1 ring-black/5 dark:ring-white/10"
+        className="w-full max-w-[1320px] h-full max-h-[900px] flex flex-col overflow-hidden rounded-2xl bg-white dark:bg-neutral-900 shadow-2xl ring-1 ring-black/5 dark:ring-white/10"
       >
         {/* Header */}
         <div className="flex items-center gap-3 px-6 h-16 shrink-0 border-b border-neutral-100 dark:border-white/[0.06]">
@@ -415,14 +726,14 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
             <h2 id="new-video-project-title" className="text-[15px] font-semibold text-neutral-900 dark:text-white leading-tight">
               Create a video
             </h2>
-            <p className="text-[12px] text-neutral-500 dark:text-neutral-400">Pick photos, choose a style - see it play before you start editing.</p>
+            <p className="text-[12px] text-neutral-500 dark:text-neutral-400">Pick photos and a style, add a song - it's cut to the beat, ready to edit.</p>
           </div>
           <button type="button" onClick={onClose} disabled={isCreating} aria-label="Close" className="p-2 -mr-2 rounded-full text-neutral-500 hover:bg-black/[0.06] dark:hover:bg-white/10">
             <IoClose size={20} />
           </button>
         </div>
 
-        <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
+        <div className="flex-1 min-h-0 flex flex-row">
           {/* Media */}
           <div className="flex-1 min-w-0 min-h-0 flex flex-col">
             <div className="flex items-center gap-2 px-6 pt-4 pb-3">
@@ -450,7 +761,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
 
             <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
               {libraryImages.length > 0 ? (
-                <div className="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-2.5 p-1.5 -mx-1.5">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 p-1.5 -mx-1.5">
                   {libraryImages.map((image) => {
                     const order = picked.indexOf(image.path);
                     const on = order >= 0;
@@ -498,33 +809,29 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                 <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-500 dark:text-neutral-400">Sequence</h3>
                 {picked.length > 0 && (
                   <span className="text-[12px] text-neutral-400 tabular-nums">
-                    {picked.length} {picked.length === 1 ? "photo" : "photos"} · {formatLength(totalSeconds)} · drag to reorder
+                    {picked.length} {picked.length === 1 ? "photo" : "photos"} · {formatLength(projectLength)} · drag to reorder
                   </span>
                 )}
               </div>
               {picked.length > 0 ? (
-                <div className="flex gap-2 overflow-x-auto pb-1">
+                <div ref={stripRef} className="flex gap-2 overflow-x-auto pb-1 select-none">
                   {picked.map((path, i) => (
                     <div
                       key={path}
-                      draggable
-                      onDragStart={() => setDragIndex(i)}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        if (dragIndex !== null && dragIndex !== i) {
-                          moveTo(dragIndex, i);
-                          setDragIndex(i);
-                        }
-                      }}
-                      onDragEnd={() => setDragIndex(null)}
-                      className={`group relative shrink-0 w-24 aspect-video rounded-lg overflow-hidden bg-neutral-100 dark:bg-white/[0.04] cursor-grab active:cursor-grabbing flex items-center justify-center transition-opacity ${
-                        dragIndex === i ? "opacity-40" : ""
+                      data-sequence-tile={path}
+                      onPointerDown={(e) => onTilePointerDown(e, path)}
+                      onPointerMove={onTilePointerMove}
+                      onPointerUp={onTilePointerUp}
+                      onPointerCancel={onTilePointerUp}
+                      className={`group relative shrink-0 w-24 aspect-video rounded-lg overflow-hidden bg-neutral-100 dark:bg-white/[0.04] flex items-center justify-center touch-none transition-[opacity,transform,box-shadow] ${
+                        draggingPath === path ? "cursor-grabbing scale-105 shadow-lg ring-2 ring-blue-500 z-10" : draggingPath ? "cursor-grabbing opacity-80" : "cursor-grab"
                       }`}
                     >
                       {renderThumb(path)}
                       <span className="absolute bottom-1 left-1 px-1.5 rounded-md bg-black/60 text-[10px] font-semibold text-white tabular-nums">{i + 1}</span>
                       <button
                         type="button"
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={() => togglePicked(path)}
                         aria-label="Remove"
                         className="absolute top-1 right-1 p-0.5 rounded-full bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity"
@@ -543,13 +850,21 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
           </div>
 
           {/* Style + stage */}
-          <aside className="w-full lg:w-[380px] shrink-0 min-h-0 flex flex-col border-t lg:border-t-0 lg:border-l border-neutral-100 dark:border-white/[0.06] bg-neutral-50/70 dark:bg-white/[0.02]">
-            <div className="relative shrink-0 h-[290px] m-4 mb-0 rounded-2xl bg-neutral-950 overflow-hidden ring-1 ring-black/5 dark:ring-white/[0.07]">
+          <aside className="w-[420px] shrink-0 min-h-0 overflow-hidden flex flex-col border-l border-neutral-100 dark:border-white/[0.06] bg-neutral-50/70 dark:bg-white/[0.02]">
+            <div className="relative shrink min-h-[170px] h-[300px] m-4 mb-0 rounded-2xl bg-neutral-950 overflow-hidden ring-1 ring-black/5 dark:ring-white/[0.07]">
               <div className="absolute inset-3 bottom-12">
-                {stageUrls.length ? (
-                  <Stage urls={stageUrls} frame={frame} imageSeconds={imageDuration} kenBurns={kenBurns} style={shownStyle} look={look} playing={playing} restartKey={`${shownStyle}|${frameId}`} />
+                {stageProject ? (
+                  <ProjectStage
+                    project={stageProject}
+                    frame={frame}
+                    images={stagePictures}
+                    blurFill={blurFill}
+                    playing={playing}
+                    restartKey={`${shownStyle}|${frameId}|${shownTemplate?.id ?? ""}`}
+                    songClock={music ? songClock : null}
+                  />
                 ) : (
-                  <div className="absolute inset-0 flex items-center justify-center text-[12px] text-white/40">Your preview plays here</div>
+                  <div className="absolute inset-0 flex items-center justify-center text-[12px] text-white/40">{stagePaths.length ? "Loading photos…" : "Your preview plays here"}</div>
                 )}
               </div>
               <div className="absolute left-3 right-3 bottom-2.5 flex items-center gap-2">
@@ -561,25 +876,111 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                 >
                   {playing ? <IoPause size={14} /> : <IoPlay size={14} className="translate-x-[1px]" />}
                 </button>
-                {!picked.length && stageUrls.length > 0 && <span className="px-2 py-0.5 rounded-full bg-white/10 text-[10.5px] text-white/70">Sample</span>}
+                {music && (
+                  <button
+                    type="button"
+                    onClick={() => setMusicMuted((m) => !m)}
+                    aria-label={musicMuted ? "Unmute song" : "Mute song"}
+                    className="w-8 h-8 rounded-full bg-white/15 hover:bg-white/25 text-white backdrop-blur flex items-center justify-center"
+                  >
+                    {musicMuted ? <IoVolumeMuteOutline size={15} /> : <IoVolumeHighOutline size={15} />}
+                  </button>
+                )}
+                {!picked.length && stagePaths.length > 0 && <span className="px-2 py-0.5 rounded-full bg-white/10 text-[10.5px] text-white/70">Sample</span>}
+                {picked.length > STAGE_MAX_PHOTOS && <span className="px-2 py-0.5 rounded-full bg-white/10 text-[10.5px] text-white/70">First {STAGE_MAX_PHOTOS}</span>}
                 <span className="flex-1" />
-                <span className="text-[11px] text-white/55 truncate">
-                  {TRANSITION_STYLES.find((t) => t.id === shownStyle)?.label}
-                  {look ? ` · ${GRADE_LOOKS.find((l) => l.value === look)?.label}` : ""}
-                </span>
+                <span className="text-[11px] text-white/55 truncate">{stageLabel}</span>
               </div>
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 flex flex-col gap-5">
+            {/* Style templates */}
+            <div className="shrink-0 px-4 pt-3">
+              <div className="flex items-center justify-between px-1 mb-1.5">
+                <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-500 dark:text-neutral-400">Style</h3>
+                <span className="text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate ml-2">{(shownTemplate ?? template)?.blurb ?? "Your own pace, transitions and look"}</span>
+              </div>
+              <div className="flex gap-1.5 overflow-x-auto pb-2 -mx-1 px-1" onMouseLeave={() => setHoverTemplateId(undefined)}>
+                {[null, ...STYLE_TEMPLATES].map((t) => (
+                  <TemplateCard key={t?.id ?? "custom"} template={t} active={(t?.id ?? null) === templateId} onClick={() => applyTemplate(t)} onHover={(on) => setHoverTemplateId(on ? t?.id ?? null : undefined)} />
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 min-h-[150px] overflow-y-auto px-5 py-4 flex flex-col gap-5 border-t border-neutral-100 dark:border-white/[0.06]">
+              {template && (
+                <Section title="Words" aside={<span className="text-[11px] text-neutral-400">Clear a line to leave it out</span>}>
+                  <div className="flex flex-col gap-2">
+                    {template.texts.map((t) => (
+                      <label key={t.id} className="flex flex-col gap-1">
+                        <span className="text-[11.5px] text-neutral-500 dark:text-neutral-400">{t.label}</span>
+                        <TextField compact value={texts[t.id] ?? ""} onChange={(v) => setText(t.id, v)} placeholder="Left out" label={t.label} />
+                      </label>
+                    ))}
+                  </div>
+                </Section>
+              )}
+
+              <Section
+                title="Music"
+                aside={
+                  <button type="button" onClick={() => void handlePickMusicFile()} className="flex items-center gap-1 text-[12px] font-medium text-blue-600 hover:text-blue-700 dark:text-blue-300">
+                    <IoFolderOpenOutline size={13} />
+                    From computer
+                  </button>
+                }
+              >
+                {music && (
+                  <div className="flex items-center gap-2.5 p-2 rounded-xl bg-white dark:bg-neutral-950 ring-1 ring-blue-500/40">
+                    <span className="w-9 h-9 shrink-0 rounded-lg bg-gradient-to-br from-blue-500 to-violet-500 text-white flex items-center justify-center">
+                      <IoMusicalNotes size={16} />
+                    </span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[13px] font-medium text-neutral-900 dark:text-white truncate">{musicTitle}</span>
+                      <span className="block text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate">
+                        {musicArtist}
+                        {musicBpm ? ` · ${Math.round(musicBpm)} BPM` : ""}
+                      </span>
+                    </span>
+                    {music.kind === "library" && suggestions.length > 1 && (
+                      <button
+                        type="button"
+                        title="Another suggestion"
+                        onClick={() => {
+                          const i = suggestions.findIndex((t) => t.id === music.track.id);
+                          chooseMusic({ kind: "library", track: suggestions[(i + 1) % suggestions.length] });
+                        }}
+                        className="p-1.5 rounded-full text-neutral-500 hover:bg-neutral-100 dark:hover:bg-white/10"
+                      >
+                        <IoShuffle size={15} />
+                      </button>
+                    )}
+                    <button type="button" title="No music" aria-label="No music" onClick={() => chooseMusic(null)} className="p-1.5 rounded-full text-neutral-500 hover:bg-neutral-100 dark:hover:bg-white/10">
+                      <IoClose size={15} />
+                    </button>
+                  </div>
+                )}
+                {suggestions.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {suggestions
+                      .filter((t) => music?.kind !== "library" || t.id !== music.track.id)
+                      .slice(0, 4)
+                      .map((t) => (
+                        <Pill key={t.id} active={false} onClick={() => chooseMusic({ kind: "library", track: t })} title={`${t.title} - ${t.artist}`}>
+                          <span className="flex items-center gap-1 max-w-[140px]">
+                            <IoMusicalNotes size={11} className="shrink-0" />
+                            <span className="truncate">{t.title}</span>
+                          </span>
+                        </Pill>
+                      ))}
+                  </div>
+                ) : (
+                  !music && <p className="text-[12px] text-neutral-500 dark:text-neutral-400">{catalogError ?? (catalog ? "No songs in the library yet." : "Loading songs…")}</p>
+                )}
+                {music && <p className="text-[11.5px] text-neutral-500 dark:text-neutral-400">Every cut lands on the beat. Change or trim the song later in the editor.</p>}
+              </Section>
+
               <Section title="Name">
-                <input
-                  id="new-video-project-name"
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  onFocus={(e) => e.target.select()}
-                  className="w-full h-10 px-3 rounded-xl text-[13.5px] bg-white dark:bg-neutral-950 ring-1 ring-neutral-200 dark:ring-white/10 text-neutral-900 dark:text-neutral-100 focus:ring-2 focus:ring-blue-500 outline-none"
-                />
+                <TextField value={name} onChange={setName} label="Video name" />
               </Section>
 
               <Section title="Format">
@@ -605,32 +1006,74 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                     );
                   })}
                 </div>
-              </Section>
-
-              <Section title="Each photo" aside={<span className="text-[12px] font-medium tabular-nums text-neutral-700 dark:text-neutral-200">{imageDuration}s</span>}>
-                <input
-                  type="range"
-                  min={0.5}
-                  max={10}
-                  step={0.5}
-                  value={imageDuration}
-                  onChange={(e) => setImageDuration(Number(e.target.value))}
-                  className="w-full accent-blue-600"
-                  aria-label="Seconds per photo"
-                />
-                <div className="flex gap-1.5">
-                  {DURATION_CHOICES.map((d) => (
-                    <Pill key={d} active={imageDuration === d} onClick={() => setImageDuration(d)}>
-                      {d}s
-                    </Pill>
-                  ))}
+                <div className="flex items-center gap-2">
+                  <span className="text-[12px] text-neutral-500 dark:text-neutral-400 flex-1">Photos of another shape</span>
+                  <Pill active={blurFill} onClick={() => setBlurFill(true)} title="Fill the frame with a soft, blurred copy of the photo">
+                    Blur fill
+                  </Pill>
+                  <Pill active={!blurFill} onClick={() => setBlurFill(false)} title="Black bars around the photo">
+                    Bars
+                  </Pill>
                 </div>
               </Section>
 
-              <Switch on={kenBurns} onChange={setKenBurns} label="Slow zoom & pan" hint="Gentle camera motion on every photo" />
+              {music ? (
+                <Section title="Cut every" aside={<span className="text-[12px] font-medium tabular-nums text-neutral-700 dark:text-neutral-200">{perPhoto.toFixed(1)}s a photo</span>}>
+                  <div className="flex gap-1.5">
+                    {BEAT_CHOICES.map((b) => (
+                      <Pill key={b} active={beatsPerPhoto === b} onClick={() => setBeatsPerPhoto(b)}>
+                        {b === 1 ? "Beat" : `${b} beats`}
+                      </Pill>
+                    ))}
+                  </div>
+                </Section>
+              ) : (
+                <Section title="Each photo" aside={<span className="text-[12px] font-medium tabular-nums text-neutral-700 dark:text-neutral-200">{imageDuration}s</span>}>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={10}
+                    step={0.1}
+                    value={imageDuration}
+                    onChange={(e) => setImageDuration(Number(e.target.value))}
+                    className="w-full accent-blue-600"
+                    aria-label="Seconds per photo"
+                  />
+                  <div className="flex gap-1.5">
+                    {DURATION_CHOICES.map((d) => (
+                      <Pill key={d} active={imageDuration === d} onClick={() => setImageDuration(d)}>
+                        {d}s
+                      </Pill>
+                    ))}
+                  </div>
+                </Section>
+              )}
+
+              <div className="flex flex-col gap-3.5">
+                <Switch on={kenBurns} onChange={setKenBurns} label="Camera motion" hint={template ? `${template.label} moves - zooms, pans and drifts` : "Gentle zoom & pan on every photo"} />
+                {template && <Switch on={captionsOn} onChange={setCaptionsOn} label="Captions" hint="The style's animated titles and words" />}
+                {template && template.scenes.length > 0 && (
+                  <Switch on={scenesOn} onChange={setScenesOn} label="Collages" hint={template.scenes.map((s) => (s.kind === "grid" ? "Photo grid" : s.kind === "triptych" ? "Framed trio" : "Word panels")).join(" + ")} />
+                )}
+                {template && (template.overlays.length > 0 || template.fx.some(Boolean)) && (
+                  <Switch
+                    on={overlaysOn}
+                    onChange={setOverlaysOn}
+                    label="Effects"
+                    hint={[...template.overlays.map((k) => assetEntry(k).label), ...Array.from(new Set(template.fx.filter(Boolean))).map((k) => CLIP_FX.find((f) => f.value === k)?.label)].filter(Boolean).join(" + ")}
+                  />
+                )}
+              </div>
 
               <Section title="Transitions">
                 <div className="flex flex-wrap gap-1.5" onMouseLeave={() => setHoverStyle(null)}>
+                  {template && (
+                    <Pill active={style === "template"} onClick={() => setStyle("template")} onHover={(on) => setHoverStyle(on ? "template" : null)} title={`${template.label}'s own mix`}>
+                      <span className="flex items-center gap-1">
+                        <IoSparkles size={12} /> {template.label}
+                      </span>
+                    </Pill>
+                  )}
                   {TRANSITION_STYLES.map((t) => (
                     <Pill
                       key={t.id}
@@ -672,8 +1115,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
           <p className="flex-1 min-w-0 text-[12.5px] text-neutral-500 dark:text-neutral-400 truncate">
             {error ? (
               <span className="text-red-600 dark:text-red-400">{error}</span>
+            ) : creatingStep ? (
+              creatingStep
             ) : picked.length > 0 ? (
-              `About ${formatLength(totalSeconds)} long - add music, text and overlays in the editor.`
+              `About ${formatLength(projectLength)} long${template ? ` in ${template.label} style` : ""}${music ? `, cut to "${musicTitle}"` : ""} - every part stays editable.`
             ) : (
               "Starts as an empty timeline."
             )}

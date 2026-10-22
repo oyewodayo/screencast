@@ -5161,7 +5161,10 @@ fn ken_burns_chain(kb: &ClipKenBurns, duration: f64, out_w: i64, out_h: i64, fps
         _ => return String::new(),
     };
     // The window kept fully on the frame, then its corners (source pixels) sent to the frame's.
-    let half = format!("(0.5/{z})");
+    // Floored at 1: zoom-out lands on 1.15-0.15*1 = 0.9999999999999999 once a transition tail runs
+    // it to its end, and a half-width past 0.5 makes clip() below NaN - perspective then fails the
+    // whole export with a bare "Invalid argument".
+    let half = format!("(0.5/max({z},1))");
     let cx = format!("clip({cx},{half},1-{half})");
     let cy = format!("clip({cy},{half},1-{half})");
     let (l, r) = (format!("(({cx})-{half})*W"), format!("(({cx})+{half})*W"));

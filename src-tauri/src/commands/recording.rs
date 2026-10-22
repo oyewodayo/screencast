@@ -997,14 +997,47 @@ pub async fn record_view_switch(
 // thing as the error - as every take_screenshot used to - buries the one line anyone can act on
 // under noise the UI can't even fully display. The real reason is reliably among the last few
 // non-empty lines.
+// The lines of a failed run's stderr that say what went wrong. Just taking the last few lines isn't
+// enough: a run that fails late ends with the encoders' closing statistics ("[libx264 @ ...] ref B
+// L0: ...", "kb/s:", "Qavg: ...") and the actual error is further up - so the message used to read
+// as a wall of numbers ending in "Conversion failed!". Lines that report a problem are picked out
+// instead (the last few, oldest first); the plain tail is only the fallback when none do.
 pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
+        .flat_map(|l| l.split('\r'))
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
         return "ffmpeg exited with an error and produced no output".to_string();
+    }
+    const PROBLEM: &[&str] = &[
+        "error", "invalid", "failed", "no such", "not found", "cannot", "can't", "unable", "too many",
+        "out of memory", "does not", "doesn't", "unsupported", "not supported", "mismatch", "denied",
+        "corrupt", "unknown", "impossible", "could not", "couldn't",
+    ];
+    let problems: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            // ffmpeg's own sign-off says nothing the lines before it don't.
+            !lower.starts_with("conversion failed") && PROBLEM.iter().any(|p| lower.contains(p))
+        })
+        .collect();
+    if !problems.is_empty() {
+        let mut unique: Vec<&str> = Vec::new();
+        for l in problems.iter().rev() {
+            if !unique.contains(l) {
+                unique.push(l);
+            }
+            if unique.len() == 4 {
+                break;
+            }
+        }
+        unique.reverse();
+        return unique.join(" | ");
     }
     let tail_len = lines.len().min(5);
     lines[lines.len() - tail_len..].join(" | ")
@@ -2989,5 +3022,33 @@ mod overlay_style_tests {
         assert_eq!(ffmpeg_color("red; drop"), "white");
         assert!(overlay_position_expr("center", 0, 1, 300, 1920).ends_with("y=(H-h)/2"));
         assert!(overlay_position_expr("center_left", 0, 1, 300, 1920).starts_with("overlay=x=48+0"));
+    }
+}
+
+#[cfg(test)]
+mod ffmpeg_error_tests {
+    use super::extract_ffmpeg_error;
+
+    #[test]
+    fn finds_the_error_above_the_closing_statistics() {
+        // The shape of a real failed export: the cause, then the encoders' sign-off statistics.
+        let stderr = "frame=  280 fps=1.3 q=23.0 size=4600KiB\r\n\
+            [Parsed_geq_12 @ 0000] Error while parsing expression 'foo'\n\
+            [fc#0 @ 0000] Error while filtering: Invalid argument\n\
+            [libx264 @ 000001bf51c63e00] ref B L0: 72.6% 18.4%  9.0%\n\
+            [libx264 @ 000001bf51c63e00] ref B L1: 85.1% 14.9%\n\
+            [libx264 @ 000001bf51c63e00] kb/s:2632.81\n\
+            [aac @ 000001bf51c62f40] Qavg: 65536.000\n\
+            Conversion failed!\n";
+        let msg = extract_ffmpeg_error(stderr);
+        assert!(msg.contains("Error while parsing expression"), "{msg}");
+        assert!(msg.contains("Error while filtering"), "{msg}");
+        assert!(!msg.contains("kb/s"), "{msg}");
+    }
+
+    #[test]
+    fn falls_back_to_the_tail_when_nothing_reads_as_an_error() {
+        assert_eq!(extract_ffmpeg_error("a\nb\nc"), "a | b | c");
+        assert_eq!(extract_ffmpeg_error(""), "ffmpeg exited with an error and produced no output");
     }
 }

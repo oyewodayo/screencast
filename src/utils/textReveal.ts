@@ -10,9 +10,12 @@
 // as the line fills in.
 import type { OverlayAnimation } from "./videoEditTypes";
 
-export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave";
+export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave" | "popin" | "mask" | "zoomin" | "flicker" | "bounce";
 
-const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave"]);
+const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave", "popin", "mask", "zoomin", "flicker", "bounce"]);
+// Reveals that scale, turn or mask letters - the preview draws these on canvas (drawTextOverlay)
+// rather than as styled DOM letters.
+export const CANVAS_TEXT_REVEALS = new Set<string>(["popin", "mask", "zoomin", "flicker", "bounce"]);
 export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal => !!animation && TEXT_REVEALS.has(animation);
 
 // How a title leaves: fade out, play its reveal backwards (un-type), or just cut at its end.
@@ -57,6 +60,9 @@ const easeOutBack = (t: number) => {
   const c1 = 1.70158;
   return 1 + (c1 + 1) * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
 };
+// A springy settle - overshoots, swings back, comes to rest (letters popping in).
+const easeOutElastic = (t: number) => (t <= 0 ? 0 : t >= 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1);
+const easeOutQuint = (t: number) => 1 - Math.pow(1 - t, 5);
 const easeOutBounce = (t: number) => {
   const n1 = 7.5625;
   const d1 = 2.75;
@@ -94,6 +100,10 @@ function naturalSeconds(text: string, kind: TextReveal, settings?: TextRevealSet
   if (kind === "spread") return 0.9;
   if (kind === "scatter") return Math.max(0.7, chars * 0.025 + 0.55);
   if (kind === "drop") return Math.max(0.7, chars * 0.04 + 0.6);
+  if (kind === "mask") return Math.max(0.5, (words - 1) * 0.12 + 0.55);
+  if (kind === "flicker") return 1.1;
+  if (kind === "zoomin") return Math.max(0.6, chars * 0.03 + 0.5);
+  if (kind === "popin" || kind === "bounce") return Math.max(0.6, chars * 0.035 + 0.5);
   return Math.max(0.5, chars * 0.03 + CHAR_IN_SEC);
 }
 
@@ -121,6 +131,12 @@ export interface CharState {
   dx?: number;
   // Blur radius in em. Undefined = sharp.
   blur?: number;
+  // Size about the letter's centre (1 = as set) and turn in degrees. Undefined = 1 / 0.
+  scale?: number;
+  rotate?: number;
+  // Rises out of its own line: everything below the line's box is hidden (the letter slides up
+  // from behind an invisible edge). Undefined = not clipped.
+  clip?: boolean;
 }
 
 export interface TextRevealState {
@@ -213,7 +229,36 @@ function revealAt(text: string, kind: TextReveal, p: number, reveal: number, set
     };
   }
 
-  const inSec = Math.min(kind === "drop" ? 0.6 : CHAR_IN_SEC, reveal);
+  if (kind === "mask") {
+    // Each word slides up out of its line, from behind an edge you can't see - crisp, no fade.
+    const { wordOf, words } = wordIndexes(text);
+    const inSec = Math.min(0.55, reveal);
+    const stagger = words > 1 ? Math.max(0, reveal - inSec) / (words - 1) : 0;
+    return {
+      char: (i) => {
+        const e = easeOutQuint(clamp01((p - wordOf[i] * stagger) / inSec));
+        return { opacity: e > 0 ? 1 : 0, dy: (1 - e) * 1.15 * dir, clip: e < 1 };
+      },
+      caretAt: null,
+    };
+  }
+
+  if (kind === "flicker") {
+    // A neon sign warming up: letters stutter on in a random order, then hold steady.
+    return {
+      char: (i) => {
+        const on = hash(i * 4.7) * 0.6 * reveal;
+        if (p >= reveal) return { opacity: 1, dy: 0 };
+        if (p < on) return { opacity: 0, dy: 0 };
+        const k = Math.floor((p - on) * 24);
+        const steady = p - on > 0.35 * reveal;
+        return { opacity: steady ? 1 : hash(i * 13.1 + k * 1.7) > 0.45 ? 1 : 0.15, dy: 0 };
+      },
+      caretAt: null,
+    };
+  }
+
+  const inSec = Math.min(kind === "drop" ? 0.6 : kind === "popin" || kind === "bounce" ? 0.55 : CHAR_IN_SEC, reveal);
   const stagger = n > 1 ? Math.max(0, reveal - inSec) / (n - 1) : 0;
   return {
     char: (i) => {
@@ -227,6 +272,20 @@ function revealAt(text: string, kind: TextReveal, p: number, reveal: number, set
         case "drop":
           // Falls from above and bounces to rest.
           return { opacity: clamp01(local * 4), dy: -(1 - easeOutBounce(local)) * 1.0 };
+        case "popin":
+          // Springs up from nothing, overshooting a touch before it settles.
+          return { opacity: clamp01(local * 6), dy: 0, scale: local >= 1 ? 1 : Math.max(0, easeOutElastic(local)) };
+        case "zoomin": {
+          // Comes in from big and soft, landing sharp.
+          const e = easeOutQuint(local);
+          return { opacity: clamp01(local * 2.5), dy: 0, scale: 1 + (1 - e) * 1.6, blur: (1 - e) * 0.2 };
+        }
+        case "bounce": {
+          // Drops in tilted, squashes on landing and springs upright - a sticker title.
+          const e = easeOutBounce(local);
+          const tilt = (hash(i * 5.3) - 0.5) * 30;
+          return { opacity: clamp01(local * 5), dy: -(1 - e) * 1.2, scale: local >= 1 ? 1 : 0.6 + 0.4 * easeOutElastic(local), rotate: tilt * (1 - easeOutCubic(local)) };
+        }
         case "wave":
           // Hops up and lands, one after another.
           return { opacity: clamp01(local * 3), dy: -Math.sin(Math.PI * local) * 0.45 };

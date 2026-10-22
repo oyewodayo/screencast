@@ -13,6 +13,7 @@ mod commands {
     pub mod background_removal;
     pub mod camera_effects;
     pub mod conversion;
+    pub mod derived_images;
     pub mod embedded_scan;
     pub mod file_info;
     pub mod motion_tracking;
@@ -534,6 +535,7 @@ fn main() {
             commands::music_library::restore_music_track,
             commands::music_library::save_music_track,
             commands::music_library::store_builtin_sound,
+            commands::derived_images::store_derived_still,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,

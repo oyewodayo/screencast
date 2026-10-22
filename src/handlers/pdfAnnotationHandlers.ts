@@ -476,10 +476,14 @@ export interface MeasuredTextBlock {
 
 // `fontSize`/`maxWidth` are read as PDF-space units here (see the section note above) — the
 // returned `height` is therefore directly usable as TextObject.height with no further scaling.
-export function measureTextBlock(text: string, fontSize: number, maxWidth: number): MeasuredTextBlock {
+// `opts.font` measures in another face (a full CSS font at `fontSize` px - a video title's
+// titleFontCss), `opts.letterSpacing` with extra px between letters.
+export function measureTextBlock(text: string, fontSize: number, maxWidth: number, opts: { font?: string; letterSpacing?: number } = {}): MeasuredTextBlock {
   const ctx = getMeasurementContext();
-  ctx.font = `${fontSize}px ${TEXT_FONT_FAMILY}`;
+  ctx.font = opts.font ?? `${fontSize}px ${TEXT_FONT_FAMILY}`;
+  ctx.letterSpacing = `${opts.letterSpacing ?? 0}px`;
   const lines = wrapTextBlock(ctx, text, maxWidth);
+  ctx.letterSpacing = "0px";
   const lineHeight = fontSize * TEXT_LINE_HEIGHT_MULTIPLIER;
   return { lines, lineHeight, height: lines.length * lineHeight };
 }

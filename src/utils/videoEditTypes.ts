@@ -322,7 +322,13 @@ export type OverlayAnimation =
   | "blur"
   | "drop"
   | "spread"
-  | "wave";
+  | "wave"
+  // Letter reveals that scale, turn or mask letters (textReveal.ts) - drawn on canvas everywhere.
+  | "popin"
+  | "mask"
+  | "zoomin"
+  | "flicker"
+  | "bounce";
 
 // How an overlay mixes with the picture under it - CSS mix-blend-mode names (the preview sets them
 // on the overlay's element). Export composites the same formula (blend_composite, conversion.rs);
@@ -388,6 +394,18 @@ export interface TextOverlay {
   // (VideoOverlayLayer) and export burn-in (videoOverlayRender.ts) - kept as a fraction rather than
   // raw px so it scales consistently with the frame the same way fontSize/x/y already do.
   padding?: number;
+  // Typography (titleFonts.ts) and finish. Any of these set and the overlay is drawn by the one
+  // canvas renderer (drawTextOverlay, videoOverlayRender.ts) in the preview as well as in export,
+  // so they always match. Undefined = the system face, solid `color`, no glow/shadow.
+  fontFamily?: string;
+  // Extra space between letters, as a fraction of the font size (0.1 = tracked-out caps).
+  letterSpacing?: number;
+  // A gradient fill in place of `color` (top to bottom by default; angle in degrees, 0 = down).
+  fill?: { from: string; to: string; angle?: number };
+  // A soft light around the letters; size is a fraction of the font size.
+  glow?: { color: string; size: number };
+  // A drop shadow; offsets and blur are fractions of the font size.
+  shadow?: { color: string; x: number; y: number; blur: number };
   // Normalized 0..1 fractions of the letterboxed VIDEO FRAME (not the player container) - stays
   // pixel-stable relative to the actual picture regardless of window size/fullscreen, since
   // object-fit:contain preserves the frame's own aspect ratio. y-down (top edge), unlike
@@ -433,6 +451,9 @@ export interface ImageOverlay {
   cornerRadius?: number; // fraction of frame height; undefined means 0 (square corners)
   rotation?: number; // degrees, clockwise; undefined means 0
   borderColor?: string; // undefined means no border
+  // A frame of borderColor this thick (fraction of the frame height) round the outside of the box -
+  // a photo print's white border. Undefined = the original thin 3px ring.
+  borderWidth?: number;
   shadow?: boolean; // undefined/false means no drop shadow
   flipHorizontal?: boolean; // undefined/false means not mirrored
   flipVertical?: boolean;

@@ -15,10 +15,13 @@
 // handle for text size, and the right edge for wrap width.
 import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { IoMove } from "react-icons/io5";
-import { TEXT_FONT_FAMILY, applyColorRun, shiftColorRunsForEdit, shiftTextRangesForEdit, toggleTextRange } from "../../handlers/pdfAnnotationHandlers";
+import { applyColorRun, shiftColorRunsForEdit, shiftTextRangesForEdit, toggleTextRange } from "../../handlers/pdfAnnotationHandlers";
 import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
 import { renderFormattedSegments } from "../../utils/textFormatting";
-import { TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { usesCanvasText } from "../../utils/videoOverlayRender";
+import CanvasTextOverlay from "./CanvasTextOverlay";
+import { titleFontStyle } from "../../utils/titleFonts";
 
 const MIN_FONT_SIZE_PX = 8;
 const MAX_FONT_SIZE_PX = 400;
@@ -47,8 +50,17 @@ interface VideoTextEditorProps {
   fontSize: number;
   paddingPx: number;
   strokeColor?: string;
+  // Pixels on screen (VideoOverlayLayer scales the overlay's own strokeWidth to the frame).
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle;
+  // The title's face (titleFonts.ts) and tracking (fraction of the font size).
+  fontFamily?: string;
+  letterSpacing?: number;
+  // The rest of its look (gradient, glow, shadow...) and the frame's size on screen: a title drawn
+  // on canvas (usesCanvasText) is drawn the same way under the caret while it's typed.
+  look?: Partial<TextOverlay>;
+  frameWidth?: number;
+  frameHeight?: number;
   initialText: string;
   initialColor: string;
   initialBackgroundColor: string | undefined;
@@ -84,6 +96,11 @@ const VideoTextEditor = forwardRef<VideoTextEditorHandle, VideoTextEditorProps>(
       paddingPx,
       strokeColor,
       strokeWidth,
+      fontFamily,
+      letterSpacing,
+      look,
+      frameWidth,
+      frameHeight,
       cornerStyle,
       initialText,
       initialColor,
@@ -262,11 +279,39 @@ const VideoTextEditor = forwardRef<VideoTextEditorHandle, VideoTextEditorProps>(
       );
     };
 
-    const hasStroke = !!(strokeColor && strokeWidth);
+    const richOverlay: TextOverlay | null =
+      look && frameWidth && frameHeight
+        ? {
+            id: "editing",
+            ...look,
+            animation: undefined,
+            keyframes: undefined,
+            text,
+            color,
+            backgroundColor,
+            colorRuns,
+            boldRuns,
+            italicRuns,
+            textAlign,
+            x: 0,
+            y: 0,
+            width: width / frameWidth,
+            height: 0,
+            fontSize: fontSize / frameHeight,
+            padding: paddingPx / frameHeight,
+            startTime: 0,
+            endTime: 1,
+            createdAt: 0,
+            updatedAt: 0,
+          }
+        : null;
+    const onCanvas = !!richOverlay && usesCanvasText(richOverlay);
+    const hasStroke = !onCanvas && !!(strokeColor && strokeWidth);
     // Same look VideoOverlayLayer gives the committed overlay - keep the two in step.
     const shared: React.CSSProperties = {
-      fontFamily: TEXT_FONT_FAMILY,
+      ...titleFontStyle(fontFamily),
       fontSize,
+      letterSpacing: letterSpacing ? `${letterSpacing}em` : undefined,
       lineHeight: 1.3,
       padding: paddingPx,
       textAlign,
@@ -276,20 +321,21 @@ const VideoTextEditor = forwardRef<VideoTextEditorHandle, VideoTextEditorProps>(
 
     return (
       <div ref={wrapperRef} className="absolute" style={{ left, top, width, zIndex: 20 }}>
+        {onCanvas && richOverlay && <CanvasTextOverlay overlay={richOverlay} frameWidth={frameWidth!} frameHeight={frameHeight!} getTime={() => 0} />}
         <div
           ref={backdropRef}
           aria-hidden="true"
           className="absolute inset-0 pointer-events-none"
           style={{
             ...shared,
-            background: backgroundColor ?? "transparent",
+            background: onCanvas ? "transparent" : backgroundColor ?? "transparent",
             borderRadius: cornerStyle === "pill" ? 9999 : cornerStyle === "rounded" ? 8 : 0,
             WebkitTextStroke: hasStroke ? `${strokeWidth}px ${strokeColor}` : undefined,
             paintOrder: hasStroke ? "stroke fill" : undefined,
-            textShadow: backgroundColor || hasStroke ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
+            textShadow: onCanvas || backgroundColor || hasStroke ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
           }}
         >
-          {renderFormattedSegments(text, colorRuns, boldRuns, italicRuns, color)}
+          {onCanvas ? <span style={{ color: "transparent" }}>{text}</span> : renderFormattedSegments(text, colorRuns, boldRuns, italicRuns, color)}
           {/* A trailing newline in a textarea adds a line the backdrop wouldn't otherwise have. */}
           {text.endsWith("\n") ? "​" : null}
         </div>
