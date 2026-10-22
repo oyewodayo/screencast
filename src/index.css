@@ -87,3 +87,21 @@ body.media-playing [class*="backdrop-blur"] {
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;
 }
+
+/* The Phones panel slides in from the right (PhonesHub.tsx). */
+@keyframes phonesHubIn {
+  from { transform: translateX(24px); opacity: 0; }
+}
+.phones-hub-in { animation: phonesHubIn 0.22s cubic-bezier(0.2, 0.9, 0.3, 1); }
+
+/* A drop landing on a phone: Briefcast's cast arcs radiate out, one after another (PhoneShelf.tsx). */
+@keyframes phoneShelfBurst {
+  0% { opacity: 0; }
+  30% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.phone-shelf-burst path { opacity: 0; animation: phoneShelfBurst 0.9s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .phones-hub-in, .phone-shelf-burst path { animation: none; }
+}

@@ -35,6 +35,7 @@ import {
     getPhoneTransferState,
     loadPhoneHistory,
     onPhoneConnected,
+    openPhonesHub,
     sendToPhone,
     startPhoneTransfer,
     subscribePhoneTransfer,
@@ -56,7 +57,7 @@ import {
     type UsbStore,
 } from "../../services/usbPhone";
 
-const formatBytes = (n: number) => {
+export const formatBytes = (n: number) => {
     if (n < 1024) return `${n} B`;
     const units = ["KB", "MB", "GB", "TB"];
     let v = n;
@@ -68,7 +69,7 @@ const formatBytes = (n: number) => {
     return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
 };
 
-const formatAgo = (ms: number) => {
+export const formatAgo = (ms: number) => {
     if (!ms) return "never";
     const s = Math.max(0, (Date.now() - ms) / 1000);
     if (s < 60) return "just now";
@@ -112,7 +113,7 @@ const StepList = ({ steps }: { steps: string[] }) => (
 );
 
 // The QR for pairing a phone: encrypted by default, plain HTTP only on request and labelled.
-const PairingPanel = ({
+export const PairingPanel = ({
     info,
     receiving,
     fileCount,
@@ -388,7 +389,7 @@ const HISTORY_TEXT: Record<HistoryEntry["kind"], string> = {
 };
 
 // The local record of pairings and transfers (phone_transfer_history.jsonl).
-const HistoryView = ({ history }: { history: HistoryEntry[] | null }) => {
+export const HistoryView = ({ history }: { history: HistoryEntry[] | null }) => {
     useEffect(() => {
         void loadPhoneHistory();
     }, []);
@@ -707,6 +708,16 @@ const PhoneTransferModal = ({ files, store }: { files: TransferFile[]; store: Ph
                                 className="mt-3 flex items-center gap-1.5 px-3 py-2 rounded-lg text-[13px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800"
                             >
                                 <IoAdd size={16} /> Connect another phone
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    closePhoneTransfer();
+                                    openPhonesHub();
+                                }}
+                                className="mt-3 ml-1 px-3 py-2 rounded-lg text-[13px] text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                            >
+                                Manage phones
                             </button>
                         </div>
                     )}

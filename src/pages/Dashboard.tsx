@@ -114,6 +114,8 @@ import {
   type PhoneCaptureHandle,
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
+import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
+import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
 import TelemetryNotice from "../components/custom/TelemetryNotice";
 import type { RecordingStatus } from "../utils/recordingStatus";
@@ -607,6 +609,11 @@ const Dashboard = () => {
     }
     setDraggingFiles(null);
     setDragPoint(null);
+    const phone = phoneDropAt(e.clientX, e.clientY);
+    if (phone) {
+      void dropOnPhone(phone, [file.path]);
+      return;
+    }
     const el = document.elementFromPoint(e.clientX, e.clientY);
     // A drop zone that takes a file itself (a split screen's shot rows).
     const zone = el?.closest("[data-media-drop]");
@@ -646,6 +653,11 @@ const Dashboard = () => {
     return null;
   };
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number; over: "timeline" | "video" | "zone" | null } | null>(null);
+  // The phone shelf (PhoneShelf.tsx): where the pointer is during a drag the shelf should follow -
+  // a library file dragged the browser's own way, or files dragged in from Explorer.
+  const [externalDrag, setExternalDrag] = useState(false);
+  const [shelfPoint, setShelfPoint] = useState<{ x: number; y: number } | null>(null);
+  const shelfPointRef = useRef<{ x: number; y: number } | null>(null);
   // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
@@ -3819,6 +3831,11 @@ const setScreen = () => {
 	const resolveExternalDropClientX = async (): Promise<number | null> => {
 		try {
 			const [clientX, clientY] = await invoke<[number, number]>("get_cursor_position_in_window");
+			if (phonesPaired()) {
+				shelfPointRef.current = { x: clientX, y: clientY };
+				setShelfPoint(shelfPointRef.current);
+				setExternalDrag(true);
+			}
 			const el = document.elementFromPoint(clientX, clientY);
 			const overTimeline = !!el?.closest("[data-timeline-track]");
 			// Temporary diagnostic - if clientX/clientY now land on the timeline while it's visibly
@@ -3846,6 +3863,19 @@ const setScreen = () => {
 				if (hoverTokenRef.current === token) dragOverTimelineXRef.current = clientX;
 				return;
 			}
+			if (event.payload.type === "drop" || event.payload.type === "leave") {
+				const at = shelfPointRef.current;
+				shelfPointRef.current = null;
+				setExternalDrag(false);
+				setShelfPoint(null);
+				// Dropped on a phone (the shelf, or a card in the Phones panel): it's sent, not imported.
+				const phone = event.payload.type === "drop" && at ? phoneDropAt(at.x, at.y) : null;
+				if (phone && event.payload.type === "drop") {
+					dragOverTimelineXRef.current = null;
+					void dropOnPhone(phone, event.payload.paths);
+					return;
+				}
+			}
 			if (event.payload.type === "drop") {
 				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
 				if (dragOverTimelineXRef.current !== null) {
@@ -3866,6 +3896,34 @@ const setScreen = () => {
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
+
+	useEffect(() => {
+		if (!draggingFiles) return;
+		const over = (e: DragEvent) => {
+			setShelfPoint({ x: e.clientX, y: e.clientY });
+			if ((e.target as Element | null)?.closest?.("[data-phone-drop]")) {
+				e.preventDefault();
+				if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+			}
+		};
+		const drop = (e: DragEvent) => {
+			const phone = (e.target as Element | null)?.closest?.<HTMLElement>("[data-phone-drop]")?.dataset.phoneDrop;
+			if (!phone) return;
+			e.preventDefault();
+			void dropOnPhone(phone, draggingFiles.map((f) => f.path));
+			setDraggingFiles(null);
+		};
+		document.addEventListener("dragover", over);
+		document.addEventListener("drop", drop);
+		return () => {
+			document.removeEventListener("dragover", over);
+			document.removeEventListener("drop", drop);
+			setShelfPoint(null);
+		};
+	}, [draggingFiles]);
+	const shelfDragging = !!draggingFiles || externalDrag;
+	const shelfAt = dragPoint ?? shelfPoint;
+	const phoneHover = shelfDragging && shelfAt ? phoneDropAt(shelfAt.x, shelfAt.y) : null;
 
 	const handleDeleteFolder = async (folder: string) => {
 		try {
@@ -5853,6 +5911,8 @@ const setScreen = () => {
       )}
 
       <PhoneTransferHost />
+      <PhonesHubHost dropHover={phoneHover} />
+      <PhoneShelf dragging={shelfDragging} point={shelfAt} />
       <UsbImportHost />
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
       {showPhoneCamera && (
