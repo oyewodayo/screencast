@@ -403,8 +403,9 @@ export interface UseVideoEditStoreResult {
   ) => void;
   // Inserts a whole new clip - from the Briefcast library or an external file dropped onto the
   // timeline - at `atIndex`, fetching its duration first if not already known. Resolves once the
-  // clip has actually been added (or been skipped, if the duration lookup failed).
-  insertClipAt: (sourcePath: string, atIndex: number) => Promise<void>;
+  // clip has actually been added (true) or been skipped (false: the duration lookup failed, or
+  // another video was opened meanwhile).
+  insertClipAt: (sourcePath: string, atIndex: number) => Promise<boolean>;
   // Swaps the media a clip plays (right-click > Replace) - keeps its place, length and effects.
   replaceClipSource: (id: string, newSourcePath: string) => Promise<void>;
   undo: () => void;
@@ -1767,11 +1768,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   }, [pushCommand]);
 
   const insertClipAt = useCallback(
-    async (newClipSourcePath: string, atIndex: number) => {
+    async (newClipSourcePath: string, atIndex: number): Promise<boolean> => {
       const current = stateRef.current;
       // `current == null` here means the edit store hasn't finished loading/seeding yet (a real
       // possible race right after opening a file), which would silently swallow every insert.
-      if (!current) return;
+      if (!current) return false;
       // Captured before the await below - if the user switches to a different video while a
       // duration lookup is in flight, sourcePathRef.current no longer matches this by the time we
       // come back, and the insert (meant for the file open when the drag happened) must be
@@ -1782,18 +1783,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       let duration = getSourceDuration(newClipSourcePath);
       if (duration == null) {
         duration = await fetchDuration(newClipSourcePath);
-        if (duration == null) return; // couldn't read this file - nothing to insert
-        if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
+        if (duration == null) return false; // couldn't read this file - nothing to insert
+        if (sourcePathRef.current !== requestedForSourcePath) return false; // switched files mid-lookup
         registerSourceDuration(newClipSourcePath, duration);
       }
-      if (sourcePathRef.current !== requestedForSourcePath) return; // switched files mid-lookup
+      if (sourcePathRef.current !== requestedForSourcePath) return false; // switched files mid-lookup
       const latest = stateRef.current;
-      if (!latest) return;
+      if (!latest) return false;
       // An image clip starts at a slideshow-friendly length rather than its (very long) maximum.
       const end = isImageClipPath(newClipSourcePath) ? Math.min(duration, DEFAULT_IMAGE_CLIP_SECONDS) : duration;
       const newClip: Clip = { id: crypto.randomUUID(), sourcePath: newClipSourcePath, start: 0, end };
       const clips = insertClipHandler(latest.clips, atIndex, newClip);
       pushCommand(snapshot(latest, {}), snapshot(latest, { clips }), "insert");
+      return true;
     },
     [pushCommand, getSourceDuration, registerSourceDuration, sourcePath]
   );

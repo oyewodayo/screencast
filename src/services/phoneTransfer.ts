@@ -82,6 +82,10 @@ export interface IncomingStatus {
     state: "receiving" | "done" | "failed";
     path: string | null;
     error: string | null;
+    // "timeline" when the phone chose "Add to timeline" - see onPhoneTimelineFile.
+    target: "timeline" | "library";
+    // Files picked or shared together; they go on the timeline together, in order.
+    batch: string | null;
 }
 
 export interface PhoneTransferStore {
@@ -115,6 +119,10 @@ let state: PhoneTransferStore = {
 };
 const listeners = new Set<Listener>();
 const connectListeners = new Set<ConnectListener>();
+const timelineListeners = new Set<(file: IncomingStatus) => void>();
+const arrivalListeners = new Set<(file: IncomingStatus) => void>();
+const arrived = new Set<string>();
+const handedToTimeline = new Set<string>();
 let listening = false;
 
 const setState = (patch: Partial<PhoneTransferStore>) => {
@@ -151,6 +159,17 @@ const ensureListening = () => {
         if (i >= 0) incoming[i] = e.payload;
         else incoming.push(e.payload);
         setState({ incoming });
+        const file = e.payload;
+        if (file.state === "done" && file.path && !arrived.has(file.id)) {
+            arrived.add(file.id);
+            arrivalListeners.forEach((l) => l(file));
+        }
+        if (file.state === "done" && file.target === "timeline" && !handedToTimeline.has(file.id)) {
+            handedToTimeline.add(file.id);
+            // No editor listening means no video is open - the file is safe in the library either way.
+            if (timelineListeners.size) timelineListeners.forEach((l) => l(file));
+            else void reportPhonePlacement(file, false, "No video is open in Briefcast — saved to your library");
+        }
     });
     void listen<PhoneDevice>("phone-transfer-connected", (e) => connectListeners.forEach((l) => l(e.payload)));
     void listen<PairRequest>("phone-transfer-pair-request", (e) =>
@@ -237,6 +256,32 @@ export const sendToPhone = async (deviceId: string, files: TransferFile[]) => {
         throw e;
     }
 };
+
+// The video editor takes files a phone sent with "Add to timeline" - it subscribes while a video is
+// open, and must answer each one with reportPhonePlacement.
+export const onPhoneTimelineFile = (listener: (file: IncomingStatus) => void) => {
+    ensureListening();
+    timelineListeners.add(listener);
+    return () => {
+        timelineListeners.delete(listener);
+    };
+};
+
+// Every file a phone finished sending here, once each (the home screen lists them).
+export const onPhoneFileArrived = (listener: (file: IncomingStatus) => void) => {
+    ensureListening();
+    arrivalListeners.add(listener);
+    return () => {
+        arrivalListeners.delete(listener);
+    };
+};
+
+// Which video is open in the editor (null: none) - phones offer "Add to timeline" while there is one.
+export const setPhoneTimeline = (name: string | null) => invoke("phone_transfer_set_timeline", { name }).catch(() => {});
+
+// Tells the phone that sent `file` where it ended up.
+export const reportPhonePlacement = (file: IncomingStatus, placed: boolean, note?: string) =>
+    invoke("phone_transfer_placed", { deviceId: file.device_id, uploadId: file.id, placed, note: note ?? null }).catch(() => {});
 
 export const forgetPhone = async (deviceId: string) => {
     await invoke("phone_transfer_forget", { deviceId });

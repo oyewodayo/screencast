@@ -45,7 +45,7 @@ use hickory_proto::rr::rdata::{A, NS, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
+    OrderStatus, RetryPolicy,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -390,16 +390,17 @@ async fn acme_account(state: &AppState) -> Result<&Account> {
             });
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 let credentials: AccountCredentials = serde_json::from_slice(&bytes).context("reading ACME account")?;
-                return Account::from_credentials(credentials).await.context("restoring ACME account");
+                return Account::builder()?.from_credentials(credentials).await.context("restoring ACME account");
             }
             let contact: Vec<&str> = state.config.acme_contact.iter().map(|s| s.as_str()).collect();
             let directory = if state.config.acme_staging { LetsEncrypt::Staging.url() } else { LetsEncrypt::Production.url() };
-            let (account, credentials) = Account::create(
-                &NewAccount { contact: &contact, terms_of_service_agreed: true, only_return_existing: false },
-                directory,
-                None,
-            )
-            .await
+            let (account, credentials) = Account::builder()?
+                .create(
+                    &NewAccount { contact: &contact, terms_of_service_agreed: true, only_return_existing: false },
+                    directory.to_string(),
+                    None,
+                )
+                .await
             .context("creating ACME account")?;
             tokio::fs::write(&path, serde_json::to_vec_pretty(&credentials)?).await?;
             log::info!("Created ACME account ({})", if state.config.acme_staging { "staging" } else { "production" });
@@ -424,57 +425,38 @@ async fn issue_certificate(state: &AppState, install_id: &str, csr_der: &[u8]) -
     let account = acme_account(state).await?;
     let wildcard = format!("*.{install_id}.{}", state.config.zone);
     let mut order = account
-        .new_order(&NewOrder { identifiers: &[Identifier::Dns(wildcard.clone())] })
+        .new_order(&NewOrder::new(&[Identifier::Dns(wildcard.clone())]))
         .await
         .context("creating order")?;
 
+    // Each challenge is marked ready as soon as its TXT value is being served. Let's Encrypt also
+    // lists challenge types this service doesn't answer (some without a token) - only dns-01 is used.
     let guard = ChallengeGuard { state, name: format!("_acme-challenge.{install_id}.{}", state.config.zone) };
-    let mut ready = Vec::new();
-    for authz in order.authorizations().await.context("fetching authorizations")? {
+    let mut authorizations = order.authorizations();
+    while let Some(authz) = authorizations.next().await {
+        let mut authz = authz.context("fetching authorizations")?;
         match authz.status {
             AuthorizationStatus::Pending => {}
             AuthorizationStatus::Valid => continue,
             other => bail!("authorization is {other:?}"),
         }
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Dns01)
-            .ok_or_else(|| anyhow!("no dns-01 challenge offered"))?;
-        let value = order.key_authorization(challenge).dns_value();
+        let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| anyhow!("no dns-01 challenge offered"))?;
+        let value = challenge.key_authorization().dns_value();
         state.challenges.lock().unwrap().entry(guard.name.clone()).or_default().push(value);
-        ready.push(challenge.url.clone());
-    }
-    for url in &ready {
-        order.set_challenge_ready(url).await.context("marking challenge ready")?;
+        challenge.set_ready().await.context("marking challenge ready")?;
     }
 
-    let mut delay = Duration::from_millis(500);
-    let mut status = order.state().status;
-    for _ in 0..20 {
-        if matches!(status, OrderStatus::Ready | OrderStatus::Invalid | OrderStatus::Valid) {
-            break;
-        }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(5));
-        status = order.refresh().await.context("polling order")?.status;
-    }
+    // Both waits together stay under Cloudflare's 100s limit for the request this runs inside.
+    let validation = RetryPolicy::new().initial_delay(Duration::from_millis(500)).backoff(2.0).timeout(Duration::from_secs(60));
+    let status = order.poll_ready(&validation).await.context("waiting for validation")?;
     if status != OrderStatus::Ready {
-        let problem = order.state().error.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
-        bail!("order did not become ready ({status:?}) {problem}");
+        bail!("order did not become ready ({status:?})");
     }
     drop(guard);
 
-    order.finalize(csr_der).await.context("finalizing order")?;
-    let mut delay = Duration::from_millis(500);
-    for _ in 0..20 {
-        if let Some(chain) = order.certificate().await.context("downloading certificate")? {
-            return Ok(chain);
-        }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(5));
-    }
-    bail!("certificate was not issued in time")
+    order.finalize_csr(csr_der).await.context("finalizing order")?;
+    let issuing = RetryPolicy::new().initial_delay(Duration::from_millis(500)).backoff(2.0).timeout(Duration::from_secs(30));
+    order.poll_certificate(&issuing).await.context("downloading certificate")
 }
 
 // The CSR must be validly self-signed and ask for exactly this install's wildcard, nothing else.
@@ -542,12 +524,15 @@ impl IntoResponse for ApiError {
 
 fn client_ip(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     if state.config.trust_proxy {
-        if let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse().ok())
-        {
+        // Behind Cloudflare (a tunnel, or an orange-cloud record) CF-Connecting-IP is the one
+        // Cloudflare itself sets; the first X-Forwarded-For entry is whatever the client sent.
+        if let Some(ip) = ["cf-connecting-ip", "x-forwarded-for"].iter().find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .and_then(|v| v.trim().parse().ok())
+        }) {
             return ip;
         }
     }

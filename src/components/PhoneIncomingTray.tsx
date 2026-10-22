@@ -91,7 +91,11 @@ const PhoneIncomingTray = ({ onOpen }: Props) => {
                     } else if (item.state === "failed") {
                         detail = <div className="text-[11px] text-red-600 dark:text-red-400 line-clamp-2">{item.error || "Didn't arrive"}</div>;
                     } else {
-                        detail = <div className="text-[11px] text-neutral-500 dark:text-neutral-400">{formatBytes(item.size)} · in “From phone”</div>;
+                        detail = (
+                            <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
+                                {formatBytes(item.size)} · {item.target === "timeline" ? "sent for the timeline · " : ""}in “From phone”
+                            </div>
+                        );
                     }
                     const done = item.state === "done" && item.path;
                     return (

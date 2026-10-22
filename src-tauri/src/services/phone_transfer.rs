@@ -61,6 +61,14 @@ use super::lan_tls;
 use super::phone_camera::{key_matches, lan_addresses, pairing_key, render_qr};
 
 const PHONE_PAGE: &str = include_str!("phone_transfer_page.html");
+// What lets the phone keep the page as an app on its home screen. Browsers only install it (and
+// only run the service worker) over HTTPS; over HTTP it's an ordinary home-screen shortcut.
+const MANIFEST: &str = include_str!("phone_transfer_manifest.json");
+const SERVICE_WORKER: &str = include_str!("phone_transfer_sw.js");
+const ICON_192: &[u8] = include_bytes!("phone_transfer_icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("phone_transfer_icons/icon-512.png");
+const ICON_MASKABLE: &[u8] = include_bytes!("phone_transfer_icons/maskable-512.png");
+const LOGO: &[u8] = include_bytes!("phone_transfer_icons/logo-96.png");
 
 // A fixed port (walked upward only if taken) rather than a random one: the phone page's
 // localStorage - where its device token lives - is scoped to the origin, port included, so a port
@@ -208,6 +216,8 @@ struct Offer {
     // Whether this offer has ever reached the phone's page. The page downloads fresh offers
     // automatically; ones it has already seen are only listed again (after a reload, say).
     delivered: bool,
+    // When it was sent, ms since the epoch - the phone shows it next to the file.
+    at: u64,
 }
 
 impl Offer {
@@ -263,6 +273,12 @@ struct Hub {
     history: Mutex<Option<PathBuf>>,
     tls: Mutex<Option<TlsListener>>,
     encryption: Mutex<Option<Encryption>>,
+    // Wakes run_tls early: opening the dialog while there's no certificate retries right away
+    // instead of leaving the last failure up for as long as the backoff says (up to a day).
+    tls_retry: tokio::sync::Notify,
+    tls_attempt: Mutex<Option<Instant>>,
+    // The video open in the editor, if any - phones offer "Add to timeline" while there is one.
+    timeline: Mutex<Option<String>>,
     seq: AtomicU64,
 }
 
@@ -363,6 +379,7 @@ impl Hub {
             "mime": mime_for(&offer.name),
             "state": offer.state,
             "fresh": fresh,
+            "at": offer.at,
         })
         .to_string()
     }
@@ -623,6 +640,52 @@ async fn ping() -> impl IntoResponse {
     )
 }
 
+// Whether the device id + token a page has stored are still paired. A socket that closes before
+// "welcome" can't say why, and the page used to guess "refused" whenever /ping answered - so a
+// Wi-Fi hiccup on wake was enough to make a paired phone forget itself. Now only a definite no
+// from here makes it let go.
+async fn hello(Query(q): Query<WsQuery>, State(ctx): State<Ctx>) -> Response {
+    let known = ctx
+        .hub
+        .devices
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|d| !q.d.is_empty() && d.id == q.d && key_matches(&q.t, &d.token));
+    let status = if known { StatusCode::NO_CONTENT } else { StatusCode::UNAUTHORIZED };
+    ([(header::CACHE_CONTROL, "no-store")], status).into_response()
+}
+
+fn static_file(content_type: &'static str, body: &'static [u8]) -> Response {
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
+async fn manifest() -> Response {
+    static_file("application/manifest+json", MANIFEST.as_bytes())
+}
+
+async fn service_worker() -> Response {
+    static_file("text/javascript; charset=utf-8", SERVICE_WORKER.as_bytes())
+}
+
+async fn icon(Path(name): Path<String>) -> Response {
+    match name.as_str() {
+        "icon-192.png" => static_file("image/png", ICON_192),
+        "icon-512.png" => static_file("image/png", ICON_512),
+        "maskable-512.png" => static_file("image/png", ICON_MASKABLE),
+        "logo-96.png" => static_file("image/png", LOGO),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// Android's share sheet posts shared files to /share; the installed app's service worker catches
+// that and keeps the files on the phone until they're sent. This only answers when it didn't
+// (not installed over HTTPS, or the worker not running yet) - the page explains, rather than the
+// share ending on an error. The body is never read.
+async fn share_without_worker() -> Response {
+    (StatusCode::SEE_OTHER, [(header::LOCATION, "/?share=unavailable")]).into_response()
+}
+
 // Where the HTTP page should try HTTPS: the trusted name for whichever address the phone itself
 // used to reach us (the Host header), since that's the one known to be routable from the phone.
 async fn tls_target(headers: HeaderMap, State(ctx): State<Ctx>) -> Response {
@@ -664,6 +727,7 @@ async fn run_tls(ctx: Ctx, router: Router) {
     };
     let mut config: Option<RustlsConfig> = None;
     loop {
+        *ctx.hub.tls_attempt.lock().unwrap() = Some(Instant::now());
         let wait = match lan_tls::ensure(&ctx.app).await {
             Ok(None) => return,
             Ok(Some(material)) => {
@@ -706,7 +770,23 @@ async fn run_tls(ctx: Ctx, router: Router) {
                     .clamp(Duration::from_secs(600), Duration::from_secs(86400))
             }
         };
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = ctx.hub.tls_retry.notified(), if config.is_none() => {}
+        }
+    }
+}
+
+// Never more often than this, however often the dialog is opened.
+const TLS_RETRY_GAP: Duration = Duration::from_secs(30);
+
+fn retry_tls_if_failed(hub: &Hub) {
+    if !matches!(hub.encryption(), Encryption::Unavailable { .. }) || !lan_tls::configured() {
+        return;
+    }
+    let recent = hub.tls_attempt.lock().unwrap().map(|at| at.elapsed() < TLS_RETRY_GAP).unwrap_or(false);
+    if !recent {
+        hub.tls_retry.notify_one();
     }
 }
 
@@ -895,6 +975,7 @@ async fn handle_socket(socket: WebSocket, ctx: Ctx, auth: Auth, ua: String, name
             "device": { "id": device.id, "token": device.token, "name": device.name },
             "host": computer_name(),
             "secure": secure,
+            "timeline": *ctx.hub.timeline.lock().unwrap(),
         })
         .to_string(),
     );
@@ -1176,6 +1257,9 @@ pub struct IncomingStatus {
     pub state: &'static str,
     pub path: Option<String>,
     pub error: Option<String>,
+    // "timeline" | "library"
+    pub target: &'static str,
+    pub batch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1188,6 +1272,12 @@ struct UploadQuery {
     name: String,
     #[serde(default)]
     size: u64,
+    // "timeline" asks the desktop to put the file on the open video once it's saved.
+    #[serde(default)]
+    to: String,
+    // Files picked or shared together, so the desktop keeps them together and in order.
+    #[serde(default)]
+    batch: String,
 }
 
 // A phone's idea of a file name, made safe to create on Windows: no directories, no characters
@@ -1280,6 +1370,8 @@ async fn receive_upload(
         state: "receiving",
         path: None,
         error: None,
+        target: if q.to == "timeline" { "timeline" } else { "library" },
+        batch: Some(q.batch.chars().take(40).collect::<String>()).filter(|b| !b.is_empty()),
     };
 
     let dir = match tauri::async_runtime::spawn_blocking(super::utility::briefcast_dir).await {
@@ -1349,10 +1441,13 @@ async fn receive_upload(
     entry.name = Some(saved_name.clone());
     entry.size = Some(status.received);
     record(&ctx.hub, &ctx.app, entry);
+    let id = status.id.clone();
     let _ = ctx.app.emit("phone-transfer-incoming", status);
+    // The id is how the page matches the "placed" message the desktop sends once the file is on
+    // the timeline - which can even arrive before this response does.
     (
         [(header::CONTENT_TYPE, "application/json")],
-        json!({ "name": saved_name }).to_string(),
+        json!({ "name": saved_name, "id": id }).to_string(),
     )
         .into_response()
 }
@@ -1360,6 +1455,7 @@ async fn receive_upload(
 async fn ensure_server(app: &AppHandle, state: &PhoneTransferState) -> Result<PhoneTransferInfo, String> {
     let mut server = state.server.lock().await;
     if let Some(port) = *server {
+        retry_tls_if_failed(&state.hub);
         return build_info(&state.hub, port);
     }
 
@@ -1396,6 +1492,11 @@ async fn ensure_server(app: &AppHandle, state: &PhoneTransferState) -> Result<Ph
     let router = Router::new()
         .route("/", get(serve_page))
         .route("/ping", get(ping))
+        .route("/hello", get(hello))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/icons/:name", get(icon))
+        .route("/share", post(share_without_worker))
         .route("/tls", get(tls_target))
         .route("/ws", get(ws_upgrade))
         .route("/f/:id", get(serve_file))
@@ -1488,6 +1589,7 @@ pub async fn phone_transfer_send(
             sent: 0,
             state: TransferState::Offered,
             delivered: true,
+            at: now_ms(),
         };
         let msg = Hub::offer_message(&offer_id, &offer, true);
         let mut status = offer.status(&offer_id);
@@ -1504,6 +1606,42 @@ pub async fn phone_transfer_send(
         statuses.push(status);
     }
     Ok(statuses)
+}
+
+// The editor opened or closed a video (None). Every connected phone hears at once, so "Add to
+// timeline" appears and disappears with it.
+#[tauri::command]
+pub async fn phone_transfer_set_timeline(
+    state: tauri::State<'_, PhoneTransferState>,
+    name: Option<String>,
+) -> Result<(), String> {
+    let name = name.map(|n| clean_name(&n)).filter(|n| !n.is_empty());
+    {
+        let mut timeline = state.hub.timeline.lock().unwrap();
+        if *timeline == name {
+            return Ok(());
+        }
+        *timeline = name.clone();
+    }
+    let msg = json!({ "type": "context", "timeline": name }).to_string();
+    for session in state.hub.sessions.lock().unwrap().values() {
+        let _ = session.tx.send(msg.clone());
+    }
+    Ok(())
+}
+
+// Where a file sent with "Add to timeline" ended up, told to the phone that sent it.
+#[tauri::command]
+pub async fn phone_transfer_placed(
+    state: tauri::State<'_, PhoneTransferState>,
+    device_id: String,
+    upload_id: String,
+    placed: bool,
+    note: Option<String>,
+) -> Result<(), String> {
+    let msg = json!({ "type": "placed", "id": upload_id, "placed": placed, "note": note }).to_string();
+    state.hub.send_to(&device_id, msg);
+    Ok(())
 }
 
 // The desktop's answer to a pair request (see approve_new_phone).

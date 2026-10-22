@@ -86,6 +86,9 @@ const setState = (patch: Partial<UsbStore>) => {
     listeners.forEach((l) => l(snapshot));
 };
 
+const importListeners = new Set<(transfer: UsbTransfer) => void>();
+const importsAnnounced = new Set<string>();
+
 const ensureStarted = () => {
     if (started) return;
     started = true;
@@ -113,7 +116,13 @@ const ensureStarted = () => {
         else transfers.push(e.payload);
         setState({ transfers });
         // Freshly imported items show as imported without a rescan.
-        if (e.payload.direction === "from_phone" && e.payload.state === "done") markImported(e.payload.id);
+        if (e.payload.direction === "from_phone" && e.payload.state === "done") {
+            markImported(e.payload.id);
+            if (!importsAnnounced.has(e.payload.id)) {
+                importsAnnounced.add(e.payload.id);
+                importListeners.forEach((l) => l(e.payload));
+            }
+        }
     });
 };
 
@@ -161,6 +170,15 @@ const markImported = (transferId: string) => {
 };
 
 export const getUsbState = () => state;
+
+// Every finished import from a phone, once each, with the paths it saved (the home screen lists them).
+export const onUsbImported = (listener: (transfer: UsbTransfer) => void) => {
+    ensureStarted();
+    importListeners.add(listener);
+    return () => {
+        importListeners.delete(listener);
+    };
+};
 
 export const subscribeUsb = (listener: Listener) => {
     ensureStarted();

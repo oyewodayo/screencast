@@ -442,6 +442,8 @@ fn main() {
             services::phone_transfer::phone_transfer_send,
             services::phone_transfer::phone_transfer_devices,
             services::phone_transfer::phone_transfer_forget,
+            services::phone_transfer::phone_transfer_set_timeline,
+            services::phone_transfer::phone_transfer_placed,
             services::phone_transfer::phone_transfer_answer_pair,
             services::phone_transfer::phone_transfer_history,
             services::usb_phone::usb_phones,

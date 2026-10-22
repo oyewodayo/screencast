@@ -11,7 +11,7 @@ axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
-instant-acme = { version = "=0.7.2", default-features = false, features = ["ring", "hyper-rustls"] }
+instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 hickory-proto = { version = "=0.24.4", default-features = false }
 x509-parser = { version = "0.16", features = ["verify"] }
 rand = "0.8"

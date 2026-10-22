@@ -80,7 +80,15 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import { PhoneTransferHost } from "../components/Modals/PhoneTransferModal";
-import { openPhoneReceive, openPhoneTransfer } from "../services/phoneTransfer";
+import {
+  IncomingStatus,
+  onPhoneFileArrived,
+  onPhoneTimelineFile,
+  openPhoneReceive,
+  openPhoneTransfer,
+  reportPhonePlacement,
+  setPhoneTimeline,
+} from "../services/phoneTransfer";
 import PhoneIncomingTray from "../components/PhoneIncomingTray";
 import UsbPhoneTray from "../components/UsbPhoneTray";
 import { UsbImportHost } from "../components/Modals/UsbImportModal";
@@ -117,7 +125,8 @@ import {
   repathFile,
   forgetFile,
 } from "../utils/homeScreenFiles";
-import { getOpenedAt, recordItemOpened } from "../utils/homeScreenFiles";
+import { getArrivals, getOpenedAt, recordFileArrived, recordItemOpened } from "../utils/homeScreenFiles";
+import { onUsbImported } from "../services/usbPhone";
 import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../utils/homeLibraryItems";
 import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
 import type { WhiteboardSummary } from "../utils/whiteboardTypes";
@@ -475,6 +484,24 @@ const Dashboard = () => {
   const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
   const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
   const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
+  // Files that came in from a phone - tagged on the home screen with where from (homeScreenFiles.ts).
+  const [arrivals, setArrivals] = useState(() => getArrivals());
+  useEffect(() => {
+    const arrive = (paths: string[], from: string, batch: string) => {
+      if (!paths.length) return;
+      let recent: string[] = [];
+      for (const path of paths) ({ recent } = recordFileArrived(path, from, batch));
+      setRecentPaths(recent);
+      setArrivals(getArrivals());
+      setOpenedAt(getOpenedAt());
+    };
+    const stopWifi = onPhoneFileArrived((file) => arrive(file.path ? [file.path] : [], file.device_name, file.batch ?? file.id));
+    const stopUsb = onUsbImported((t) => arrive(t.paths, t.device_name || "Phone", `usb:${t.id}`));
+    return () => {
+      stopWifi();
+      stopUsb();
+    };
+  }, []);
   // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
   // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
   // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
@@ -1162,6 +1189,71 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     }
   };
   const [addMenuFor, setAddMenuFor] = useState<string | null>(null);
+
+  // ---- From a phone: its "Add to timeline" button and Android's share sheet (see
+  // phone_transfer_page.html). Phones are told which video is open, and offer "Add to timeline"
+  // while there is one. Files arrive one at a time; a batch goes in after the clip at the playhead
+  // in the order it was picked - each after the one before - and sound lines up on its own track
+  // from the playhead. Every file gets an answer, so the phone can say where it really landed.
+  const phoneTimelineName =
+    selectedFile && getFileCategory(selectedFile.name) === "video" && dockerMode === "file-tools" ? selectedFile.name : null;
+  useEffect(() => {
+    void setPhoneTimeline(phoneTimelineName);
+  }, [phoneTimelineName]);
+  const phoneBatchRef = useRef<{ batch: string; index: number; audioAt: number; added: number } | null>(null);
+  const placeFromPhoneRef = useRef<(file: IncomingStatus) => Promise<void>>(async () => {});
+  placeFromPhoneRef.current = async (file) => {
+    const keep = (why: string) => void reportPhonePlacement(file, false, why);
+    if (!editingVideoRef.current || !file.path) return keep("No video is open in Briefcast — saved to your library");
+    const category = getFileCategory(file.name);
+    if (category !== "video" && category !== "image" && category !== "audio") {
+      return keep("Not a picture, video or sound — saved to your library");
+    }
+    const batch = file.batch ?? file.id;
+    let cursor = phoneBatchRef.current;
+    if (!cursor || cursor.batch !== batch) {
+      const t = Math.max(0, Math.min(currentOutputTime, totalOutputDuration));
+      let end = 0;
+      let index = editStore.clips.findIndex((c) => (end += clipOutputDuration(c)) > t + 1e-3) + 1;
+      if (index <= 0) index = editStore.clips.length;
+      cursor = phoneBatchRef.current = { batch, index, audioAt: t, added: 0 };
+    }
+    try {
+      if (category === "audio") {
+        const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: file.path });
+        const d = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+        if (!Number.isFinite(d) || d <= 0) return keep("Briefcast couldn't read this sound — saved to your library");
+        const total = Math.max(totalOutputDuration, cursor.audioAt + d);
+        editStore.addAudioOverlay(file.path, d, cursor.audioAt, Math.min(total, cursor.audioAt + d));
+        cursor.audioAt += d;
+      } else {
+        if (!(await editStore.insertClipAt(file.path, cursor.index))) {
+          return keep("Briefcast couldn't open this file — saved to your library");
+        }
+        cursor.index += 1;
+      }
+      cursor.added += 1;
+      setMessage(
+        cursor.added === 1
+          ? `Added ${file.name} from ${file.device_name}`
+          : `Added ${cursor.added} files from ${file.device_name} to the timeline`
+      );
+      void reportPhonePlacement(file, true);
+    } catch (err) {
+      keep(`Couldn't add it (${err instanceof Error ? err.message : String(err)}) — saved to your library`);
+    }
+  };
+  // One at a time, in arrival order - a batch's files must not race each other into the timeline.
+  useEffect(() => {
+    let chain = Promise.resolve();
+    const stop = onPhoneTimelineFile((file) => {
+      chain = chain.then(() => placeFromPhoneRef.current(file)).catch(() => {});
+    });
+    return () => {
+      stop();
+      void setPhoneTimeline(null);
+    };
+  }, []);
 
   // Ctrl+V in the video editor: what was copied on the timeline (timelineClipboard.ts), pasted at
   // the playhead - or, when something else was copied since, that: files copied in Explorer
@@ -5392,7 +5484,18 @@ const setScreen = () => {
                             {file ? truncateFileName(file.name) : item.name}
                           </span>
                           <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
-                            {file ? (
+                            {file && arrivals[file.path] ? (
+                              <span
+                                className="flex items-center gap-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 px-2 py-0.5"
+                                title={`Sent from ${arrivals[file.path].from} ${relativeTime(arrivals[file.path].at)}`}
+                              >
+                                <IoPhonePortraitOutline size={12} />
+                                <span className="max-w-[9rem] truncate">{arrivals[file.path].from}</span>
+                                {arrivals[file.path].count > 1 && <span>· +{arrivals[file.path].count - 1} more</span>}
+                                <span aria-hidden>·</span>
+                                <span>{relativeTime(arrivals[file.path].at)}</span>
+                              </span>
+                            ) : file ? (
                               <>
                                 {libraryPreviewDurations.has(file.path) && (
                                   <>
