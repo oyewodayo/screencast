@@ -126,7 +126,7 @@ import { Audition, type AuditionPiece, type AuditionState } from "../../utils/au
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
-import { subscribeVideoFrames } from "../../utils/videoFrameCache";
+import { subscribeVideoFrames, wantVideoFrames, type FrameWant } from "../../utils/videoFrameCache";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
 import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
@@ -474,12 +474,32 @@ const ImageClipTiles: React.FC<{ sourcePath: string; first: number; last: number
 
 // A video clip from a file other than the primary one - its own frames (videoFrameCache.ts),
 // never the primary's: borrowing those is what made an inserted video show the clips around it.
-const ForeignVideoClipTiles: React.FC<{ clip: Clip; first: number; last: number; tileWidth: number; width: number; pxPerSec: number }> = ({ clip, first, last, tileWidth, width, pxPerSec }) => {
+// Like the primary's strip, the tiles drawn ask for a frame inside their own stretch of source,
+// nearest `viewCenter` (px into the clip) first - exact when zoomed into a long video.
+const ForeignVideoClipTiles: React.FC<{ clip: Clip; first: number; last: number; tileWidth: number; width: number; pxPerSec: number; viewCenter: number }> = ({ clip, first, last, tileWidth, width, pxPerSec, viewCenter }) => {
   const [frames, setFrames] = useState<ThumbFrame[]>([]);
+  const owner = useRef({}).current;
   useEffect(() => {
     setFrames([]);
-    return subscribeVideoFrames(clip.sourcePath, setFrames);
-  }, [clip.sourcePath]);
+    const stop = subscribeVideoFrames(clip.sourcePath, setFrames);
+    return () => {
+      wantVideoFrames(clip.sourcePath, owner, []);
+      stop();
+    };
+  }, [clip.sourcePath, owner]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const tolerance = Math.max(0.25, ((tileWidth / pxPerSec) * (clip.speed ?? 1)) / 2);
+      const wants: (FrameWant & { distance: number })[] = [];
+      for (let k = first; k < last; k++) {
+        const time = Math.min(clip.end, outputOffsetToSource(clip, Math.min((k + 0.5) * tileWidth, width) / pxPerSec));
+        wants.push({ time, tolerance, distance: Math.abs((k + 0.5) * tileWidth - viewCenter) });
+      }
+      wants.sort((a, b) => a.distance - b.distance);
+      wantVideoFrames(clip.sourcePath, owner, wants.map(({ time, tolerance }) => ({ time, tolerance })));
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [clip, first, last, tileWidth, width, pxPerSec, viewCenter, owner]);
   return (
     <>
       {Array.from({ length: last - first }, (_, j) => first + j).map((k) => {
@@ -4659,7 +4679,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     ) : isForeignVideo ? (
                       <>
                         {tileSpacer}
-                        <ForeignVideoClipTiles clip={clip} first={firstTile} last={lastTile} tileWidth={tileWidth} width={width} pxPerSec={pxPerSec} />
+                        <ForeignVideoClipTiles clip={clip} first={firstTile} last={lastTile} tileWidth={tileWidth} width={width} pxPerSec={pxPerSec} viewCenter={(drawWindow.from + drawWindow.to) / 2 - left} />
                       </>
                     ) : clipThumbs.length > 0 ? (
                       clipThumbs.map((t, ti) =>
