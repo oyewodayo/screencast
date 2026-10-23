@@ -10,6 +10,8 @@
 // deleting removes a clip from the array outright.
 
 import type { AudioFx } from "./audioFx";
+import type { GainPoint } from "./audioAutomation";
+import type { MasterBus } from "./masterBus";
 import type { ChromaKey } from "./chromaKey";
 import type { LayerMask } from "./layerMask";
 import type { CutoutBackground } from "./cutoutBackground";
@@ -544,6 +546,8 @@ export interface AudioOverlay {
   // replaces all of these rather than stacking a second copy on top - which would otherwise keep
   // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
   detached?: boolean;
+  // A take recorded in the editor (the music panel's Record tab) - speech, like a detached Voice.
+  recorded?: boolean;
   // Beat sync: the track's tempo and beats (its own file's seconds), from detect_beats - drawn on
   // the timeline, snapped to, and what "cut images on the beat" fits to (beatSync.ts).
   bpm?: number;
@@ -560,8 +564,27 @@ export interface AudioOverlay {
   // Its mixer channel's EQ/compressor/balance (audioFx.ts) - every piece of one track (same
   // label, or same file) carries the same settings; the mixer edits them together.
   fx?: AudioFx;
+  // Volume automation - points pinned to the song's own time (audioAutomation.ts).
+  gain?: GainPoint[];
+  // Noise clean-up - the same Reduce/Remove modes and extra stages as a clip's sound
+  // (Clip.noiseReduction/audioCleanup). The whole file is rendered through the export's chain and
+  // played in its place (audioTrackCleanup.ts), so preview and export match exactly.
+  noiseReduction?: number;
+  audioCleanup?: AudioCleanup;
+  // Playback bleed taken out (utils/bleed): `src` is then the cleaned file, and this remembers the
+  // take as recorded and what was found - where (seconds into the file), how late, how much.
+  bleed?: BleedRemoval;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface BleedRemoval {
+  originalSrc: string;
+  strength: "gentle" | "normal" | "strong";
+  delaysMs: number[];
+  regions: [number, number][];
+  removedDb: number;
+  bleedDb: number;
 }
 
 export interface AudioLibraryInfo {
@@ -805,6 +828,8 @@ export interface VideoEditState {
   videoAudioVolume: number; // 0..1, defaults to 1
   // The video's own sound's mixer channel - EQ/compressor/balance after its volume (audioFx.ts).
   videoAudioFx?: AudioFx;
+  // The mix's master bus - trim and limiter on everything (masterBus.ts).
+  master?: MasterBus;
   // Video tracks (PipOverlay.track) switched off with their eye toggle - left out of the preview
   // and the export alike.
   hiddenVideoTracks?: number[];
@@ -835,6 +860,7 @@ export interface EditableFields {
   videoAudioMuted: boolean;
   videoAudioVolume: number;
   videoAudioFx?: AudioFx;
+  master?: MasterBus;
   hiddenVideoTracks?: number[];
   captions: CaptionTrack | null;
   screenStyle?: ScreenStyle | null;
@@ -887,6 +913,8 @@ export interface VideoEditCommand {
     | "edit-chapters"
     | "track-motion"
     | "edit-mixer"
+    | "edit-master"
+    | "edit-automation"
     | "edit-video-tracks"
     | "find-hide"
     | "edit-screen-style";
@@ -964,6 +992,33 @@ export const isVideoProjectPath = (path: string): boolean => path.toLowerCase().
 export interface VideoProjectFrame {
   width: number;
   height: number;
+}
+
+// ---- Audio-only projects ----------------------------------------------------------------------
+//
+// A project with sound but no pictures plays and exports over black that runs as long as the audio
+// does. It's never part of the saved timeline - the store derives it (playbackClips) and the video
+// lane keeps showing its empty state. To the player it's the project's own canvas (a hundred hours
+// of black, get_video_canvas_proxy) cut into clips of at most VIDEO_CANVAS_SECONDS: the player is
+// already on that file, so playback runs through with nothing to load, switch or seek to. To the
+// export it's a black still (get_blank_frame_image) as image clips of at most
+// IMAGE_CLIP_MAX_SECONDS - a proper 30 fps picture.
+const BLANK_CLIP_PREFIX = "__blank__";
+export const isBlankClipId = (id: string): boolean => id.startsWith(BLANK_CLIP_PREFIX);
+
+// Where the last audio track ends - the length of an audio-only project.
+export const audioEndTime = (audioOverlays: { endTime: number }[]): number => audioOverlays.reduce((end, o) => Math.max(end, o.endTime), 0);
+
+// The length of the project canvas (get_video_canvas_proxy, conversion.rs).
+export const VIDEO_CANVAS_SECONDS = 100 * 3600;
+
+// `length` seconds of `sourcePath` (black) as clips of at most `piece` seconds, each from its start.
+export function blankClipsFor(sourcePath: string, length: number, piece: number): Clip[] {
+  const clips: Clip[] = [];
+  for (let at = 0, i = 0; length - at > 1e-3; at += piece, i++) {
+    clips.push({ id: `${BLANK_CLIP_PREFIX}${i}`, sourcePath, start: 0, end: Math.min(piece, length - at) });
+  }
+  return clips;
 }
 
 export interface NewProjectOptions {

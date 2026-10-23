@@ -34,6 +34,7 @@ import {
 } from "../../utils/musicLibrary";
 import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost } from "./ToolPanelHost";
 import { BUILTIN_SFX_TRACKS, isBuiltinSfxId } from "../../utils/builtinSfx";
+import VoiceRecorder from "./VoiceRecorder";
 
 export interface TrackBeats {
   bpm: number;
@@ -54,6 +55,11 @@ interface MusicLibraryPanelProps {
   // Beats that were still being detected when the track was added.
   onLateBeats: (overlayId: string, beats: TrackBeats) => void;
   onPickFile: () => void;
+  // The Record tab (VoiceRecorder): the playhead, the transport, and placing a take.
+  recordAt: number;
+  onTimelinePlay: (play: boolean) => void;
+  onSeek: (time: number) => void;
+  onTakes: (takes: { path: string; seconds: number; label: string }[], at: number, replaces: string[]) => string[];
   onClose: () => void;
 }
 
@@ -341,11 +347,13 @@ const PartPicker: React.FC<PartPickerProps> = ({ track, part, wanted, beats, pla
   );
 };
 
-const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, videoDuration, context, timelinePlaying, onPreviewStart, onAdd, onLateBeats, onPickFile, onClose }) => {
+const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, videoDuration, context, timelinePlaying, onPreviewStart, onAdd, onLateBeats, onPickFile, recordAt, onTimelinePlay, onSeek, onTakes, onClose }) => {
   const dockHost = useToolPanelHost();
   const { ref: panelRef, position } = useClampedPopoverPosition(anchor);
   const [catalog, setCatalog] = useState<Catalog>({ status: "loading" });
   const [tab, setTab] = useState<"music" | "sfx">("music");
+  // The Record tab is open (the library's own tab is kept for coming back to).
+  const [recordOpen, setRecordOpen] = useState(false);
   const [filter, setFilter] = useState<Filter>("foryou");
   const [query, setQuery] = useState("");
   const [saved, setSaved] = useState<string[]>(readSavedTracks);
@@ -748,13 +756,26 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
               type="button"
               onClick={() => {
                 setTab(k);
+                setRecordOpen(false);
                 setExpandedId(null);
               }}
-              className={`px-2 py-0.5 rounded ${tab === k ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
+              className={`px-2 py-0.5 rounded ${tab === k && !recordOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
             >
               {k === "music" ? "Music" : "Sound effects"}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={() => {
+              setRecordOpen(true);
+              audioRef.current?.pause();
+            }}
+            title="Record a voice-over (or anything) straight onto the timeline"
+            className={`flex items-center gap-1 px-2 py-0.5 rounded ${recordOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${recordOpen ? "bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.9)]" : "bg-red-500/70"}`} />
+            Record
+          </button>
         </div>
         <span className="flex-1" />
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
@@ -762,6 +783,10 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
         </button>
       </div>
 
+      {recordOpen ? (
+        <VoiceRecorder recordAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} />
+      ) : (
+      <>
       <label className="flex items-center gap-1.5 h-7 px-2 rounded-md bg-white/[0.07] focus-within:ring-1 focus-within:ring-teal-400">
         <IoSearchOutline size={13} className="text-white/40 shrink-0" />
         <input
@@ -849,6 +874,8 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
           {downloadsOn ? "Free to use & download" : "Free to use"}
         </span>
       </div>
+      </>
+      )}
     </div>,
     dockHost ?? document.body,
   );

@@ -897,28 +897,77 @@ pub async fn get_image_clip_proxy(
 }
 
 // The "primary file" a video project plays while no clip is under the playhead (an empty
-// timeline, or before the first clip has loaded) - a short black video at the project's own frame
-// size. The timeline reads the project's frame size off this (its videoPixelSize), the same way it
+// timeline, or before the first clip has loaded) - a black video at the project's own frame size.
+// The timeline reads the project's frame size off this (its videoPixelSize), the same way it
 // reads a real video's, so overlay burn-in and export resolution need no project-specific path.
+// A hundred hours long (VIDEO_CANVAS_SECONDS in videoEditTypes.ts), because a project of sound
+// alone plays straight over it (blankClipsFor) - the player is already on it, so there's nothing to
+// load or switch to, and audio of any length a person records or extracts plays through without
+// the picture ever jumping back to the start (a seek the timeline's clock would stall on). Made
+// in a moment however long: one hour encoded (one frame every 10 s - it's all black), then
+// repeated by stream copy, and the whole file is a few hundred KB.
+const VIDEO_CANVAS_SECONDS: u32 = 100 * 3600;
+const CANVAS_BASE_SECONDS: u32 = 3600;
+
 #[tauri::command]
 pub async fn get_video_canvas_proxy(app_handle: AppHandle, width: u32, height: u32) -> Result<String, String> {
     let (w, h) = ((width.max(2) / 2) * 2, (height.max(2) / 2) * 2);
-    let cache_path = std::env::temp_dir()
-        .join("briefcast_preview_cache")
-        .join("video_canvas_v1")
-        .join(format!("{}x{}.mp4", w, h));
+    let dir = std::env::temp_dir().join("briefcast_preview_cache").join("video_canvas_v3");
+    let cache_path = dir.join(format!("{}x{}.mp4", w, h));
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    let base = dir.join(format!("{}x{}.hour.mp4", w, h));
+    if !base.exists() {
+        let args: Vec<String> = vec![
+            "-f".into(), "lavfi".into(),
+            "-i".into(), format!("color=c=black:s={}x{}:r=0.1:d={}", w, h, CANVAS_BASE_SECONDS),
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "ultrafast".into(),
+            "-pix_fmt".into(), "yuv420p".into(),
+            "-an".into(),
+        ];
+        encode_preview_proxy(ffmpeg_path.clone(), args, base.clone()).await?;
+    }
+    let list = dir.join(format!("{}x{}.concat.txt", w, h));
+    let entry = format!("file '{}'\n", path_to_str(&base)?.replace('\\', "/"));
+    std::fs::write(&list, entry.repeat((VIDEO_CANVAS_SECONDS / CANVAS_BASE_SECONDS) as usize)).map_err(|e| format!("Couldn't prepare the project canvas: {e}"))?;
+    let args: Vec<String> = vec![
+        "-f".into(), "concat".into(),
+        "-safe".into(), "0".into(),
+        "-i".into(), path_to_str(&list)?.to_string(),
+        "-c".into(), "copy".into(),
+        "-movflags".into(), "+faststart".into(),
+    ];
+    let made = encode_preview_proxy(ffmpeg_path, args, cache_path).await;
+    let _ = std::fs::remove_file(&list);
+    let _ = std::fs::remove_file(&base);
+    made
+}
+
+// The picture of an audio-only project: a black still at the project's frame size, laid under the
+// audio as ordinary image clips (videoEditTypes.ts blankClipsFor) so it previews through the
+// image-clip proxy and exports as a blank-screen video with no special case on either side.
+#[tauri::command]
+pub async fn get_blank_frame_image(app_handle: AppHandle, width: u32, height: u32) -> Result<String, String> {
+    let (w, h) = ((width.max(2) / 2) * 2, (height.max(2) / 2) * 2);
+    let cache_path = std::env::temp_dir()
+        .join("briefcast_preview_cache")
+        .join("blank_frame_v1")
+        .join(format!("{}x{}.png", w, h));
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
+    // encode_preview_proxy writes to a ".partial.mp4" first, so the image muxer is named outright.
     let args: Vec<String> = vec![
         "-f".into(), "lavfi".into(),
-        "-i".into(), format!("color=c=black:s={}x{}:r=1:d=10", w, h),
-        "-c:v".into(), "libx264".into(),
-        "-preset".into(), "ultrafast".into(),
-        "-pix_fmt".into(), "yuv420p".into(),
-        "-an".into(),
-        "-movflags".into(), "+faststart".into(),
+        "-i".into(), format!("color=c=black:s={}x{}", w, h),
+        "-frames:v".into(), "1".into(),
+        "-c:v".into(), "png".into(),
+        "-f".into(), "image2".into(),
+        "-update".into(), "1".into(),
     ];
     encode_preview_proxy(ffmpeg_path, args, cache_path).await
 }
@@ -4070,6 +4119,74 @@ pub struct OverlayAudio {
     // The mixer channel's EQ/compressor/balance (audio_fx.rs), after the volume and fades.
     #[serde(default)]
     pub fx: Option<AudioFxSpec>,
+    // Volume automation: [seconds from this track's start, dB] points (audioAutomation.ts) - see
+    // automation_volume_filter.
+    #[serde(default)]
+    pub gain: Option<Vec<[f64; 2]>>,
+}
+
+// The mix's master bus (masterBus.ts): a trim, then a lookahead limiter - see master_audio_filters.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterBusSpec {
+    #[serde(default)]
+    pub trim_db: Option<f64>,
+    #[serde(default)]
+    pub limiter: Option<MasterLimiterSpec>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterLimiterSpec {
+    pub ceiling_db: f64,
+    pub release_ms: f64,
+}
+
+// The master bus as filters on the finished mix. The limiter runs at 4x the sample rate so it
+// catches the peaks between samples too (true peak), with the preview's 5 ms lookahead
+// (master-bus-processor.js) as its attack; latency=1 keeps the sound in sync with the picture.
+fn master_audio_filters(master: Option<&MasterBusSpec>) -> Vec<String> {
+    let Some(m) = master else { return Vec::new() };
+    let mut filters = Vec::new();
+    let trim = m.trim_db.filter(|t| t.is_finite()).unwrap_or(0.0).clamp(-24.0, 24.0);
+    if trim.abs() > 0.001 {
+        filters.push(format!("volume={trim:.3}dB"));
+    }
+    if let Some(lim) = &m.limiter {
+        filters.push(format!(
+            "aresample=192000,alimiter=limit={:.5}:attack=5:release={:.1}:level=false:latency=1,aresample=48000",
+            master_ceiling(lim),
+            lim.release_ms.clamp(1.0, 2000.0)
+        ));
+    }
+    filters
+}
+
+// The limiter's ceiling as a linear level, inside alimiter's range.
+fn master_ceiling(lim: &MasterLimiterSpec) -> f64 {
+    10f64.powf(lim.ceiling_db.clamp(-24.0, 0.0) / 20.0).clamp(0.0625, 1.0)
+}
+
+// A `volume` filter for one track's automation, in its own local time (its chain starts at 0 =
+// its start_time): the dB line runs straight between points and holds flat beyond the ends -
+// written as the first level plus each segment's share of its change, so the expression stays flat
+// however many points there are. Evaluated per frame, and the frames are cut to 256 samples first
+// (~5 ms) so a ramp moves smoothly rather than in audible steps. None when it would change nothing.
+fn automation_volume_filter(points: &[[f64; 2]]) -> Option<String> {
+    let pts: Vec<[f64; 2]> = points.iter().copied().filter(|[t, db]| t.is_finite() && db.is_finite()).collect();
+    if pts.is_empty() || pts.iter().all(|[_, db]| db.abs() < 0.01) {
+        return None;
+    }
+    let mut expr = format!("{:.3}", pts[0][1]);
+    for w in pts.windows(2) {
+        let ([t0, d0], [t1, d1]) = (w[0], w[1]);
+        if (d1 - d0).abs() < 1e-6 {
+            continue;
+        }
+        let span = (t1 - t0).max(1e-3);
+        expr.push_str(&format!("+({:.3})*clip((t{})/{:.4},0,1)", d1 - d0, minus_term(t0), span));
+    }
+    Some(format!("asetnsamples=n=256:p=0,volume='pow(10,({expr})/20)':eval=frame"))
 }
 
 // Where to lower a music track under speech, worked out by the frontend (src/utils/musicDucking.ts,
@@ -6182,7 +6299,7 @@ fn probe_audio_channels(ffprobe_path: &PathBuf, source_path: &str) -> Option<u32
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
+pub(crate) fn probe_has_audio(ffprobe_path: &PathBuf, source_path: &str) -> bool {
     let mut cmd = Command::new(ffprobe_path);
     cmd.args([
         "-v",
@@ -7001,6 +7118,8 @@ pub async fn export_trimmed_video(
     // The video's own sound's mixer channel - EQ/compressor/balance after the track volume
     // (audio_fx.rs); None = none.
     video_audio_fx: Option<AudioFxSpec>,
+    // The mix's master bus - trim and limiter on everything (MasterBusSpec); None = none.
+    master: Option<MasterBusSpec>,
     // The frame around the video (Screen Style - screenStyle.ts): wallpaper, padding, corners and
     // shadow at the final frame's size. None = the video fills the frame as always.
     screen_style: Option<ScreenStyleSpec>,
@@ -7030,6 +7149,9 @@ pub async fn export_trimmed_video(
     let adjustment_layers = adjustment_layers.unwrap_or_default();
     let chapters = chapters.unwrap_or_default();
     let video_fx_filters = video_audio_fx.as_ref().map(audio_fx_filters).unwrap_or_default();
+    let master_filters = master_audio_filters(master.as_ref());
+    // A loudness target is reached under the master limiter's ceiling, never over it.
+    let loudness_ceiling = master.as_ref().and_then(|m| m.limiter.as_ref()).map(master_ceiling);
     // HEIC/HEIF image clips render from their decoded PNG (see still_image_source) - swapped in
     // before anything below reads a segment's path, so every later step just sees a plain image.
     let mut segments = segments;
@@ -7410,6 +7532,7 @@ pub async fn export_trimmed_video(
         && !has_clip_effects
         && !has_transitions
         && video_fx_filters.is_empty()
+        && master_filters.is_empty()
         && captions_ass_path.is_none()
         && output_frame.is_none()
         && screen_style.is_none()
@@ -7428,7 +7551,7 @@ pub async fn export_trimmed_video(
                 for temp_path in &temp_overlay_paths {
                     let _ = std::fs::remove_file(temp_path);
                 }
-                return finish_export(&app_handle, path, loudness_lufs, &chapters).await;
+                return finish_export(&app_handle, path, loudness_lufs, loudness_ceiling, &chapters).await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -7489,6 +7612,7 @@ pub async fn export_trimmed_video(
             af.push(format!("volume={:.3}", effective_video_volume));
         }
         af.extend(video_fx_filters.iter().cloned());
+        af.extend(master_filters.iter().cloned());
         if !af.is_empty() {
             args.push("-af".into());
             args.push(af.join(","));
@@ -8120,6 +8244,10 @@ pub async fn export_trimmed_video(
                     chain.push(',');
                     chain.push_str(&duck);
                 }
+                if let Some(auto) = audio_ov.gain.as_deref().and_then(automation_volume_filter) {
+                    chain.push(',');
+                    chain.push_str(&auto);
+                }
                 if audio_ov.fade_in > 0.0 {
                     chain.push_str(&format!(",afade=t=in:st=0:d={:.3}", audio_ov.fade_in));
                 }
@@ -8172,7 +8300,14 @@ pub async fn export_trimmed_video(
         } else {
             base_audio_label.to_string()
         };
-        // (A loudness target is applied after the render - see normalize_loudness.)
+        // The master bus on the whole mix. (A loudness target is applied after the render - see
+        // normalize_loudness.)
+        let audio_label = if master_filters.is_empty() {
+            audio_label
+        } else {
+            filter.push_str(&format!("[{audio_label}]{}[outa_master];", master_filters.join(",")));
+            "outa_master".to_string()
+        };
 
         // Trailing `;` is harmless to ffmpeg either way, but trimmed for consistency with how the
         // original concat-only filter string here was always built without one.
@@ -8243,7 +8378,7 @@ pub async fn export_trimmed_video(
         let _ = std::fs::remove_file(temp_path);
     }
 
-    finish_export(&app_handle, result?, loudness_lufs, &chapters).await
+    finish_export(&app_handle, result?, loudness_lufs, loudness_ceiling, &chapters).await
 }
 
 // ffmpeg arguments writing the live preview frame (RunExtras) after whatever selects its stream.
@@ -8257,9 +8392,10 @@ fn preview_output_args(path: &Path) -> Vec<String> {
 }
 
 // What every finished export still gets: its loudness target, then its chapters.
-async fn finish_export(app_handle: &AppHandle, path: String, loudness_lufs: Option<f64>, chapters: &[ChapterSpec]) -> Result<String, String> {
+// `ceiling`: the master limiter's, when it has one - the loudness pass then limits there instead.
+async fn finish_export(app_handle: &AppHandle, path: String, loudness_lufs: Option<f64>, ceiling: Option<f64>, chapters: &[ChapterSpec]) -> Result<String, String> {
     if let Some(target) = loudness_lufs {
-        normalize_loudness(app_handle, &path, target).await?;
+        normalize_loudness(app_handle, &path, target, ceiling).await?;
     }
     if !chapters.is_empty() {
         embed_chapters(app_handle, &path, chapters).await?;
@@ -8352,9 +8488,15 @@ const LOUDNESS_TOLERANCE_LU: f64 = 0.1;
 const LOUDNESS_MAX_SEARCH_PASSES: usize = 10;
 const LOUDNESS_MAX_GAIN_DB: f64 = 30.0;
 
-fn loudness_chain(gain: f64) -> String {
+fn loudness_chain(gain: f64, limit: f64) -> String {
     // latency=1: the 2ms lookahead is compensated, so the sound stays in sync with the picture.
-    format!("volume={gain:.3}dB,alimiter=limit=0.79:attack=2:release=8:level=false:latency=1")
+    format!("volume={gain:.3}dB,alimiter=limit={limit:.5}:attack=2:release=8:level=false:latency=1")
+}
+
+// The loudness pass's own peak limit (-2 dBFS, room for AAC's overshoot), or a master ceiling below it.
+const LOUDNESS_LIMIT: f64 = 0.79;
+fn loudness_limit(ceiling: Option<f64>) -> f64 {
+    ceiling.map_or(LOUDNESS_LIMIT, |c| c.min(LOUDNESS_LIMIT))
 }
 
 // Integrated loudness of `path`'s audio after `chain`, without writing anything.
@@ -8418,7 +8560,8 @@ fn search_loudness_gain(target: f64, first_gain: f64, mut f: impl FnMut(f64) -> 
     best.ok_or_else(|| "Couldn't measure the export's loudness".to_string())
 }
 
-async fn normalize_loudness(app_handle: &AppHandle, path: &str, target: f64) -> Result<(), String> {
+async fn normalize_loudness(app_handle: &AppHandle, path: &str, target: f64, ceiling: Option<f64>) -> Result<(), String> {
+    let limit = loudness_limit(ceiling);
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let target = target.clamp(-30.0, -5.0);
     let file = path.to_string();
@@ -8428,14 +8571,14 @@ async fn normalize_loudness(app_handle: &AppHandle, path: &str, target: f64) -> 
             return Ok(()); // silent, or already on target
         }
         let (mut gain, searched) =
-            search_loudness_gain(target, target - measured, |g| measure_loudness_through(&ffmpeg_path, &file, &loudness_chain(g)))?;
+            search_loudness_gain(target, target - measured, |g| measure_loudness_through(&ffmpeg_path, &file, &loudness_chain(g, limit)))?;
 
         let source = PathBuf::from(&file);
         let temps = TempFiles(vec![source.with_extension("loudness.m4a"), source.with_extension("loudness.mp4")]);
         let (audio, muxed) = (&temps.0[0], &temps.0[1]);
         let encode = |g: f64| -> Result<f64, String> {
             let args: Vec<String> = vec![
-                "-i".into(), file.clone(), "-vn".into(), "-af".into(), loudness_chain(g),
+                "-i".into(), file.clone(), "-vn".into(), "-af".into(), loudness_chain(g, limit),
                 "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), path_to_str(audio)?.to_string(),
             ];
             run_ffmpeg_quiet(&ffmpeg_path, &args).map_err(|e| format!("Couldn't adjust the export's loudness: {}", e))?;
@@ -8490,11 +8633,17 @@ pub async fn extract_clip_audio(
     // ffmpeg's own default pick - the single "best" audio stream - which silently ignores any
     // others in a multi-track file.
     stream_index: Option<u32>,
+    // An audio track's own fades and mixer effects, for saving one piece as it sounds on the
+    // timeline - applied after the volume, the export's order (volume, fades, then effects).
+    fade_in: Option<f64>,
+    fade_out: Option<f64>,
+    fx: Option<AudioFxSpec>,
 ) -> Result<String, String> {
     if end <= start {
         return Err("End must be after start".to_string());
     }
     let speed = speed.max(0.25).min(16.0);
+    let out_duration = (end - start) / speed;
     // "Detach audio" writes into the app cache dir, which may not exist yet on a fresh install.
     if let Some(parent) = PathBuf::from(&output_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create output folder: {}", e))?;
@@ -8513,6 +8662,21 @@ pub async fn extract_clip_audio(
     );
     if (volume - 1.0).abs() > 0.001 {
         filters.push(format!("volume={:.3}", volume.max(0.0)));
+    }
+    if let Some(d) = fade_in.filter(|d| *d > 0.0) {
+        filters.push(format!("afade=t=in:st=0:d={:.3}", d.min(out_duration)));
+    }
+    if let Some(d) = fade_out.filter(|d| *d > 0.0) {
+        let d = d.min(out_duration);
+        filters.push(format!("afade=t=out:st={:.3}:d={:.3}", out_duration - d, d));
+    }
+    if let Some(fx) = &fx {
+        let fx_filters = audio_fx_filters(fx);
+        // Balance works on two channels - a mono file is spread to both first.
+        if fx.pan.map_or(false, |p| p.abs() > 1e-4) {
+            filters.push("aformat=channel_layouts=stereo".to_string());
+        }
+        filters.extend(fx_filters);
     }
     // Same branch builder as the export (audio_branch) - a filter graph rather than a plain -af so
     // a noise sample can be split off the same input and prepended.
@@ -8549,6 +8713,144 @@ pub async fn extract_clip_audio(
         &args,
     )
     .await
+}
+
+// An audio track's own noise clean-up (Reduce/Remove, low-cut, hum, gate, levelling - the same
+// chain a clip's sound gets, through extract_clip_audio) rendered once for the WHOLE file, so the
+// track keeps its trims and timing and simply plays this file instead - in the preview and the
+// export alike, so what is heard while editing is exactly what is saved. Cached by the source
+// (path, size, modified time) and the settings; written to a .partial first so an interrupted run
+// never passes for a finished one.
+#[tauri::command]
+pub async fn clean_audio_track(
+    app_handle: AppHandle,
+    window: Window,
+    state: State<'_, ConversionState>,
+    source_path: String,
+    source_duration: f64,
+    noise_reduction: Option<f64>,
+    audio_cleanup: Option<AudioCleanup>,
+) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    if !(source_duration.is_finite() && source_duration > 0.0) {
+        return Err("The track's length isn't known.".to_string());
+    }
+    let meta = std::fs::metadata(&source_path).map_err(|e| format!("Couldn't read the track: {e}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis()).hash(&mut hasher);
+    format!("{:.4}", noise_reduction.unwrap_or(0.0)).hash(&mut hasher);
+    serde_json::to_string(&audio_cleanup).unwrap_or_default().hash(&mut hasher);
+    let dir = std::env::temp_dir().join("briefcast_preview_cache").join("cleaned_audio_v1");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create the clean-up cache: {e}"))?;
+    let finished = dir.join(format!("{:016x}.wav", hasher.finish()));
+    if finished.exists() {
+        return path_to_str(&finished).map(|s| s.to_string());
+    }
+    let partial = finished.with_extension("partial.wav");
+    let _ = std::fs::remove_file(&partial);
+    let written = extract_clip_audio(
+        app_handle,
+        window,
+        state,
+        source_path,
+        0.0,
+        source_duration,
+        1.0,
+        noise_reduction,
+        audio_cleanup,
+        1.0,
+        "wav".to_string(),
+        path_to_str(&partial)?.to_string(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    std::fs::rename(&written, &finished).map_err(|e| format!("Couldn't store the cleaned track: {e}"))?;
+    path_to_str(&finished).map(|s| s.to_string())
+}
+
+// One sound playing on the timeline over a stretch - for render_timeline_audio.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineAudioPiece {
+    pub source_path: String,
+    // Seconds into the source, and where that lands in the rendered stretch.
+    pub source_start: f64,
+    pub source_end: f64,
+    pub at: f64,
+    #[serde(default = "one")]
+    pub speed: f64,
+    #[serde(default = "one")]
+    pub volume: f64,
+}
+
+// What the timeline sounded like over a stretch - every piece of sound playing in it, trimmed,
+// re-timed, levelled and laid at its place, mixed to mono 48 kHz float - as the reference the bleed
+// remover subtracts from a voice take (src/utils/bleed). Pieces whose file has no sound are skipped;
+// nothing sounding at all gives silence. Answered as raw little-endian f32 samples of exactly
+// `duration` - asked for a stretch at a time, so a long take never becomes one huge file or buffer.
+#[tauri::command]
+pub async fn render_timeline_audio(app_handle: AppHandle, pieces: Vec<TimelineAudioPiece>, duration: f64) -> Result<tauri::ipc::Response, String> {
+    if !(duration.is_finite() && duration > 0.0) {
+        return Err("Nothing to render.".to_string());
+    }
+    let ffmpeg = get_ffmpeg_path(&app_handle)?;
+    let ffprobe = get_ffprobe_path(&app_handle)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let has_audio = |path: &str| Path::new(path).exists() && probe_has_audio(&ffprobe, path);
+        mix_timeline_pcm(&ffmpeg, &pieces, duration, &has_audio).map(tauri::ipc::Response::new)
+    })
+    .await
+    .map_err(|e| format!("Render task panicked: {e}"))?
+}
+
+// render_timeline_audio's work: the raw little-endian f32 bytes. `has_audio` says which pieces'
+// files are worth reading (a caller rendering many stretches asks once per file).
+pub(crate) fn mix_timeline_pcm(ffmpeg: &Path, pieces: &[TimelineAudioPiece], duration: f64, has_audio: &dyn Fn(&str) -> bool) -> Result<Vec<u8>, String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut graph = String::new();
+    let mut labels = String::new();
+    let mut n = 0;
+    for p in pieces {
+        let length = (p.source_end - p.source_start).max(0.0);
+        if length < 0.01 || !has_audio(&p.source_path) {
+            continue;
+        }
+        args.extend(["-ss".into(), format!("{:.6}", p.source_start.max(0.0)), "-t".into(), format!("{:.6}", length), "-i".into(), p.source_path.clone()]);
+        let speed = if p.speed.is_finite() && p.speed > 0.0 { p.speed } else { 1.0 };
+        graph.push_str(&format!(
+            "[{n}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,{tempo},volume={vol:.4},adelay={delay:.0}:all=1[p{n}];",
+            tempo = atempo_chain(speed),
+            vol = p.volume.max(0.0),
+            delay = (p.at.max(0.0) * 1000.0).round()
+        ));
+        labels.push_str(&format!("[p{n}]"));
+        n += 1;
+    }
+    if n == 0 {
+        args.extend(["-f".into(), "lavfi".into(), "-i".into(), "anullsrc=r=48000:cl=mono".into(), "-t".into(), format!("{:.6}", duration)]);
+    } else {
+        graph.push_str(&format!("{labels}amix=inputs={n}:normalize=0:duration=longest,apad,atrim=0:{duration:.6}[out]"));
+        args.extend(["-filter_complex".into(), graph, "-map".into(), "[out]".into()]);
+    }
+    args.extend(["-ac".into(), "1".into(), "-ar".into(), "48000".into(), "-f".into(), "f32le".into(), "pipe:1".into()]);
+    let mut cmd = Command::new(ffmpeg);
+    #[cfg(windows)]
+    hide_console_window(&mut cmd);
+    cmd.args(["-hide_banner", "-nostdin", "-v", "error"]).args(&args);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
+    if !out.status.success() {
+        let reason = String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown error").to_string();
+        return Err(format!("Couldn't render what the timeline played: {reason}"));
+    }
+    let mut bytes = out.stdout;
+    bytes.resize((duration * 48000.0).round() as usize * 4, 0);
+    Ok(bytes)
 }
 
 // Cancel ongoing conversion
@@ -8895,12 +9197,16 @@ pub async fn detect_silence(
     let noise_db = noise_db.unwrap_or(-30.0);
     let min_duration = min_duration.unwrap_or(0.5).max(0.05);
 
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
+    let app = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let duration = probe_duration_secs(&ffprobe_path, &input).unwrap_or(0.0);
         let mut cmd = Command::new(&ffmpeg_path);
         #[cfg(windows)]
         hide_console_window(&mut cmd);
-        cmd.arg("-i").arg(&input_path);
+        cmd.args(["-nostdin", "-i"]).arg(&input_path);
         cmd.args([
+            "-vn",
             "-af",
             &format!("silencedetect=noise={noise_db}dB:d={min_duration}"),
             "-f",
@@ -8908,20 +9214,51 @@ pub async fn detect_silence(
             "-",
         ]);
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
+        cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
-        let output = cmd
-            .output()
-            .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
-        // silencedetect writes to stderr regardless of the overall exit status (a `-f null -`
-        // "encode" succeeds as long as the input decodes at all) - parsed either way, since the
-        // only real failure mode here is ffmpeg being unable to read the file at all, which the
-        // exists() check above already rules out for the common case.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(parse_silence_ranges(&stderr))
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+        let stderr = child.stderr.take().ok_or("ffmpeg gave no log")?;
+        // Read as it runs: the silence lines kept (only those - a long file's log is long), and
+        // ffmpeg's own "time=" stamps reported as progress ("audio-job-progress", "silence:<path>").
+        // silencedetect logs regardless of the overall exit status (a `-f null -` "encode"
+        // succeeds as long as the input decodes at all).
+        let key = format!("silence:{input_path}");
+        let mut kept = String::new();
+        let mut line = Vec::new();
+        let mut last = std::time::Instant::now();
+        for byte in std::io::Read::bytes(BufReader::new(stderr)) {
+            let Ok(byte) = byte else { break };
+            if byte != b'\n' && byte != b'\r' {
+                line.push(byte);
+                continue;
+            }
+            let text = String::from_utf8_lossy(&line).to_string();
+            line.clear();
+            if text.contains("silence_") {
+                kept.push_str(&text);
+                kept.push('\n');
+            } else if duration > 0.0 && last.elapsed().as_millis() > 250 {
+                if let Some(t) = text.split("time=").nth(1).and_then(|r| parse_ffmpeg_clock(r.split_whitespace().next().unwrap_or(""))) {
+                    last = std::time::Instant::now();
+                    emit_job_progress(&app, &key, (t / duration).min(0.99));
+                }
+            }
+        }
+        let _ = child.wait();
+        emit_job_progress(&app, &key, 1.0);
+        Ok(parse_silence_ranges(&kept))
     })
     .await
     .map_err(|e| format!("Silence detection task panicked: {}", e))?
+}
+
+// "01:02:03.45" (ffmpeg's progress clock) -> seconds.
+fn parse_ffmpeg_clock(clock: &str) -> Option<f64> {
+    let parts: Vec<&str> = clock.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some(parts[0].parse::<f64>().ok()? * 3600.0 + parts[1].parse::<f64>().ok()? * 60.0 + parts[2].parse::<f64>().ok()?)
 }
 
 // Parses ffmpeg silencedetect's own stderr log lines:
@@ -9116,6 +9453,18 @@ pub struct BeatsResult {
     pub beats: Vec<f64>,
 }
 
+// Progress of a long audio job (beats, speech scan, separation...) - `key` names the job and its file,
+// `fraction` 0..1. The panels turn it into a bar and the time left (src/utils/jobProgress.ts).
+#[derive(Serialize, Clone)]
+pub struct JobProgress {
+    key: String,
+    fraction: f64,
+}
+
+pub fn emit_job_progress(app: &AppHandle, key: &str, fraction: f64) {
+    let _ = app.emit("audio-job-progress", JobProgress { key: key.to_string(), fraction });
+}
+
 // Beat sync (video editor): the tempo and every beat of a music file, in that file's own seconds.
 // Decoded to mono 22.05kHz and analysed by services/beat_detect.rs; cached per file, since
 // analysing a long track takes a few seconds and the answer never changes.
@@ -9129,18 +9478,48 @@ pub async fn detect_beats(app_handle: AppHandle, source_path: String) -> Result<
         }
     }
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    let args: Vec<String> = vec![
-        "-v".into(), "error".into(), "-i".into(), source_path,
-        "-vn".into(), "-ac".into(), "1".into(), "-ar".into(), "22050".into(),
-        "-f".into(), "f32le".into(), "pipe:1".into(),
-    ];
-    let bytes = run_ffmpeg_capture(ffmpeg_path, args).await?;
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let samples: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        crate::services::beat_detect::track_beats(&samples, 22050.0)
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
+    let app = app_handle.clone();
+    // Streamed: ffmpeg's samples go straight into the frame energies a block at a time, so an
+    // hours-long file costs a few bytes a frame rather than gigabytes of samples - with progress
+    // ("audio-job-progress", key "beats:<path>") measured against its length.
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<Option<crate::services::beat_detect::BeatAnalysis>, String> {
+        let duration = probe_duration_secs(&ffprobe_path, &input).unwrap_or(0.0);
+        let mut cmd = Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        hide_console_window(&mut cmd);
+        cmd.args(["-v", "error", "-nostdin", "-i", &source_path, "-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "pipe:1"]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
+        let mut stdout = child.stdout.take().ok_or("ffmpeg gave no output")?;
+        let mut energies = crate::services::beat_detect::FrameEnergies::new();
+        let key = format!("beats:{source_path}");
+        let mut buf = vec![0u8; 1 << 16];
+        let mut carry: Vec<u8> = Vec::new();
+        let mut samples = 0usize;
+        let mut last = std::time::Instant::now();
+        loop {
+            let n = std::io::Read::read(&mut stdout, &mut buf).map_err(|e| format!("Couldn't read the audio: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            carry.extend_from_slice(&buf[..n]);
+            let whole = carry.len() / 4 * 4;
+            let block: Vec<f32> = carry[..whole].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            carry.drain(..whole);
+            samples += block.len();
+            energies.push(&block);
+            if duration > 0.0 && last.elapsed().as_millis() > 250 {
+                last = std::time::Instant::now();
+                emit_job_progress(&app, &key, (samples as f64 / 22050.0 / duration).min(0.99));
+            }
+        }
+        let _ = child.wait();
+        emit_job_progress(&app, &key, 1.0);
+        Ok(crate::services::beat_detect::beats_from_envelope(energies.envelope(), 22050.0))
     })
     .await
-    .map_err(|e| format!("Beat detection task panicked: {e}"))?
+    .map_err(|e| format!("Beat detection task panicked: {e}"))??
     .ok_or("No steady beat found - the track may be too short, or have no clear rhythm")?;
     let out = BeatsResult { bpm: (result.bpm * 10.0).round() / 10.0, beats: result.beats };
     if let Some(parent) = cache_path.parent() {
@@ -9652,8 +10031,37 @@ mod tests {
 
     #[test]
     fn loudness_chain_is_one_shape_for_every_gain() {
-        assert_eq!(loudness_chain(-1.0), "volume=-1.000dB,alimiter=limit=0.79:attack=2:release=8:level=false:latency=1");
-        assert!(loudness_chain(12.0).starts_with("volume=12.000dB,alimiter"));
+        assert_eq!(loudness_chain(-1.0, LOUDNESS_LIMIT), "volume=-1.000dB,alimiter=limit=0.79000:attack=2:release=8:level=false:latency=1");
+        assert!(loudness_chain(12.0, LOUDNESS_LIMIT).starts_with("volume=12.000dB,alimiter"));
+    }
+
+    #[test]
+    fn loudness_pass_never_limits_above_the_master_ceiling() {
+        assert_eq!(loudness_limit(None), LOUDNESS_LIMIT);
+        assert!((loudness_limit(Some(0.5)) - 0.5).abs() < 1e-12);
+        assert_eq!(loudness_limit(Some(1.0)), LOUDNESS_LIMIT);
+    }
+
+    #[test]
+    fn master_bus_filters_trim_then_limit_at_four_times_the_rate() {
+        assert!(master_audio_filters(None).is_empty());
+        let neutral = MasterBusSpec { trim_db: Some(0.0), limiter: None };
+        assert!(master_audio_filters(Some(&neutral)).is_empty());
+        let m = MasterBusSpec { trim_db: Some(-3.0), limiter: Some(MasterLimiterSpec { ceiling_db: -1.0, release_ms: 60.0 }) };
+        let f = master_audio_filters(Some(&m));
+        assert_eq!(f[0], "volume=-3.000dB");
+        assert_eq!(f[1], "aresample=192000,alimiter=limit=0.89125:attack=5:release=60.0:level=false:latency=1,aresample=48000");
+    }
+
+    #[test]
+    fn automation_is_a_flat_sum_of_ramps_in_db() {
+        assert!(automation_volume_filter(&[]).is_none());
+        assert!(automation_volume_filter(&[[0.0, 0.0], [2.0, 0.0]]).is_none());
+        let f = automation_volume_filter(&[[-1.0, -6.0], [2.0, 0.0], [3.0, 0.0], [4.0, -60.0]]).unwrap();
+        assert_eq!(
+            f,
+            "asetnsamples=n=256:p=0,volume='pow(10,(-6.000+(6.000)*clip((t+1.000)/3.0000,0,1)+(-60.000)*clip((t-3.000)/1.0000,0,1))/20)':eval=frame"
+        );
     }
 
     // ---- segment_effect_chain - ordering matters (mirrored in VideoPlayer.tsx's own preview) -----

@@ -66,6 +66,7 @@ const LOUDNESS_OPTIONS: { value: number | null; label: string; hint: string }[] 
   { value: null, label: "As mixed", hint: "No change" },
   { value: -14, label: "-14 LUFS", hint: "YouTube, Spotify, most streaming" },
   { value: -16, label: "-16 LUFS", hint: "Podcasts, Apple" },
+  { value: -23, label: "-23 LUFS", hint: "Broadcast (EBU R128)" },
 ];
 
 const ExportOptionsPopover: React.FC<ExportOptionsPopoverProps> = ({

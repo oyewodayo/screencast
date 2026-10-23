@@ -9,6 +9,8 @@ use std::env::consts::OS;
 use tauri::Manager;
 
 mod commands {
+    pub mod audio_stream;
+    pub mod bleed_removal;
     pub mod audio_tracks;
     pub mod background_removal;
     pub mod camera_effects;
@@ -27,6 +29,7 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod bleed;
     pub mod transition_graphs;
     pub mod clip_fx;
     pub mod audio_fx;
@@ -472,6 +475,7 @@ fn main() {
             commands::conversion::get_playable_preview,
             commands::conversion::get_image_clip_proxy,
             commands::conversion::get_video_canvas_proxy,
+            commands::conversion::get_blank_frame_image,
             commands::conversion::stabilized_clip_preview,
             commands::conversion::extract_frame_still,
             commands::conversion::render_reversed_clip,
@@ -526,7 +530,18 @@ fn main() {
             commands::background_removal::remove_video_background,
             commands::background_removal::cancel_background_removal,
             commands::conversion::extract_clip_audio,
+            commands::conversion::clean_audio_track,
+            commands::conversion::render_timeline_audio,
             commands::audio_tracks::probe_audio_streams,
+            commands::audio_tracks::save_voice_recording,
+            commands::audio_stream::wav_writer_open,
+            commands::audio_stream::wav_writer_append,
+            commands::audio_stream::wav_writer_close,
+            commands::audio_stream::wav_writer_discard,
+            commands::audio_stream::audio_range,
+            commands::bleed_removal::remove_bleed,
+            commands::bleed_removal::cancel_bleed,
+            commands::audio_stream::audio_peaks,
             commands::file_info::get_file_info,
             commands::file_info::get_library_item_info,
             commands::audio_tracks::get_separation_engine,

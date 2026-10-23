@@ -33,6 +33,9 @@ import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import PipOverlayLayer from "../components/video/PipOverlayLayer";
+import { setMasterBus } from "../utils/mixerGraph";
+import { isNeutralMaster } from "../utils/masterBus";
+import AudioOnlyStage from "../components/video/AudioOnlyStage";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
@@ -681,13 +684,17 @@ const Dashboard = () => {
   );
   // The mixer's session state (open for its meters, solo) - mixerState.ts.
   const mixerSession = useMixerSession();
+  // The open project's master bus drives the preview's (mixerGraph.ts) - none outside the editor.
+  const editingMaster = selectedFile && getFileCategory(selectedFile.name) === "video" ? editStore.master : undefined;
+  useEffect(() => setMasterBus(editingMaster), [editingMaster]);
   // The assembled/output timeline's own total length - a clip's own contribution is
   // (end-start)/speed, not just (end-start), once it has a speed edit (Clip.speed's own doc
   // comment, videoEditTypes.ts): a sped-up clip plays back in LESS output time than its source
   // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
   // default end time clamps against the timeline's REAL length instead of a stale, too-long value
   // that ignores every sped-up clip already on it.
-  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
+  // playbackClips: an audio-only project runs as long as its audio (blankClipsFor).
+  const totalOutputDuration = editStore.playbackClips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
   // Burned-in captions preview (CaptionOverlayLayer) - the same lines Save exports.
   const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
@@ -1058,7 +1065,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // into it, read from the <video> itself. For per-frame preview (keyframed overlays); the
   // timeline's own currentOutputTime only updates a few times a second.
   const outputTimingRef = useRef<{ clips: Clip[]; activeId: string | null }>({ clips: [], activeId: null });
-  outputTimingRef.current = { clips: editStore.clips, activeId: activeClipEffects?.id ?? null };
+  outputTimingRef.current = { clips: editStore.playbackClips, activeId: activeClipEffects?.id ?? null };
   const getExactOutputTime = useCallback((): number | null => {
     const playback = getPlayerPlaybackState();
     const { clips, activeId } = outputTimingRef.current;
@@ -1513,7 +1520,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     const primaryPath = selectedFile?.sourcePath;
     if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
-    const imagePaths = Array.from(new Set(editStore.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    const imagePaths = Array.from(new Set(editStore.playbackClips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
     let cancelled = false;
     (async () => {
       for (const imagePath of imagePaths) {
@@ -1526,7 +1533,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFile?.sourcePath, editStore.clips, resolveImageClipProxyUrl]);
+  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -5331,11 +5338,15 @@ const setScreen = () => {
                         return (
                         <>
                           <div className="absolute pointer-events-none" style={contentBox}>
+                          {/* A project that is only sound: its live waveform over the blank picture. */}
+                          {isVideoProjectPath(selectedFile.sourcePath) && editStore.clips.length === 0 && editStore.audioOverlays.length > 0 && (
+                            <AudioOnlyStage audioOverlays={editStore.audioOverlays} isPlaying={playerIsPlaying} currentOutputTime={currentOutputTime} />
+                          )}
                           {/* The next clip, covering the player while it switches to it. Under
                               the transition preview, which draws the outgoing clip over it. */}
                           <ClipHandoffLayer
                             frameRect={frameRect}
-                            clips={editStore.clips}
+                            clips={editStore.playbackClips}
                             activeClipId={activeClipEffects?.id ?? null}
                             apiRef={handoffRef}
                             resolveClipUrl={resolveTimelineClipUrl}
@@ -5536,7 +5547,8 @@ const setScreen = () => {
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted || silencedBySolo(mixerSession, VIDEO_CHANNEL)}
                 trackFx={editStore.videoAudioFx}
-                meterTrack={mixerSession.open}
+                // The master bus in use takes every sound through it - this one included.
+                meterTrack={mixerSession.open || !isNeutralMaster(editStore.master)}
                 activeClipEffects={activeClipEffects}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}

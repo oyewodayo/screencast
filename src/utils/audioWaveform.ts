@@ -1,87 +1,57 @@
 // utils/audioWaveform.ts
 //
-// Decodes an audio file's real peak amplitudes for the audio-overlay timeline chip's waveform -
-// confirmed with the user as a real decode (Web Audio API), not a decorative placeholder. No Rust
-// involvement needed: Tauri's asset:// protocol already serves plain fetchable bytes, and unlike
-// the tainted-canvas bug fixed for image overlay export (videoOverlayRender.ts), decoding audio
-// into peak numbers never touches a <canvas> at all, so there's no tainting concern here either.
-import { convertFileSrc } from "@tauri-apps/api/core";
+// A file's waveform - its real peak levels, PEAKS_PER_SECOND of them a second - for the audio
+// chips on the timeline, the audio panel and the player's audio view. Worked out by streaming the
+// file through ffmpeg once (audio_peaks, audio_stream.rs) and cached on disk, so a five-hour file
+// costs no more memory than a five-second one and is only ever read once; zoomed in, a long file's
+// waveform is as sharp as a short one's.
+import { invoke } from "@tauri-apps/api/core";
 
-// Keyed by source path, not overlay id - two overlays pointing at the same file (e.g. one
-// duplicated from the other) share one decode. Cached forever for the life of the app session;
-// audio files on disk aren't expected to change out from under an open editing session.
-const peaksCache = new Map<string, Promise<number[]>>();
+export const PEAKS_PER_SECOND = 50;
 
-// One shared AudioContext rather than one per decode - browsers cap how many can exist at once,
-// and decodeAudioData doesn't need a dedicated context per call.
-let sharedAudioContext: AudioContext | null = null;
-function getAudioContext(): AudioContext {
-  if (!sharedAudioContext) sharedAudioContext = new AudioContext();
-  return sharedAudioContext;
-}
+// Keyed by source path - two pieces of the same file share one read. Kept for the session; files on
+// disk aren't expected to change under an open edit (and the disk cache is keyed by size and date).
+const peaksCache = new Map<string, Promise<Float32Array>>();
 
-async function decode(path: string, buckets: number): Promise<number[]> {
-  const response = await fetch(convertFileSrc(path));
-  const arrayBuffer = await response.arrayBuffer();
-  // decodeAudioData detaches/consumes the buffer, and some engines mutate it in place - slice()
-  // isn't needed here since this ArrayBuffer isn't reused for anything else afterward.
-  const audioBuffer = await getAudioContext().decodeAudioData(arrayBuffer);
-
-  const channelCount = audioBuffer.numberOfChannels;
-  const samplesPerBucket = Math.max(1, Math.floor(audioBuffer.length / buckets));
-  const peaks: number[] = new Array(buckets).fill(0);
-
-  for (let channel = 0; channel < channelCount; channel++) {
-    const data = audioBuffer.getChannelData(channel);
-    for (let bucket = 0; bucket < buckets; bucket++) {
-      const start = bucket * samplesPerBucket;
-      const end = Math.min(data.length, start + samplesPerBucket);
-      let max = 0;
-      for (let i = start; i < end; i++) {
-        const abs = Math.abs(data[i]);
-        if (abs > max) max = abs;
-      }
-      // Averaged across channels rather than taking the max of both - a waveform meant to
-      // represent "the sound", not exaggerate whichever channel happens to be louder at each
-      // instant.
-      peaks[bucket] += max / channelCount;
-    }
-  }
-
-  return peaks;
-}
-
-// Returns (and caches) the full-file peak amplitudes, one per bucket, each 0..1. Callers slice
-// this according to whichever sub-window of the source is actually in play (an AudioOverlay's own
-// trimStart/duration) rather than re-decoding per-trim - see AudioOverlayPopover/the timeline
-// chip's own waveform-slicing logic.
-export function getWaveformPeaks(path: string, buckets = 400): Promise<number[]> {
-  const cacheKey = `${path}::${buckets}`;
-  let cached = peaksCache.get(cacheKey);
+// The whole file's peaks, PEAKS_PER_SECOND a second, each 0..1 - a typed array, since a day-long file
+// has millions. Callers slice the stretch they show (sliceWaveformWindow) rather than asking per trim.
+export function getWaveformPeaks(path: string): Promise<Float32Array> {
+  let cached = peaksCache.get(path);
   if (!cached) {
-    cached = decode(path, buckets).catch((err) => {
-      console.error("Failed to decode waveform for", path, err);
-      peaksCache.delete(cacheKey);
-      throw err;
-    });
-    peaksCache.set(cacheKey, cached);
+    cached = invoke<ArrayBuffer>("audio_peaks", { path })
+      .then((buffer) => new Float32Array(buffer))
+      .catch((err) => {
+        console.error("Failed to read the waveform of", path, err);
+        peaksCache.delete(path);
+        throw err;
+      });
+    peaksCache.set(path, cached);
   }
   return cached;
+}
+
+// The loudest peak in each of `buckets` equal stretches of `peaks` - a waveform drawn at any width
+// keeps every loud moment, however many peaks fall into one bar.
+export function downsamplePeaks(peaks: ArrayLike<number>, buckets: number, from = 0, to = peaks.length): number[] {
+  const out: number[] = new Array(buckets).fill(0);
+  const span = Math.max(0, to - from);
+  if (span === 0) return out;
+  for (let i = 0; i < buckets; i++) {
+    const a = from + Math.floor((i / buckets) * span);
+    const b = Math.max(a + 1, from + Math.floor(((i + 1) / buckets) * span));
+    let max = 0;
+    for (let j = Math.max(0, a); j < Math.min(peaks.length, b); j++) if (peaks[j] > max) max = peaks[j];
+    out[i] = max;
+  }
+  return out;
 }
 
 // Slices the full-file peaks down to just the [trimStart, trimStart+duration) window, resampled
 // to `outputBuckets` points - what the chip actually draws, so its waveform always reflects
 // exactly the portion of the source that will actually play.
-export function sliceWaveformWindow(fullPeaks: number[], sourceDuration: number, trimStart: number, duration: number, outputBuckets: number): number[] {
+export function sliceWaveformWindow(fullPeaks: ArrayLike<number>, sourceDuration: number, trimStart: number, duration: number, outputBuckets: number): number[] {
   if (fullPeaks.length === 0 || sourceDuration <= 0) return new Array(outputBuckets).fill(0);
   const startIndex = Math.floor((trimStart / sourceDuration) * fullPeaks.length);
   const endIndex = Math.ceil(((trimStart + duration) / sourceDuration) * fullPeaks.length);
-  const windowLength = Math.max(1, endIndex - startIndex);
-
-  const result: number[] = new Array(outputBuckets);
-  for (let i = 0; i < outputBuckets; i++) {
-    const sourceIndex = startIndex + Math.floor((i / outputBuckets) * windowLength);
-    result[i] = fullPeaks[Math.min(fullPeaks.length - 1, Math.max(0, sourceIndex))] ?? 0;
-  }
-  return result;
+  return downsamplePeaks(fullPeaks, outputBuckets, startIndex, Math.max(startIndex + 1, endIndex));
 }

@@ -13,7 +13,7 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
-import { getWaveformPeaks } from '../utils/audioWaveform';
+import { downsamplePeaks, getWaveformPeaks } from '../utils/audioWaveform';
 
 // Import utility functions
 import {
@@ -34,7 +34,7 @@ import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
 import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { isNeutralFx, type AudioFx } from '../utils/audioFx';
-import { createTrackFxNode, loadTrackFxModule, resumeMixer, setNodeFx } from '../utils/mixerGraph';
+import { createTrackFxNode, loadTrackFxModule, loadWorkletModule, masterInput, mixerContext, resumeMixer, setListenLevel, setNodeFx, useTimelineMuted } from '../utils/mixerGraph';
 import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
@@ -358,6 +358,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reconnecting it once an async module load finishes left a gap the media pipeline's AV-sync
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
+  // Once this element's sound runs through Web Audio it meets the timeline's other sounds on the
+  // mixer's master bus, and the listening volume moves there (setListenLevel).
+  const [routedToMixer, setRoutedToMixer] = useState(false);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
   // This element's one MediaElementAudioSourceNode (createMediaElementSource can only ever be called
   // once per element) and the bus everything audible flows through to the speakers, both on
@@ -369,19 +372,19 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (!mediaSourceRef.current) {
       const source = ctx.createMediaElementSource(video);
       const bus = new GainNode(ctx, { gain: 1 });
-      bus.connect(ctx.destination);
+      // Onto the mixer's master bus with every other sound (mixerGraph.ts) - the listening volume
+      // is applied after it from here on (see the volume effect).
+      bus.connect(masterInput());
       source.connect(bus);
       mediaSourceRef.current = { source, bus };
+      setRoutedToMixer(true);
     }
     return mediaSourceRef.current;
   };
-  // The video sound's mixer channel: bus -> track-fx worklet -> monitor -> speakers. The user's own
-  // listening volume moves to `monitor` once this exists (the element then plays at just the track
-  // level), so the compressor reacts to the level the export mixes at, not to how loud the user
-  // happens to be listening. Built once, the first time effects or the meter are wanted.
-  const trackFxRef = useRef<{ node: AudioWorkletNode; monitor: GainNode } | null>(null);
+  // The video sound's mixer channel: bus -> track-fx worklet -> master bus. Built once, the first
+  // time effects or the meter are wanted.
+  const trackFxRef = useRef<{ node: AudioWorkletNode } | null>(null);
   const trackFxSetupRef = useRef(false);
-  const [trackFxReady, setTrackFxReady] = useState(false);
   const trackFxLatestRef = useRef(trackFx);
   trackFxLatestRef.current = trackFx;
   // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only).
@@ -457,10 +460,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reduction is never used at all this session. 48kHz because RNNoise ("Remove" mode) only works
   // at that rate - the media element source is resampled into it automatically.
   useEffect(() => {
-    const ctx = new AudioContext({ sampleRate: 48000 });
+    // The mixer's own context (48kHz too), shared with every track so they all reach one master bus -
+    // it outlives this player, so unmounting only lets go of this element's nodes.
+    const ctx = mixerContext();
     noiseCtxRef.current = ctx;
-    noiseWorkletReadyRef.current = ctx.audioWorklet
-      .addModule("/audio-worklets/noise-reduction-processor.js")
+    noiseWorkletReadyRef.current = loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
       .catch((err) => {
         console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
         throw err;
@@ -468,7 +472,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => {
       noiseGraphUnmountedRef.current = true;
       mediaSourceRef.current?.source.disconnect();
-      ctx.close().catch(() => {});
+      mediaSourceRef.current?.bus.disconnect();
     };
   }, []);
 
@@ -620,6 +624,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [, setIsMuted] = useState<boolean>(true);
   const [volume, setVolumeState] = useState<number>(1.0);
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
   const [volumeLevel, setVolumeLevel] = useState<VolumeLevel>('high');
   const [currentPlaySpeed, setCurrentPlaySpeed] = useState<string>("1x");
 
@@ -787,7 +793,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
   // thumbnail of. null until decoded, or permanently for a file with no audio track/a failed decode
   // (that util already logs its own failures - this just stays empty rather than erroring).
-  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<number[] | null>(null);
+  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<Float32Array | null>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   // Audio's own equivalent of the chapter-hover tooltip / video thumbnail: since there's nothing
   // visual to preview, hovering the timeline just shows the timestamp under the cursor instead of
@@ -1042,8 +1048,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const buckets = Math.max(8, Math.floor(widthPx / 2));
     const barWidth = widthPx / buckets;
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    const bars = downsamplePeaks(audioWaveformPeaks, buckets);
     for (let i = 0; i < buckets; i++) {
-      const amp = audioWaveformPeaks[Math.min(audioWaveformPeaks.length - 1, Math.floor((i / buckets) * audioWaveformPeaks.length))] ?? 0;
+      const amp = bars[i];
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
     }
@@ -1742,15 +1749,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // volume and silence from the muted flag are indistinguishable to the ear, so there's no need to
   // juggle two separate "why is this silent" states for what the local mute button already owns.
   // With the mixer channel built, the listening volume is applied after its effects instead.
+  // Routed into the mixer, the listening volume is the master's last stage (setListenLevel) - for
+  // every sound on the timeline at once, and after the meters and limiter.
+  // Silent while a voice-over records over the picture (setTimelineMuted).
+  const timelineMuted = useTimelineMuted();
   useEffect(() => {
-    const fx = trackFxRef.current;
-    if (fx) {
-      setVolume(videoRef.current, trackMuted ? 0 : trackVolume);
-      fx.monitor.gain.value = Math.max(0, Math.min(1, volume));
-    } else {
-      setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
-    }
-  }, [volume, trackVolume, trackMuted, trackFxReady]);
+    setListenLevel(volume);
+    const track = trackMuted || timelineMuted ? 0 : trackVolume;
+    setVolume(videoRef.current, routedToMixer ? track : volume * track);
+  }, [volume, trackVolume, trackMuted, routedToMixer, timelineMuted]);
 
   const trackFxKey = JSON.stringify(trackFx ?? null);
   useEffect(() => {
@@ -1770,16 +1777,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         // Rewired in one synchronous block (see attachMediaSource) - no gap in the sound.
         const { bus } = attachMediaSource(ctx, video);
         const node = createTrackFxNode(ctx, 'video');
-        const monitor = new GainNode(ctx, { gain: 1 });
         try {
-          bus.disconnect(ctx.destination);
+          bus.disconnect(masterInput());
         } catch {
           // Not connected straight to the speakers - nothing to undo.
         }
-        bus.connect(node).connect(monitor).connect(ctx.destination);
+        bus.connect(node).connect(masterInput());
         setNodeFx(node, trackFxLatestRef.current);
-        trackFxRef.current = { node, monitor };
-        setTrackFxReady(true);
+        trackFxRef.current = { node };
         if (ctx.state === 'suspended') ctx.resume().catch(() => {});
       })
       .catch((err) => console.error('Mixer effects unavailable on the video sound:', err))
@@ -2317,8 +2322,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
 
     const handleVolumeChange = (): void => {
-      // With the mixer channel built, what's heard is the element's (track) volume times the monitor's.
-      setVolumeLevel(getVolumeLevel(video.volume * (trackFxRef.current?.monitor.gain.value ?? 1), video.muted));
+      // Routed into the mixer, what's heard is the element's (track) volume times the listening volume.
+      setVolumeLevel(getVolumeLevel(video.volume * (mediaSourceRef.current ? volumeRef.current : 1), video.muted));
     };
 
     const handleEnded = (): void => {

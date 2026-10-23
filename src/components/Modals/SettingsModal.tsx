@@ -174,7 +174,7 @@ const CACHE_CATEGORY_INFO: Record<string, { label: string; description: string }
   thumb_v1: { label: "Image thumbnails (old)", description: "Earlier gallery-grid previews, before photo rotation was honored." },
   thumb_v2: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
   image_clip_v1: { label: "Image clip previews", description: "Still-video previews of photos used as clips in the video editor." },
-  video_canvas_v1: { label: "Video project canvases", description: "Blank frames video projects preview on." },
+  video_canvas_v3: { label: "Video project canvases", description: "Blank frames video projects preview on." },
   video_thumb_v1: { label: "Video poster frames", description: "Gallery-grid preview frames for videos." },
   scrub_sprite_v1: { label: "Video scrub-bar previews", description: "Hover-preview thumbnails shown while dragging a video's timeline." },
   heic_v2: { label: "HEIC/HEIF photo previews", description: "Decoded previews for iPhone-style photos." },

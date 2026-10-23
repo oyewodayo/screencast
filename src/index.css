@@ -105,3 +105,43 @@ body.media-playing [class*="backdrop-blur"] {
 @media (prefers-reduced-motion: reduce) {
   .phones-hub-in, .phone-shelf-burst path { animation: none; }
 }
+
+/* The audio panels' slim sliders (KnobSlider.tsx): a 3px track lit between the control's zero and
+   its value - from the centre for a +/- control - and a small round thumb. */
+.studio-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  background: transparent;
+  cursor: pointer;
+  --tone: 45, 212, 191;
+}
+.studio-range-amber { --tone: 252, 211, 77; }
+.studio-range::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    rgba(255, 255, 255, 0.12) min(var(--origin), var(--fill)),
+    rgb(var(--tone)) min(var(--origin), var(--fill)),
+    rgb(var(--tone)) max(var(--origin), var(--fill)),
+    rgba(255, 255, 255, 0.12) max(var(--origin), var(--fill))
+  );
+}
+.studio-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: rgb(244, 244, 245);
+  box-shadow: 0 0 0 2px rgba(var(--tone), 0.35), 0 1px 2px rgba(0, 0, 0, 0.6);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.studio-range:hover::-webkit-slider-thumb,
+.studio-range:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.2);
+  box-shadow: 0 0 0 3px rgba(var(--tone), 0.45), 0 0 8px rgba(var(--tone), 0.6);
+}
+.studio-range:focus { outline: none; }
