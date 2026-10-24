@@ -886,6 +886,7 @@ export interface VideoEditCommand {
     | "insert"
     | "replace-clip"
     | "merge-clips"
+    | "sound-pro"
     | "edit-clip-effects"
     | "add-text"
     | "edit-text"

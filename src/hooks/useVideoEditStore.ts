@@ -5,6 +5,7 @@ import { hasShapeOrMask, layerMaskGreyPng, revealMaskMotion } from "../utils/lay
 import { compactTracks, exportFades, freeTrack, isTrackHidden, pipTrack, stackOrder } from "../utils/videoTracks";
 import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/audioFx";
 import { automationForExport, type GainPoint } from "../utils/audioAutomation";
+import { joinFades, NO_FADES } from "../utils/audioJoins";
 import { cleanedTrackPath, isCleaned } from "../utils/audioTrackCleanup";
 import { isNeutralMaster, masterForExport, type MasterBus } from "../utils/masterBus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -183,6 +184,7 @@ type ImageOverlayContentPatch = Partial<
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation" | "keyframes" | "track">>;
 export type AdjustmentLayerPatch = Partial<Omit<AdjustmentLayer, "id" | "createdAt" | "updatedAt">>;
+export type SoundProPatch = Pick<EditableFields, "clips" | "audioOverlays" | "master" | "videoAudioFx">;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats" | "duckUnderSpeech" | "duckLevel" | "fx" | "noiseReduction" | "audioCleanup" | "bleed">>;
 // What a caller can set up front on a new audio overlay beyond its timing (a library song arrives
 // with its part, title, licence, beats and ducking already decided).
@@ -422,6 +424,12 @@ export interface UseVideoEditStoreResult {
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
+  // The kind of the step an undo (or a redo) would take back - "Make it sound pro"'s Before/After
+  // is an undo and a redo of its own step, so long as that's still the one on top.
+  undoTopLabel: VideoEditCommand["label"] | null;
+  redoTopLabel: VideoEditCommand["label"] | null;
+  // "Make it sound pro" (soundPro.ts): its clips, tracks and master in one undo step.
+  applySoundPro: (patch: SoundProPatch) => void;
   canRedo: boolean;
   isExporting: boolean;
   exportProgress: number | null;
@@ -1742,6 +1750,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const applySoundPro = useCallback(
+    (patch: SoundProPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, { ...patch, videoAudioFx: tidyFx(patch.videoAudioFx), master: isNeutralMaster(patch.master) ? undefined : patch.master }),
+        "sound-pro"
+      );
+    },
+    [pushCommand]
+  );
+
   // A point drag streams updates - pushCommand folds a quick run of them into one undo step.
   const setAudioGain = useCallback(
     (id: string, gain: GainPoint[] | undefined) => {
@@ -2162,6 +2183,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         // eslint-disable-next-line no-await-in-loop
         if (!o.muted && isCleaned(o)) cleanedSrc.set(o.id, await cleanedTrackPath(o));
       }
+      // Fades as played: each piece's own, its crossfades and its click-proof edges (audioJoins.ts).
+      const fades = joinFades(current.audioOverlays);
       const audioOverlays = current.audioOverlays
         .filter((o) => !o.muted)
         .map((o) => ({
@@ -2170,8 +2193,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           endTime: o.endTime,
           trimStart: o.trimStart,
           volume: o.volume,
-          fadeIn: o.fadeInSec ?? 0,
-          fadeOut: o.fadeOutSec ?? 0,
+          fadeIn: (fades.get(o.id) ?? NO_FADES).fadeIn,
+          fadeOut: (fades.get(o.id) ?? NO_FADES).fadeOut,
+          fadeInCurve: (fades.get(o.id) ?? NO_FADES).fadeInCurve,
+          fadeOutCurve: (fades.get(o.id) ?? NO_FADES).fadeOutCurve,
           duck: duckEnvelopeFor(o, speech),
           fx: fxForExport(o.fx),
           gain: automationForExport(o),
@@ -2484,6 +2509,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     redo,
     canUndo: undoStack.length > 0,
     canRedo: redoStack.length > 0,
+    undoTopLabel: undoStack[undoStack.length - 1]?.label ?? null,
+    redoTopLabel: redoStack[redoStack.length - 1]?.label ?? null,
+    applySoundPro,
     isExporting,
     exportProgress,
     exportError,

@@ -71,7 +71,7 @@ import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
 import AudioChipContextMenu, { AudioSaveFormat } from "./AudioChipContextMenu";
 import AutomationLine from "./AutomationLine";
 import { claimPlayback, readPreviewHead, registerPlayback } from "../../utils/previewHead";
-import { describeProgress, etaTracker, listenJobProgress } from "../../utils/jobProgress";
+import { describeProgress, etaTracker, listenJobProgress, useJobProgress } from "../../utils/jobProgress";
 import { startBleedRemoval } from "../../utils/bleed/bleedJob";
 import type { BleedStrength } from "../../utils/bleed/bleedJob";
 import { cleanedTrackPath, cleanupKey, isCleaned } from "../../utils/audioTrackCleanup";
@@ -124,6 +124,9 @@ const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.wi
 import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
+import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
+import DuckShade from "./DuckShade";
+import SoundProPopover from "./SoundProPopover";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
 import { subscribeVideoFrames, wantVideoFrames, type FrameWant } from "../../utils/videoFrameCache";
@@ -1367,6 +1370,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
   // The mixer (MixerPanel), and the strip it opens with its effects showing.
   const [mixerAnchor, setMixerAnchor] = useState<{ left: number; top: number } | null>(null);
+  // "Make it sound pro" (SoundProPopover).
+  const [soundProAnchor, setSoundProAnchor] = useState<{ left: number; top: number } | null>(null);
+  const soundProInput = useMemo(
+    () => ({
+      clips: editStore.clips,
+      audioOverlays: editStore.audioOverlays,
+      videoAudioMuted: editStore.videoAudioMuted,
+      videoAudioFx: editStore.videoAudioFx,
+      master: editStore.master,
+      loudnessLufs: exportLoudness,
+    }),
+    [editStore.clips, editStore.audioOverlays, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.master, exportLoudness]
+  );
+  // "Make it sound pro" waits on a cleaned voice track rendering - the first still going, and how far.
+  const soundProCleaningTrack = soundProAnchor ? editStore.audioOverlays.find((o) => !o.muted && cleanupStatus(o) === "calibrating") ?? null : null;
+  const soundProCleaningProgress = useJobProgress(soundProCleaningTrack ? { conversionOf: soundProCleaningTrack.src } : null, !!soundProCleaningTrack);
   const [mixerFocus, setMixerFocus] = useState<string | null>(null);
   const mixerButtonRef = useRef<HTMLButtonElement>(null);
   const mixerSession = useMixerSession();
@@ -2841,8 +2860,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         volume: overlay.muted ? 0 : overlay.volume,
         outputFormat: format,
         outputPath: chosen,
-        fadeIn: overlay.fadeInSec ?? null,
-        fadeOut: overlay.fadeOutSec ?? null,
+        // Its fades as heard - its own, and the edge fades its cuts get (audioJoins.ts).
+        fadeIn: pieceFades.get(overlay.id)?.fadeIn || null,
+        fadeOut: pieceFades.get(overlay.id)?.fadeOut || null,
         fx: fxForExport(overlay.fx),
       });
       const done = `Saved ${name}`;
@@ -3510,16 +3530,26 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const anyDucked = editStore.audioOverlays.some(isDucked);
   const anyAutomated = editStore.audioOverlays.some(hasAutomation);
   const speechRangesRef = useRef<TimeRange[]>([]);
+  // The same, to draw (DuckShade) - and each ducked channel's duck gain right now, as the sync below
+  // last set it (the mixer's ducking meter reads this).
+  const [speechRanges, setSpeechRanges] = useState<TimeRange[]>([]);
+  const duckNowRef = useRef(new Map<string, number>());
   useEffect(() => {
     if (!anyDucked) return;
     let cancelled = false;
     computeSpeechTimeline({ clips: editStore.clips, videoAudioMuted: editStore.videoAudioMuted, audioOverlays: editStore.audioOverlays }).then((r) => {
-      if (!cancelled) speechRangesRef.current = r;
+      if (cancelled) return;
+      speechRangesRef.current = r;
+      setSpeechRanges(r);
     });
     return () => {
       cancelled = true;
     };
   }, [anyDucked, editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays]);
+
+  // Every piece's fades as played: its own, plus a crossfade where pieces of one track overlap and a
+  // click-proof edge fade where one is cut mid-sound (audioJoins.ts) - the export's, exactly.
+  const pieceFades = useMemo(() => joinFades(editStore.audioOverlays), [editStore.audioOverlays]);
 
   // A library song missing from disk (app data cleared, project opened on another machine) is
   // fetched again - checked once per overlay per session, which is just a file-exists test.
@@ -3541,6 +3571,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   syncAudioOverlaysRef.current = () => {
     const now = (isPlaying ? getExactOutputTime?.() : null) ?? currentOutputTime;
     const activeIds = new Set(overlaysActiveAt(editStore.audioOverlays, now).map((o) => o.id));
+    const duckNow = new Map<string, number>();
+    duckNowRef.current = duckNow;
     editStore.audioOverlays.forEach((o) => {
       const audio = audioElementsRef.current.get(o.id);
       if (!audio) return;
@@ -3565,12 +3597,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       }
       if (!isPlaying && !audio.paused) audio.pause();
 
-      const fadeIn = o.fadeInSec ?? 0;
-      const fadeOut = o.fadeOutSec ?? 0;
-      let envelope = 1;
-      if (fadeIn > 0) envelope = Math.min(envelope, (now - o.startTime) / fadeIn);
-      if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - now) / fadeOut);
+      const envelope = fadeLevel(pieceFades.get(o.id) ?? NO_FADES, now - o.startTime, o.endTime - o.startTime);
       const duck = isDucked(o) ? duckGainAt(speechRangesRef.current, now, o.duckLevel ?? DEFAULT_DUCK_LEVEL) : 1;
+      if (isDucked(o)) duckNow.set(audioChannelKey(o), Math.min(duckNow.get(audioChannelKey(o)) ?? 1, duck));
       const session = getMixerSession();
       const soloOff = silencedBySolo(session, audioChannelKey(o));
       const automated = hasAutomation(o);
@@ -3608,8 +3637,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       endTime: o.endTime,
       trimStart: o.trimStart,
       volume: o.volume,
-      fadeInSec: o.fadeInSec,
-      fadeOutSec: o.fadeOutSec,
+      fades: pieceFades.get(o.id),
       gain: o.gain,
       fx: o.fx,
       silenced: !!o.muted || silencedBySolo(getMixerSession(), audioChannelKey(o)),
@@ -3664,6 +3692,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         fx: first.fx,
         meterIds: pieces.flatMap((p) => [`audio:${p.id}`, `audition:${p.id}`]),
         detail: pieces.length > 1 ? `${pieces.length} pieces` : undefined,
+        ducking: pieces.some(isDucked) ? { read: () => duckNowRef.current.get(key) ?? 1, levelDb: 20 * Math.log10(pieces.find(isDucked)?.duckLevel ?? DEFAULT_DUCK_LEVEL) } : undefined,
       });
     }
     for (const p of editStore.pipOverlays) {
@@ -4238,6 +4267,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${mixerAnchor ? "bg-neutral-700 text-teal-300" : "text-neutral-300 hover:bg-neutral-700"}`}
           >
             <MdTune size={15} />
+          </button>
+          <button
+            type="button"
+            data-sound-pro-button
+            title="Make it sound pro - clean voice, music under it, the right loudness, in one click"
+            onClick={(e) => {
+              if (soundProAnchor) return setSoundProAnchor(null);
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSoundProAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${soundProAnchor ? "bg-neutral-700 text-amber-300" : "text-neutral-300 hover:bg-neutral-700 hover:text-amber-200"}`}
+          >
+            <IoSparklesOutline size={15} />
           </button>
           </div>
         </div>
@@ -5216,6 +5258,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   >
                     {/* The cleaned file's waveform once it's in - the noise floor visibly drops. */}
                     <AudioChipWaveform overlay={{ ...overlay, src: playedSrc(overlay) }} widthPx={width} heightPx={height - 4} visible={[drawWindow.from - left, drawWindow.to - left]} />
+                    {/* Where it dips under the voice (music ducking). */}
+                    {isDucked(overlay) && speechRanges.length > 0 && (
+                      <DuckShade
+                        ranges={speechRanges}
+                        startTime={overlay.startTime}
+                        endTime={overlay.endTime}
+                        level={overlay.duckLevel ?? DEFAULT_DUCK_LEVEL}
+                        pxPerSec={pxPerSec}
+                        widthPx={width}
+                        heightPx={height - 4}
+                        visible={[drawWindow.from - left, drawWindow.to - left]}
+                      />
+                    )}
                     {/* Where playback bleed was found and taken out. */}
                     {overlay.bleed?.regions.map(([a, b], i) => (
                       <div
@@ -5459,6 +5514,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           );
         })()}
 
+      {soundProAnchor && editStore.editState && (
+        <SoundProPopover
+          anchor={soundProAnchor}
+          input={soundProInput}
+          apply={editStore.applySoundPro}
+          cleaning={{ pending: !!soundProCleaningTrack || noiseReductionStatus === "calibrating", progress: soundProCleaningProgress }}
+          undo={editStore.undo}
+          redo={editStore.redo}
+          undoTopLabel={editStore.undoTopLabel}
+          redoTopLabel={editStore.redoTopLabel}
+          onLoudnessChange={setExportLoudness}
+          isPlaying={isPlaying}
+          onTogglePlay={onTogglePlay}
+          onClose={() => setSoundProAnchor(null)}
+        />
+      )}
       {mixerAnchor && (
         <MixerPanel
           anchor={mixerAnchor}

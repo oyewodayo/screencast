@@ -4113,6 +4113,12 @@ pub struct OverlayAudio {
     pub volume: f64,
     pub fade_in: f64,
     pub fade_out: f64,
+    // "linear" (a fade set in the panel) or "equalPower" (a crossfade or a cut's edge fade, sin/cos
+    // so overlapping pieces hold their level through it - audioJoins.ts).
+    #[serde(default)]
+    pub fade_in_curve: Option<String>,
+    #[serde(default)]
+    pub fade_out_curve: Option<String>,
     // Music ducking: lowered to `level` while someone speaks - see duck_volume_filter.
     #[serde(default)]
     pub duck: Option<DuckEnvelope>,
@@ -4123,6 +4129,12 @@ pub struct OverlayAudio {
     // automation_volume_filter.
     #[serde(default)]
     pub gain: Option<Vec<[f64; 2]>>,
+}
+
+// afade's curve for an OverlayAudio fade: qsin (a quarter sine - its fade-out is the cosine, so a
+// crossfade holds its power) for "equalPower", tri (straight) otherwise.
+fn fade_curve(curve: Option<&str>) -> &'static str {
+    if curve == Some("equalPower") { "qsin" } else { "tri" }
 }
 
 // The mix's master bus (masterBus.ts): a trim, then a lookahead limiter - see master_audio_filters.
@@ -8249,14 +8261,16 @@ pub async fn export_trimmed_video(
                     chain.push_str(&auto);
                 }
                 if audio_ov.fade_in > 0.0 {
-                    chain.push_str(&format!(",afade=t=in:st=0:d={:.3}", audio_ov.fade_in));
+                    chain.push_str(&format!(",afade=t=in:st=0:d={:.4}:curve={}", audio_ov.fade_in, fade_curve(audio_ov.fade_in_curve.as_deref())));
                 }
                 if audio_ov.fade_out > 0.0 {
                     let track_duration = audio_ov.end_time - audio_ov.start_time;
                     let fade_out_start = (track_duration - audio_ov.fade_out).max(0.0);
                     chain.push_str(&format!(
-                        ",afade=t=out:st={:.3}:d={:.3}",
-                        fade_out_start, audio_ov.fade_out
+                        ",afade=t=out:st={:.4}:d={:.4}:curve={}",
+                        fade_out_start,
+                        audio_ov.fade_out,
+                        fade_curve(audio_ov.fade_out_curve.as_deref())
                     ));
                 }
                 for f in audio_ov.fx.as_ref().map(audio_fx_filters).unwrap_or_default() {
