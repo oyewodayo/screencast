@@ -32,6 +32,29 @@ import * as THREE from "three";
 // own comment for why that was a real, permanent per-frame GPU/compositor cost, not a one-time
 // one). Keyed by node.id, same lookup key the live canvas itself is already tagged with.
 export const latticeRenderOnDemand = new Map<string, () => void>();
+
+// Offline frame renderer for exporting a seamless rotation loop (see latticeLoopExport.ts). `begin`
+// resizes the renderer to the export resolution and pauses the live rAF loop; `frame(f)` renders the
+// lattice at loop phase f (0-1) - the rotation advanced by exactly one full cycle across the loop, so
+// frame 0 and the frame after the last are identical - and returns the WebGL canvas to read; `end`
+// restores the live view. Same "module-level map keyed by node.id" side channel as
+// latticeRenderOnDemand above.
+export interface LatticeLoopRenderer {
+  begin(width: number, height: number): void;
+  frame(phase: number, timeSec: number): HTMLCanvasElement;
+  end(): void;
+}
+export const latticeLoopRenderers = new Map<string, LatticeLoopRenderer>();
+
+// Per-axis rotation rate multipliers for each auto-rotate mode. Tumble's 1:2:1 ratio is chosen so
+// one full turn of the slowest axis brings EVERY axis back to its start - the property that makes
+// an exported tumble loop seamless (incommensurate rates would never repeat exactly).
+const AUTO_ROTATE_AXES: Record<"x" | "y" | "z" | "tumble", [number, number, number]> = {
+  x: [1, 0, 0],
+  y: [0, 1, 0],
+  z: [0, 0, 1],
+  tumble: [0.5, 1, 0.5],
+};
 import {
   DEFAULT_LATTICE_LINK_WIDTH,
   DEFAULT_LATTICE_SITE_RADIUS,
@@ -49,6 +72,10 @@ import {
   MIN_LATTICE_SIZE,
   MIN_LATTICE_SPIN_ARROW_SIZE,
   WhiteboardNode,
+  DEFAULT_LATTICE_LABEL_BODY,
+  DEFAULT_LATTICE_LABEL_TITLE,
+  DEFAULT_LATTICE_ROTATE_SPEED,
+  MAX_LATTICE_ROTATE_SPEED,
 } from "../../utils/whiteboardTypes";
 
 type SpinModel = "ising" | "xy" | "heisenberg";
@@ -450,6 +477,12 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   const spinArrowSize = clamp(node.latticeSpinArrowSize ?? DEFAULT_LATTICE_SPIN_ARROW_SIZE, MIN_LATTICE_SPIN_ARROW_SIZE, MAX_LATTICE_SPIN_ARROW_SIZE);
   const spinModel: SpinModel = node.latticeSpinModel ?? "ising";
   const animateSpins = node.latticeAnimateSpins ?? false;
+  const showLabel = node.latticeShowLabel ?? true;
+  const labelTitle = node.latticeLabelTitle ?? DEFAULT_LATTICE_LABEL_TITLE;
+  const labelBody = node.latticeLabelBody ?? DEFAULT_LATTICE_LABEL_BODY;
+  const labelShowStats = node.latticeLabelShowStats ?? true;
+  const autoRotate = node.latticeAutoRotate ?? "off";
+  const rotateSpeed = clamp(node.latticeRotateSpeed ?? DEFAULT_LATTICE_ROTATE_SPEED, -MAX_LATTICE_ROTATE_SPEED, MAX_LATTICE_ROTATE_SPEED);
   // Every one of these lives on the node and is edited from WhiteboardStylePanel.tsx's own
   // "latticeGauge" Field block now (see its own doc comment there) - this widget only ever READS
   // them, plus owns the one thing that has to happen inside the live 3D view itself: picking a new
@@ -525,6 +558,13 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
   const basisRightRef = useRef(new THREE.Vector3());
   const basisUpRef = useRef(new THREE.Vector3());
   const basisForwardRef = useRef(new THREE.Vector3());
+  // Auto-rotation (WhiteboardNode.latticeAutoRotate) - read by the mount effect's rAF loop through
+  // a ref so changing the axis/speed never tears down the renderer. `angles` accumulates the
+  // rotation applied so far; `rate` eases toward the target speed rather than jumping, so turning
+  // rotation on/off, changing axis or speed, or releasing an orbit drag glides instead of snapping.
+  const autoRotateRef = useRef({ mode: autoRotate, speed: rotateSpeed, rates: new THREE.Vector3(), angles: new THREE.Euler(0, 0, 0, "YXZ") });
+  autoRotateRef.current.mode = autoRotate;
+  autoRotateRef.current.speed = rotateSpeed;
 
   // ---- Mount: renderer/scene/camera/lights, the rAF loop, and resize tracking - runs exactly
   // once per mounted widget instance (empty deps), never re-run by prop changes. ------------------
@@ -615,6 +655,33 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
 
     let raf = 0;
     let lastFrameTime = 0;
+    let lastTickTime = 0;
+    let exporting = false;
+    const autoTargetRate = new THREE.Vector3();
+    const autoQuat = new THREE.Quaternion();
+    const camOffset = new THREE.Vector3();
+    // Auto-rotation spins the LATTICE about its own x/y/z axes; it's realized by moving the camera
+    // the opposite way about the orbit target - identical on screen, and it leaves every mesh,
+    // instanced buffer and the PNG export path untouched.
+    const placeCamera = (angles: THREE.Euler) => {
+      const orbit = orbitRef.current;
+      autoQuat.setFromEuler(angles).invert();
+      camOffset.set(
+        orbit.radius * Math.sin(orbit.polar) * Math.cos(orbit.azimuth),
+        orbit.radius * Math.cos(orbit.polar),
+        orbit.radius * Math.sin(orbit.polar) * Math.sin(orbit.azimuth)
+      );
+      camOffset.applyQuaternion(autoQuat);
+      camera.position.copy(orbit.target).add(camOffset);
+      camera.up.set(0, 1, 0).applyQuaternion(autoQuat);
+      camera.lookAt(orbit.target);
+    };
+    const setTime = (t: number) => {
+      if (linkMaterialRef.current) linkMaterialRef.current.uniforms.uTime.value = t;
+      // Pulses regardless of the group's own visibility - cheap (one float), and simpler than
+      // gating it on teaching mode for no real benefit.
+      plaquetteMaterial.opacity = 0.75 + 0.25 * Math.sin(t * 3.0);
+    };
     // Caps this scene's own continuous rendering to ~60fps regardless of the display's actual
     // refresh rate - a 120/144Hz monitor otherwise renders this every 8.3ms/6.9ms forever (see
     // this effect's own preserveDrawingBuffer comment for why that's a real, standing cost), for
@@ -625,27 +692,59 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
     const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
     const animate = (now: number) => {
       raf = requestAnimationFrame(animate);
-      if (now - lastFrameTime < TARGET_FRAME_INTERVAL_MS) return;
+      if (exporting || now - lastFrameTime < TARGET_FRAME_INTERVAL_MS) return;
       lastFrameTime = now;
-
-      const orbit = orbitRef.current;
-      const x = orbit.target.x + orbit.radius * Math.sin(orbit.polar) * Math.cos(orbit.azimuth);
-      const y = orbit.target.y + orbit.radius * Math.cos(orbit.polar);
-      const z = orbit.target.z + orbit.radius * Math.sin(orbit.polar) * Math.sin(orbit.azimuth);
-      camera.position.set(x, y, z);
-      camera.up.set(0, 1, 0);
-      camera.lookAt(orbit.target);
-      const t = now / 1000;
-      if (linkMaterialRef.current) linkMaterialRef.current.uniforms.uTime.value = t;
-      // Pulses regardless of the group's own visibility - cheap (one float), and simpler than
-      // gating it on teaching mode for no real benefit.
-      plaquetteMaterial.opacity = 0.75 + 0.25 * Math.sin(t * 3.0);
+      const dt = lastTickTime ? Math.min(0.1, (now - lastTickTime) / 1000) : 0;
+      lastTickTime = now;
+      // The rate eases toward its target (zero while orbit-dragging or "off") instead of jumping,
+      // so starting, stopping, switching axis and releasing a drag all glide.
+      const auto = autoRotateRef.current;
+      const rad = (auto.speed * Math.PI) / 180;
+      const axes = dragRef.current !== null || auto.mode === "off" ? null : AUTO_ROTATE_AXES[auto.mode];
+      autoTargetRate.set(axes ? axes[0] * rad : 0, axes ? axes[1] * rad : 0, axes ? axes[2] * rad : 0);
+      auto.rates.lerp(autoTargetRate, 1 - Math.exp(-dt * 3));
+      auto.angles.x += auto.rates.x * dt;
+      auto.angles.y += auto.rates.y * dt;
+      auto.angles.z += auto.rates.z * dt;
+      placeCamera(auto.angles);
+      setTime(now / 1000);
       renderNow();
     };
     raf = requestAnimationFrame(animate);
 
+    const exportAngles = new THREE.Euler(0, 0, 0, "YXZ");
+    let exportStart = new THREE.Euler(0, 0, 0, "YXZ");
+    latticeLoopRenderers.set(node.id, {
+      begin(width, height) {
+        exporting = true;
+        exportStart = autoRotateRef.current.angles.clone();
+        renderer.setPixelRatio(1);
+        renderer.setSize(width, height, false);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      },
+      frame(phase, timeSec) {
+        // Exactly one full cycle across the loop, starting from the angle currently on screen. An
+        // "off" lattice still exports a turn about Y - a still loop isn't worth exporting.
+        const auto = autoRotateRef.current;
+        const axes = AUTO_ROTATE_AXES[auto.mode === "off" ? "y" : auto.mode];
+        const turn = Math.PI * 2 * phase * (auto.speed < 0 ? -1 : 1) * (auto.mode === "tumble" ? 2 : 1);
+        exportAngles.set(exportStart.x + axes[0] * turn, exportStart.y + axes[1] * turn, exportStart.z + axes[2] * turn);
+        placeCamera(exportAngles);
+        setTime(timeSec);
+        renderNow();
+        return renderer.domElement;
+      },
+      end() {
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        resize();
+        exporting = false;
+      },
+    });
+
     return () => {
       latticeRenderOnDemand.delete(node.id);
+      latticeLoopRenderers.delete(node.id);
       cancelAnimationFrame(raf);
       observer.disconnect();
       siteMeshRef.current?.geometry.dispose();
@@ -1093,12 +1192,21 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
           over whatever's rendered behind it, not a container for the whole shape. pointer-events
           none so it never steals a click/drag meant for the 3D view underneath - including the
           click-to-move-plaquette gesture the last block's own hint describes. */}
+      {showLabel && (labelTitle || labelBody || labelShowStats || mode === "plaquette") && (
       <div className="absolute left-2 bottom-2 max-w-[80%] pointer-events-none">
         <div className="inline-block rounded px-2 py-1.5 bg-white/80 dark:bg-neutral-900/75 backdrop-blur-[2px] font-mono text-[9.5px] leading-relaxed text-gray-600 dark:text-neutral-400">
-          <div className="text-[10px] font-semibold" style={{ color: "#0d9488" }}>
-            LATTICE::GAUGE <span className="font-normal text-gray-500 dark:text-neutral-500">· {n}×{n}×{n} · {totalSites} sites</span>
-          </div>
-          <div className="mt-0.5">drag to orbit · scroll to zoom · right-drag to pan</div>
+          {(labelTitle || labelShowStats) && (
+            <div className="text-[10px] font-semibold" style={{ color: "#0d9488" }}>
+              {labelTitle}
+              {labelShowStats && (
+                <span className="font-normal text-gray-500 dark:text-neutral-500">
+                  {labelTitle ? " · " : ""}
+                  {n}×{n}×{n} · {totalSites} sites
+                </span>
+              )}
+            </div>
+          )}
+          {labelBody && <div className="mt-0.5 whitespace-pre-line">{labelBody}</div>}
           {mode === "plaquette" && (
             <div className="mt-1.5 pt-1.5 border-t border-gray-300/70 dark:border-neutral-700/70 max-w-[280px]">
               <div className="font-semibold" style={{ color: "#b45309" }}>
@@ -1114,6 +1222,7 @@ export default function LatticeGaugeWidget({ node, canvasZoom, onCommit, onSelec
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

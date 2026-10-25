@@ -1,0 +1,31 @@
+/* utils/titleFonts.css
+ *
+ * The typefaces offered for video titles and captions (titleFonts.ts) - bundled with the app
+ * (latin subsets, only the weights titleFonts.ts uses), so they work offline and export renders
+ * them exactly as the preview does. All SIL Open Font License except Luckiest Guy (Apache 2.0).
+ */
+@import "@fontsource/bebas-neue/latin-400.css";
+@import "@fontsource/anton/latin-400.css";
+@import "@fontsource/oswald/latin-700.css";
+@import "@fontsource/montserrat/latin-800.css";
+@import "@fontsource/montserrat/latin-900.css";
+@import "@fontsource/montserrat/latin-900-italic.css";
+@import "@fontsource/poppins/latin-600.css";
+@import "@fontsource/poppins/latin-800.css";
+@import "@fontsource/abril-fatface/latin-400.css";
+@import "@fontsource/playfair-display/latin-700.css";
+@import "@fontsource/playfair-display/latin-700-italic.css";
+@import "@fontsource/dm-serif-display/latin-400.css";
+@import "@fontsource/dm-serif-display/latin-400-italic.css";
+@import "@fontsource/cinzel/latin-700.css";
+@import "@fontsource/great-vibes/latin-400.css";
+@import "@fontsource/pacifico/latin-400.css";
+@import "@fontsource/dancing-script/latin-700.css";
+@import "@fontsource/permanent-marker/latin-400.css";
+@import "@fontsource/caveat/latin-700.css";
+@import "@fontsource/special-elite/latin-400.css";
+@import "@fontsource/luckiest-guy/latin-400.css";
+@import "@fontsource/bangers/latin-400.css";
+@import "@fontsource/righteous/latin-400.css";
+@import "@fontsource/orbitron/latin-800.css";
+@import "@fontsource/monoton/latin-400.css";

@@ -33,7 +33,7 @@ import PipOverlayPopover, { PipOverlayPatch } from "./PipOverlayPopover";
 import { cssBlendMode } from "../../utils/blendModes";
 import ClipCropOverlay from "./ClipCropOverlay";
 import { isNeutralFx } from "../../utils/audioFx";
-import { syncElementFx } from "../../utils/mixerGraph";
+import { syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
 import { pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, layerOpacityAt, pipTrack, stackOrder } from "../../utils/videoTracks";
 import { DEFAULT_CHROMA_KEY, guessKeyColor } from "../../utils/chromaKey";
@@ -346,12 +346,14 @@ const PipVideoElement: React.FC<{
   // the track-fx worklet (mixerGraph.ts) once it has any, or the mixer's meters want it.
   const mixer = useMixerSession();
   const soloOff = silencedBySolo(mixer, pipChannelKey(overlay.id));
+  // Silent while a voice-over records over the picture (setTimelineMuted).
+  const timelineMuted = useTimelineMuted();
   useEffect(() => {
     const sound = cutout ? audioRef.current : videoRef.current;
     if (!sound) return;
     const volume = Number.isFinite(overlay.volume) ? overlay.volume : 1;
-    sound.volume = soloOff ? 0 : Math.max(0, Math.min(1, volume));
-  }, [overlay.volume, soloOff, cutout, sounds]);
+    sound.volume = soloOff || timelineMuted ? 0 : Math.max(0, Math.min(1, volume));
+  }, [overlay.volume, soloOff, cutout, sounds, timelineMuted]);
   useEffect(() => {
     const sound = cutout ? audioRef.current : videoRef.current;
     if (!sound || overlay.muted !== false) return;

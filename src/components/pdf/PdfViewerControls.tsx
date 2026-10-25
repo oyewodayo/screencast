@@ -3,7 +3,7 @@
 // (top-right), and the Edit button with the page navigator beneath it (bottom-right). The markup tools themselves live in the vertical dock
 // (AnnotationToolbar) that the Edit button reveals.
 import React, { useEffect, useState } from "react";
-import { IoAdd, IoRemove, IoPencil, IoClose, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoScanOutline } from "react-icons/io5";
+import { IoAdd, IoRemove, IoPencil, IoClose, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoScanOutline, IoChatbubblesOutline } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 
 const PillButton: React.FC<{
@@ -175,6 +175,36 @@ export const EditButton: React.FC<{ open: boolean; onToggle: () => void }> = ({ 
     <span className={`absolute transition-[transform,opacity] duration-300 ${open ? "opacity-100 rotate-0 scale-100" : "opacity-0 -rotate-90 scale-50"}`}>
       <IoClose size={19} />
     </span>
+  </button>
+);
+
+// Amber count badge shared by the floating Comments chip and the dock's Comments entry.
+export const CountBadge: React.FC<{ count: number; className?: string }> = ({ count, className = "" }) => (
+  <span
+    key={count}
+    className={`pdfPopIn absolute pointer-events-none min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full bg-amber-400 text-[9.5px] font-bold leading-none text-neutral-900 tabular-nums ring-2 ring-white dark:ring-neutral-900 ${className}`}
+  >
+    {count > 99 ? "99+" : count}
+  </span>
+);
+
+// Shown above the Edit button while the tools dock is closed, whenever the document has comments.
+export const CommentsChip: React.FC<{ count: number; active: boolean; onClick: () => void }> = ({ count, active, onClick }) => (
+  <button
+    type="button"
+    data-tip={active ? "Hide comments" : `${count} comment${count === 1 ? "" : "s"} in this PDF`}
+    data-tip-side="left"
+    aria-label="Comments"
+    aria-pressed={active}
+    onClick={onClick}
+    className={`pdfPopIn relative flex items-center justify-center w-10 h-10 rounded-full backdrop-blur-xl ring-1 transition-[transform,background-color,color] duration-200 hover:scale-105 active:scale-95 shadow-[0_4px_16px_rgba(0,0,0,0.10)] ${
+      active
+        ? "bg-amber-400 text-neutral-900 ring-amber-500/30"
+        : "bg-white/85 dark:bg-neutral-900/85 text-amber-500 ring-black/[0.05] dark:ring-white/[0.08]"
+    }`}
+  >
+    <IoChatbubblesOutline size={18} />
+    {!active && <CountBadge count={count} className="-top-1 -right-1" />}
   </button>
 );
 

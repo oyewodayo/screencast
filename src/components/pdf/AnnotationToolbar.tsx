@@ -1,18 +1,20 @@
 // components/pdf/AnnotationToolbar.tsx
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { IoPencil, IoArrowUndo, IoArrowRedo, IoText, IoExpand, IoGridOutline, IoListOutline, IoImageOutline, IoDownloadOutline } from "react-icons/io5";
+import { IoPencil, IoArrowUndo, IoArrowRedo, IoText, IoExpand, IoGridOutline, IoListOutline, IoImageOutline, IoDownloadOutline, IoChatbubblesOutline } from "react-icons/io5";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
 import { MdAutoStories } from "react-icons/md";
 import { AnnotationTool } from "../../utils/pdfAnnotationTypes";
 import { PdfSidebarView } from "./PdfSidebar";
 import ColorSwatchPicker from "./ColorSwatchPicker";
+import { CountBadge } from "./PdfViewerControls";
 
 interface AnnotationToolbarProps {
   // The dock stays mounted while closed so it can animate both ways - `open` drives the reveal.
   open: boolean;
   sidebarView: PdfSidebarView | null;
   onSidebarViewChange: (view: PdfSidebarView) => void;
+  commentCount: number;
   tool: AnnotationTool | null;
   onToolChange: (tool: AnnotationTool) => void;
   onDeselectTool: () => void;
@@ -55,6 +57,7 @@ type DockEntry =
       onClick: () => void;
       icon: React.ReactNode;
       tool?: AnnotationTool;
+      badge?: number;
     };
 
 // Total stagger spread across the dock's buttons as it rises - small enough that the last button
@@ -65,6 +68,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   open,
   sidebarView,
   onSidebarViewChange,
+  commentCount,
   tool,
   onToolChange,
   onDeselectTool,
@@ -145,6 +149,15 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
       active: sidebarView === "outline",
       onClick: () => onSidebarViewChange("outline"),
       icon: <IoListOutline size={14} />,
+    },
+    {
+      kind: "button",
+      key: "comments",
+      title: commentCount > 0 ? `Comments (${commentCount})` : "Comments",
+      active: sidebarView === "comments",
+      onClick: () => onSidebarViewChange("comments"),
+      icon: <IoChatbubblesOutline size={14} />,
+      badge: commentCount,
     },
     // Flattens annotations into a brand-new standalone PDF next to the source file - unlike the
     // sidecar JSON the save indicator reports on, this is readable outside this app.
@@ -231,7 +244,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             return <div key={entry.key} style={itemStyle} className="w-3.5 h-px my-0.5 bg-black/[0.08] dark:bg-white/[0.1] shrink-0" />;
           }
           return (
-            <div key={entry.key} style={itemStyle} className="shrink-0">
+            <div key={entry.key} style={itemStyle} className="shrink-0 relative">
             <button
               ref={entry.tool ? (el) => void (toolButtonRefs.current[entry.tool!] = el) : undefined}
               type="button"
@@ -251,6 +264,7 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             >
               {entry.icon}
             </button>
+            {!!entry.badge && !entry.active && <CountBadge count={entry.badge} className="-top-0.5 -right-0.5 scale-[0.85] origin-top-right" />}
             </div>
           );
         })}

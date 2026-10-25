@@ -1,9 +1,9 @@
-import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline } from "react-icons/io5";
+import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline, IoSearch, IoNavigateOutline, IoBrowsersOutline, IoShieldCheckmarkOutline, IoInformationCircleOutline, IoSparklesOutline, IoKeypadOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../services/phoneCamera";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
-import { WindowInfo, MonitorInfo } from "../Types";
+import { WindowInfo, MonitorInfo, CaptureCapabilities } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
 import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type CameraBackgroundPref } from "../utils/appSettings";
@@ -245,6 +245,32 @@ const EnhancedScreenOptions = ({
     const [selectedMonitor, setSelectedMonitor] = useState<string>("");
     const [selectedWindow, setSelectedWindow] = useState<number | null>(null);
     const [isLoading, setIsLoading] = useState(false);
+    // Narrows the window grid by title or app name - with a dozen windows open, typing "chr" beats
+    // scanning thumbnails.
+    const [windowQuery, setWindowQuery] = useState("");
+    // Small live pictures of each monitor (temp PNGs), keyed by monitor id.
+    const [monitorPreviews, setMonitorPreviews] = useState<Record<string, string>>({});
+    // Whether a picked window is recorded on its own - decides what the picker promises.
+    const [caps, setCaps] = useState<CaptureCapabilities | null>(null);
+    useEffect(() => {
+        invoke<CaptureCapabilities>("get_capture_capabilities")
+            .then(setCaps)
+            .catch(() => setCaps({ window_isolated: false }));
+    }, []);
+    // Remembered between recordings (appSettings) and sent with every capture by Dashboard.
+    const [captureCursor, setCaptureCursor] = useState(() => loadSettings().captureCursor);
+    const [windowTitleBar, setWindowTitleBar] = useState(() => loadSettings().windowTitleBar);
+    const [editablePointer, setEditablePointer] = useState(() => loadSettings().editablePointer);
+    const [recordShortcuts, setRecordShortcuts] = useState(() => loadSettings().recordShortcuts);
+    const updateCapturePrefs = (next: { captureCursor?: boolean; windowTitleBar?: boolean; editablePointer?: boolean; recordShortcuts?: boolean }) => {
+        saveSettings({ ...loadSettings(), ...next });
+        if (next.captureCursor !== undefined) setCaptureCursor(next.captureCursor);
+        if (next.windowTitleBar !== undefined) setWindowTitleBar(next.windowTitleBar);
+        if (next.editablePointer !== undefined) setEditablePointer(next.editablePointer);
+        if (next.recordShortcuts !== undefined) setRecordShortcuts(next.recordShortcuts);
+    };
+    // The pointer/shortcut recording is a Windows input hook (services/input_tracker.rs).
+    const inputTrackingSupported = navigator.userAgent.includes("Windows");
     // Bubble border, remembered between recordings (appSettings) and sent with every recording
     // by Dashboard's handleStartRecording.
     const [border, setBorder] = useState(() => loadSettings().cameraBorder);
@@ -298,6 +324,7 @@ const EnhancedScreenOptions = ({
         const windowsWithUrls = windowTitles.map((window) => ({
             ...window,
             imageUrl: window.image_path ? convertFileSrc(window.image_path) : undefined,
+            iconUrl: window.icon_path ? convertFileSrc(window.icon_path) : undefined,
         }));
         setWindows(windowsWithUrls as any);
         setMode("windows");
@@ -320,7 +347,9 @@ const EnhancedScreenOptions = ({
 
     useEffect(() => {
         return () => {
-            const tempFilePaths = windows.map((w) => w.image_path).filter((path) => path && path.includes("briefcast_window_"));
+            const tempFilePaths = windows
+                .flatMap((w) => [w.image_path, w.icon_path])
+                .filter((path): path is string => !!path && path.includes("briefcast_window_"));
             if (tempFilePaths.length > 0) {
                 invoke("cleanup_screenshot_files", { filePaths: tempFilePaths }).catch((err) =>
                     console.error("Failed to cleanup files:", err)
@@ -338,7 +367,31 @@ const EnhancedScreenOptions = ({
         } finally {
             setIsLoading(false);
         }
+        // The pictures come after the list - a moment later, never holding it up.
+        loadMonitorPreviews();
     };
+
+    const loadMonitorPreviews = () => {
+        invoke<Record<string, string>>("get_monitor_previews")
+            .then((paths) => {
+                setMonitorPreviews((old) => {
+                    const stale = Object.values(old);
+                    if (stale.length > 0) invoke("cleanup_screenshot_files", { filePaths: stale }).catch(() => {});
+                    return paths;
+                });
+            })
+            .catch((err) => console.error("Failed to load monitor previews:", err));
+    };
+
+    // Monitor previews are temp files too - gone with the dialog.
+    const monitorPreviewsRef = useRef(monitorPreviews);
+    monitorPreviewsRef.current = monitorPreviews;
+    useEffect(() => {
+        return () => {
+            const paths = Object.values(monitorPreviewsRef.current);
+            if (paths.length > 0) invoke("cleanup_screenshot_files", { filePaths: paths }).catch(() => {});
+        };
+    }, []);
 
     const loadWindows = async () => {
         setIsLoading(true);
@@ -379,15 +432,18 @@ const EnhancedScreenOptions = ({
     };
 
     // Screenshotting a window is a single click: picking it *is* confirming the target. Video
-    // recording keeps select-then-confirm, since a recording has room to be corrected.
+    // recording keeps select-then-confirm, since a recording has room to be corrected. A window
+    // captured on its own is taken where it is; otherwise it's brought forward first.
     const handleWindowClick = async (window: WindowInfo & { hwnd: number }) => {
         setSelectedWindow(window.hwnd);
         setSelectedMonitor("");
         if (recordType === "c") {
-            try {
-                await invoke("activate_and_open_window", { title: window.title });
-            } catch (err) {
-                console.error("Failed to activate window:", err);
+            if (!caps?.window_isolated) {
+                try {
+                    await invoke("activate_and_open_window", { title: window.title, hwnd: window.hwnd });
+                } catch (err) {
+                    console.error("Failed to activate window:", err);
+                }
             }
             confirmAndStart({ screenSize: `window:${window.hwnd}`, selectedScreen: window.title || "" });
         }
@@ -446,7 +502,8 @@ const EnhancedScreenOptions = ({
 
     const renderSources = () => (
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            {sourceCard(fullscreenSelected, <IoScanOutline />, "Full screen", "Your whole display", () => {
+            {/* Not lit while a monitor or window is being picked - only one source looks chosen. */}
+            {sourceCard(fullscreenSelected && mode === "main", <IoScanOutline />, "Full screen", "Your whole display", () => {
                 setSelectedMonitor("");
                 setSelectedWindow(null);
                 setScreenSize("fullscreen");
@@ -463,7 +520,11 @@ const EnhancedScreenOptions = ({
                 selectedWindow !== null || mode === "windows",
                 <IoApps />,
                 "Window",
-                selectedWindowInfo ? selectedWindowInfo.title : "Record one app",
+                selectedWindowInfo
+                    ? selectedWindowInfo.title
+                    : caps?.window_isolated
+                    ? "Just one app - even behind others"
+                    : "Record one app",
                 () => {
                     setMode("windows");
                     loadWindows();
@@ -472,15 +533,16 @@ const EnhancedScreenOptions = ({
         </div>
     );
 
-    const pickerHeader = (title: string, onRefresh?: () => void) => (
-        <div className="flex items-center justify-between mb-3">
+    const pickerHeader = (title: string, onRefresh?: () => void, extra?: React.ReactNode) => (
+        <div className="flex items-center gap-3 mb-3">
             <button
                 type="button"
                 onClick={handleBack}
-                className="flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-white"
+                className="flex items-center gap-1.5 text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-white shrink-0"
             >
                 <IoArrowBack /> {title}
             </button>
+            <div className="flex-1 min-w-0 flex justify-end">{extra}</div>
             {onRefresh && (
                 <button
                     type="button"
@@ -496,7 +558,7 @@ const EnhancedScreenOptions = ({
 
     const renderMonitors = () => (
         <div>
-            {pickerHeader("Choose a monitor")}
+            {pickerHeader("Choose a monitor", loadMonitors)}
             {isLoading ? (
                 <div className="py-10 text-center text-sm text-neutral-500">Looking for displays…</div>
             ) : (
@@ -516,10 +578,14 @@ const EnhancedScreenOptions = ({
                             }`}
                         >
                             <div
-                                className="w-full rounded-lg bg-gradient-to-br from-slate-200 to-slate-300 dark:from-neutral-800 dark:to-neutral-700 mb-3 flex items-center justify-center text-neutral-400"
+                                className="w-full rounded-lg overflow-hidden bg-gradient-to-br from-slate-200 to-slate-300 dark:from-neutral-800 dark:to-neutral-700 mb-3 flex items-center justify-center text-neutral-400 ring-1 ring-black/5 dark:ring-white/10"
                                 style={{ aspectRatio: `${monitor.width} / ${monitor.height}` }}
                             >
-                                <FiMonitor className="text-3xl" />
+                                {monitorPreviews[monitor.id] ? (
+                                    <img src={convertFileSrc(monitorPreviews[monitor.id])} alt={monitor.name} className="w-full h-full object-cover" />
+                                ) : (
+                                    <FiMonitor className="text-3xl" />
+                                )}
                             </div>
                             <div className="flex items-center gap-2">
                                 <span className="text-sm font-semibold">{monitor.name}</span>
@@ -539,53 +605,131 @@ const EnhancedScreenOptions = ({
         </div>
     );
 
+    const query = windowQuery.trim().toLowerCase();
+    const shownWindows = query
+        ? windows.filter((w) => `${w.title} ${w.app_name ?? ""} ${w.exe_path?.split(/[\\/]/).pop() ?? ""}`.toLowerCase().includes(query))
+        : windows;
+
     const renderWindows = () => (
         <div>
-            {pickerHeader("Choose a window", loadWindows)}
+            {pickerHeader(
+                "Choose a window",
+                loadWindows,
+                windows.length > 6 && (
+                    <label className="relative w-full max-w-xs">
+                        <IoSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                        <input
+                            value={windowQuery}
+                            onChange={(e) => setWindowQuery(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === "Escape" && windowQuery) {
+                                    e.stopPropagation();
+                                    setWindowQuery("");
+                                }
+                            }}
+                            placeholder="Find a window or app"
+                            className="w-full pl-9 pr-3 py-1.5 rounded-xl text-sm bg-neutral-100 dark:bg-neutral-800 border border-transparent focus:border-emerald-500/50 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                        />
+                    </label>
+                )
+            )}
+            {caps && (
+                <div
+                    className={`mb-3 flex items-start gap-2 px-3 py-2 rounded-xl text-xs ${
+                        caps.window_isolated
+                            ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
+                            : "bg-amber-50 dark:bg-amber-500/10 text-amber-800 dark:text-amber-200"
+                    }`}
+                >
+                    {caps.window_isolated ? <IoShieldCheckmarkOutline className="mt-px shrink-0 text-sm" /> : <IoInformationCircleOutline className="mt-px shrink-0 text-sm" />}
+                    <span>
+                        {caps.window_isolated
+                            ? recordType === "c"
+                                ? "Captures just this window, exactly as it is - even if other windows cover it. Nothing is brought to the front."
+                                : "Records just this window - other windows on top of it and the apps you switch to stay out of the video. It follows the window if you move it."
+                            : "This window is recorded as the part of the screen it covers - keep it in front while recording."}
+                    </span>
+                </div>
+            )}
             {isLoading ? (
-                <div className="py-10 text-center text-sm text-neutral-500">Finding open windows…</div>
+                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3" aria-label="Finding open windows">
+                    {Array.from({ length: 8 }).map((_, i) => (
+                        <div key={i} className="rounded-2xl border border-neutral-200 dark:border-neutral-800 overflow-hidden animate-pulse">
+                            <div className="aspect-video bg-neutral-100 dark:bg-neutral-800" />
+                            <div className="p-2.5 space-y-1.5">
+                                <div className="h-3 rounded bg-neutral-100 dark:bg-neutral-800 w-3/4" />
+                                <div className="h-2.5 rounded bg-neutral-100 dark:bg-neutral-800 w-1/3" />
+                            </div>
+                        </div>
+                    ))}
+                </div>
             ) : windows.length === 0 ? (
                 <div className="py-10 text-center text-sm text-neutral-500">No windows found. Try refreshing.</div>
+            ) : shownWindows.length === 0 ? (
+                <div className="py-10 text-center text-sm text-neutral-500">No window matches "{windowQuery}".</div>
             ) : (
                 <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3">
-                    {windows.map((window: any) => (
-                        <button
-                            key={window.hwnd}
-                            type="button"
-                            onClick={() => handleWindowClick(window)}
-                            className={`rounded-2xl border overflow-hidden text-left transition-all ${
-                                selectedWindow === window.hwnd
-                                    ? "border-emerald-500 ring-4 ring-emerald-500/15"
-                                    : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600 hover:shadow-sm"
-                            }`}
-                        >
-                            <div className="aspect-video bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center">
-                                {window.imageUrl ? (
-                                    <img
-                                        src={window.imageUrl}
-                                        alt={window.title}
-                                        className="w-full h-full object-cover"
-                                        onError={(e) => {
-                                            (e.target as HTMLImageElement).style.display = "none";
-                                        }}
-                                    />
-                                ) : (
-                                    <IoApps className="text-3xl text-neutral-300 dark:text-neutral-600" />
-                                )}
-                            </div>
-                            <div className="p-2.5">
-                                <p className="text-xs font-medium truncate" title={window.title}>
-                                    {window.title}
-                                </p>
-                                {/* Titles alone can be ambiguous, and thumbnails aren't always available. */}
-                                {window.exe_path && (
-                                    <p className="text-[10px] text-neutral-500 truncate" title={window.exe_path}>
-                                        {window.exe_path.split(/[\\/]/).pop()}
-                                    </p>
-                                )}
-                            </div>
-                        </button>
-                    ))}
+                    {shownWindows.map((window: any) => {
+                        const exeName = window.exe_path ? window.exe_path.split(/[\\/]/).pop() : "";
+                        const appLabel = window.app_name || exeName;
+                        return (
+                            <button
+                                key={window.hwnd}
+                                type="button"
+                                onClick={() => handleWindowClick(window)}
+                                title={window.exe_path || window.title}
+                                className={`group rounded-2xl border overflow-hidden text-left transition-all ${
+                                    selectedWindow === window.hwnd
+                                        ? "border-emerald-500 ring-4 ring-emerald-500/15"
+                                        : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600 hover:shadow-sm"
+                                }`}
+                            >
+                                <div className="relative aspect-video bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center overflow-hidden">
+                                    {window.imageUrl ? (
+                                        <img
+                                            src={window.imageUrl}
+                                            alt={window.title}
+                                            className="w-full h-full object-cover object-top"
+                                            onError={(e) => {
+                                                (e.target as HTMLImageElement).style.display = "none";
+                                            }}
+                                        />
+                                    ) : window.iconUrl ? (
+                                        <img src={window.iconUrl} alt="" className="w-12 h-12 opacity-90" />
+                                    ) : (
+                                        <IoBrowsersOutline className="text-3xl text-neutral-300 dark:text-neutral-600" />
+                                    )}
+                                    <span className="absolute top-2 left-2 flex gap-1">
+                                        {window.is_own && (
+                                            <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-600 text-white shadow-sm">Briefcast</span>
+                                        )}
+                                        {window.is_minimized && (
+                                            <span
+                                                className="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-neutral-900/70 text-white backdrop-blur-sm"
+                                                title="Minimized - it's restored for the capture without taking focus"
+                                            >
+                                                Minimized
+                                            </span>
+                                        )}
+                                    </span>
+                                </div>
+                                <div className="p-2.5 flex items-start gap-2">
+                                    {window.iconUrl ? (
+                                        <img src={window.iconUrl} alt="" className="w-4 h-4 mt-px shrink-0" />
+                                    ) : (
+                                        <IoApps className="w-4 h-4 mt-px shrink-0 text-neutral-400" />
+                                    )}
+                                    <span className="min-w-0">
+                                        <span className="block text-xs font-medium truncate">{window.title}</span>
+                                        <span className="block text-[10px] text-neutral-500 truncate">
+                                            {appLabel}
+                                            {window.width && window.height ? ` · ${window.width} × ${window.height}` : ""}
+                                        </span>
+                                    </span>
+                                </div>
+                            </button>
+                        );
+                    })}
                 </div>
             )}
         </div>
@@ -854,6 +998,55 @@ const EnhancedScreenOptions = ({
         </label>
     );
 
+    const capturesScreen = isScreenType || recordType === "c";
+    const windowPicked = selectedWindow !== null;
+    const renderCaptureToggles = () => (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {toggleRow(
+                captureCursor || (isScreenType && editablePointer && inputTrackingSupported),
+                () => updateCapturePrefs({ captureCursor: !captureCursor }),
+                <IoNavigateOutline className="text-emerald-500 -scale-x-100" />,
+                "Show cursor",
+                recordType === "c"
+                    ? "Include the mouse pointer in the screenshot."
+                    : isScreenType && editablePointer && inputTrackingSupported
+                    ? "Drawn by the editor - see Editable pointer."
+                    : "Include the mouse pointer in the video.",
+                isScreenType && editablePointer && inputTrackingSupported
+            )}
+            {isScreenType &&
+                toggleRow(
+                    editablePointer && inputTrackingSupported,
+                    () => updateCapturePrefs({ editablePointer: !editablePointer }),
+                    <IoSparklesOutline className="text-emerald-500" />,
+                    "Editable pointer",
+                    inputTrackingSupported
+                        ? "Records the pointer separately, so the editor can smooth and enlarge it and ripple every click (Screen style). The recorded file itself has no pointer."
+                        : "Windows only for now.",
+                    !inputTrackingSupported
+                )}
+            {isScreenType &&
+                toggleRow(
+                    recordShortcuts && inputTrackingSupported,
+                    () => updateCapturePrefs({ recordShortcuts: !recordShortcuts }),
+                    <IoKeypadOutline className="text-emerald-500" />,
+                    "Record shortcuts",
+                    inputTrackingSupported
+                        ? "Keys you press with Ctrl, Alt or Win (and Enter, Esc, Tab, F-keys), shown as keycaps in the editor. Ordinary typing is never recorded."
+                        : "Windows only for now.",
+                    !inputTrackingSupported
+                )}
+            {windowPicked &&
+                toggleRow(
+                    windowTitleBar,
+                    () => updateCapturePrefs({ windowTitleBar: !windowTitleBar }),
+                    <IoBrowsersOutline className="text-emerald-500" />,
+                    "Include title bar",
+                    "Keep the window's title bar and frame - off captures just its content."
+                )}
+        </div>
+    );
+
     const renderOptions = () => (
         <div className="space-y-5">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -981,6 +1174,8 @@ const EnhancedScreenOptions = ({
                 </div>
             )}
 
+            {capturesScreen && renderCaptureToggles()}
+
             {isScreenType && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     {toggleRow(
@@ -1011,7 +1206,7 @@ const EnhancedScreenOptions = ({
         selectedMonitorInfo
             ? `Monitor · ${selectedMonitorInfo.name}`
             : selectedWindowInfo
-            ? `Window · ${selectedWindowInfo.title}`
+            ? `Window · ${selectedWindowInfo.app_name ? `${selectedWindowInfo.app_name} - ` : ""}${selectedWindowInfo.title}`
             : "Full screen";
 
     return (
@@ -1146,7 +1341,7 @@ const EnhancedScreenOptions = ({
                                 </p>
                             </div>
                         )}
-                        {recordType !== "c" && (
+                        {!isAudioOnly && (
                             <div className="pt-2 border-t border-neutral-200/80 dark:border-neutral-800">
                                 <div className="pt-4">
                                     <SectionLabel>Options</SectionLabel>

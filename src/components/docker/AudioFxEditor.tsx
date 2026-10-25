@@ -4,6 +4,7 @@
 // transfer curve) and balance. The curves are drawn from the same maths the preview's worklet and
 // the export's ffmpeg filters run (audioFx.ts), so what the picture shows is what is heard.
 import React from "react";
+import KnobSlider from "./KnobSlider";
 import {
   AudioCompressor,
   AudioEq,
@@ -31,7 +32,6 @@ const Row: React.FC<{ label: string; value: string; children: React.ReactNode; t
   </label>
 );
 
-const range = "flex-1 min-w-0 accent-teal-400";
 const dB = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
 const hz = (f: number) => (f >= 1000 ? `${(f / 1000).toFixed(f >= 10000 ? 0 : 1)} kHz` : `${Math.round(f)} Hz`);
 
@@ -117,27 +117,19 @@ const AudioFxEditor: React.FC<AudioFxEditorProps> = ({ fx, onChange }) => {
           onPick={(id) => onChange({ ...fx, eq: id === "flat" ? undefined : { ...EQ_PRESETS.find((p) => p.id === id)!.eq } })}
         />
         <Row label="Low" value={dB(eq.low)} title="Low shelf at 100 Hz - rumble, boom, warmth">
-          <input type="range" min={-12} max={12} step={0.5} value={eq.low} onChange={(e) => setEq({ low: Number(e.target.value) })} onDoubleClick={() => setEq({ low: 0 })} className={range} />
+          <KnobSlider min={-12} max={12} step={0.5} value={eq.low} onChange={(v) => setEq({ low: v })} resetTo={0} />
         </Row>
         <Row label="Mid" value={dB(eq.mid)} title="A bell around the frequency below - presence, honk, mud">
-          <input type="range" min={-12} max={12} step={0.5} value={eq.mid} onChange={(e) => setEq({ mid: Number(e.target.value) })} onDoubleClick={() => setEq({ mid: 0 })} className={range} />
+          <KnobSlider min={-12} max={12} step={0.5} value={eq.mid} onChange={(v) => setEq({ mid: v })} resetTo={0} />
         </Row>
         <Row label="Mid at" value={hz(eq.midFreq)}>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.001}
-            value={Math.log(eq.midFreq / 150) / Math.log(8000 / 150)}
-            onChange={(e) => setEq({ midFreq: Math.round(150 * Math.pow(8000 / 150, Number(e.target.value))) })}
-            className={range}
-          />
+          <KnobSlider min={0} max={1} step={0.001} value={Math.log(eq.midFreq / 150) / Math.log(8000 / 150)} onChange={(v) => setEq({ midFreq: Math.round(150 * Math.pow(8000 / 150, v)) })} />
         </Row>
         <Row label="Width" value={`Q ${eq.midQ.toFixed(1)}`} title="Lower = broader bell">
-          <input type="range" min={0.3} max={4} step={0.1} value={eq.midQ} onChange={(e) => setEq({ midQ: Number(e.target.value) })} className={range} />
+          <KnobSlider min={0.3} max={4} step={0.1} value={eq.midQ} onChange={(v) => setEq({ midQ: v })} />
         </Row>
         <Row label="High" value={dB(eq.high)} title="High shelf at 8 kHz - air, sibilance, hiss">
-          <input type="range" min={-12} max={12} step={0.5} value={eq.high} onChange={(e) => setEq({ high: Number(e.target.value) })} onDoubleClick={() => setEq({ high: 0 })} className={range} />
+          <KnobSlider min={-12} max={12} step={0.5} value={eq.high} onChange={(v) => setEq({ high: v })} resetTo={0} />
         </Row>
       </div>
 
@@ -153,24 +145,24 @@ const AudioFxEditor: React.FC<AudioFxEditorProps> = ({ fx, onChange }) => {
               <CompCurve comp={comp} />
               <div className="flex-1 min-w-0 flex flex-col gap-1">
                 <Row label="Threshold" value={`${comp.threshold} dB`}>
-                  <input type="range" min={-60} max={0} step={1} value={comp.threshold} onChange={(e) => setComp({ threshold: Number(e.target.value) })} className={range} />
+                  <KnobSlider min={-60} max={0} step={1} value={comp.threshold} onChange={(v) => setComp({ threshold: v })} />
                 </Row>
                 <Row label="Ratio" value={`${comp.ratio}:1`}>
-                  <input type="range" min={1} max={20} step={0.5} value={comp.ratio} onChange={(e) => setComp({ ratio: Number(e.target.value) })} className={range} />
+                  <KnobSlider min={1} max={20} step={0.5} value={comp.ratio} onChange={(v) => setComp({ ratio: v })} />
                 </Row>
               </div>
             </div>
             <Row label="Attack" value={`${comp.attack} ms`}>
-              <input type="range" min={1} max={200} step={1} value={comp.attack} onChange={(e) => setComp({ attack: Number(e.target.value) })} className={range} />
+              <KnobSlider min={1} max={200} step={1} value={comp.attack} onChange={(v) => setComp({ attack: v })} />
             </Row>
             <Row label="Release" value={`${comp.release} ms`}>
-              <input type="range" min={20} max={1000} step={10} value={comp.release} onChange={(e) => setComp({ release: Number(e.target.value) })} className={range} />
+              <KnobSlider min={20} max={1000} step={10} value={comp.release} onChange={(v) => setComp({ release: v })} />
             </Row>
             <Row label="Makeup" value={dB(comp.makeup)} title="Brings the level back up after compression">
-              <input type="range" min={0} max={24} step={0.5} value={comp.makeup} onChange={(e) => setComp({ makeup: Number(e.target.value) })} className={range} />
+              <KnobSlider min={0} max={24} step={0.5} value={comp.makeup} onChange={(v) => setComp({ makeup: v })} />
             </Row>
             <Row label="Knee" value={`${comp.knee} dB`} title="How gradually compression starts around the threshold">
-              <input type="range" min={0} max={18} step={1} value={comp.knee} onChange={(e) => setComp({ knee: Number(e.target.value) })} className={range} />
+              <KnobSlider min={0} max={18} step={1} value={comp.knee} onChange={(v) => setComp({ knee: v })} />
             </Row>
           </>
         )}
@@ -178,7 +170,7 @@ const AudioFxEditor: React.FC<AudioFxEditorProps> = ({ fx, onChange }) => {
 
       <div className="flex flex-col gap-1.5 pt-2 border-t border-white/10">
         <Row label="Balance" value={Math.abs(pan) < 0.005 ? "Centre" : `${Math.round(Math.abs(pan) * 100)}% ${pan < 0 ? "L" : "R"}`} title="Double-click to centre">
-          <input type="range" min={-1} max={1} step={0.01} value={pan} onChange={(e) => onChange({ ...fx, pan: Number(e.target.value) })} onDoubleClick={() => onChange({ ...fx, pan: 0 })} className={range} />
+          <KnobSlider min={-1} max={1} step={0.01} value={pan} onChange={(v) => onChange({ ...fx, pan: v })} resetTo={0} />
         </Row>
       </div>
     </div>

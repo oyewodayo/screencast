@@ -10,6 +10,7 @@ import { downloadDir, join } from "@tauri-apps/api/path";
 import { save } from "@tauri-apps/plugin-dialog";
 import { trackEvent } from "./telemetry";
 import { AudioLibraryInfo } from "./videoEditTypes";
+import { builtinSfxFile, isBuiltinSfxId } from "./builtinSfx";
 
 export interface MusicAsset {
   url: string;
@@ -51,6 +52,8 @@ export const fetchMusicCatalog = (refresh = false) => invoke<MusicCatalogRespons
 const inFlight = new Map<string, Promise<string>>();
 // A local, verified copy of the track's preview clip or full file.
 export function getTrackFile(trackId: string, variant: TrackVariant): Promise<string> {
+  // Briefcast's own sounds are made here, not downloaded (one file for preview and full).
+  if (isBuiltinSfxId(trackId)) return builtinSfxFile(trackId);
   const key = `${trackId}:${variant}`;
   let p = inFlight.get(key);
   if (!p) {
@@ -64,7 +67,10 @@ export function onMusicDownloadProgress(cb: (p: { trackId: string; variant: Trac
   return listen<{ trackId: string; variant: TrackVariant; downloaded: number; total: number }>("music-download-progress", (e) => cb(e.payload));
 }
 
-export const restoreMusicTrack = (trackId: string, expectedPath: string) => invoke<string | null>("restore_music_track", { trackId, expectedPath });
+export const restoreMusicTrack = (trackId: string, expectedPath: string): Promise<string | null> =>
+  isBuiltinSfxId(trackId)
+    ? builtinSfxFile(trackId).then((path) => (path === expectedPath ? null : path))
+    : invoke<string | null>("restore_music_track", { trackId, expectedPath });
 
 // ---- Downloads ------------------------------------------------------------------------------
 

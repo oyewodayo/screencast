@@ -30,7 +30,7 @@ mod assembly;
 #[cfg(target_os = "windows")]
 mod capture_watchdog;
 #[cfg(target_os = "windows")]
-mod gpu_capture;
+pub(crate) mod gpu_capture;
 #[cfg(target_os = "windows")]
 mod win;
 // pub(crate): window_capture::macos (a sibling module, not a descendant of this one) needs
@@ -84,6 +84,10 @@ pub struct AppState {
     // audio that isn't assembled (which enhances as it assembles): camera and audio-only modes, and
     // every mode outside Windows. See services/audio_enhance.rs.
     post_enhance: Arc<Mutex<bool>>,
+    // A recording where a phone is the only camera ("Camera + Mic" / "Camera only" with just the
+    // phone): ffmpeg captures only this computer's mic, and stop_recording joins that sound to the
+    // phone's `_webcam.mp4` into one video. Some(keep_audio) while such a recording runs.
+    phone_only_camera: Arc<Mutex<Option<bool>>>,
     // The parts of a screen recording in progress (Windows) - the picture-only intermediate, its
     // frame timing, and the mic/system audio captured beside it - which stop_recording assembles
     // into the final file. See recording/assembly.rs.
@@ -94,6 +98,10 @@ pub struct AppState {
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
     #[cfg(target_os = "windows")]
     click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    // The pointer/shortcut recording for the recording in progress (FormData.track_pointer /
+    // track_keys - services/input_tracker.rs), written to "<name>.pointer.json" at stop.
+    #[cfg(target_os = "windows")]
+    input_capture: Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
     // Screen<->camera view-switch events for the recording currently in progress, logged by the
     // record_view_switch command as the user toggles the live recording bar's "Screen"/"Camera"
     // control - see that command's own doc comment. Not Windows-only by construction (unlike
@@ -187,6 +195,13 @@ pub struct FormData {
     // doesn't set it (screen_size isn't "window:...") doesn't need to send an empty string.
     #[serde(default)]
     window_title: String,
+    // A window capture includes its title bar and frame - off: just the window's content, the
+    // way recordings of one app usually look best.
+    #[serde(default)]
+    window_title_bar: bool,
+    // Draw the mouse pointer into screen captures. On for a caller that doesn't send it.
+    #[serde(default = "capture_cursor_by_default")]
+    capture_cursor: bool,
     // Whether to also capture system/"what you hear" audio (WASAPI loopback, Windows-only) -
     // only meaningful for the screen-capture modes (sva/sa/s); ignored otherwise. See
     // start_recording's handling of this field and services/audio_capture.rs.
@@ -206,6 +221,13 @@ pub struct FormData {
     // as include_system_audio above.
     #[serde(default)]
     track_clicks: bool,
+    // "Editable pointer" (Windows, screen modes): the screen is captured without the pointer and
+    // its path, clicks and looks are recorded beside it for the editor to draw (input_tracker.rs).
+    #[serde(default)]
+    track_pointer: bool,
+    // "Record shortcuts": keyboard shortcuts (never typing) recorded for the editor's key chips.
+    #[serde(default)]
+    track_keys: bool,
     // Max output width in px for screen-capture modes (sva/sa/s) - None reproduces the previous
     // hardcoded behavior exactly (MAX_RECORDING_WIDTH, 1920). The frontend's "native" option sends
     // a very large value (comfortably above any realistic display) rather than a separate sentinel/
@@ -241,6 +263,10 @@ fn default_border() -> String {
 
 fn default_border_color() -> String {
     "#ffffff".to_string()
+}
+
+fn capture_cursor_by_default() -> bool {
+    true
 }
 
 fn enhance_by_default() -> bool {
@@ -292,7 +318,13 @@ pub(crate) enum CaptureTarget {
         height: i32,
     },
     Window {
+        // The picked window's handle ("window:<hwnd>") - what Windows captures by. None when it
+        // didn't parse; the title is then the only way to find it (and the only way on Linux and
+        // macOS, which match by title).
+        hwnd: Option<isize>,
         title: String,
+        // Capture the title bar and frame too, not just the content (FormData.window_title_bar).
+        title_bar: bool,
     },
 }
 
@@ -322,10 +354,15 @@ pub(crate) fn resolve_capture_target(
         return CaptureTarget::FullScreen;
     }
 
-    if form_data.screen_size.starts_with("window:") && !form_data.window_title.is_empty() {
-        return CaptureTarget::Window {
-            title: form_data.window_title.clone(),
-        };
+    if let Some(raw) = form_data.screen_size.strip_prefix("window:") {
+        let hwnd = raw.trim().parse::<isize>().ok().filter(|&h| h != 0);
+        if hwnd.is_some() || !form_data.window_title.is_empty() {
+            return CaptureTarget::Window {
+                hwnd,
+                title: form_data.window_title.clone(),
+                title_bar: form_data.window_title_bar,
+            };
+        }
     }
 
     CaptureTarget::FullScreen
@@ -361,8 +398,8 @@ pub(crate) fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32,
             width,
             height,
         } => Some((*x, *y, *width, *height)),
-        CaptureTarget::Window { title } => {
-            crate::commands::window_capture::win::get_window_rect_by_title(title).ok()
+        CaptureTarget::Window { hwnd, title, title_bar } => {
+            crate::commands::window_capture::win::get_window_rect(*hwnd, title, *title_bar).ok()
         }
     }
 }
@@ -394,6 +431,23 @@ pub fn load_click_sidecar(video_path: String) -> Result<Option<String>, String> 
     fs::read_to_string(&sidecar)
         .map(Some)
         .map_err(|e| format!("Failed to read click-tracking sidecar: {}", e))
+}
+
+// Where a recording's editable pointer and shortcut keys live (services/input_tracker.rs) - read by
+// the editor (pointerTrack.ts) to draw the pointer back and show the shortcuts. Named like the
+// library's other companions (sidecars.rs) so it moves, copies and goes to the trash with the
+// video: a recording parted from it would have no pointer at all.
+fn pointer_sidecar_path(video_path: &Path) -> PathBuf {
+    crate::services::sidecars::sidecar_path(video_path, ".pointer.json")
+}
+
+#[tauri::command(async)]
+pub fn load_pointer_sidecar(video_path: String) -> Result<Option<String>, String> {
+    let sidecar = pointer_sidecar_path(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar).map(Some).map_err(|e| format!("Failed to read the pointer sidecar: {}", e))
 }
 
 // Where the camera bubble was baked into a screen recording - its shape, anchor, size, border and
@@ -947,14 +1001,47 @@ pub async fn record_view_switch(
 // thing as the error - as every take_screenshot used to - buries the one line anyone can act on
 // under noise the UI can't even fully display. The real reason is reliably among the last few
 // non-empty lines.
+// The lines of a failed run's stderr that say what went wrong. Just taking the last few lines isn't
+// enough: a run that fails late ends with the encoders' closing statistics ("[libx264 @ ...] ref B
+// L0: ...", "kb/s:", "Qavg: ...") and the actual error is further up - so the message used to read
+// as a wall of numbers ending in "Conversion failed!". Lines that report a problem are picked out
+// instead (the last few, oldest first); the plain tail is only the fallback when none do.
 pub(crate) fn extract_ffmpeg_error(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
+        .flat_map(|l| l.split('\r'))
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
         return "ffmpeg exited with an error and produced no output".to_string();
+    }
+    const PROBLEM: &[&str] = &[
+        "error", "invalid", "failed", "no such", "not found", "cannot", "can't", "unable", "too many",
+        "out of memory", "does not", "doesn't", "unsupported", "not supported", "mismatch", "denied",
+        "corrupt", "unknown", "impossible", "could not", "couldn't",
+    ];
+    let problems: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            // ffmpeg's own sign-off says nothing the lines before it don't.
+            !lower.starts_with("conversion failed") && PROBLEM.iter().any(|p| lower.contains(p))
+        })
+        .collect();
+    if !problems.is_empty() {
+        let mut unique: Vec<&str> = Vec::new();
+        for l in problems.iter().rev() {
+            if !unique.contains(l) {
+                unique.push(l);
+            }
+            if unique.len() == 4 {
+                break;
+            }
+        }
+        unique.reverse();
+        return unique.join(" | ");
     }
     let tail_len = lines.len().min(5);
     lines[lines.len() - tail_len..].join(" | ")
@@ -1763,16 +1850,26 @@ pub async fn start_recording(
     // The single case that genuinely cannot work is a camera-only recording where the phone is the
     // ONLY camera selected: stripping the sentinel leaves ffmpeg with no video input at all, so
     // the main recording would have no picture. Everything else is now allowed.
+    // The phone as the only camera: ffmpeg has no picture of its own to record, so it records this
+    // computer's mic by itself, and stop_recording puts the phone's video and that sound together
+    // (join_phone_only_recording). "Camera only" records the mic too - it's the clock the phone's
+    // video is lined up against - and drops it at the join.
+    *state.phone_only_camera.lock().await = None;
     if uses_phone_camera
         && matches!(form_data.record_type.as_str(), "v" | "va")
         && form_data.video_devices.is_empty()
     {
-        return Err(
-            "The phone can't be the only camera for this recording type yet. Also tick a camera \
-             attached to this computer, or pick a \"Screen…\" recording option - either way the \
-             phone is recorded as its own layer you can position in the editor."
-                .to_string(),
-        );
+        if form_data.audio_device.trim().is_empty() {
+            return Err(
+                "To record with the phone as the camera, pick a microphone on this computer too - \
+                 its sound is what the phone's video is lined up with."
+                    .to_string(),
+            );
+        }
+        let keep_audio = form_data.record_type == "va";
+        form_data.record_type = "a".to_string();
+        form_data.file_ext = "wav".to_string();
+        *state.phone_only_camera.lock().await = Some(keep_audio);
     }
 
     // The phone claims the `<stem>_webcam.mp4` sidecar slot (save_phone_camera_capture writes
@@ -1823,6 +1920,8 @@ pub async fn start_recording(
     let assembly_state = state.assembly.clone();
     #[cfg(target_os = "windows")]
     let click_capture = state.click_capture.clone();
+    #[cfg(target_os = "windows")]
+    let input_capture = state.input_capture.clone();
 
     // Screen recordings are assembled at stop from separately captured parts, in exact sync - see
     // recording/assembly.rs. The audio captures start here, before ffmpeg, so they're already
@@ -1897,6 +1996,36 @@ pub async fn start_recording(
                 None => warn!("Failed to resolve the capture region's own bounds, recording will proceed without click tracking"),
             }
         }
+
+        // The editable pointer and shortcut keys (services/input_tracker.rs). Only once the pointer
+        // really is being recorded does the capture leave it out of the picture - if the tracker
+        // can't start, the recording keeps its pointer as usual.
+        let screen_capture = matches!(form_data.record_type.as_str(), "sva" | "sa" | "s");
+        let wants_pointer = form_data.track_pointer && screen_capture;
+        let wants_keys = form_data.track_keys && screen_capture;
+        *state.input_capture.lock().await = None;
+        if wants_pointer || wants_keys {
+            let target = resolve_capture_target(&app_handle, &form_data);
+            match capture_region_bounds(&target) {
+                Some((x, y, width, height)) => {
+                    use crate::services::input_tracker::{Area, InputCapture};
+                    let area = match target {
+                        CaptureTarget::Window { hwnd, title, title_bar } => Area::Window { hwnd, title, title_bar, x, y, width, height },
+                        _ => Area::Fixed { x, y, width, height },
+                    };
+                    match InputCapture::start(area, wants_pointer, wants_keys) {
+                        Ok(capture) => {
+                            if wants_pointer {
+                                form_data.capture_cursor = false;
+                            }
+                            *state.input_capture.lock().await = Some(capture);
+                        }
+                        Err(e) => warn!("Couldn't record the pointer/shortcuts, recording will proceed without them: {}", e),
+                    }
+                }
+                None => warn!("Failed to resolve the capture region's own bounds, recording will proceed without the editable pointer"),
+            }
+        }
     }
 
     // ffmpeg's Command::spawn() only fails if the executable itself can't launch - a bad device
@@ -1913,7 +2042,7 @@ pub async fn start_recording(
     let (output, early_exit_status) = loop {
         attempts += 1;
         #[cfg(target_os = "windows")]
-        gpu_capture::USED_BY_LAST_START.store(false, std::sync::atomic::Ordering::SeqCst);
+        gpu_capture::note_start(None);
         // A previous attempt's progress file would read as this one having started already.
         let _ = fs::remove_file(&progress_path);
 
@@ -1921,22 +2050,30 @@ pub async fn start_recording(
             Ok(output) => output,
             Err(e) => {
                 #[cfg(target_os = "windows")]
-                discard_start(&assembly_state, &click_capture).await;
+                discard_start(&assembly_state, &click_capture, &input_capture).await;
                 return Err(e);
             }
         };
         let exited = wait_for_capture_start(&ffmpeg_process, &progress_path).await;
 
         #[cfg(target_os = "windows")]
-        if exited.is_some()
-            && attempts == 1
-            && gpu_capture::USED_BY_LAST_START.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            gpu_capture::disable_for_session(&format!(
-                "ffmpeg exited at start with {}",
-                exited.unwrap()
-            ));
-            continue;
+        // A window that can't be captured on its own is retried as the screen area it covers,
+        // and a GPU capture that can't start at all as gdigrab - so up to two retries.
+        if let Some(status) = exited {
+            // What ffmpeg said - a microphone or camera that won't open is no reason to capture the
+            // screen differently (that used to turn GPU capture off for the whole session).
+            let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(150))).await;
+            let said = assembly_state
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|a| a.current_timing().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()).diagnostics()))
+                .unwrap_or_default();
+            if attempts <= 2
+                && gpu_capture::fallback_after_failed_start(&format!("ffmpeg exited at start with {}", status), &said)
+            {
+                continue;
+            }
         }
         break (output, exited);
     };
@@ -1944,7 +2081,7 @@ pub async fn start_recording(
     if let Some(status) = early_exit_status {
         *output_path_state.lock().await = None;
         #[cfg(target_os = "windows")]
-        discard_start(&assembly_state, &click_capture).await;
+        discard_start(&assembly_state, &click_capture, &input_capture).await;
         return Err(format!(
             "Recording failed to start (ffmpeg exited immediately with {}). The selected device may be in use by another app, or unavailable.",
             status
@@ -2252,7 +2389,11 @@ fn retime_webcam(ffmpeg_path: &Path, segments: &assembly::Segments, camera: &ass
 async fn discard_start(
     assembly_state: &Arc<Mutex<Option<assembly::Assembly>>>,
     click_capture: &Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
+    input_capture: &Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
 ) {
+    if let Some(capture) = input_capture.lock().await.take() {
+        let _ = crate::services::responsiveness::blocking(move || capture.stop()).await;
+    }
     if let Some(mut parts) = assembly_state.lock().await.take() {
         if let Some(mut camera) = parts.camera.take() {
             if let Some(mut process) = camera.process.take() {
@@ -2282,6 +2423,10 @@ async fn dispatch_recording(
     output_path: &PathBuf,
     form_data: &FormData,
 ) -> Result<String, String> {
+    // Said plainly up front, instead of ffmpeg rejecting `-i audio=` with a bare exit code.
+    if matches!(form_data.record_type.as_str(), "sva" | "sa" | "va" | "a") && form_data.audio_device.trim().is_empty() {
+        return Err("No microphone is selected. Pick one under Options > Microphone, or record without sound (Screen only).".to_string());
+    }
     match form_data.record_type.as_str() {
         "sva" => platform::recording_with_output_sva(app_handle, state, output_path, form_data).await,
         "sa" => platform::recording_with_output_sa(app_handle, state, output_path, form_data).await,
@@ -2563,6 +2708,32 @@ pub async fn stop_recording(
                 }
             }
         }
+
+        // The editable pointer and shortcut keys, onto the final file's timeline the same way.
+        let input_capture = state.input_capture.lock().await.take();
+        if let Some(capture) = input_capture {
+            let started_hns = capture.started_hns;
+            if let Some(log) = crate::services::responsiveness::blocking(move || capture.stop()).await.ok().flatten() {
+                let to_output = |hns: i64| match &segments {
+                    Some((segments, _)) => segments.output_time(hns),
+                    None => Some((hns - started_hns) as f64 / 1e7).filter(|t| *t >= 0.0),
+                };
+                if !log.is_empty() {
+                    if let Err(e) = fs::write(pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
+                        warn!("Failed to write the pointer sidecar: {}", e);
+                    }
+                }
+                // Auto zoom on click reads the clicks sidecar - written from the pointer's own clicks
+                // when "Track clicks" wasn't also on.
+                let clicks_path = click_sidecar_path(&output_path);
+                let clicks = log.left_clicks(to_output);
+                if !clicks_path.exists() && !clicks.is_empty() {
+                    if let Ok(json) = serde_json::to_string(&clicks) {
+                        let _ = fs::write(&clicks_path, json);
+                    }
+                }
+            }
+        }
     }
 
     // Same idea as the click-tracking sidecar just above, for this recording's own screen<->camera
@@ -2593,6 +2764,11 @@ pub async fn stop_recording(
         }
     }
 
+    let output_path = match state.phone_only_camera.lock().await.take() {
+        Some(keep_audio) => join_phone_only_recording(&app_handle, &output_path, keep_audio).await?,
+        None => output_path,
+    };
+
     let output_str = path_to_str(&output_path)?.to_string();
 
     if let Err(e) = app_handle.emit("refresh-file-list", ()) {
@@ -2610,11 +2786,70 @@ pub async fn stop_recording(
         Ok(_) => ("done", None),
         Err(e) => ("failed", Some(e.as_str())),
     };
+    let modal_path = finished.as_ref().map(|p| p.clone()).unwrap_or(modal_path);
     if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
         warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
 
     finished
+}
+
+// The phone was the only camera (see start_recording): its picture - `<stem>_webcam.mp4`, saved by
+// the WebView before stop_recording ran, already lined up with the recording's start - and this
+// computer's mic recording become one `<stem>.mp4`, and both parts go. Camera only keeps no sound.
+// If the phone's video never arrived, the sound is still the recording rather than nothing.
+async fn join_phone_only_recording(app_handle: &AppHandle, audio_path: &Path, keep_audio: bool) -> Result<PathBuf, String> {
+    let stem = audio_path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording").to_string();
+    let video_path = audio_path.with_file_name(format!("{stem}_webcam.mp4"));
+    if !video_path.exists() {
+        warn!("The phone camera's video never arrived - keeping {:?} as the recording", audio_path);
+        return Ok(audio_path.to_path_buf());
+    }
+    let mut out = audio_path.with_extension("mp4");
+    let mut n = 2;
+    while out.exists() {
+        out = audio_path.with_file_name(format!("{stem} ({n}).mp4"));
+        n += 1;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path(app_handle)?;
+    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), path_to_str(&video_path)?.to_string()];
+    if keep_audio {
+        args.extend(["-i".into(), path_to_str(audio_path)?.to_string(), "-map".into(), "0:v:0".into(), "-map".into(), "1:a:0".into()]);
+        // AAC rather than the WAV's raw PCM, which mp4 can't hold; the picture is copied untouched
+        // (it was encoded once already, by save_phone_camera_capture).
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-shortest".into()]);
+    } else {
+        args.extend(["-map".into(), "0:v:0".into(), "-an".into()]);
+    }
+    args.extend(["-c:v".into(), "copy".into(), "-movflags".into(), "+faststart".into(), path_to_str(&out)?.to_string()]);
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(&args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    hide_console_window(&mut cmd);
+    let output = tauri::async_runtime::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| format!("Couldn't put the phone's video and the sound together: {e}"))?
+        .map_err(|e| format!("Couldn't put the phone's video and the sound together: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&out);
+        log::error!("Joining the phone camera recording failed: {}", stderr);
+        // Both parts are kept - the footage can't be re-shot.
+        return Err(format!(
+            "Couldn't put the phone's video and the sound together ({}). Both were kept: {} and {}.",
+            stderr.lines().last().unwrap_or("unknown ffmpeg error"),
+            video_path.display(),
+            audio_path.display()
+        ));
+    }
+    let _ = fs::remove_file(&video_path);
+    let _ = fs::remove_file(audio_path);
+    info!("Joined the phone camera recording into {:?}", out);
+    Ok(out)
 }
 
 // Pauses the in-progress recording: suspends every thread of the ffmpeg process (see each
@@ -2865,5 +3100,33 @@ mod overlay_style_tests {
         assert_eq!(ffmpeg_color("red; drop"), "white");
         assert!(overlay_position_expr("center", 0, 1, 300, 1920).ends_with("y=(H-h)/2"));
         assert!(overlay_position_expr("center_left", 0, 1, 300, 1920).starts_with("overlay=x=48+0"));
+    }
+}
+
+#[cfg(test)]
+mod ffmpeg_error_tests {
+    use super::extract_ffmpeg_error;
+
+    #[test]
+    fn finds_the_error_above_the_closing_statistics() {
+        // The shape of a real failed export: the cause, then the encoders' sign-off statistics.
+        let stderr = "frame=  280 fps=1.3 q=23.0 size=4600KiB\r\n\
+            [Parsed_geq_12 @ 0000] Error while parsing expression 'foo'\n\
+            [fc#0 @ 0000] Error while filtering: Invalid argument\n\
+            [libx264 @ 000001bf51c63e00] ref B L0: 72.6% 18.4%  9.0%\n\
+            [libx264 @ 000001bf51c63e00] ref B L1: 85.1% 14.9%\n\
+            [libx264 @ 000001bf51c63e00] kb/s:2632.81\n\
+            [aac @ 000001bf51c62f40] Qavg: 65536.000\n\
+            Conversion failed!\n";
+        let msg = extract_ffmpeg_error(stderr);
+        assert!(msg.contains("Error while parsing expression"), "{msg}");
+        assert!(msg.contains("Error while filtering"), "{msg}");
+        assert!(!msg.contains("kb/s"), "{msg}");
+    }
+
+    #[test]
+    fn falls_back_to_the_tail_when_nothing_reads_as_an_error() {
+        assert_eq!(extract_ffmpeg_error("a\nb\nc"), "a | b | c");
+        assert_eq!(extract_ffmpeg_error(""), "ffmpeg exited with an error and produced no output");
     }
 }

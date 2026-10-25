@@ -60,7 +60,12 @@ const RevealText: React.FC<RevealTextProps> = ({ overlay, kind, paddingPx, getTi
       {renderFormattedSegments(overlay.text, overlay.colorRuns ?? [], overlay.boldRuns ?? [], overlay.italicRuns ?? [], overlay.color, {
         charStyle: (i) => {
           const c = state.char(i);
-          return c.dy ? { opacity: c.opacity, position: "relative", top: `${c.dy}em` } : { opacity: c.opacity };
+          // Offsets move the letter without touching the line's layout (relative positioning on
+          // the inline span); a blur is a filter on it - both as export draws them.
+          const style: React.CSSProperties = { opacity: c.opacity };
+          if (c.dy || c.dx) Object.assign(style, { position: "relative", top: `${c.dy}em`, left: `${c.dx ?? 0}em` });
+          if (c.blur && c.blur > 0.001) style.filter = `blur(${c.blur}em)`;
+          return style;
         },
         caretAt: state.caretAt,
         caretStyle: settings?.caretStyle ?? "bar",

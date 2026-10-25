@@ -94,7 +94,7 @@ struct WsQuery {
 // recording. A fresh key per server start rides in the pairing URL's fragment (#k=...), which
 // browsers never send in a request, and the phone page hands it back on the socket URL.
 // 64 random bits from the OS source behind RandomState - unguessable over a network.
-fn pairing_key() -> String {
+pub(crate) fn pairing_key() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(0);
@@ -102,7 +102,7 @@ fn pairing_key() -> String {
 }
 
 // Constant-time, so response timing can't be used to guess the key a character at a time.
-fn key_matches(given: &str, expected: &str) -> bool {
+pub(crate) fn key_matches(given: &str, expected: &str) -> bool {
     given.len() == expected.len()
         && given.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
@@ -141,7 +141,7 @@ pub struct PhoneCameraState {
 //
 // Excluded: loopback (the phone is not localhost) and link-local 169.254.x (APIPA - an adapter
 // that failed to get a DHCP lease, i.e. not on a working network at all).
-fn lan_addresses() -> Result<Vec<IpAddr>, String> {
+pub(crate) fn lan_addresses() -> Result<Vec<IpAddr>, String> {
     let usable = |ip: &IpAddr| match ip {
         IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
         // IPv6 is skipped entirely: the URL would need bracket syntax, and any phone that can
@@ -213,7 +213,7 @@ fn generate_cert(ips: &[IpAddr]) -> Result<(Vec<u8>, Vec<u8>), String> {
     ))
 }
 
-fn render_qr(url: &str) -> String {
+pub(crate) fn render_qr(url: &str) -> String {
     use qrcode::{render::svg, QrCode};
     match QrCode::new(url) {
         Ok(code) => code
@@ -420,6 +420,33 @@ pub async fn phone_camera_status(
         }
         None => Ok(None),
     }
+}
+
+// The Briefcast phone app (phone_transfer.rs) can be the phone camera too, over the connection it
+// already has instead of this module's own server - no second QR code, no certificate warning. It
+// hands over a sender for what this side writes, and passes on what the phone writes, exactly as
+// handle_phone_socket does for this module's own page; everything downstream sees one phone.
+pub(crate) async fn attach_external_phone(app: &AppHandle, tx: mpsc::UnboundedSender<String>) {
+    use tauri::Manager;
+    *app.state::<PhoneCameraState>().phone_tx.lock().await = Some(tx);
+    let _ = app.emit("phone-camera-state", "connected");
+    log::info!("Phone camera: the Briefcast phone app connected as the camera");
+}
+
+// Only if `tx` is still the current phone - a newer one must not be torn down by this one leaving.
+pub(crate) async fn detach_external_phone(app: &AppHandle, tx: &mpsc::UnboundedSender<String>) {
+    use tauri::Manager;
+    let state = app.state::<PhoneCameraState>();
+    let mut guard = state.phone_tx.lock().await;
+    if guard.as_ref().map(|s| s.same_channel(tx)).unwrap_or(false) {
+        *guard = None;
+        drop(guard);
+        let _ = app.emit("phone-camera-state", "disconnected");
+    }
+}
+
+pub(crate) fn relay_from_external_phone(app: &AppHandle, signal: String) {
+    let _ = app.emit("phone-camera-signal", signal);
 }
 
 // Desktop -> phone half of the signalling relay. `payload` is an already-serialised JSON string

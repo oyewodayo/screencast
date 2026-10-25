@@ -22,8 +22,357 @@
 // The previous live filter (compressor + 6dB) made pauses *louder* relative to speech (-18dB ->
 // -8.5dB) and left a quiet passage 2.5dB under. Cost of this one: ~1.7% of the recording's
 // length (5.2s for 5 minutes), on a background thread, once.
+//
+// Before all that, steady tones are notched out (see `hum`): a fan, coil whine or electrical hum
+// is a fixed set of pitches - one measured here at 80.8Hz and its harmonics, a "vannnn" under every
+// word - that RNNoise keeps (it's broadband noise it removes, and tones look voice-like), the 80Hz
+// highpass barely touches, and dynaudnorm then lifts in every pause.
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+pub mod hum {
+    // Finds the steady tones in a recording and builds the narrow notches that remove them.
+    //
+    // Speech moves - its pitch and harmonics change from one half second to the next - while a fan
+    // or whine sits on the same frequencies for the whole recording, pauses included. So the
+    // analysis takes the per-bin *median* spectrum of the quietest frames (the pauses: speech is
+    // gone, the tone isn't), keeps peaks standing well clear of their neighbourhood, and confirms
+    // each is there in most of those frames individually.
+    //
+    // Each tone is then removed by two `bandreject` notches in series, ~4-9Hz wide. Measured on a
+    // real recording (a fan at 80.7Hz + 13 harmonics): every harmonic down 19-27dB in the pauses,
+    // while white noise through the same chain loses 0.13dB overall (0.5dB at 10Hz from a tone,
+    // nothing beyond). The first version used `equalizer` cuts instead: a peaking EQ's width is
+    // measured at half its cut, so a -25dB cut spread into a skirt still -3.5dB 20Hz away and took
+    // 3dB off the voice - don't go back to it.
+    use std::io::Read;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    const RATE: usize = 16_000;
+    const FRAME: usize = 8192; // ~2Hz bins at 16kHz
+    const HOP: usize = 4096;
+    // Up to two minutes is plenty to find a steady tone, and keeps the analysis well under a second.
+    const MAX_SECONDS: usize = 120;
+    const MIN_HZ: f64 = 40.0;
+    const MAX_HZ: f64 = 6000.0;
+    // How far a peak must stand above its surroundings in the median spectrum, and in each frame.
+    const PROMINENCE_DB: f64 = 10.0;
+    const PER_FRAME_DB: f64 = 5.0;
+    // Share of the quiet frames (the pauses - see QUIET_SHARE) a tone must show up in. A voice is by
+    // definition absent from the pauses, so this is what tells a fan from speech.
+    const PRESENCE: f64 = 0.7;
+    const QUIET_SHARE: f64 = 0.4;
+    const MAX_NOTCHES: usize = 16;
+    // Notch width (-3dB points): a fan's pitch wanders a little, and more in Hz the higher the
+    // harmonic, so the width grows with frequency - 4.4Hz at 80Hz, 8.9Hz at 980Hz.
+    const WIDTH_HZ: f64 = 4.0;
+    const WIDTH_PER_HZ: f64 = 0.005;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Tone {
+        pub hz: f64,
+        // How far it stands above its surroundings (dB) - which tones count, and which matter most.
+        pub prominence_db: f64,
+    }
+
+    // The notch chain for `map` of `input`, or None when there's no steady tone (or it can't be
+    // analysed - this is a refinement, never a reason for enhancement to fail).
+    pub fn notch_filter(ffmpeg: &Path, input: &Path, map: &str) -> Option<String> {
+        let samples = decode(ffmpeg, input, map)?;
+        let tones = find_tones(&samples);
+        if tones.is_empty() {
+            return None;
+        }
+        log::info!(
+            "Removing {} steady tone(s): {}",
+            tones.len(),
+            tones.iter().map(|t| format!("{:.1}Hz ({:.0}dB)", t.hz, t.prominence_db)).collect::<Vec<_>>().join(", ")
+        );
+        Some(filter_for(&tones))
+    }
+
+    // Two identical notches per tone: one notch's center is deep but narrow; a second in series
+    // roughly doubles the cut across the width the tone wanders in.
+    pub fn filter_for(tones: &[Tone]) -> String {
+        tones
+            .iter()
+            .flat_map(|t| {
+                let notch = format!("bandreject=f={:.1}:t=h:w={:.1}", t.hz, WIDTH_HZ + t.hz * WIDTH_PER_HZ);
+                [notch.clone(), notch]
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn decode(ffmpeg: &Path, input: &Path, map: &str) -> Option<Vec<f32>> {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(input)
+            .args(["-map", map, "-t", &MAX_SECONDS.to_string(), "-ac", "1", "-ar", &RATE.to_string(), "-f", "f32le", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        crate::commands::recording::hide_console_window(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
+        let mut bytes = Vec::new();
+        child.stdout.take()?.read_to_end(&mut bytes).ok()?;
+        let _ = child.wait();
+        Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    }
+
+    pub fn find_tones(samples: &[f32]) -> Vec<Tone> {
+        if samples.len() < FRAME * 4 {
+            return Vec::new();
+        }
+        let window: Vec<f32> = (0..FRAME)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FRAME - 1) as f32).cos())
+            .collect();
+        // Per-frame spectra in dB with each frame's energy, digital silence skipped (it would drag
+        // every median down).
+        let mut frames: Vec<(f32, Vec<f32>)> = Vec::new();
+        let mut start = 0;
+        while start + FRAME <= samples.len() {
+            let chunk = &samples[start..start + FRAME];
+            let energy: f32 = chunk.iter().map(|s| s * s).sum();
+            if chunk.iter().any(|s| s.abs() > 1e-6) {
+                let mut re: Vec<f32> = chunk.iter().zip(&window).map(|(s, w)| s * w).collect();
+                let mut im = vec![0.0f32; FRAME];
+                fft(&mut re, &mut im);
+                frames.push((energy, (0..FRAME / 2).map(|k| 10.0 * (re[k] * re[k] + im[k] * im[k] + 1e-20).log10()).collect()));
+            }
+            start += HOP;
+        }
+        // The pauses: the quietest frames.
+        frames.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let quiet = ((frames.len() as f64 * QUIET_SHARE).ceil() as usize).max(4);
+        if frames.len() < quiet {
+            return Vec::new();
+        }
+        let frames: Vec<Vec<f32>> = frames.into_iter().take(quiet).map(|(_, f)| f).collect();
+        let bins = FRAME / 2;
+        let median: Vec<f32> = (0..bins)
+            .map(|k| {
+                let mut v: Vec<f32> = frames.iter().map(|f| f[k]).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            })
+            .collect();
+
+        let hz_per_bin = RATE as f64 / FRAME as f64;
+        let lo = (MIN_HZ / hz_per_bin) as usize;
+        let hi = ((MAX_HZ / hz_per_bin) as usize).min(bins - 2);
+        let mut tones = Vec::new();
+        for k in lo.max(1)..hi {
+            if !(median[k] > median[k - 1] && median[k] >= median[k + 1]) {
+                continue;
+            }
+            let prominence = (median[k] - floor(&median, k)) as f64;
+            if prominence < PROMINENCE_DB {
+                continue;
+            }
+            let present = frames.iter().filter(|f| {
+                let best = f[k - 1].max(f[k]).max(f[k + 1]);
+                (best - floor(f, k)) as f64 >= PER_FRAME_DB
+            });
+            if (present.count() as f64) < PRESENCE * frames.len() as f64 {
+                continue;
+            }
+            // Parabolic interpolation between bins for the exact pitch.
+            let (a, b, c) = (median[k - 1] as f64, median[k] as f64, median[k + 1] as f64);
+            let offset = 0.5 * (a - c) / (a - 2.0 * b + c);
+            let offset = if offset.is_finite() { offset.clamp(-0.5, 0.5) } else { 0.0 };
+            tones.push(Tone { hz: (k as f64 + offset) * hz_per_bin, prominence_db: prominence });
+        }
+        tones.sort_by(|a, b| b.prominence_db.partial_cmp(&a.prominence_db).unwrap());
+        tones.truncate(MAX_NOTCHES);
+        tones.sort_by(|a, b| a.hz.partial_cmp(&b.hz).unwrap());
+        tones
+    }
+
+    // The spectrum's level around bin `k`: the median of a ±40Hz neighbourhood, leaving out ±6Hz
+    // around the bin itself (the peak's own skirt).
+    fn floor(spectrum: &[f32], k: usize) -> f32 {
+        let span = 20; // bins, ~40Hz
+        let gap = 3; // bins, ~6Hz
+        let mut v: Vec<f32> = (k.saturating_sub(span)..(k + span + 1).min(spectrum.len()))
+            .filter(|&i| i + gap < k || i > k + gap)
+            .map(|i| spectrum[i])
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    // Fast Fourier transform: turns `re` (+ `im`, all zeros for audio) from N time-domain samples
+    // into N frequency bins, in place. Afterwards bin k holds the amplitude and phase of frequency
+    // k * sample_rate / N as the complex number (re[k], im[k]); for real input only bins 0..N/2
+    // matter (the rest mirror them). Here N = FRAME = 8192 at 16kHz, so a bin is 1.95Hz wide.
+    //
+    // This is the textbook iterative radix-2 Cooley-Tukey algorithm (decimation in time):
+    //   1. Bit-reversal permutation. The algorithm combines pairs of samples whose indices differ in
+    //      their lowest bit first, then pairs of pairs, and so on; reordering the input by the
+    //      bit-reversed index puts every pair it combines next to each other, so all later steps
+    //      work on contiguous blocks. E.g. for N = 8, index 1 (001) swaps with 4 (100).
+    //   2. log2(N) passes of "butterflies". Pass `len` merges every two neighbouring transforms of
+    //      length len/2 into one of length len: for each k in the first half,
+    //          X[k]         = E[k] + w^k * O[k]
+    //          X[k + len/2] = E[k] - w^k * O[k]
+    //      where E/O are the two halves' transforms (the even- and odd-indexed samples, thanks to
+    //      step 1) and w^k = e^(-2*pi*i*k/len) is the "twiddle factor" - a rotation by k/len of a
+    //      turn. One complex multiply serves both outputs, which is the whole O(N log N) trick.
+    //
+    // Cost: 8192 points x 13 passes per frame, ~470 frames for the two minutes analysed. Measured:
+    // the whole analysis (decode + every frame) of a 3.5-minute MP3 took 2.1s in a release build.
+    //
+    // Requirements: re.len() == im.len(), and a power of two (FRAME is).
+    //
+    // If it ever needs to be faster, in order of payoff:
+    //   - precompute the twiddles once (a table of N/2 cos/sin pairs) instead of sin_cos() in the
+    //     inner loop - the single biggest cost here;
+    //   - use a real-input FFT (half the work: pack the N real samples as N/2 complex ones, transform,
+    //     then untangle), or the `realfft`/`rustfft` crates, which add SIMD and mixed radices;
+    //   - process frames in parallel (they're independent) with std::thread::scope.
+    // `fft_matches_a_direct_dft` checks any change against the definition.
+    fn fft(re: &mut [f32], im: &mut [f32]) {
+        let n = re.len();
+        debug_assert!(n.is_power_of_two() && im.len() == n);
+
+        // 1. Bit-reversal permutation. `j` walks the bit-reversed counterpart of `i`: adding 1 to a
+        //    bit-reversed number means flipping its top bits down to (and including) the first 0,
+        //    which is what the inner loop does.
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                // Swap each pair once (i < j), not twice.
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+
+        // 2. Butterfly passes: transforms of length 2, 4, 8, ... N, each built from two of half length.
+        let mut len = 2;
+        while len <= n {
+            // The rotation per step for this length: -2*pi/len (negative = forward transform).
+            let angle = -2.0 * std::f64::consts::PI / len as f64;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    // Twiddle w^k, computed in f64 so rounding doesn't build up over 13 passes.
+                    let (s, c) = (angle * k as f64).sin_cos();
+                    let (wr, wi) = (c as f32, s as f32);
+                    // a: E[k] (first half of the block), b: O[k] (second half).
+                    let (a, b) = (start + k, start + k + len / 2);
+                    // t = w^k * O[k] (complex multiply).
+                    let tr = re[b] * wr - im[b] * wi;
+                    let ti = re[b] * wi + im[b] * wr;
+                    // X[k + len/2] = E[k] - t, X[k] = E[k] + t.
+                    re[b] = re[a] - tr;
+                    im[b] = im[a] - ti;
+                    re[a] += tr;
+                    im[a] += ti;
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Deterministic noise without a dependency.
+        fn noise(n: usize, seed: u64) -> Vec<f32> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
+                })
+                .collect()
+        }
+
+        #[test]
+        fn finds_a_fan_and_its_harmonics_but_not_a_moving_voice() {
+            let n = RATE * 30;
+            let room = noise(n, 7);
+            let pi2 = 2.0 * std::f64::consts::PI;
+            let samples: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = i as f64 / RATE as f64;
+                    // The hum measured in a real recording: 80.8Hz and harmonics, ~-60dBFS.
+                    let hum: f64 = (1..=5).map(|h| 0.001 * (pi2 * 80.8 * h as f64 * t).sin()).sum();
+                    // "Speech": a loud voice whose pitch glides 110-220Hz, with harmonics.
+                    let f0 = 165.0 + 55.0 * (pi2 * 0.4 * t).sin();
+                    let phase = pi2 * (165.0 * t - 55.0 / (pi2 * 0.4) * (pi2 * 0.4 * t).cos());
+                    let voice: f64 = (1..=6).map(|h| 0.05 / h as f64 * (phase * h as f64).sin()).sum::<f64>()
+                        * if (t / 4.0).fract() < 0.625 { 1.0 } else { 0.0 }; // 2.5s phrases, 1.5s pauses
+                    let _ = f0;
+                    (hum + voice) as f32 + room[i] * 0.0003
+                })
+                .collect();
+            let tones = find_tones(&samples);
+            let hz: Vec<f64> = tones.iter().map(|t| t.hz).collect();
+            for h in 1..=5 {
+                let want = 80.8 * h as f64;
+                assert!(hz.iter().any(|f| (f - want).abs() < 1.0), "missed {want}Hz in {hz:?}");
+            }
+            assert_eq!(tones.len(), 5, "found more than the hum: {tones:?}");
+        }
+
+        // Not a unit test: prints the notches for a real recording ($HUM_FILE, $FFMPEG_DIR).
+        #[test]
+        #[ignore]
+        fn notches_for_a_real_recording() {
+            let (Ok(file), Ok(dir)) = (std::env::var("HUM_FILE"), std::env::var("FFMPEG_DIR")) else { return };
+            let ffmpeg = std::path::Path::new(&dir).join("ffmpeg.exe");
+            let t = std::time::Instant::now();
+            let f = notch_filter(&ffmpeg, std::path::Path::new(&file), "0:a:0");
+            println!("analysis {:?}
+FILTER {}", t.elapsed(), f.unwrap_or_default());
+        }
+
+        // The FFT against the definition, X[k] = sum_n x[n] * e^(-2*pi*i*k*n/N), on noise.
+        #[test]
+        fn fft_matches_a_direct_dft() {
+            let n = 256;
+            let x = noise(n, 11);
+            let (mut re, mut im) = (x.clone(), vec![0.0f32; n]);
+            fft(&mut re, &mut im);
+            for k in 0..n {
+                let (mut dr, mut di) = (0.0f64, 0.0f64);
+                for (t, &v) in x.iter().enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                    dr += v as f64 * a.cos();
+                    di += v as f64 * a.sin();
+                }
+                assert!((re[k] as f64 - dr).abs() < 1e-3 && (im[k] as f64 - di).abs() < 1e-3, "bin {k}");
+            }
+        }
+
+        #[test]
+        fn a_clean_recording_gets_no_notches() {
+            let samples: Vec<f32> = noise(RATE * 20, 3).iter().map(|s| s * 0.01).collect();
+            assert!(find_tones(&samples).is_empty());
+        }
+
+        #[test]
+        fn notches_are_narrow_true_notches() {
+            let f = filter_for(&[Tone { hz: 80.84, prominence_db: 22.0 }, Tone { hz: 980.0, prominence_db: 40.0 }]);
+            assert_eq!(
+                f,
+                "bandreject=f=80.8:t=h:w=4.4,bandreject=f=80.8:t=h:w=4.4,bandreject=f=980.0:t=h:w=8.9,bandreject=f=980.0:t=h:w=8.9"
+            );
+        }
+    }
+}
 
 // Integrated loudness everything is delivered at.
 pub const TARGET_LUFS: f64 = -16.0;
@@ -94,8 +443,10 @@ pub fn clean_voice(
     out: &Path,
     model: Option<&str>,
 ) -> Result<Option<f64>, String> {
+    let hum = hum::notch_filter(ffmpeg, input, map);
     let af = format!(
-        "aformat=channel_layouts=mono,{},ebur128=framelog=quiet",
+        "aformat=channel_layouts=mono,{}{},ebur128=framelog=quiet",
+        hum.map(|h| format!("{},", h)).unwrap_or_default(),
         voice_chain(model)
     );
     let mut cmd = Command::new(ffmpeg);

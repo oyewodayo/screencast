@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { PhonesDockButton } from './PhonesHub';
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
 import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
 
@@ -203,6 +204,7 @@ const ActiveRecordingState = (
                     >
                       <IoCutOutline />
                     </button>
+                    <PhonesDockButton className={iconButtonClass()} />
                     <button
                     type="button"
                     className={iconButtonClass()}

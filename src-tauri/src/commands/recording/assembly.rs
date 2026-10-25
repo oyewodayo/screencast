@@ -465,6 +465,8 @@ pub(crate) struct CaptureCommand {
     pub progress_path: PathBuf,
     pub framerate: i32,
     pub latency_hns: i64,
+    // The window this captures on its own (gfxcapture), if it does - see capture_watchdog.
+    pub window: Option<isize>,
 }
 
 // One restart's intermediate (see Assembly::restarts).

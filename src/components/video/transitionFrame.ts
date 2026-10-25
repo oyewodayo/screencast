@@ -3,11 +3,12 @@
 // Draws one moment of a transition: the outgoing clip's frozen frame (`mover`) animated out over
 // whatever sits beneath it (the incoming clip), plus the synthetic layers some transitions add on
 // top - a black dip, a coloured glow, a pixelated copy, and an `fx` canvas for the drawn ones (a
-// page curl's flap and shadow, a colour sweep's panels). Shared by the player's live preview
+// colour sweep's panels). Shared by the player's live preview
 // (TransitionPreviewLayer) and the animated tiles in the transition picker (TransitionGrid), so a
 // tile shows exactly what the preview - and the export (transition_fold_step, conversion.rs),
 // which mirrors the same maths - will do.
 import { LeakDirection, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
+import { TransitionPictures, drawCanvasTransition, isCanvasTransition } from "./transitionCanvas";
 
 export interface TransitionElements {
   // The outgoing frame, filling the whole container box.
@@ -21,6 +22,10 @@ export interface TransitionElements {
   fx: HTMLCanvasElement | null;
   // The outgoing frame itself, for the pixelize copy.
   source: CanvasImageSource;
+  // Both pictures as the frame shows them, for the transitions that move both (transitionCanvas.ts) -
+  // asked for only by those, once per drawn frame. Null while they aren't ready: the outgoing
+  // picture then just holds.
+  pictures?: () => TransitionPictures | null;
 }
 
 // The frame rect (the picture) inside the container box the mover fills.
@@ -33,10 +38,19 @@ export interface TransitionGeometry {
   containerH: number;
 }
 
-// Pixelize's coarsest block, as a fraction of the frame width (export: transition_window_graph).
+// Pixelize's coarsest block, as a fraction of the frame width (times look.size; export:
+// transition_window_graph).
 const PIXELIZE_MAX_BLOCK_FRACTION = 1 / 24;
+// Dissolve grain / pixelize block size.
+const lookSize = (look: TransitionLook) => Math.max(0.3, Math.min(3, look.size ?? 1));
+// Soft edges (look.softness 0..1): a wipe's, as a fraction of the frame width; a circle's, of its
+// diagonal; a clock wipe's, in degrees.
+const softness = (look: TransitionLook) => Math.max(0, Math.min(1, look.softness ?? 0));
+const wipeSoftness = (look: TransitionLook) => 0.3 * softness(look);
+const circleSoftness = (look: TransitionLook) => 0.15 * softness(look);
+const radialSoftness = (look: TransitionLook) => 60 * softness(look);
 
-// Dissolve's grain: a fixed noise field DISSOLVE_COLS cells across (rows to the frame's aspect),
+// Dissolve's grain: a fixed noise field DISSOLVE_COLS / look.size cells across (rows to the frame's aspect),
 // each cell switching to the new clip once the progress passes its value - the same hash, grid
 // and bilinear upscale as the export's mask (transition_window_graph, conversion.rs).
 const DISSOLVE_COLS = 160;
@@ -57,8 +71,7 @@ function noiseField(cols: number, rows: number): Float32Array {
 }
 let dissolveCanvas: HTMLCanvasElement | null = null;
 // The outgoing picture's dissolve mask at progress p, as a data URL (opaque = still showing).
-function dissolveMask(W: number, H: number, p: number): string {
-  const cols = DISSOLVE_COLS;
+function dissolveMask(W: number, H: number, p: number, cols: number): string {
   const rows = Math.max(1, Math.round((cols * H) / W));
   const field = noiseField(cols, rows);
   dissolveCanvas ??= document.createElement("canvas");
@@ -73,11 +86,6 @@ function dissolveMask(W: number, H: number, p: number): string {
   return dissolveCanvas.toDataURL();
 }
 
-// Page curl: how wide the curl is, and the shadows either side of it, in u+v units (u, v =
-// position across / down the frame, 0..1). Same constants as drawn_transition (conversion.rs).
-export const CURL_FLAP = 0.45;
-const CURL_SHADOW = 0.12;
-const CURL_CAST = 0.06;
 // Colour sweep: the lighter band at the panel's edges, as a fraction of the frame.
 export const SWEEP_ACCENT = 0.08;
 export const DEFAULT_SWEEP_COLOR = "#ffb020";
@@ -123,31 +131,6 @@ const smoothstep = (x: number) => {
   return c * c * (3 - 2 * c);
 };
 
-type Pt = [number, number];
-const UNIT_SQUARE: Pt[] = [
-  [0, 0],
-  [1, 0],
-  [1, 1],
-  [0, 1],
-];
-
-// The part of a convex polygon where a*u + b*v <= c (one Sutherland-Hodgman pass).
-function clipPoly(poly: Pt[], a: number, b: number, c: number): Pt[] {
-  const out: Pt[] = [];
-  for (let i = 0; i < poly.length; i++) {
-    const p = poly[i];
-    const q = poly[(i + 1) % poly.length];
-    const fp = a * p[0] + b * p[1] - c;
-    const fq = a * q[0] + b * q[1] - c;
-    if (fp <= 0) out.push(p);
-    if ((fp < 0 && fq > 0) || (fp > 0 && fq < 0)) {
-      const t = fp / (fp - fq);
-      out.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
-    }
-  }
-  return out;
-}
-
 // The sweep's travel coordinate g (0 where it starts, 1 where it leaves) for a point (u, v).
 const sweepAxis = (direction: LeakDirection | undefined): "up" | "down" | "left" | "right" =>
   direction === "down" || direction === "left" || direction === "right" ? direction : "up";
@@ -181,8 +164,7 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
   mover.style.transform = "";
   mover.style.transformOrigin = "";
   mover.style.clipPath = "";
-  mover.style.setProperty("mask-image", "");
-  mover.style.setProperty("-webkit-mask-image", "");
+  for (const prefix of ["", "-webkit-"]) for (const prop of ["mask-image", "mask-size", "mask-position", "mask-repeat"]) mover.style.setProperty(prefix + prop, "");
   mover.style.filter = "";
   black.style.opacity = "0";
   glow.style.opacity = "0";
@@ -190,8 +172,16 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
   if (pixel) pixel.style.display = "none";
   if (fx) fx.style.display = "none";
 
-  // Frame-local (0..1) polygon -> mover clip-path in container px.
-  const toClipPath = (poly: Pt[]) => `polygon(${poly.map(([u, v]) => `${L + u * W}px ${T + v * H}px`).join(",")})`;
+  if (isCanvasTransition(type)) {
+    // Composited whole from both pictures on the fx canvas, which covers the frame.
+    const pics = els.pictures?.() ?? null;
+    const ctx = pics && fx ? fxContext(fx, W, H) : null;
+    if (!pics || !fx || !ctx) return;
+    fx.style.display = "block";
+    mover.style.opacity = "0";
+    drawCanvasTransition(ctx, type, look, p, pics, W, H, window.devicePixelRatio || 1);
+    return;
+  }
 
   switch (type) {
     case null:
@@ -260,57 +250,6 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
       glow.style.opacity = String(Math.min(1, 0.35 * strength * Math.sin(Math.PI * p) ** 2));
       break;
     }
-    case "pagecurl": {
-      // The outgoing page peels away from its bottom-right corner: what's left of it, a paper-white
-      // curl along its edge, a shadow cast on the page by the curl and on the new clip by the
-      // fold. The fold line is u + v = k, sweeping from the corner (k = 2) to the opposite one (0);
-      // everything is a function of u + v - k alone, which is what lets the export draw it once and
-      // slide it (drawn_transition, conversion.rs).
-      const k = 2 - 2 * p;
-      const page = clipPoly(UNIT_SQUARE, 1, 1, k);
-      if (page.length < 3) {
-        mover.style.opacity = "0";
-      } else {
-        mover.style.clipPath = toClipPath(page);
-      }
-      const ctx = fx && fxContext(fx, W, H);
-      if (!fx || !ctx) break;
-      fx.style.display = "block";
-      // A point on the line u + v = c, along the line's normal from the frame's origin (frame px).
-      const n2 = 1 / (W * W) + 1 / (H * H);
-      const onLine = (c: number): Pt => [(c / n2) / W, (c / n2) / H];
-      const fill = (poly: Pt[], from: number, to: number, stops: [number, string][]) => {
-        if (poly.length < 3) return;
-        const [x0, y0] = onLine(from);
-        const [x1, y1] = onLine(to);
-        const grad = ctx.createLinearGradient(x0, y0, x1, y1);
-        stops.forEach(([at, color]) => grad.addColorStop(at, color));
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        poly.forEach(([u, v], i) => (i ? ctx.lineTo(u * W, v * H) : ctx.moveTo(u * W, v * H)));
-        ctx.closePath();
-        ctx.fill();
-      };
-      // Shadow on the new clip, just past the fold.
-      fill(clipPoly(clipPoly(UNIT_SQUARE, -1, -1, -k), 1, 1, k + CURL_SHADOW), k, k + CURL_SHADOW, [
-        [0, "rgba(0,0,0,0.45)"],
-        [1, "rgba(0,0,0,0)"],
-      ]);
-      // Shadow the curl casts on the page beyond its inner edge.
-      fill(clipPoly(clipPoly(page, 1, 1, k - CURL_FLAP), -1, -1, -(k - CURL_FLAP - CURL_CAST)), k - CURL_FLAP, k - CURL_FLAP - CURL_CAST, [
-        [0, "rgba(0,0,0,0.3)"],
-        [1, "rgba(0,0,0,0)"],
-      ]);
-      // The curl, CURL_FLAP wide: dim at the crease and the edge, bright across the middle.
-      fill(clipPoly(page, -1, -1, -(k - CURL_FLAP)), k, k - CURL_FLAP, [
-        [0, "#bfbfbf"],
-        [0.25, "#e4e4e4"],
-        [0.5, "#f3f3f3"],
-        [0.75, "#e4e4e4"],
-        [1, "#bfbfbf"],
-      ]);
-      break;
-    }
     case "colorsweep": {
       // A colour panel slides across - one frame plus a lighter band at each end long, so its
       // leading edge has covered the old clip by the midpoint and its trailing edge uncovers the
@@ -356,11 +295,23 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
       break;
     }
     case "wipeleft":
-      mover.style.clipPath = `inset(${T}px ${R + W * p}px ${B}px ${L}px)`;
+    case "wiperight": {
+      const left = type === "wipeleft";
+      const S = wipeSoftness(look) * W;
+      if (S < 0.5) {
+        mover.style.clipPath = left ? `inset(${T}px ${R + W * p}px ${B}px ${L}px)` : `inset(${T}px ${R}px ${B}px ${L + W * p}px)`;
+        break;
+      }
+      // A soft edge S wide, travelling far enough to clear the frame at both ends.
+      const e = L + (left ? (1 - p) * (W + S) : p * (W + S)) - S / 2;
+      const mask = left
+        ? `linear-gradient(to right, #000 ${e - S / 2}px, transparent ${e + S / 2}px)`
+        : `linear-gradient(to right, transparent ${e - S / 2}px, #000 ${e + S / 2}px)`;
+      mover.style.clipPath = `inset(${T}px ${R}px ${B}px ${L}px)`;
+      mover.style.setProperty("mask-image", mask);
+      mover.style.setProperty("-webkit-mask-image", mask);
       break;
-    case "wiperight":
-      mover.style.clipPath = `inset(${T}px ${R}px ${B}px ${L + W * p}px)`;
-      break;
+    }
     case "slideleft":
       mover.style.transform = `translateX(${-W * p}px)`;
       break;
@@ -368,15 +319,21 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
       mover.style.transform = `translateX(${W * p}px)`;
       break;
     case "circleopen": {
-      const radius = (p * Math.hypot(W, H)) / 2;
-      const mask = `radial-gradient(circle at ${cx}px ${cy}px, transparent ${radius}px, #000 ${radius + 1}px)`;
+      const S = circleSoftness(look) * Math.hypot(W, H);
+      const radius = p * (Math.hypot(W, H) / 2 + S) - S / 2;
+      const mask = `radial-gradient(circle at ${cx}px ${cy}px, transparent ${radius - S / 2}px, #000 ${radius + Math.max(1, S / 2)}px)`;
       mover.style.setProperty("mask-image", mask);
       mover.style.setProperty("-webkit-mask-image", mask);
       break;
     }
     case "radial": {
-      const angle = p * 360;
-      const mask = `conic-gradient(from 0deg at ${cx}px ${cy}px, transparent ${angle}deg, #000 ${angle}deg)`;
+      // A clock hand sweeping round from 12 o'clock, its edge A degrees soft.
+      const A = radialSoftness(look);
+      const angle = p * (360 + A) - A / 2;
+      const mask =
+        look.direction === "left"
+          ? `conic-gradient(from 0deg at ${cx}px ${cy}px, #000 ${360 - angle - A / 2}deg, transparent ${360 - angle + A / 2}deg)`
+          : `conic-gradient(from 0deg at ${cx}px ${cy}px, transparent ${angle - A / 2}deg, #000 ${angle + A / 2}deg)`;
       mover.style.setProperty("mask-image", mask);
       mover.style.setProperty("-webkit-mask-image", mask);
       break;
@@ -392,7 +349,7 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
         mover.style.opacity = "0";
         break;
       }
-      const block = 1 + (Math.max(2, W * PIXELIZE_MAX_BLOCK_FRACTION) - 1) * Math.min(1, p * 2);
+      const block = 1 + (Math.max(2, W * PIXELIZE_MAX_BLOCK_FRACTION * lookSize(look)) - 1) * Math.min(1, p * 2);
       const w = Math.max(1, Math.round(W / block));
       const h = Math.max(1, Math.round(H / block));
       if (pixel.width !== w || pixel.height !== h) {
@@ -410,7 +367,7 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
       break;
     }
     case "dissolve": {
-      const mask = `url(${dissolveMask(W, H, p)})`;
+      const mask = `url(${dissolveMask(W, H, p, Math.round(DISSOLVE_COLS / lookSize(look)))})`;
       mover.style.setProperty("mask-image", mask);
       mover.style.setProperty("-webkit-mask-image", mask);
       for (const prefix of ["", "-webkit-"]) {

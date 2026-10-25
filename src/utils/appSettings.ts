@@ -88,6 +88,16 @@ export interface AppSettings {
   // Live background behind the person in the webcam bubble while recording (camera_effects.rs) -
   // off unless picked in the Screen Options modal; remembered between recordings.
   cameraBackground: CameraBackgroundPref;
+  // Draw the mouse pointer into screen recordings and screenshots (Screen Options -> Options).
+  captureCursor: boolean;
+  // A window capture includes the window's title bar and frame; off records just its content.
+  windowTitleBar: boolean;
+  // "Editable pointer": screen recordings leave the pointer out of the picture and record its path,
+  // clicks and looks beside it, for the editor to draw smoothed / enlarged / with click ripples
+  // (Screen Style). Windows only.
+  editablePointer: boolean;
+  // "Record shortcuts": keyboard shortcuts (never typing) recorded for the editor's key chips.
+  recordShortcuts: boolean;
 }
 
 export interface CameraBackgroundPref {
@@ -146,6 +156,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   cameraBorder: "none",
   cameraBorderColor: "#ffffff",
   cameraBackground: { kind: "off", amount: 0.6, color: "#0f172a", imagePath: null },
+  captureCursor: true,
+  windowTitleBar: false,
+  editablePointer: false,
+  recordShortcuts: false,
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

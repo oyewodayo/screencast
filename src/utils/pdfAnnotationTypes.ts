@@ -99,9 +99,28 @@ export interface ImageObject extends BaseObject {
   rotation: number; // radians
 }
 
+// An axis-aligned box in PDF page-space, normalized so x1 <= x2 and y1 <= y2 (y-up, like Pt).
+export interface PdfRect {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+// A comment pinned to a run of the page's own text: one rect per selected line (merged from the
+// text layer's selection at creation time, so it never re-derives against the text layer later),
+// plus the quoted text itself so the comment still reads sensibly without the page in view.
+export interface CommentObject extends BaseObject {
+  type: "comment";
+  rects: PdfRect[];
+  quote: string;
+  text: string;
+  color: string;
+}
+
 // Discriminated union. Phase 2 still has room for 'shape'/'note' (sticky-note) variants beyond
 // this — purely additive, no migration needed as long as readers skip unknown types.
-export type AnnotationObject = StrokeObject | HighlightObject | TextObject | ImageObject;
+export type AnnotationObject = StrokeObject | HighlightObject | TextObject | ImageObject | CommentObject;
 
 export interface PdfAnnotationPage {
   pageIndex: number;

@@ -92,10 +92,17 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
     };
   }, [on]);
 
-  // Off, or the preview went away: the feed stops (unless a recording is using it).
+  // Switched off with the preview still open: the feed hands the camera straight back, so the
+  // plain preview (and nothing else waiting on the camera) isn't left on "In use elsewhere".
+  // Closing the preview (below) keeps the grace period, for Start to reuse the warm feed.
+  const wasOn = useRef(false);
   useEffect(() => {
-    if (on) return;
-    void invoke("camera_effect_stop").catch(() => {});
+    if (on) {
+      wasOn.current = true;
+      return;
+    }
+    void invoke("camera_effect_stop", { immediate: wasOn.current }).catch(() => {});
+    wasOn.current = false;
   }, [on]);
   useEffect(
     () => () => {

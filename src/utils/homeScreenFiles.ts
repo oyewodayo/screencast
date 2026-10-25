@@ -14,6 +14,18 @@ const RECENT_KEY = "briefcast.recentFiles.v1";
 // opened but not edited still rank as recent (its file/updated time wouldn't move).
 const OPENED_AT_KEY = "briefcast.openedAt.v1";
 const MAX_OPENED_AT = 200;
+// Files that came in from a phone (Wi-Fi transfer, its share sheet, or a USB import), keyed by
+// path - they join the recent list so the home screen shows what just arrived, and from where.
+const ARRIVALS_KEY = "briefcast.fileArrivals.v1";
+const MAX_ARRIVALS = 50;
+
+export interface FileArrival {
+  from: string; // the phone's name
+  at: number;
+  batch: string;
+  // Files of the same batch this entry stands for (itself included).
+  count: number;
+}
 
 function loadPaths(key: string): string[] {
   try {
@@ -89,6 +101,48 @@ export function recordFileOpened(path: string): string[] {
   return next;
 }
 
+export function getArrivals(): Record<string, FileArrival> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ARRIVALS_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveArrivals(map: Record<string, FileArrival>): void {
+  const kept = Object.entries(map)
+    .sort((a, b) => b[1].at - a[1].at)
+    .slice(0, MAX_ARRIVALS);
+  try {
+    localStorage.setItem(ARRIVALS_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    /* storage unavailable - arrivals just aren't tagged */
+  }
+}
+
+// A file arrived from a phone: it goes to the top of the recent list, tagged with where it came
+// from. One row per batch - a later file of the same batch takes the earlier one's place and
+// carries the count - so twelve shared photos show as one entry rather than pushing everything
+// the user was working on off the home screen.
+export function recordFileArrived(
+  path: string,
+  from: string,
+  batch: string,
+  at = Date.now()
+): { recent: string[]; arrivals: Record<string, FileArrival> } {
+  const arrivals = getArrivals();
+  const earlier = Object.keys(arrivals).filter((p) => p !== path && arrivals[p].batch === batch);
+  const count = 1 + earlier.reduce((n, p) => Math.max(n, arrivals[p].count), 0);
+  for (const p of earlier) delete arrivals[p];
+  arrivals[path] = { from, at, batch, count };
+  saveArrivals(arrivals);
+  const recent = [path, ...getRecentPaths().filter((p) => p !== path && !earlier.includes(p))].slice(0, MAX_HOME_SCREEN_FILES);
+  savePaths(RECENT_KEY, recent);
+  recordItemOpened(path, at);
+  return { recent, arrivals: getArrivals() };
+}
+
 // Keeps pin/recent-history entries pointing at a file across rename/move, instead of them silently
 // going stale the moment its path on disk changes.
 export function repathFile(oldPath: string, newPath: string): { pinned: string[]; recent: string[] } {
@@ -102,6 +156,12 @@ export function repathFile(oldPath: string, newPath: string): { pinned: string[]
     opened[newPath] = opened[oldPath];
     delete opened[oldPath];
     saveOpenedAt(opened);
+  }
+  const arrivals = getArrivals();
+  if (oldPath in arrivals) {
+    arrivals[newPath] = arrivals[oldPath];
+    delete arrivals[oldPath];
+    saveArrivals(arrivals);
   }
   return { pinned, recent };
 }
@@ -117,6 +177,11 @@ export function forgetFile(path: string): { pinned: string[]; recent: string[] }
   if (path in opened) {
     delete opened[path];
     saveOpenedAt(opened);
+  }
+  const arrivals = getArrivals();
+  if (path in arrivals) {
+    delete arrivals[path];
+    saveArrivals(arrivals);
   }
   return { pinned, recent };
 }

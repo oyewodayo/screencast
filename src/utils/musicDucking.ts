@@ -26,7 +26,7 @@ const MIN_PAUSE_SEC = 0.4;
 
 // A detached Voice track is speech to duck under, never something to duck itself.
 export function isSpeechOverlay(o: AudioOverlay): boolean {
-  return o.detached === true && /voice/i.test(o.label ?? "");
+  return (o.detached === true && /voice/i.test(o.label ?? "")) || o.recorded === true;
 }
 
 export function isDucked(o: AudioOverlay): boolean {

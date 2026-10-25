@@ -10,6 +10,8 @@
 // deleting removes a clip from the array outright.
 
 import type { AudioFx } from "./audioFx";
+import type { GainPoint } from "./audioAutomation";
+import type { MasterBus } from "./masterBus";
 import type { ChromaKey } from "./chromaKey";
 import type { LayerMask } from "./layerMask";
 import type { CutoutBackground } from "./cutoutBackground";
@@ -19,6 +21,10 @@ import type { OverlayKeyframe } from "./keyframes";
 import type { OverlayAsset } from "./videoAssets";
 import type { TextRevealSettings } from "./textReveal";
 import type { ImageRevealSettings } from "./imageReveal";
+import type { ScreenStyle } from "./screenStyle";
+import type { PointerStyle } from "./pointerTrack";
+import type { KeystrokeStyle } from "./keystrokes";
+import type { SpriteTrackSpec } from "./spriteTrack";
 
 // A per-clip color grade, applied to that clip's own trimmed segment (both live preview -
 // VideoPlayer's CSS `filter`, see cssFilterForColorPreset in videoColorFilters.ts - and export
@@ -46,7 +52,11 @@ export interface ClipGrade {
   shadows?: number;
   // A .cube file from disk (camera log conversions, film looks), applied first, mixed by intensity.
   lut?: { path: string; name: string; intensity: number };
+  // A built-in creative look (gradeLooks.ts) applied last, on top of the corrections, mixed by
+  // intensity 0..1 - baked into the same LUT, so preview and export match exactly.
+  look?: { name: GradeLookName; intensity: number };
 }
+export type GradeLookName = "film" | "tealorange" | "moody" | "golden" | "cyber" | "bleach" | "pastel" | "noir";
 
 // A simple, non-keyframed motion effect animated across THIS clip's own [start,end) source
 // range, not the output timeline - preview (VideoPlayer, driven off video.currentTime directly
@@ -134,24 +144,56 @@ export type TransitionType =
   // Not ffmpeg names: a crossfade / horizontal blur plus a glow pass (transition_fold_step).
   | "lightleak"
   | "whip"
-  // Not ffmpeg names: xfade custom expressions (page_curl_expr, zoom_blur_expr, color_sweep_expr).
-  | "pagecurl"
+  // Not ffmpeg names: drawn over the outgoing picture (transitionFrame.ts / transition_window_graph).
   | "zoomblur"
-  | "colorsweep";
+  | "colorsweep"
+  // Not ffmpeg names: both pictures move - composited from the two frames (transitionCanvas.ts and
+  // pageCurl.ts in the preview, canvas_transition in transition_graphs.rs).
+  | "pagecurl"
+  | "blocks"
+  | "mosaic"
+  | "split"
+  | "slider"
+  | "strips"
+  | "beam"
+  | "iris"
+  | "spin"
+  | "glitch"
+  | "slice"
+  | "push"
+  | "cube"
+  | "flip"
+  | "tiles";
+// The shape an iris transition opens out of.
+export type IrisShape = "triangle" | "diamond" | "hexagon" | "star" | "heart";
 // Where a light leak's hot spot travels.
 export type LeakDirection = "right" | "left" | "down" | "up" | "diagonal" | "center";
+// The corner or edge a page curl lifts from.
+export type PeelFrom = "bottomRight" | "bottomLeft" | "topRight" | "topLeft" | "right" | "left" | "bottom" | "top";
+// A transition's motion curve: ease in and out (default), constant speed, speeding up, slowing down.
+export type TransitionEasing = "smooth" | "linear" | "in" | "out";
 // The look of transitions that have one (TransitionLookControls). All optional - undefined is the
 // default look. Export: transition_glow_filter (conversion.rs); preview: TransitionPreviewLayer.
 export interface TransitionLook {
-  // Light leak / flash / colour sweep colour, "#rrggbb".
+  // Light leak / flash / colour sweep colour, "#rrggbb". Page curl: the paper's colour.
   color?: string;
-  // Glow strength, 0.1..1.5 (1 = default).
+  // Glow strength, 0.1..1.5 (1 = default). Page curl: its shadow, 0..1.5.
   intensity?: number;
   direction?: LeakDirection;
-  // Light leak hot-spot size, 0.3..2.5 (1 = default).
+  // Light leak hot-spot size, 0.3..2.5 (1 = default). Page curl: the curl's radius, 0.4..2.
+  // Dissolve: grain size, pixelize: block size, 0.3..3.
   size?: number;
-  // Bar open: out of a horizontal line (default) or a vertical one.
+  // Page curl: where it lifts from (default bottom-right), how much of the picture shows through
+  // the back of the page (0..1, default 0.15), and its motion curve.
+  peelFrom?: PeelFrom;
+  seeThrough?: number;
+  easing?: TransitionEasing;
+  // Wipe / circle / clock wipe: how soft the edge is, 0..1 (0 = hard, the default).
+  softness?: number;
+  // Bar open: out of a horizontal line (default) or a vertical one. Strips: columns (default) or rows.
   orientation?: "horizontal" | "vertical";
+  // Iris: the shape the new clip opens out of (default triangle).
+  shape?: IrisShape;
 }
 export interface ClipTransitionIn {
   type: TransitionType;
@@ -211,6 +253,15 @@ export interface Clip {
   // The clip's own sound is silenced, in the preview and the export - e.g. the quick cuts of a
   // highlight intro (highlightIntro.ts), which play over music.
   muted?: boolean;
+  // An effect over the clip's whole picture (echo, RGB split, colour cycle...) - clipFx.ts in the
+  // preview, services/clip_fx.rs on export.
+  fx?: ClipFx;
+}
+
+export type ClipFxKind = "echo" | "rgbsplit" | "huecycle" | "focus" | "colorin" | "flicker";
+export interface ClipFx {
+  kind: ClipFxKind;
+  intensity: number; // 0..1
 }
 
 // Optional audio-cleanup stages for one clip, applied in this order in both the live preview
@@ -255,7 +306,32 @@ export type TextOverlayCornerStyle = "square" | "rounded" | "pill";
 // exports as a per-frame scale (overlay_pop_scale_expr, conversion.rs).
 // "typewriter"/"words"/"rise" are text-only title reveals, letter by letter or word by word -
 // see textReveal.ts; they export exactly (as a frame sequence).
-export type OverlayAnimation = "none" | "fade" | "slide-left" | "slide-right" | "slide-up" | "slide-down" | "pop" | "typewriter" | "words" | "rise";
+export type OverlayAnimation =
+  | "none"
+  | "fade"
+  | "slide-left"
+  | "slide-right"
+  | "slide-up"
+  | "slide-down"
+  | "pop"
+  | "flip"
+  | "zoom"
+  | "drop"
+  | "typewriter"
+  | "words"
+  | "rise"
+  | "scatter"
+  | "blur"
+  | "drop"
+  | "spread"
+  | "wave"
+  // Letter reveals that scale, turn or mask letters (textReveal.ts) - drawn on canvas everywhere.
+  | "popin"
+  | "mask"
+  | "zoomin"
+  | "flicker"
+  | "bounce"
+  | "roll";
 
 // How an overlay mixes with the picture under it - CSS mix-blend-mode names (the preview sets them
 // on the overlay's element). Export composites the same formula (blend_composite, conversion.rs);
@@ -321,6 +397,20 @@ export interface TextOverlay {
   // (VideoOverlayLayer) and export burn-in (videoOverlayRender.ts) - kept as a fraction rather than
   // raw px so it scales consistently with the frame the same way fontSize/x/y already do.
   padding?: number;
+  // Typography (titleFonts.ts) and finish. Any of these set and the overlay is drawn by the one
+  // canvas renderer (drawTextOverlay, videoOverlayRender.ts) in the preview as well as in export,
+  // so they always match. Undefined = the system face, solid `color`, no glow/shadow.
+  fontFamily?: string;
+  // Extra space between letters, as a fraction of the font size (0.1 = tracked-out caps).
+  letterSpacing?: number;
+  // A gradient fill in place of `color` (top to bottom by default; angle in degrees, 0 = down).
+  fill?: { from: string; to: string; angle?: number };
+  // A soft light around the letters; size is a fraction of the font size.
+  glow?: { color: string; size: number };
+  // A drop shadow; offsets and blur are fractions of the font size.
+  shadow?: { color: string; x: number; y: number; blur: number };
+  // Degrees clockwise about the box's centre (-90 = reading bottom to top, a vertical title).
+  rotation?: number;
   // Normalized 0..1 fractions of the letterboxed VIDEO FRAME (not the player container) - stays
   // pixel-stable relative to the actual picture regardless of window size/fullscreen, since
   // object-fit:contain preserves the frame's own aspect ratio. y-down (top edge), unlike
@@ -366,6 +456,9 @@ export interface ImageOverlay {
   cornerRadius?: number; // fraction of frame height; undefined means 0 (square corners)
   rotation?: number; // degrees, clockwise; undefined means 0
   borderColor?: string; // undefined means no border
+  // A frame of borderColor this thick (fraction of the frame height) round the outside of the box -
+  // a photo print's white border. Undefined = the original thin 3px ring.
+  borderWidth?: number;
   shadow?: boolean; // undefined/false means no drop shadow
   flipHorizontal?: boolean; // undefined/false means not mirrored
   flipVertical?: boolean;
@@ -453,6 +546,8 @@ export interface AudioOverlay {
   // replaces all of these rather than stacking a second copy on top - which would otherwise keep
   // playing the old Music/Voice underneath the new ones, hidden in lower lane rows.
   detached?: boolean;
+  // A take recorded in the editor (the music panel's Record tab) - speech, like a detached Voice.
+  recorded?: boolean;
   // Beat sync: the track's tempo and beats (its own file's seconds), from detect_beats - drawn on
   // the timeline, snapped to, and what "cut images on the beat" fits to (beatSync.ts).
   bpm?: number;
@@ -469,8 +564,27 @@ export interface AudioOverlay {
   // Its mixer channel's EQ/compressor/balance (audioFx.ts) - every piece of one track (same
   // label, or same file) carries the same settings; the mixer edits them together.
   fx?: AudioFx;
+  // Volume automation - points pinned to the song's own time (audioAutomation.ts).
+  gain?: GainPoint[];
+  // Noise clean-up - the same Reduce/Remove modes and extra stages as a clip's sound
+  // (Clip.noiseReduction/audioCleanup). The whole file is rendered through the export's chain and
+  // played in its place (audioTrackCleanup.ts), so preview and export match exactly.
+  noiseReduction?: number;
+  audioCleanup?: AudioCleanup;
+  // Playback bleed taken out (utils/bleed): `src` is then the cleaned file, and this remembers the
+  // take as recorded and what was found - where (seconds into the file), how late, how much.
+  bleed?: BleedRemoval;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface BleedRemoval {
+  originalSrc: string;
+  strength: "gentle" | "normal" | "strong";
+  delaysMs: number[];
+  regions: [number, number][];
+  removedDb: number;
+  bleedDb: number;
 }
 
 export interface AudioLibraryInfo {
@@ -686,6 +800,10 @@ export interface KeepSegment {
   // time map (speed_steps, conversion.rs). When set, `speed` is ignored.
   speedSteps?: { sourceStart: number; sourceEnd: number; speed: number }[];
   muted?: boolean;
+  // The editor-drawn pointer of an "Editable pointer" recording (pointerTrack.ts): its ripples and
+  // cursor as sprite tracks timed in the source's seconds, composited onto the clip's own picture.
+  pointerLayers?: SpriteTrackSpec[];
+  fx?: ClipFx;
 }
 
 export interface VideoEditState {
@@ -710,11 +828,20 @@ export interface VideoEditState {
   videoAudioVolume: number; // 0..1, defaults to 1
   // The video's own sound's mixer channel - EQ/compressor/balance after its volume (audioFx.ts).
   videoAudioFx?: AudioFx;
+  // The mix's master bus - trim and limiter on everything (masterBus.ts).
+  master?: MasterBus;
   // Video tracks (PipOverlay.track) switched off with their eye toggle - left out of the preview
   // and the export alike.
   hiddenVideoTracks?: number[];
   // null until captions are first generated - see CaptionTrack.
   captions: CaptionTrack | null;
+  // Screen-recording polish (Screen Style panel): the frame around the video - wallpaper, padding,
+  // corners, shadow (screenStyle.ts; undefined/null = none); how the editor draws the pointer of
+  // recordings made with "Editable pointer" (pointerTrack.ts); and the keyboard-shortcut chips
+  // (keystrokes.ts). The latter two hold only what was changed from their defaults.
+  screenStyle?: ScreenStyle | null;
+  pointerStyle?: Partial<PointerStyle>;
+  keystrokeStyle?: Partial<KeystrokeStyle>;
   updatedAt: string;
 }
 
@@ -733,8 +860,12 @@ export interface EditableFields {
   videoAudioMuted: boolean;
   videoAudioVolume: number;
   videoAudioFx?: AudioFx;
+  master?: MasterBus;
   hiddenVideoTracks?: number[];
   captions: CaptionTrack | null;
+  screenStyle?: ScreenStyle | null;
+  pointerStyle?: Partial<PointerStyle>;
+  keystrokeStyle?: Partial<KeystrokeStyle>;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -782,8 +913,11 @@ export interface VideoEditCommand {
     | "edit-chapters"
     | "track-motion"
     | "edit-mixer"
+    | "edit-master"
+    | "edit-automation"
     | "edit-video-tracks"
-    | "find-hide";
+    | "find-hide"
+    | "edit-screen-style";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -860,6 +994,33 @@ export interface VideoProjectFrame {
   height: number;
 }
 
+// ---- Audio-only projects ----------------------------------------------------------------------
+//
+// A project with sound but no pictures plays and exports over black that runs as long as the audio
+// does. It's never part of the saved timeline - the store derives it (playbackClips) and the video
+// lane keeps showing its empty state. To the player it's the project's own canvas (a hundred hours
+// of black, get_video_canvas_proxy) cut into clips of at most VIDEO_CANVAS_SECONDS: the player is
+// already on that file, so playback runs through with nothing to load, switch or seek to. To the
+// export it's a black still (get_blank_frame_image) as image clips of at most
+// IMAGE_CLIP_MAX_SECONDS - a proper 30 fps picture.
+const BLANK_CLIP_PREFIX = "__blank__";
+export const isBlankClipId = (id: string): boolean => id.startsWith(BLANK_CLIP_PREFIX);
+
+// Where the last audio track ends - the length of an audio-only project.
+export const audioEndTime = (audioOverlays: { endTime: number }[]): number => audioOverlays.reduce((end, o) => Math.max(end, o.endTime), 0);
+
+// The length of the project canvas (get_video_canvas_proxy, conversion.rs).
+export const VIDEO_CANVAS_SECONDS = 100 * 3600;
+
+// `length` seconds of `sourcePath` (black) as clips of at most `piece` seconds, each from its start.
+export function blankClipsFor(sourcePath: string, length: number, piece: number): Clip[] {
+  const clips: Clip[] = [];
+  for (let at = 0, i = 0; length - at > 1e-3; at += piece, i++) {
+    clips.push({ id: `${BLANK_CLIP_PREFIX}${i}`, sourcePath, start: 0, end: Math.min(piece, length - at) });
+  }
+  return clips;
+}
+
 export interface NewProjectOptions {
   // Seconds each image is shown for.
   imageDuration: number;
@@ -867,7 +1028,14 @@ export interface NewProjectOptions {
   kenBurns: boolean;
   // Crossfade into every image after the first.
   transition: TransitionType | null;
+  // Overrides `transition`: these, in turn, into each image after the first (a "mix").
+  transitionCycle?: TransitionType[];
+  // A built-in look (gradeLooks.ts) on every clip.
+  look?: GradeLookName;
 }
+
+// How long the transition into each image of a new project lasts.
+export const projectTransitionSeconds = (imageSeconds: number) => Math.min(1, imageSeconds / 3);
 
 // Initial timeline for a new project - one clip per image, in the order given.
 export function createProjectState(imagePaths: string[], options: NewProjectOptions): VideoEditState {
@@ -882,7 +1050,10 @@ export function createProjectState(imagePaths: string[], options: NewProjectOpti
       start: 0,
       end: duration,
       ...(options.kenBurns ? { kenBurns: { preset: kenBurnsCycle[i % kenBurnsCycle.length], intensity: 0.5 } } : {}),
-      ...(options.transition && i > 0 ? { transitionIn: { type: options.transition, duration: Math.min(1, duration / 3) } } : {}),
+      ...(i > 0 && (options.transitionCycle?.length || options.transition)
+        ? { transitionIn: { type: options.transitionCycle?.length ? options.transitionCycle[(i - 1) % options.transitionCycle.length] : options.transition!, duration: projectTransitionSeconds(duration) } }
+        : {}),
+      ...(options.look ? { grade: { look: { name: options.look, intensity: 0.85 } } } : {}),
     })),
     textOverlays: [],
     imageOverlays: [],

@@ -21,47 +21,82 @@ pub struct BeatAnalysis {
 const HOP: usize = 512;
 const WINDOW: usize = 1024;
 
+// Per-frame log energies of the signal and of its high-emphasis copy, worked out from a stream of
+// samples a block at a time - only the last WINDOW samples are ever held, so a track of any length
+// (hours of a long recording) costs a few bytes a frame, never the whole signal.
+pub struct FrameEnergies {
+    ring: Vec<f32>,
+    filled: usize,
+    since_frame: usize,
+    full: Vec<f32>,
+    high: Vec<f32>,
+}
+
+impl FrameEnergies {
+    pub fn new() -> Self {
+        FrameEnergies { ring: vec![0.0; WINDOW], filled: 0, since_frame: 0, full: Vec::new(), high: Vec::new() }
+    }
+
+    pub fn push(&mut self, samples: &[f32]) {
+        for &s in samples {
+            // A sliding window kept as a ring: the newest sample overwrites the oldest.
+            self.ring[self.filled % WINDOW] = s;
+            self.filled += 1;
+            if self.filled < WINDOW {
+                continue;
+            }
+            // A frame every HOP samples once the first window is full - the same frames as
+            // windowing the whole signal at f * HOP.
+            if self.filled == WINDOW || { self.since_frame += 1; self.since_frame == HOP } {
+                self.since_frame = 0;
+                let start = self.filled % WINDOW; // the oldest sample in the window
+                let mut e_full = 0.0f32;
+                let mut e_high = 0.0f32;
+                let mut prev = self.ring[start];
+                for k in 0..WINDOW {
+                    let v = self.ring[(start + k) % WINDOW];
+                    e_full += v * v;
+                    let d = v - prev;
+                    e_high += d * d;
+                    prev = v;
+                }
+                self.full.push((1e-6 + e_full / WINDOW as f32).ln());
+                self.high.push((1e-6 + e_high / WINDOW as f32).ln());
+            }
+        }
+    }
+
+    // The onset strength envelope (see the module comment, step 1).
+    pub fn envelope(self) -> Vec<f32> {
+        let (full, high) = (self.full, self.high);
+        let frames = full.len();
+        let mut env = vec![0.0f32; frames];
+        for f in 1..frames {
+            env[f] = (full[f] - full[f - 1]).max(0.0) + (high[f] - high[f - 1]).max(0.0);
+        }
+        // Remove the slowly varying part (a local mean), keep the peaks.
+        let half = 8;
+        let mut out = vec![0.0f32; frames];
+        for f in 0..frames {
+            let lo = f.saturating_sub(half);
+            let hi = (f + half + 1).min(frames);
+            let mean: f32 = env[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+            out[f] = (env[f] - mean).max(0.0);
+        }
+        let peak = out.iter().cloned().fold(0.0f32, f32::max);
+        if peak > 0.0 {
+            for v in &mut out {
+                *v /= peak;
+            }
+        }
+        out
+    }
+}
+
 fn onset_envelope(samples: &[f32]) -> Vec<f32> {
-    if samples.len() < WINDOW {
-        return Vec::new();
-    }
-    let frames = (samples.len() - WINDOW) / HOP + 1;
-    let mut full = Vec::with_capacity(frames);
-    let mut high = Vec::with_capacity(frames);
-    for f in 0..frames {
-        let window = &samples[f * HOP..f * HOP + WINDOW];
-        let mut e_full = 0.0f32;
-        let mut e_high = 0.0f32;
-        let mut prev = window[0];
-        for &s in window {
-            e_full += s * s;
-            let d = s - prev;
-            e_high += d * d;
-            prev = s;
-        }
-        full.push((1e-6 + e_full / WINDOW as f32).ln());
-        high.push((1e-6 + e_high / WINDOW as f32).ln());
-    }
-    let mut env = vec![0.0f32; frames];
-    for f in 1..frames {
-        env[f] = (full[f] - full[f - 1]).max(0.0) + (high[f] - high[f - 1]).max(0.0);
-    }
-    // Remove the slowly varying part (a local mean), keep the peaks.
-    let half = 8;
-    let mut out = vec![0.0f32; frames];
-    for f in 0..frames {
-        let lo = f.saturating_sub(half);
-        let hi = (f + half + 1).min(frames);
-        let mean: f32 = env[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
-        out[f] = (env[f] - mean).max(0.0);
-    }
-    let peak = out.iter().cloned().fold(0.0f32, f32::max);
-    if peak > 0.0 {
-        for v in &mut out {
-            *v /= peak;
-        }
-    }
-    out
+    let mut energies = FrameEnergies::new();
+    energies.push(samples);
+    energies.envelope()
 }
 
 fn autocorrelation(env: &[f32], lag: usize) -> f64 {
@@ -118,7 +153,11 @@ fn estimate_period(env: &[f32], frame_rate: f64) -> Option<f64> {
 }
 
 pub fn track_beats(samples: &[f32], sample_rate: f64) -> Option<BeatAnalysis> {
-    let env = onset_envelope(samples);
+    beats_from_envelope(onset_envelope(samples), sample_rate)
+}
+
+// Steps 2 and 3 on an envelope already worked out (FrameEnergies - streamed for a long file).
+pub fn beats_from_envelope(env: Vec<f32>, sample_rate: f64) -> Option<BeatAnalysis> {
     let frame_rate = sample_rate / HOP as f64;
     let period_frac = estimate_period(&env, frame_rate)?;
     let period = period_frac.round().max(1.0) as usize;
@@ -179,6 +218,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn streaming_in_any_block_size_gives_the_same_envelope() {
+        let samples = click_track(120.0, 6.0, 22050.0);
+        let whole = onset_envelope(&samples);
+        let mut energies = FrameEnergies::new();
+        for block in samples.chunks(777) {
+            energies.push(block);
+        }
+        let streamed = energies.envelope();
+        assert_eq!(whole.len(), (samples.len() - WINDOW) / HOP + 1);
+        assert_eq!(whole, streamed);
     }
 
     #[test]

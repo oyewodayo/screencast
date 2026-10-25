@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { MdClosedCaption, MdOutlineOpacity, MdSpeed, MdOutlineNoiseControlOff } from 'react-icons/md';
-import { IoBrowsersOutline, IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline, IoEyeOutline, IoScanOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoSparkles } from 'react-icons/io5';
+import { IoCutOutline, IoBrowsersOutline, IoPlayCircleOutline, IoChevronForward, IoCheckmark, IoImageOutline, IoEyeOutline, IoScanOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoSparkles } from 'react-icons/io5';
 import { CAPTIONS_LANGUAGE_OPTIONS } from '../../utils/videoUtils';
 import type { PlayerNoise } from '../VideoPlayer';
 
@@ -52,6 +52,10 @@ interface PlaytimeSettingsProps {
   noise: PlayerNoise;
   noiseStatus: 'idle' | 'calibrating' | 'active';
   onNoiseChange: (noise: PlayerNoise) => void;
+  // Opens this video in the editor (the bottom dock's video tools) - or closes them when already
+  // open. Absent where the player isn't showing a library video.
+  onEditVideo?: () => void;
+  isEditingVideo?: boolean;
 }
 
 const languageName = (code: string): string =>
@@ -80,6 +84,8 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
   onCaptionsLanguageChange,
   onSetThumbnail,
   thumbnailStatus,
+  onEditVideo,
+  isEditingVideo,
   noise,
   noiseStatus,
   onNoiseChange
@@ -107,6 +113,24 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
 
   return (
     <div className="origin-bottom-right absolute bottom-full right-0 settings-menu rounded-md shadow-lg bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 ring-1 ring-black dark:ring-white/10 ring-opacity-5 z-50">
+      {/* Edit - into the editor */}
+      {onEditVideo && (
+        <>
+          <button
+            className="settings-row"
+            onClick={onEditVideo}
+            data-tip={isEditingVideo ? "Hide the editing timeline" : "Trim, cut, add transitions, effects, music, text and captions"}
+          >
+            <span className="settings-row-label">
+              <IoCutOutline />
+              {isEditingVideo ? "Close editor" : "Edit video"}
+            </span>
+            <IoChevronForward className="settings-chevron" />
+          </button>
+          <div className="settings-divider" />
+        </>
+      )}
+
       {/* Autoplay */}
       <button className="settings-row" onClick={onAutoplayChange} data-tip="Plays the next file in the folder when this one ends">
         <span className="settings-row-label">

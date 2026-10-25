@@ -63,7 +63,9 @@ interface GlState {
 }
 
 function initGl(canvas: HTMLCanvasElement): GlState | null {
-  const gl = canvas.getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: false, antialias: false });
+  // preserveDrawingBuffer: a transition reads the graded picture back (paintDisplayedPicture,
+  // TransitionPreviewLayer) on frames where this layer had nothing new to draw.
+  const gl = canvas.getContext("webgl2", { premultipliedAlpha: false, preserveDrawingBuffer: true, antialias: false });
   if (!gl) return null;
   const program = gl.createProgram()!;
   gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
@@ -196,6 +198,7 @@ const GradeCanvas: React.FC<GradeCanvasProps> = ({ videoRef, lut }) => {
     <canvas
       ref={canvasRef}
       aria-hidden
+      data-grade-canvas
       className="absolute inset-0 w-full h-full pointer-events-none"
       style={{ objectFit: "contain", display: active && !failedRef.current ? "block" : "none" }}
     />

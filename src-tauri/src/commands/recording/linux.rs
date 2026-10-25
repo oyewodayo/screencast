@@ -81,7 +81,7 @@ fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
             "-i".to_string(),
             format!("{}+{},{}", x11_display(), x, y),
         ]),
-        CaptureTarget::Window { title } => {
+        CaptureTarget::Window { title, .. } => {
             let (x, y, width, height) =
                 crate::commands::window_capture::linux::get_window_rect_by_title(title)?;
             Ok(vec![

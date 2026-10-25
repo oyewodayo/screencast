@@ -1,7 +1,7 @@
 // utils/textReveal.ts
 //
-// Title animations that work letter by letter or word by word - typewriter, word-by-word, rise -
-// rather than moving the whole box like fade/slide/pop do. One timing model shared by the live
+// Title animations that work letter by letter or word by word - typewriter, word-by-word, rise,
+// scatter, blur-in, drop, spread, wave - rather than moving the whole box like fade/slide/pop do. One timing model shared by the live
 // preview (VideoOverlayLayer's RevealText, per-character <span>s) and export
 // (renderTextOverlayToPng drawing per character, sent as a frame sequence), so the title types
 // on exactly the same way on screen and in the file.
@@ -10,10 +10,13 @@
 // as the line fills in.
 import type { OverlayAnimation } from "./videoEditTypes";
 
-export type TextReveal = "typewriter" | "words" | "rise";
+export type TextReveal = "typewriter" | "words" | "rise" | "scatter" | "blur" | "drop" | "spread" | "wave" | "popin" | "mask" | "zoomin" | "flicker" | "bounce" | "roll";
 
-export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal =>
-  animation === "typewriter" || animation === "words" || animation === "rise";
+const TEXT_REVEALS = new Set<string>(["typewriter", "words", "rise", "scatter", "blur", "drop", "spread", "wave", "popin", "mask", "zoomin", "flicker", "bounce", "roll"]);
+// Reveals that scale, turn or mask letters - the preview draws these on canvas (drawTextOverlay)
+// rather than as styled DOM letters.
+export const CANVAS_TEXT_REVEALS = new Set<string>(["popin", "mask", "zoomin", "flicker", "bounce", "roll"]);
+export const isTextReveal = (animation: OverlayAnimation | undefined): animation is TextReveal => !!animation && TEXT_REVEALS.has(animation);
 
 // How a title leaves: fade out, play its reveal backwards (un-type), or just cut at its end.
 export type TextRevealExit = "fade" | "reverse" | "none";
@@ -36,7 +39,7 @@ export interface TextRevealSettings {
   humanize?: boolean;
   // Typewriter only. Default "bar".
   caretStyle?: CaretStyle;
-  // Words / rise: where letters come in from. Default "below".
+  // Words / rise / blur: where letters come in from. Default "below".
   from?: "below" | "above";
   // An accent line that draws itself under the title as it reveals, in this colour.
   underline?: string;
@@ -56,6 +59,17 @@ const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
 const easeOutBack = (t: number) => {
   const c1 = 1.70158;
   return 1 + (c1 + 1) * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+};
+// A springy settle - overshoots, swings back, comes to rest (letters popping in).
+const easeOutElastic = (t: number) => (t <= 0 ? 0 : t >= 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1);
+const easeOutQuint = (t: number) => 1 - Math.pow(1 - t, 5);
+const easeOutBounce = (t: number) => {
+  const n1 = 7.5625;
+  const d1 = 2.75;
+  if (t < 1 / d1) return n1 * t * t;
+  if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+  if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+  return n1 * (t -= 2.625 / d1) * t + 0.984375;
 };
 
 const speedOf = (settings?: TextRevealSettings) => Math.max(TEXT_REVEAL_SPEED_MIN, Math.min(TEXT_REVEAL_SPEED_MAX, settings?.speed ?? 1));
@@ -83,6 +97,14 @@ function naturalSeconds(text: string, kind: TextReveal, settings?: TextRevealSet
   const { words } = wordIndexes(text);
   if (kind === "typewriter") return settings?.unit === "word" ? Math.max(0.3, words * 0.22) : Math.max(0.4, chars * 0.045);
   if (kind === "words") return Math.max(0.4, (words - 1) * 0.14 + WORD_IN_SEC);
+  if (kind === "spread") return 0.9;
+  if (kind === "scatter") return Math.max(0.7, chars * 0.025 + 0.55);
+  if (kind === "drop") return Math.max(0.7, chars * 0.04 + 0.6);
+  if (kind === "mask") return Math.max(0.5, (words - 1) * 0.12 + 0.55);
+  if (kind === "flicker") return 1.1;
+  if (kind === "roll") return Math.max(0.8, chars * 0.06 + 0.6);
+  if (kind === "zoomin") return Math.max(0.6, chars * 0.03 + 0.5);
+  if (kind === "popin" || kind === "bounce") return Math.max(0.6, chars * 0.035 + 0.5);
   return Math.max(0.5, chars * 0.03 + CHAR_IN_SEC);
 }
 
@@ -106,6 +128,19 @@ export interface CharState {
   opacity: number;
   // Vertical offset in em (positive = lower).
   dy: number;
+  // Horizontal offset in em (positive = right). Undefined = 0.
+  dx?: number;
+  // Blur radius in em. Undefined = sharp.
+  blur?: number;
+  // Size about the letter's centre (1 = as set) and turn in degrees. Undefined = 1 / 0.
+  scale?: number;
+  rotate?: number;
+  // Rises out of its own line: everything below the line's box is hidden (the letter slides up
+  // from behind an invisible edge). Undefined = not clipped.
+  clip?: boolean;
+  // Another character shown in this one's place for now (a slot-machine roll passing through) -
+  // laid out at the real character's width. Undefined = the character itself.
+  glyph?: string;
 }
 
 export interface TextRevealState {
@@ -176,12 +211,115 @@ function revealAt(text: string, kind: TextReveal, p: number, reveal: number, set
     };
   }
 
-  const inSec = Math.min(CHAR_IN_SEC, reveal);
+  if (kind === "spread") {
+    // The letters start pulled apart about the middle, soft, and close up into the word.
+    const e = easeOutCubic(clamp01(p / reveal));
+    const mid = (n - 1) / 2;
+    return { char: (i) => ({ opacity: e, dy: 0, dx: (i - mid) * 0.6 * (1 - e), blur: 0.15 * (1 - e) }), caretAt: null };
+  }
+
+  if (kind === "scatter") {
+    // Letters fly in from all around in a random order and settle into place.
+    const inSec = Math.min(0.5, reveal);
+    const spread = Math.max(0, reveal - inSec);
+    return {
+      char: (i) => {
+        const local = clamp01((p - hash(i * 2.9) * spread) / inSec);
+        const e = easeOutCubic(local);
+        const a = hash(i * 3.1 + 7) * Math.PI * 2;
+        return { opacity: clamp01(local * 3), dx: Math.cos(a) * 1.2 * (1 - e), dy: Math.sin(a) * 1.2 * (1 - e) };
+      },
+      caretAt: null,
+    };
+  }
+
+  if (kind === "mask") {
+    // Each word slides up out of its line, from behind an edge you can't see - crisp, no fade.
+    const { wordOf, words } = wordIndexes(text);
+    const inSec = Math.min(0.55, reveal);
+    const stagger = words > 1 ? Math.max(0, reveal - inSec) / (words - 1) : 0;
+    return {
+      char: (i) => {
+        const e = easeOutQuint(clamp01((p - wordOf[i] * stagger) / inSec));
+        return { opacity: e > 0 ? 1 : 0, dy: (1 - e) * 1.15 * dir, clip: e < 1 };
+      },
+      caretAt: null,
+    };
+  }
+
+  if (kind === "roll") {
+    // A slot machine: each letter spins through others of its kind (digits through digits) up
+    // out of its line, slowing until it lands - left to right, like a date or a price settling.
+    const inSec = Math.min(0.6, reveal);
+    const stagger = n > 1 ? Math.max(0, reveal - inSec) / (n - 1) : 0;
+    const DIGITS = "0123456789";
+    const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return {
+      char: (i) => {
+        const ch = text[i];
+        const local = clamp01((p - i * stagger) / inSec);
+        if (local >= 1 || /\s/.test(ch)) return { opacity: 1, dy: 0 };
+        // Spins fast, then slower: how many characters have rolled past by now.
+        const rolled = easeOutCubic(local) * 9;
+        const step = Math.floor(rolled);
+        const frac = rolled - step;
+        const pool = /\d/.test(ch) ? DIGITS : /[a-z]/.test(ch) ? LETTERS.toLowerCase() : LETTERS;
+        const glyph = step >= 8 ? ch : pool[Math.floor(hash(i * 7.7 + step * 3.1) * pool.length)];
+        return { opacity: 1, dy: (1 - frac) * 0.9, clip: true, glyph };
+      },
+      caretAt: null,
+    };
+  }
+
+  if (kind === "flicker") {
+    // A neon sign warming up: letters stutter on in a random order, then hold steady.
+    return {
+      char: (i) => {
+        const on = hash(i * 4.7) * 0.6 * reveal;
+        if (p >= reveal) return { opacity: 1, dy: 0 };
+        if (p < on) return { opacity: 0, dy: 0 };
+        const k = Math.floor((p - on) * 24);
+        const steady = p - on > 0.35 * reveal;
+        return { opacity: steady ? 1 : hash(i * 13.1 + k * 1.7) > 0.45 ? 1 : 0.15, dy: 0 };
+      },
+      caretAt: null,
+    };
+  }
+
+  const inSec = Math.min(kind === "drop" ? 0.6 : kind === "popin" || kind === "bounce" ? 0.55 : CHAR_IN_SEC, reveal);
   const stagger = n > 1 ? Math.max(0, reveal - inSec) / (n - 1) : 0;
   return {
     char: (i) => {
       const local = clamp01((p - i * stagger) / inSec);
-      return { opacity: clamp01(local * 2.5), dy: local >= 1 ? 0 : (1 - easeOutBack(local)) * 0.8 * dir };
+      switch (kind) {
+        case "blur": {
+          // Each letter rises a little out of a blur.
+          const e = easeOutCubic(local);
+          return { opacity: e, dy: (1 - e) * 0.35 * dir, blur: (1 - e) * 0.25 };
+        }
+        case "drop":
+          // Falls from above and bounces to rest.
+          return { opacity: clamp01(local * 4), dy: -(1 - easeOutBounce(local)) * 1.0 };
+        case "popin":
+          // Springs up from nothing, overshooting a touch before it settles.
+          return { opacity: clamp01(local * 6), dy: 0, scale: local >= 1 ? 1 : Math.max(0, easeOutElastic(local)) };
+        case "zoomin": {
+          // Comes in from big and soft, landing sharp.
+          const e = easeOutQuint(local);
+          return { opacity: clamp01(local * 2.5), dy: 0, scale: 1 + (1 - e) * 1.6, blur: (1 - e) * 0.2 };
+        }
+        case "bounce": {
+          // Drops in tilted, squashes on landing and springs upright - a sticker title.
+          const e = easeOutBounce(local);
+          const tilt = (hash(i * 5.3) - 0.5) * 30;
+          return { opacity: clamp01(local * 5), dy: -(1 - e) * 1.2, scale: local >= 1 ? 1 : 0.6 + 0.4 * easeOutElastic(local), rotate: tilt * (1 - easeOutCubic(local)) };
+        }
+        case "wave":
+          // Hops up and lands, one after another.
+          return { opacity: clamp01(local * 3), dy: -Math.sin(Math.PI * local) * 0.45 };
+        default:
+          return { opacity: clamp01(local * 2.5), dy: local >= 1 ? 0 : (1 - easeOutBack(local)) * 0.8 * dir };
+      }
     },
     caretAt: null,
   };

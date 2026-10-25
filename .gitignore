@@ -52,3 +52,6 @@ docs/*
 music-library/originals/
 music-library/dist/
 music-library/audio/
+
+# Release binaries bundle made by scripts/package-build-binaries.ps1 (uploaded as a release asset)
+/build-binaries-*.zip

@@ -12,8 +12,11 @@
 // inputs), safe there since a blur region has no editing session to end.
 import { REVEAL_STYLES, revealStartingMask, type LayerMask, type RevealStyle } from "../../utils/layerMask";
 import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import RevealText from "./RevealText";
+import TitleLookTile from "./TitleLookTile";
+import { TITLE_FONTS, TITLE_FONT_CATEGORIES, TitleFontCategory, loadTitleFonts, titleFont, titleFontStyle } from "../../utils/titleFonts";
+import { TITLE_STYLES, TitleStyle, wearsTitleStyle } from "../../utils/titleStyles";
 import { overlayAnimationStyle } from "../../utils/overlayAnimation";
 import {
   IoArrowDown,
@@ -36,7 +39,7 @@ import { MAX_ADJUSTMENT_BLUR } from "../../utils/adjustmentLayers";
 import { BLEND_MODES } from "../../utils/blendModes";
 import { TextAlign } from "../../utils/pdfAnnotationTypes";
 import { ImageRevealDirection, ImageRevealSettings, ImageRevealStyle } from "../../utils/imageReveal";
-import { TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
+import { CANVAS_TEXT_REVEALS, TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
 import { ASSET_ENTRANCES, ASSET_LOOPS, AssetEntrance, AssetLoop, OverlayAsset, assetEntry, assetSupportsOutline, assetUsesColor2, countdownPlan } from "../../utils/videoAssets";
 
 const keepFocus = (e: React.MouseEvent) => e.preventDefault();
@@ -158,6 +161,9 @@ const ANIMATIONS: { value: OverlayAnimation; label: string; title: string }[] = 
   { value: "none", label: "None", title: "No animation" },
   { value: "fade", label: "Fade", title: "Fade in and out" },
   { value: "pop", label: "Pop", title: "Pop in with a springy overshoot" },
+  { value: "flip", label: "Flip", title: "Spin in like a tossed coin" },
+  { value: "zoom", label: "Zoom", title: "Rush in from big, fading in" },
+  { value: "drop", label: "Drop", title: "Fall from above and bounce to rest" },
   { value: "slide-left", label: "← Slide", title: "Slide in from the right, out to the left" },
   { value: "slide-right", label: "Slide →", title: "Slide in from the left, out to the right" },
   { value: "slide-up", label: "↑ Slide", title: "Slide up" },
@@ -169,6 +175,17 @@ const TEXT_REVEALS: { value: OverlayAnimation; label: string; title: string }[] 
   { value: "typewriter", label: "Type", title: "Typewriter - letters type on with a caret" },
   { value: "words", label: "Words", title: "Word by word - each word rises into place" },
   { value: "rise", label: "Rise", title: "Letters bounce up one after another" },
+  { value: "blur", label: "Blur in", title: "Letters rise out of a soft blur" },
+  { value: "scatter", label: "Scatter", title: "Letters fly in from all around and settle" },
+  { value: "drop", label: "Drop", title: "Letters fall from above and bounce to rest" },
+  { value: "spread", label: "Spread", title: "Letters close up from far apart" },
+  { value: "wave", label: "Wave", title: "Letters hop up one after another" },
+  { value: "popin", label: "Pop up", title: "Letters spring up from nothing, one after another" },
+  { value: "mask", label: "Mask rise", title: "Each word slides up out of its line" },
+  { value: "zoomin", label: "Zoom in", title: "Letters land from big and soft" },
+  { value: "bounce", label: "Bounce", title: "Letters drop in tilted and bounce upright - sticker titles" },
+  { value: "flicker", label: "Flicker", title: "A neon sign warming up" },
+  { value: "roll", label: "Roll", title: "Letters and digits spin like a slot machine and land in turn" },
 ];
 
 // The animation picker's tiles play each animation on a sample title, on a loop: on screen for
@@ -211,7 +228,7 @@ const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange
         }
         const s = overlayAnimationStyle(animation, 0, SAMPLE_LIFE_SEC, t, box.clientWidth, box.clientHeight);
         el.style.opacity = String(s.opacity);
-        el.style.transform = `translate(${s.translateXPx}px, ${s.translateYPx}px) scale(${s.scale})`;
+        el.style.transform = `translate(${s.translateXPx}px, ${s.translateYPx}px) scale(${s.scale * (s.scaleX ?? 1)}, ${s.scale})`;
       });
     };
     raf = requestAnimationFrame(tick);
@@ -232,7 +249,9 @@ const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange
               className={`flex flex-col items-stretch gap-0.5 p-0.5 rounded-md transition-colors ${selected ? "bg-blue-500/20 ring-1 ring-blue-400/50" : "bg-white/[0.04] hover:bg-white/10"}`}
             >
               <span className="relative h-7 rounded-[5px] bg-neutral-950/70 overflow-hidden flex items-center justify-center text-[12px] font-semibold text-white">
-                {isTextReveal(a.value) ? (
+                {CANVAS_TEXT_REVEALS.has(a.value) ? (
+                  <TitleLookTile look={{ fontFamily: "montserrat-bold", color: "#ffffff" }} text={SAMPLE_TEXT} width={64} height={28} animation={a.value} loopSec={SAMPLE_LIFE_SEC} />
+                ) : isTextReveal(a.value) ? (
                   <span className="relative">
                     <RevealText overlay={sampleOverlay(a.value)} kind={a.value} paddingPx={0} getTime={loopTime} />
                   </span>
@@ -588,7 +607,11 @@ export interface TextStylePreset {
 }
 
 export interface TextDockedPanelProps extends CommonProps {
-  presets: TextStylePreset[];
+  // The overlay as it looks now - what the look gallery, font and effects controls show.
+  look: Partial<TextOverlay>;
+  // A ready-made look (titleStyles.ts), and single look fields (face, tracking, gradient, glow, shadow).
+  onApplyLook: (style: TitleStyle) => void;
+  onLook: (patch: Pick<Partial<TextOverlay>, "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "rotation">) => void;
   backgroundColor?: string;
   strokeColor?: string;
   strokeWidth?: number;
@@ -596,7 +619,6 @@ export interface TextDockedPanelProps extends CommonProps {
   animation?: OverlayAnimation;
   fontSizePx: number;
   paddingPx: number;
-  onApplyPreset: (preset: TextStylePreset) => void;
   onFontSizePx: (px: number) => void;
   onPaddingPx: (px: number) => void;
   onCornerStyle: (corner: TextOverlayCornerStyle) => void;
@@ -772,49 +794,157 @@ const Swatches: React.FC<{ colors: (string | undefined)[]; value: string | undef
   </div>
 );
 
-const presetMatches = (p: TextStylePreset, props: TextDockedPanelProps): boolean =>
-  (p.backgroundColor ?? null) === (props.backgroundColor ?? null) &&
-  !!p.strokeWidth === !!props.strokeWidth &&
-  (p.cornerStyle ?? "square") === (props.cornerStyle ?? "square");
+// ---------- title looks, fonts and effects ----------
+
+// Every ready-made look as a tile drawn by the real text renderer - what you see is what you get.
+const TitleLookGallery: React.FC<{ look: Partial<TextOverlay>; onApply: (style: TitleStyle) => void }> = ({ look, onApply }) => (
+  <Section title="Style">
+    <div className="grid grid-cols-3 gap-1.5">
+      {TITLE_STYLES.map((style) => {
+        const selected = wearsTitleStyle(look, style);
+        return (
+          <button
+            key={style.id}
+            type="button"
+            title={style.label}
+            onMouseDown={keepFocus}
+            onClick={() => onApply(style)}
+            className={`group flex flex-col items-stretch gap-0.5 p-0.5 rounded-lg transition-shadow ${selected ? "ring-2 ring-blue-400 bg-blue-500/10" : "ring-1 ring-white/10 hover:ring-white/30"}`}
+          >
+            <span className="relative h-[44px] rounded-md overflow-hidden bg-[linear-gradient(135deg,#3f3f46,#18181b)] flex items-center justify-center">
+              <TitleLookTile look={style.look} text={style.sample} width={84} height={44} />
+            </span>
+            <span className={`truncate text-center text-[10px] leading-tight ${selected ? "text-blue-200" : "text-white/55 group-hover:text-white/80"}`}>{style.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  </Section>
+);
+
+// Every face, each name set in itself, a category at a time.
+const FontSection: React.FC<{ value: string | undefined; onChange: (id: string | undefined) => void }> = ({ value, onChange }) => {
+  const [category, setCategory] = useState<TitleFontCategory | "All">(() => titleFont(value)?.category ?? "All");
+  const [, setLoaded] = useState(0);
+  useEffect(() => {
+    // The picker shows each face in itself - redraw once they're all in.
+    void loadTitleFonts(TITLE_FONTS.map((f) => f.id)).then(() => setLoaded((n) => n + 1));
+  }, []);
+  const fonts = TITLE_FONTS.filter((f) => category === "All" || f.category === category);
+  return (
+    <Section title="Font">
+      <div className="flex flex-wrap gap-1">
+        {(["All", ...TITLE_FONT_CATEGORIES] as const).map((c) => (
+          <button
+            key={c}
+            type="button"
+            onMouseDown={keepFocus}
+            onClick={() => setCategory(c)}
+            className={`h-6 px-2 rounded-full text-[10.5px] transition-colors ${category === c ? "bg-white text-neutral-900" : "bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10"}`}
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+      <div className="grid grid-cols-2 gap-1 max-h-[210px] overflow-y-auto pr-0.5">
+        {category === "All" && (
+          <button
+            type="button"
+            onMouseDown={keepFocus}
+            onClick={() => onChange(undefined)}
+            className={`h-9 px-2 rounded-md text-left text-[14px] truncate transition-colors ${!value ? "bg-blue-500/25 text-white ring-1 ring-blue-400/60" : "bg-white/[0.05] text-white/80 hover:bg-white/10"}`}
+            style={titleFontStyle(undefined)}
+          >
+            System
+          </button>
+        )}
+        {fonts.map((f) => (
+          <button
+            key={f.id}
+            type="button"
+            title={f.label}
+            onMouseDown={keepFocus}
+            onClick={() => onChange(f.id)}
+            className={`h-9 px-2 rounded-md text-left text-[15px] leading-none truncate transition-colors ${value === f.id ? "bg-blue-500/25 text-white ring-1 ring-blue-400/60" : "bg-white/[0.05] text-white/80 hover:bg-white/10"}`}
+            style={titleFontStyle(f.id)}
+          >
+            {f.caps ? f.label.toUpperCase() : f.label}
+          </button>
+        ))}
+      </div>
+    </Section>
+  );
+};
+
+const GRADIENTS: { from: string; to: string; title: string }[] = [
+  { from: "#ffffff", to: "#8be9ff", title: "Ice" },
+  { from: "#fff3c4", to: "#e0a526", title: "Gold" },
+  { from: "#fff59d", to: "#ef4444", title: "Fire" },
+  { from: "#fbcfe8", to: "#8b5cf6", title: "Candy" },
+  { from: "#a7f3d0", to: "#0ea5e9", title: "Ocean" },
+  { from: "#ffffff", to: "#6b7280", title: "Chrome" },
+  { from: "#f0abfc", to: "#22d3ee", title: "Neon" },
+];
+const GLOW_COLORS = ["#22d3ee", "#2f8bff", "#ff2d95", "#a855f7", "#f97316", "#facc15", "#ffffff"];
+const SHADOWS: { value: TextOverlay["shadow"]; label: string; title: string }[] = [
+  { value: undefined, label: "None", title: "No shadow" },
+  { value: { color: "rgba(0,0,0,0.55)", x: 0, y: 0.04, blur: 0.12 }, label: "Soft", title: "Soft shadow under the letters" },
+  { value: { color: "rgba(0,0,0,0.6)", x: 0.04, y: 0.06, blur: 0 }, label: "Hard", title: "A solid offset copy behind - poster style" },
+  { value: { color: "rgba(0,0,0,0.75)", x: 0, y: 0, blur: 0.3 }, label: "Halo", title: "A dark halo all round - legible on anything" },
+];
+
+// Tracking, gradient fill, glow and shadow.
+const TextEffectsSection: React.FC<{ look: Partial<TextOverlay>; onLook: TextDockedPanelProps["onLook"] }> = ({ look, onLook }) => {
+  const shadowIndex = Math.max(0, SHADOWS.findIndex((s) => JSON.stringify(s.value ?? null) === JSON.stringify(look.shadow ?? null)));
+  return (
+    <Section title="Effects">
+      <SliderRow label="Spacing" value={look.letterSpacing ?? 0} min={-0.05} max={0.5} step={0.01} marks={[0]} format={(v) => `${Math.round(v * 100)}%`} onChange={(v) => onLook({ letterSpacing: Math.abs(v) < 0.005 ? undefined : v })} />
+      <LabeledRow label="Gradient">
+        <Switch on={!!look.fill} label={look.fill ? "Solid colour instead" : "Gradient fill"} onChange={(on) => onLook({ fill: on ? { from: GRADIENTS[0].from, to: GRADIENTS[0].to } : undefined })} />
+      </LabeledRow>
+      {look.fill && (
+        <div className="flex flex-wrap gap-1.5">
+          {GRADIENTS.map((g) => {
+            const selected = look.fill?.from === g.from && look.fill?.to === g.to;
+            return (
+              <button
+                key={g.title}
+                type="button"
+                title={g.title}
+                onMouseDown={keepFocus}
+                onClick={() => onLook({ fill: { from: g.from, to: g.to } })}
+                className={`w-[22px] h-[22px] rounded-full transition-transform hover:scale-110 ${selected ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-900" : "ring-1 ring-white/25"}`}
+                style={{ background: `linear-gradient(180deg, ${g.from}, ${g.to})` }}
+              />
+            );
+          })}
+        </div>
+      )}
+      <LabeledRow label="Glow">
+        <Switch on={!!look.glow} label={look.glow ? "Remove glow" : "Add glow"} onChange={(on) => onLook({ glow: on ? { color: GLOW_COLORS[0], size: 0.35 } : undefined })} />
+      </LabeledRow>
+      {look.glow && (
+        <>
+          <Swatches colors={GLOW_COLORS} value={look.glow.color} onPick={(c) => c && onLook({ glow: { color: c, size: look.glow?.size ?? 0.35 } })} />
+          <SliderRow label="Glow size" value={look.glow.size} min={0.05} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} onChange={(size) => onLook({ glow: { color: look.glow?.color ?? GLOW_COLORS[0], size } })} />
+        </>
+      )}
+      <LabeledRow label="Shadow">
+        <div className="flex-1">
+          <Segmented value={String(shadowIndex)} onChange={(i) => onLook({ shadow: SHADOWS[Number(i)].value })} options={SHADOWS.map((s, i) => ({ value: String(i), title: s.title, label: s.label }))} />
+        </div>
+      </LabeledRow>
+    </Section>
+  );
+};
+
 
 export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
   const outlineOn = !!props.strokeWidth;
   return (
     <>
-      <Section title="Style">
-        <div className="grid grid-cols-3 gap-1.5">
-          {props.presets.map((p) => {
-            const selected = presetMatches(p, props);
-            return (
-              <button
-                key={p.name}
-                type="button"
-                title={p.name}
-                onMouseDown={keepFocus}
-                onClick={() => props.onApplyPreset(p)}
-                className={`flex flex-col items-center justify-center gap-1 h-[58px] rounded-lg bg-gradient-to-br from-neutral-600/60 to-neutral-800/80 transition-shadow ${
-                  selected ? "ring-2 ring-blue-400" : "ring-1 ring-white/10 hover:ring-white/30"
-                }`}
-              >
-                <span
-                  className="text-[15px] font-bold leading-none px-1.5 py-0.5"
-                  style={{
-                    color: "#fff",
-                    background: p.backgroundColor ?? "transparent",
-                    borderRadius: p.cornerStyle === "pill" ? 999 : p.cornerStyle === "rounded" ? 4 : 0,
-                    WebkitTextStroke: p.strokeWidth ? `${Math.min(p.strokeWidth, 2)}px ${p.strokeColor ?? "#000"}` : undefined,
-                    paintOrder: p.strokeWidth ? "stroke fill" : undefined,
-                    textShadow: p.backgroundColor || p.strokeWidth ? undefined : "0 1px 3px rgba(0,0,0,0.9)",
-                  }}
-                >
-                  Aa
-                </span>
-                <span className="text-[10px] text-white/60">{p.name}</span>
-              </button>
-            );
-          })}
-        </div>
-      </Section>
+      <TitleLookGallery look={props.look} onApply={props.onApplyLook} />
+      <FontSection value={props.look.fontFamily} onChange={(fontFamily) => props.onLook({ fontFamily })} />
 
       <Section title="Text">
         <SliderRow label="Size" value={props.fontSizePx} min={8} max={200} step={1} format={(v) => `${Math.round(v)}px`} onChange={props.onFontSizePx} />
@@ -874,6 +1004,41 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
             onChange={(w) => props.onStroke({ strokeWidth: w, strokeColor: props.strokeColor ?? "#000000" })}
           />
         )}
+      </Section>
+
+      <TextEffectsSection look={props.look} onLook={props.onLook} />
+      <Section title="Rotate">
+        <SliderRow
+          label="Angle"
+          value={props.look.rotation ?? 0}
+          min={-180}
+          max={180}
+          step={1}
+          marks={[0, -90, 90]}
+          format={(v) => `${Math.round(v)}°`}
+          onChange={(v) => props.onLook({ rotation: Math.abs(v) < 0.5 ? undefined : v })}
+        />
+        <div className="grid grid-cols-4 gap-1">
+          {[
+            { v: 0, label: "Level", title: "Straight" },
+            { v: -90, label: "Up ↑", title: "Vertical, reading bottom to top" },
+            { v: 90, label: "Down ↓", title: "Vertical, reading top to bottom" },
+            { v: -8, label: "Tilt", title: "A slight, lively tilt" },
+          ].map((r) => (
+            <button
+              key={r.v}
+              type="button"
+              title={r.title}
+              onMouseDown={keepFocus}
+              onClick={() => props.onLook({ rotation: r.v || undefined })}
+              className={`h-7 rounded-md text-[11px] transition-colors ${
+                (props.look.rotation ?? 0) === r.v ? "bg-blue-500/25 text-blue-200 ring-1 ring-blue-400/50" : "bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10"
+              }`}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
       </Section>
 
       <Section title="Box">

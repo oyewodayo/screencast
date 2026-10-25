@@ -47,8 +47,22 @@ export const TRANSITION_PRESETS: { value: TransitionType; label: string }[] = [
   { value: "fadewhite", label: "Flash" },
   { value: "whip", label: "Whip" },
   { value: "zoomblur", label: "Zoom blur" },
+  { value: "push", label: "Push" },
+  { value: "cube", label: "Cube" },
+  { value: "tiles", label: "Tile wall" },
+  { value: "split", label: "Split" },
+  { value: "strips", label: "Strips" },
+  { value: "glitch", label: "Glitch" },
+  { value: "spin", label: "Spin" },
+  { value: "beam", label: "Light beam" },
+  { value: "slice", label: "Slice" },
+  { value: "flip", label: "Flip" },
   { value: "pagecurl", label: "Page curl" },
   { value: "colorsweep", label: "Colour sweep" },
+  { value: "iris", label: "Shape" },
+  { value: "blocks", label: "Blocks" },
+  { value: "mosaic", label: "Grid" },
+  { value: "slider", label: "Before/after" },
   { value: "horzopen", label: "Bar open" },
   { value: "fadeblack", label: "Fade to black" },
   { value: "dissolve", label: "Dissolve" },
@@ -288,6 +302,23 @@ export interface PlayerFraming {
   clipPath: string;
   // Where the project frame sits in the element - what overlays, captions and the vignette use.
   frameRect: { x: number; y: number; width: number; height: number };
+  // `transform` as numbers: screen = (a*X + e, d*Y + f), origin 0 0.
+  matrix: { a: number; d: number; e: number; f: number };
+}
+
+// The framing with the frame's picture placed into `inset` instead of the whole frame (fractions
+// of the frame - the Screen Style's content rectangle, screenStyle.ts): one more scale + offset
+// after it, the clip path unchanged (it's in the element's own space, before the transform).
+export function insetFraming(framing: PlayerFraming, inset: { x: number; y: number; width: number; height: number } | null | undefined): PlayerFraming {
+  if (!inset) return framing;
+  const F = framing.frameRect;
+  const sx = inset.width;
+  const sy = inset.height;
+  const ox = F.x + inset.x * F.width - sx * F.x;
+  const oy = F.y + inset.y * F.height - sy * F.y;
+  const { a, d, e, f } = framing.matrix;
+  const m = { a: sx * a, d: sy * d, e: sx * e + ox, f: sy * f + oy };
+  return { ...framing, transform: `matrix(${m.a}, 0, 0, ${m.d}, ${m.e}, ${m.f})`, matrix: m };
 }
 
 export function playerFraming(
@@ -318,6 +349,7 @@ export function playerFraming(
     transform: identity ? "" : `matrix(${x.A}, 0, 0, ${y.A}, ${x.E}, ${y.E})`,
     clipPath: identity ? "" : `inset(${y.lo}px ${element.width - x.hi}px ${element.height - y.hi}px ${x.lo}px)`,
     frameRect: F,
+    matrix: identity ? { a: 1, d: 1, e: 0, f: 0 } : { a: x.A, d: y.A, e: x.E, f: y.E },
   };
 }
 
@@ -377,4 +409,35 @@ export interface ActiveClipEffects {
   // The project frame in px (the primary file's size - what export renders at). The player fits
   // every clip into it, as export does, so a clip of another shape previews letterboxed in it.
   frame?: { width: number; height: number };
+}
+
+// Everything switched on for a clip, as short labels - the badges its timeline block carries, so a
+// clip's look and effects are visible without opening it. Transitions are drawn on the cut instead.
+export interface ClipEffectBadge {
+  key: string;
+  label: string;
+  // Badge colour family.
+  tone: "look" | "fx" | "motion" | "time" | "frame" | "sound";
+}
+export function clipEffectBadges(
+  clip: Pick<Clip, "grade" | "colorFilter" | "fx" | "kenBurns" | "speed" | "speedRamp" | "crop" | "flipHorizontal" | "stabilize" | "muted" | "reversedFrom">,
+  labels: { look?: (name: string) => string | undefined; fx?: (kind: string) => string | undefined } = {}
+): ClipEffectBadge[] {
+  const out: ClipEffectBadge[] = [];
+  const g = clip.grade;
+  if (g?.look && g.look.intensity > 0) out.push({ key: "look", label: labels.look?.(g.look.name) ?? g.look.name, tone: "look" });
+  const manual = g && (["exposure", "contrast", "saturation", "temperature", "tint", "highlights", "shadows"] as const).some((k) => Math.abs(g[k] ?? 0) > 1e-4);
+  if (manual || (g?.lut && g.lut.intensity > 0)) out.push({ key: "grade", label: g?.lut && g.lut.intensity > 0 ? "LUT" : "Graded", tone: "look" });
+  if (clip.colorFilter && clip.colorFilter.preset !== "none")
+    out.push({ key: "color", label: COLOR_FILTER_PRESETS.find((p) => p.value === clip.colorFilter!.preset)?.label ?? clip.colorFilter.preset, tone: "look" });
+  if (clip.fx && clip.fx.intensity > 0) out.push({ key: "fx", label: labels.fx?.(clip.fx.kind) ?? clip.fx.kind, tone: "fx" });
+  if (clip.kenBurns) out.push({ key: "motion", label: KEN_BURNS_PRESETS.find((p) => p.value === clip.kenBurns!.preset)?.label ?? "Motion", tone: "motion" });
+  if (clip.speedRamp) out.push({ key: "speed", label: "Ramp", tone: "time" });
+  else if (clip.speed && Math.abs(clip.speed - 1) > 1e-3) out.push({ key: "speed", label: `${+clip.speed.toFixed(2)}x`, tone: "time" });
+  if (clip.reversedFrom) out.push({ key: "reverse", label: "Reverse", tone: "time" });
+  if (clip.crop) out.push({ key: "crop", label: "Crop", tone: "frame" });
+  if (clip.flipHorizontal) out.push({ key: "flip", label: "Mirror", tone: "frame" });
+  if (clip.stabilize) out.push({ key: "steady", label: "Steady", tone: "frame" });
+  if (clip.muted) out.push({ key: "muted", label: "Muted", tone: "sound" });
+  return out;
 }

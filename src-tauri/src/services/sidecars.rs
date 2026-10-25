@@ -13,7 +13,7 @@ use std::{
 };
 
 // Every companion-file suffix the app writes (see each service's own sidecar_path_for).
-pub const SIDECAR_SUFFIXES: &[&str] = &[".edits.json", ".chapters.json", ".imageedit.json", ".annotations.json"];
+pub const SIDECAR_SUFFIXES: &[&str] = &[".edits.json", ".chapters.json", ".imageedit.json", ".annotations.json", ".pointer.json"];
 
 pub fn sidecar_path(file: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = file.as_os_str().to_os_string();

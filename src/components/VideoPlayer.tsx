@@ -13,7 +13,7 @@ import { RxDoubleArrowLeft, RxDoubleArrowRight } from 'react-icons/rx';
 import Alert from './custom/Alert';
 import PlaytimeSettings from './custom/PlaytimeSettings';
 import useAutoHideControls from '../hooks/useAutoHideControls';
-import { getWaveformPeaks } from '../utils/audioWaveform';
+import { downsamplePeaks, getWaveformPeaks } from '../utils/audioWaveform';
 
 // Import utility functions
 import {
@@ -31,10 +31,10 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { isNeutralFx, type AudioFx } from '../utils/audioFx';
-import { createTrackFxNode, loadTrackFxModule, resumeMixer, setNodeFx } from '../utils/mixerGraph';
+import { createTrackFxNode, loadTrackFxModule, loadWorkletModule, masterInput, mixerContext, resumeMixer, setListenLevel, setNodeFx, useTimelineMuted } from '../utils/mixerGraph';
 import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile } from '../utils/captions';
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
@@ -147,6 +147,9 @@ const ARROW_SEEK_SECONDS = 5;
 interface VideoPlayerProps {
   src?: string;
   title?: string;
+  // "Edit video" in the settings menu - opens (or closes) the editor for what's playing.
+  onEditVideo?: () => void;
+  isEditingVideo?: boolean;
   autoPlay?: boolean;
   // Real filesystem path behind `src` (which is already a browser-loadable asset:// URL) -
   // needed only to invoke get_playable_preview if native playback fails. Without it, a decode
@@ -218,6 +221,10 @@ interface VideoPlayerProps {
   // (no buttons) when there's nothing else to switch to.
   onPrevious?: () => void;
   onNext?: () => void;
+  // The Screen Style's content rectangle (fractions of the frame - screenStyle.ts): the picture is
+  // drawn inside it instead of filling the frame, the frame's wallpaper drawn around it by the
+  // caller. Null/undefined: the picture fills the frame.
+  contentInset?: { x: number; y: number; width: number; height: number } | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -261,6 +268,9 @@ export interface VideoPlayerHandle {
   // until that source has decoded a frame to show. `paused` lets a layer that plays its own
   // <video> in step (the transition's moving outgoing tail) follow play/pause/scrub.
   getPlaybackState: () => { src: string | null; time: number; hasFrame: boolean; paused: boolean; seeking: boolean; volume: number; muted: boolean } | null;
+  // The <video> itself - transitions that move the incoming clip paint what it shows (with its
+  // inline framing transform/filter, or GradeCanvas's graded copy) into their own canvas.
+  getVideoElement: () => HTMLVideoElement | null;
   // Opens the "Set thumbnail" picker for this video (waits for it to load if it just opened).
   openThumbnailPicker: () => void;
 }
@@ -306,7 +316,9 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo }, ref) => {
+  const contentInsetRef = useRef(contentInset);
+  contentInsetRef.current = contentInset;
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -346,6 +358,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reconnecting it once an async module load finishes left a gap the media pipeline's AV-sync
   // clock could stall on, which read as "clicking the clip stopped playback".
   const noiseCtxRef = useRef<AudioContext | null>(null);
+  // Once this element's sound runs through Web Audio it meets the timeline's other sounds on the
+  // mixer's master bus, and the listening volume moves there (setListenLevel).
+  const [routedToMixer, setRoutedToMixer] = useState(false);
   const noiseWorkletReadyRef = useRef<Promise<void> | null>(null);
   // This element's one MediaElementAudioSourceNode (createMediaElementSource can only ever be called
   // once per element) and the bus everything audible flows through to the speakers, both on
@@ -357,19 +372,19 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (!mediaSourceRef.current) {
       const source = ctx.createMediaElementSource(video);
       const bus = new GainNode(ctx, { gain: 1 });
-      bus.connect(ctx.destination);
+      // Onto the mixer's master bus with every other sound (mixerGraph.ts) - the listening volume
+      // is applied after it from here on (see the volume effect).
+      bus.connect(masterInput());
       source.connect(bus);
       mediaSourceRef.current = { source, bus };
+      setRoutedToMixer(true);
     }
     return mediaSourceRef.current;
   };
-  // The video sound's mixer channel: bus -> track-fx worklet -> monitor -> speakers. The user's own
-  // listening volume moves to `monitor` once this exists (the element then plays at just the track
-  // level), so the compressor reacts to the level the export mixes at, not to how loud the user
-  // happens to be listening. Built once, the first time effects or the meter are wanted.
-  const trackFxRef = useRef<{ node: AudioWorkletNode; monitor: GainNode } | null>(null);
+  // The video sound's mixer channel: bus -> track-fx worklet -> master bus. Built once, the first
+  // time effects or the meter are wanted.
+  const trackFxRef = useRef<{ node: AudioWorkletNode } | null>(null);
   const trackFxSetupRef = useRef(false);
-  const [trackFxReady, setTrackFxReady] = useState(false);
   const trackFxLatestRef = useRef(trackFx);
   trackFxLatestRef.current = trackFx;
   // Real-time audio-reactive visualizer for audio-file playback (mediaType 'audio' only).
@@ -445,10 +460,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reduction is never used at all this session. 48kHz because RNNoise ("Remove" mode) only works
   // at that rate - the media element source is resampled into it automatically.
   useEffect(() => {
-    const ctx = new AudioContext({ sampleRate: 48000 });
+    // The mixer's own context (48kHz too), shared with every track so they all reach one master bus -
+    // it outlives this player, so unmounting only lets go of this element's nodes.
+    const ctx = mixerContext();
     noiseCtxRef.current = ctx;
-    noiseWorkletReadyRef.current = ctx.audioWorklet
-      .addModule("/audio-worklets/noise-reduction-processor.js")
+    noiseWorkletReadyRef.current = loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
       .catch((err) => {
         console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
         throw err;
@@ -456,7 +472,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => {
       noiseGraphUnmountedRef.current = true;
       mediaSourceRef.current?.source.disconnect();
-      ctx.close().catch(() => {});
+      mediaSourceRef.current?.bus.disconnect();
     };
   }, []);
 
@@ -478,11 +494,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // Export's exact framing: fitted into the project frame, then flip -> crop -> Ken Burns
     // (clipFrameAffine), clipped to the frame (playerFraming).
     const m = clipFrameAffine({ crop, kenBurns: kb, flipHorizontal: effects?.flipHorizontal, sourceStart: effects?.sourceStart, sourceEnd: effects?.sourceEnd }, progress);
-    const framing = playerFraming(
-      m,
-      { width: video.clientWidth, height: video.clientHeight },
-      { width: video.videoWidth, height: video.videoHeight },
-      effects?.frame ?? null
+    // ...then, with a Screen Style, into its content rectangle.
+    const framing = insetFraming(
+      playerFraming(
+        m,
+        { width: video.clientWidth, height: video.clientHeight },
+        { width: video.videoWidth, height: video.videoHeight },
+        effects?.frame ?? null
+      ),
+      contentInsetRef.current
     );
     video.style.transformOrigin = framing.transform ? '0 0' : '';
     video.style.transform = framing.transform;
@@ -566,6 +586,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (!video) return null;
       return { src: video.getAttribute('src'), time: video.currentTime, hasFrame: video.readyState >= 2, paused: video.paused, seeking: video.seeking, volume: video.volume, muted: video.muted };
     },
+    getVideoElement: () => videoRef.current,
     openThumbnailPicker: () => openThumbnailPickerRef.current(),
   }), []);
 
@@ -603,6 +624,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [, setIsMuted] = useState<boolean>(true);
   const [volume, setVolumeState] = useState<number>(1.0);
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
   const [volumeLevel, setVolumeLevel] = useState<VolumeLevel>('high');
   const [currentPlaySpeed, setCurrentPlaySpeed] = useState<string>("1x");
 
@@ -770,7 +793,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
   // thumbnail of. null until decoded, or permanently for a file with no audio track/a failed decode
   // (that util already logs its own failures - this just stays empty rather than erroring).
-  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<number[] | null>(null);
+  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<Float32Array | null>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   // Audio's own equivalent of the chapter-hover tooltip / video thumbnail: since there's nothing
   // visual to preview, hovering the timeline just shows the timestamp under the cursor instead of
@@ -1025,8 +1048,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const buckets = Math.max(8, Math.floor(widthPx / 2));
     const barWidth = widthPx / buckets;
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    const bars = downsamplePeaks(audioWaveformPeaks, buckets);
     for (let i = 0; i < buckets; i++) {
-      const amp = audioWaveformPeaks[Math.min(audioWaveformPeaks.length - 1, Math.floor((i / buckets) * audioWaveformPeaks.length))] ?? 0;
+      const amp = bars[i];
       const barHeight = Math.max(1, amp * heightPx);
       ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
     }
@@ -1725,15 +1749,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // volume and silence from the muted flag are indistinguishable to the ear, so there's no need to
   // juggle two separate "why is this silent" states for what the local mute button already owns.
   // With the mixer channel built, the listening volume is applied after its effects instead.
+  // Routed into the mixer, the listening volume is the master's last stage (setListenLevel) - for
+  // every sound on the timeline at once, and after the meters and limiter.
+  // Silent while a voice-over records over the picture (setTimelineMuted).
+  const timelineMuted = useTimelineMuted();
   useEffect(() => {
-    const fx = trackFxRef.current;
-    if (fx) {
-      setVolume(videoRef.current, trackMuted ? 0 : trackVolume);
-      fx.monitor.gain.value = Math.max(0, Math.min(1, volume));
-    } else {
-      setVolume(videoRef.current, volume * (trackMuted ? 0 : trackVolume));
-    }
-  }, [volume, trackVolume, trackMuted, trackFxReady]);
+    setListenLevel(volume);
+    const track = trackMuted || timelineMuted ? 0 : trackVolume;
+    setVolume(videoRef.current, routedToMixer ? track : volume * track);
+  }, [volume, trackVolume, trackMuted, routedToMixer, timelineMuted]);
 
   const trackFxKey = JSON.stringify(trackFx ?? null);
   useEffect(() => {
@@ -1753,16 +1777,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
         // Rewired in one synchronous block (see attachMediaSource) - no gap in the sound.
         const { bus } = attachMediaSource(ctx, video);
         const node = createTrackFxNode(ctx, 'video');
-        const monitor = new GainNode(ctx, { gain: 1 });
         try {
-          bus.disconnect(ctx.destination);
+          bus.disconnect(masterInput());
         } catch {
           // Not connected straight to the speakers - nothing to undo.
         }
-        bus.connect(node).connect(monitor).connect(ctx.destination);
+        bus.connect(node).connect(masterInput());
         setNodeFx(node, trackFxLatestRef.current);
-        trackFxRef.current = { node, monitor };
-        setTrackFxReady(true);
+        trackFxRef.current = { node };
         if (ctx.state === 'suspended') ctx.resume().catch(() => {});
       })
       .catch((err) => console.error('Mixer effects unavailable on the video sound:', err))
@@ -2015,7 +2037,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       video.style.clipPath = '';
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height]);
+  }, [activeClipEffects?.sourceStart, activeClipEffects?.sourceEnd, activeClipEffects?.kenBurns, activeClipEffects?.crop, activeClipEffects?.flipHorizontal, activeClipEffects?.frame?.width, activeClipEffects?.frame?.height, contentInset?.x, contentInset?.y, contentInset?.width, contentInset?.height]);
 
   const handleForwardSkip = (): void => {
     setShowSkipTime(!showSkipTime);
@@ -2300,8 +2322,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     };
 
     const handleVolumeChange = (): void => {
-      // With the mixer channel built, what's heard is the element's (track) volume times the monitor's.
-      setVolumeLevel(getVolumeLevel(video.volume * (trackFxRef.current?.monitor.gain.value ?? 1), video.muted));
+      // Routed into the mixer, what's heard is the element's (track) volume times the listening volume.
+      setVolumeLevel(getVolumeLevel(video.volume * (mediaSourceRef.current ? volumeRef.current : 1), video.muted));
     };
 
     const handleEnded = (): void => {
@@ -2893,6 +2915,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							noise={playerNoise}
 							noiseStatus={noiseStatus}
 							onNoiseChange={setPlayerNoise}
+							onEditVideo={onEditVideo ? () => { setShowSettings(false); onEditVideo(); } : undefined}
+							isEditingVideo={isEditingVideo}
 							/>
 							</div>
 						)}
@@ -3067,10 +3091,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						<div
 							className="absolute pointer-events-none"
 							style={{
-								left: frameRect.left,
-								top: frameRect.top,
-								width: frameRect.width,
-								height: frameRect.height,
+								// On the clip's own picture - inside the Screen Style's content rectangle when there is one.
+								left: frameRect.left + (contentInset?.x ?? 0) * frameRect.width,
+								top: frameRect.top + (contentInset?.y ?? 0) * frameRect.height,
+								width: frameRect.width * (contentInset?.width ?? 1),
+								height: frameRect.height * (contentInset?.height ?? 1),
 								background: vignetteBackground(activeClipEffects.colorFilter.intensity),
 							}}
 						/>

@@ -12,22 +12,25 @@
 // of their own subfeatures to earn a dedicated surface instead of being one more section buried
 // inside "Clip effects".
 import React, { useState } from "react";
-import { ColorGrid, MotionGrid } from "./EffectPreviewGrids";
+import { ColorGrid, FxGrid, LookGrid, MotionGrid } from "./EffectPreviewGrids";
+import { DEFAULT_CLIP_FX_INTENSITY } from "../../utils/clipFx";
+import { TRANSITION_SOUNDS } from "../../utils/builtinSfx";
 import { hasGrade } from "../../utils/colorGrade";
 import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
-import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
+import { Clip, ClipFxKind, ClipGrade, ColorFilterPreset, GradeLookName, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
 import TransitionGrid from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted" | "fx">>;
 
 export const DEFAULT_STABILIZE_STRENGTH = 0.5;
 
 export const DEFAULT_COLOR_INTENSITY = 0.7;
+export const DEFAULT_LOOK_INTENSITY = 0.85;
 export const DEFAULT_KEN_BURNS_INTENSITY = 0.5;
 export const DEFAULT_TRANSITION_DURATION = 0.5;
 
@@ -43,13 +46,16 @@ interface ClipEffectsPopoverProps {
   // `clip`'s values, and every change is applied to all of them.
   selectedCount?: number;
   onUpdate: (patch: ClipEffectsPatch) => void;
+  // Puts a built-in sound (TRANSITION_SOUNDS) on the timeline at this clip's cut.
+  onAddTransitionSound?: (soundId: string) => void;
   onClose: () => void;
 }
 
-type EffectsTab = "look" | "motion" | "sound" | "transition";
+type EffectsTab = "look" | "motion" | "fx" | "sound" | "transition";
 const TABS: { value: EffectsTab; label: string; title: string }[] = [
-  { value: "look", label: "Look", title: "Colour presets and grading" },
+  { value: "look", label: "Look", title: "Looks, colour presets and grading" },
   { value: "motion", label: "Motion", title: "Camera moves and stabilizing" },
+  { value: "fx", label: "Effects", title: "Echo, RGB split, colour cycle, focus in..." },
   { value: "sound", label: "Sound", title: "This clip's own sound" },
   { value: "transition", label: "Transition", title: "How this clip comes in from the one before" },
 ];
@@ -69,7 +75,7 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, previousClip, isOnScreen, anchor, selectedCount, onUpdate, onClose }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, previousClip, isOnScreen, anchor, selectedCount, onUpdate, onAddTransitionSound, onClose }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -87,6 +93,15 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
     } else {
       onUpdate({ colorFilter: { preset, intensity: colorIntensity } });
     }
+  };
+
+  // A built-in look rides on the grade (it's baked into the same LUT).
+  const lookName = clip.grade?.look?.name ?? null;
+  const lookIntensity = clip.grade?.look?.intensity ?? DEFAULT_LOOK_INTENSITY;
+  const setLook = (name: GradeLookName | null, intensity = lookIntensity) => {
+    const next: ClipGrade = { ...(clip.grade ?? {}), look: name ? { name, intensity } : undefined };
+    if (!name) delete next.look;
+    onUpdate({ grade: !!next.lut || hasGrade(next) ? next : undefined });
   };
 
   const kenBurnsPreset = clip.kenBurns?.preset ?? null;
@@ -117,6 +132,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
   const active: Record<EffectsTab, boolean> = {
     look: (clip.colorFilter?.preset ?? "none") !== "none" || hasGrade(clip.grade),
     motion: !!clip.kenBurns || !!clip.stabilize,
+    fx: !!clip.fx,
     sound: !!clip.muted,
     transition: !!clip.transitionIn && hasPrecedingClip,
   };
@@ -146,7 +162,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         </button>
       </div>
 
-      <div role="tablist" className="grid grid-cols-4 gap-0.5 p-0.5 rounded-md bg-white/[0.05]">
+      <div role="tablist" className="grid grid-cols-5 gap-0.5 p-0.5 rounded-md bg-white/[0.05]">
         {TABS.map((t) => (
           <button
             key={t.value}
@@ -166,6 +182,25 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       {tab === "look" && (
         <>
           <div className="flex flex-col gap-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-white/40">Looks</span>
+            <LookGrid clip={clip} value={lookName} intensity={lookIntensity} onChange={(name) => setLook(name)} />
+            {lookName && (
+              <label className="flex items-center gap-2 text-[11px] pt-0.5">
+                <span className="w-12 shrink-0 text-white/60">Amount</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={lookIntensity}
+                  onChange={(e) => setLook(lookName, Number(e.target.value))}
+                  className="flex-1 accent-blue-400"
+                />
+                <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(lookIntensity * 100)}%</span>
+              </label>
+            )}
+          </div>
+          <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
             <span className="text-[10px] uppercase tracking-wide text-white/40">Color</span>
             <ColorGrid clip={clip} value={colorPreset} intensity={colorIntensity} onChange={setColorPreset} />
             {colorPreset !== "none" && (
@@ -247,6 +282,33 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         </>
       )}
 
+      {tab === "fx" && (
+        <div className="flex flex-col gap-1.5">
+          <span className="text-[10px] uppercase tracking-wide text-white/40">Clip effect</span>
+          <FxGrid
+            clip={clip}
+            value={clip.fx?.kind ?? null}
+            intensity={clip.fx?.intensity ?? DEFAULT_CLIP_FX_INTENSITY}
+            onChange={(kind: ClipFxKind | null) => onUpdate({ fx: kind ? { kind, intensity: clip.fx?.intensity ?? DEFAULT_CLIP_FX_INTENSITY } : undefined })}
+          />
+          {clip.fx && (
+            <label className="flex items-center gap-2 text-[11px] pt-0.5">
+              <span className="w-12 shrink-0 text-white/60">Amount</span>
+              <input
+                type="range"
+                min={0.05}
+                max={1}
+                step={0.01}
+                value={clip.fx.intensity}
+                onChange={(e) => onUpdate({ fx: { kind: clip.fx!.kind, intensity: Number(e.target.value) } })}
+                className="flex-1 accent-blue-400"
+              />
+              <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(clip.fx.intensity * 100)}%</span>
+            </label>
+          )}
+        </div>
+      )}
+
       {tab === "sound" && (
         <div className="flex items-center justify-between gap-2 text-[11px]">
           <span className="text-[10px] uppercase tracking-wide text-white/40">Clip sound</span>
@@ -287,6 +349,24 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
                 look={transitionLook}
                 onChange={(look) => onUpdate({ transitionIn: { type: transitionType, duration: transitionDuration, look } })}
               />
+            )}
+            {onAddTransitionSound && (
+              <div className="flex items-start gap-2 text-[11px] pt-1">
+                <span className="w-12 shrink-0 pt-1 text-white/60">Sound</span>
+                <div className="flex-1 min-w-0 flex flex-wrap gap-1">
+                  {TRANSITION_SOUNDS.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      title={`Add a ${s.label.toLowerCase()} timed to this cut (as its own audio track)`}
+                      onClick={() => onAddTransitionSound(s.id)}
+                      className="h-6 px-1.5 rounded text-[11px] bg-white/[0.06] text-white/70 hover:text-white hover:bg-white/10"
+                    >
+                      ＋ {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
         ) : (

@@ -25,12 +25,21 @@
 //     Desktop Duplication source plus an uploaded webcam always are in this build, so a baked-in
 //     camera composites on the CPU after a GPU downscale.
 //
+//   - vpp_qsv is asked for a size only, never `format=nv12`: since ffmpeg 8 the NV12 frame pool it
+//     then allocates fails on Intel's pre-oneVPL drivers (HD 630 here: "Could not create the
+//     texture (80070057)"), while BGRA scaled frames go to h264_qsv fine.
+//
+// A single window is captured with Windows.Graphics.Capture (ffmpeg's `gfxcapture`, ffmpeg 8+)
+// instead of a crop of the desktop: it delivers that window's own pixels - not whatever happens
+// to be on top of it - follows it when it moves, and keeps going while the user works in another
+// app. Its frames are D3D11 textures exactly like ddagrab's, so everything downstream is shared.
+//
 // Which path works is decided by actually running it (see probe), not by asking what the build
 // supports - hw_encoder.rs's own header has the history of why "listed" doesn't mean "works".
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -89,13 +98,23 @@ struct Output {
     bottom: i32,
 }
 
-// One recording's GPU capture: which output, which part of it, and how it gets encoded.
+// A window captured on its own (gfxcapture) rather than as part of an output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowSource {
+    pub(crate) hwnd: isize,
+    // The title bar and frame too, not just the window's content.
+    pub(crate) title_bar: bool,
+}
+
+// One recording's GPU capture: which output (or window), which part of it, and how it gets encoded.
 #[derive(Clone, Debug)]
 pub(crate) struct GpuCapture {
     adapter: u32,
     output: u32,
     // Relative to the output, only when capturing less than the whole output.
     crop: Option<(i32, i32)>,
+    window: Option<WindowSource>,
+    cursor: bool,
     width: i32,
     height: i32,
     pub(crate) encoder: GpuEncoder,
@@ -103,9 +122,97 @@ pub(crate) struct GpuCapture {
 
 static PROBED: Mutex<Option<HashMap<u32, Option<GpuEncoder>>>> = Mutex::new(None);
 static DISABLED: AtomicBool = AtomicBool::new(false);
-// Whether the recording most recently started went through GPU capture - start_recording reads
-// it to decide whether an ffmpeg that died at start is worth retrying through gdigrab.
-pub(crate) static USED_BY_LAST_START: AtomicBool = AtomicBool::new(false);
+// Windows whose own capture died at start (a suspended Store app's frame, say) - recorded as the
+// screen area they cover from then on.
+static FAILED_WINDOWS: Mutex<Option<HashSet<isize>>> = Mutex::new(None);
+static WINDOW_CAPTURE: Mutex<Option<bool>> = Mutex::new(None);
+
+// How the recording most recently started captured the screen - start_recording reads it to
+// decide whether an ffmpeg that died at start is worth retrying another way.
+const START_NONE: u8 = 0;
+const START_DESKTOP: u8 = 1;
+const START_WINDOW: u8 = 2;
+static LAST_START: AtomicU8 = AtomicU8::new(START_NONE);
+static LAST_START_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+pub(crate) fn note_start(capture: Option<&GpuCapture>) {
+    let (kind, hwnd) = match capture {
+        Some(GpuCapture { window: Some(w), .. }) => (START_WINDOW, w.hwnd),
+        Some(_) => (START_DESKTOP, 0),
+        None => (START_NONE, 0),
+    };
+    LAST_START_WINDOW.store(hwnd, Ordering::SeqCst);
+    LAST_START.store(kind, Ordering::SeqCst);
+}
+
+// After the capture ffmpeg died at start: whether another attempt can go differently. A window
+// that can't be captured on its own falls back to the screen area it covers (still on the GPU);
+// a Desktop Duplication failure turns GPU capture off for the session (gdigrab next).
+// `ffmpeg_output` is the tail of what that ffmpeg printed: only a failure of the screen capture
+// itself is retried - a microphone or camera that wouldn't open fails the same way however the
+// screen is captured.
+pub(crate) fn fallback_after_failed_start(reason: &str, ffmpeg_output: &str) -> bool {
+    if !blames_screen(ffmpeg_output) {
+        LAST_START.store(START_NONE, Ordering::SeqCst);
+        log::info!("Capture start failed on an input device, not the screen capture - not retrying it differently");
+        return false;
+    }
+    match LAST_START.swap(START_NONE, Ordering::SeqCst) {
+        START_WINDOW => {
+            let hwnd = LAST_START_WINDOW.load(Ordering::SeqCst);
+            log::warn!("Window capture of {:#x} failed ({}), recording the screen area it covers instead", hwnd, reason);
+            FAILED_WINDOWS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert_with(HashSet::new)
+                .insert(hwnd);
+            true
+        }
+        START_DESKTOP => {
+            disable_for_session(reason);
+            true
+        }
+        _ => false,
+    }
+}
+
+// Whether a failed start's ffmpeg output points at the screen capture (or says nothing useful,
+// which is treated the same as before: the screen gets the blame) rather than at a dshow device.
+fn blames_screen(ffmpeg_output: &str) -> bool {
+    let out = ffmpeg_output.to_lowercase();
+    if out.trim().is_empty() {
+        return true;
+    }
+    let screen = ["gfxcapture", "ddagrab", "desktop duplication", "hwmap", "qsv", "d3d11", "nvenc", "amf", "gdigrab"]
+        .iter()
+        .any(|k| out.contains(k));
+    let device = out.contains("dshow") || out.contains("audio=") || out.contains("video=");
+    screen || !device
+}
+
+// Whether this ffmpeg has gfxcapture (ffmpeg 8+, Windows 10 1903+). Asked once per session.
+pub(crate) fn window_capture_available(ffmpeg_path: &Path) -> bool {
+    let mut cached = WINDOW_CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(known) = *cached {
+        return known;
+    }
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(["-hide_banner", "-h", "filter=gfxcapture"]);
+    super::hide_console_window(&mut cmd);
+    let known = match crate::services::responsiveness::output_with_timeout(cmd, Duration::from_secs(10)) {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.contains("Filter gfxcapture") && text.contains("hwnd")
+        }
+        Err(_) => false,
+    };
+    log::info!(
+        "Window capture (gfxcapture): {}",
+        if known { "available" } else { "unavailable, windows are recorded as screen areas" }
+    );
+    *cached = Some(known);
+    known
+}
 
 // Turns GPU capture off for the rest of this session, after a recording that used it died at
 // start - the next attempt goes through gdigrab instead of failing the same way again.
@@ -135,7 +242,7 @@ pub(crate) fn warm(ffmpeg_path: &Path) {
 // `exact` is for regions that must be captured as given (the full screen, a whole monitor): they
 // have to match one output exactly. Otherwise (a window) the region is clipped to the output
 // holding its centre, which is what the user can actually see of it anyway.
-pub(crate) fn plan(ffmpeg_path: &Path, region: (i32, i32, i32, i32), exact: bool) -> Option<GpuCapture> {
+pub(crate) fn plan(ffmpeg_path: &Path, region: (i32, i32, i32, i32), exact: bool, cursor: bool) -> Option<GpuCapture> {
     if DISABLED.load(Ordering::SeqCst) {
         return None;
     }
@@ -170,10 +277,64 @@ pub(crate) fn plan(ffmpeg_path: &Path, region: (i32, i32, i32, i32), exact: bool
         adapter: out.adapter,
         output: out.output,
         crop: if full { None } else { Some((left, top)) },
+        window: None,
+        cursor,
         width,
         height,
         encoder,
     })
+}
+
+// A window captured on its own, or None when that isn't possible here (no gfxcapture, GPU
+// capture off, the window already failed this way, or it has no area) and the caller should
+// capture the screen area it covers instead. `region` is what the capture will hold, in screen
+// pixels (window_capture::win::capture_rect): its size fixes the recording's size - the window
+// is scaled to fit it, aspect kept, if it's resized while recording - and its centre picks the
+// GPU whose encoder is used.
+pub(crate) fn plan_window(
+    ffmpeg_path: &Path,
+    window: WindowSource,
+    region: (i32, i32, i32, i32),
+    cursor: bool,
+) -> Option<GpuCapture> {
+    if DISABLED.load(Ordering::SeqCst) || !window_capture_available(ffmpeg_path) {
+        return None;
+    }
+    let failed = FAILED_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    if failed.as_ref().is_some_and(|f| f.contains(&window.hwnd)) {
+        return None;
+    }
+    drop(failed);
+    let (x, y, w, h) = region;
+    let (width, height) = (w & !1, h & !1);
+    if width < MIN_REGION || height < MIN_REGION {
+        return None;
+    }
+    let outputs = enumerate_outputs();
+    let (cx, cy) = (x + w / 2, y + h / 2);
+    let out = outputs
+        .iter()
+        .find(|o| cx >= o.left && cx < o.right && cy >= o.top && cy < o.bottom)
+        .or_else(|| outputs.first())?;
+    let encoder = encoder_for(ffmpeg_path, out)?;
+    Some(GpuCapture {
+        adapter: out.adapter,
+        output: out.output,
+        crop: None,
+        window: Some(window),
+        cursor,
+        width,
+        height,
+        encoder,
+    })
+}
+
+// The gfxcapture source for a still of `window`, sized as it is now - for screenshots.
+pub(crate) fn window_still_filter(window: WindowSource, cursor: bool) -> String {
+    format!(
+        "gfxcapture=hwnd={}:capture_cursor={}:capture_border={}:display_border=0,hwdownload,format=bgra",
+        window.hwnd, cursor as u8, window.title_bar as u8
+    )
 }
 
 impl GpuCapture {
@@ -193,10 +354,23 @@ impl GpuCapture {
         ]
     }
 
+    pub(crate) fn window(&self) -> Option<WindowSource> {
+        self.window
+    }
+
     pub(crate) fn source_filter(&self, framerate: i32) -> String {
+        if let Some(w) = self.window {
+            // resize_mode=scale_aspect: a window resized mid-recording is fitted into the size the
+            // recording started at (an encoder can't change size mid-stream) rather than cropped.
+            // display_border=0 asks Windows not to draw its yellow "being captured" frame.
+            return format!(
+                "gfxcapture=hwnd={}:max_framerate={}:capture_cursor={}:capture_border={}:display_border=0:resize_mode=scale_aspect:scale_mode=bicubic:width={}:height={}",
+                w.hwnd, framerate, self.cursor as u8, w.title_bar as u8, self.width, self.height
+            );
+        }
         let mut source = format!(
-            "ddagrab=output_idx={}:framerate={}:draw_mouse=1",
-            self.output, framerate
+            "ddagrab=output_idx={}:framerate={}:draw_mouse={}",
+            self.output, framerate, self.cursor as u8
         );
         if let Some((x, y)) = self.crop {
             source.push_str(&format!(
@@ -224,13 +398,14 @@ impl GpuCapture {
         let scaled = out != (self.width, self.height);
         match self.encoder {
             GpuEncoder::Qsv => {
-                let mut chain = String::from("hwmap=derive_device=qsv,format=qsv,vpp_qsv=");
+                // Scaled frames stay BGRA (see the header on vpp_qsv and NV12); h264_qsv takes
+                // BGRA surfaces as they are, and a CPU filter after this gets them as bgra.
+                let mut chain = String::from("hwmap=derive_device=qsv,format=qsv");
                 if scaled {
-                    chain.push_str(&format!("w={}:h={}:", out.0, out.1));
+                    chain.push_str(&format!(",vpp_qsv=w={}:h={}", out.0, out.1));
                 }
-                chain.push_str("format=nv12");
                 if to_cpu {
-                    chain.push_str(",hwdownload,format=nv12");
+                    chain.push_str(",hwdownload,format=bgra");
                 }
                 (chain, to_cpu)
             }
@@ -299,7 +474,22 @@ fn encoder_for(ffmpeg_path: &Path, out: &Output) -> Option<GpuEncoder> {
         VENDOR_AMD => &[GpuEncoder::Amf, GpuEncoder::Copy],
         _ => &[GpuEncoder::Copy],
     };
-    let found = candidates.iter().copied().find(|&e| probe(ffmpeg_path, out, e));
+    let mut transient = false;
+    let found = candidates.iter().copied().find(|&e| match probe(ffmpeg_path, out, e) {
+        Probe::Works => true,
+        Probe::Fails => false,
+        Probe::Unavailable => {
+            transient = true;
+            false
+        }
+    });
+    // Desktop Duplication refuses everyone while the secure desktop is up (a locked screen, a UAC
+    // prompt) - which says nothing about this GPU. Not remembered, so the next recording asks again
+    // instead of the whole session falling back to gdigrab because the app started on a lock screen.
+    if found.is_none() && transient {
+        log::info!("GPU screen capture probe on adapter {} deferred: the desktop is not available right now", out.adapter);
+        return None;
+    }
     match found {
         Some(e) => log::info!(
             "GPU screen capture on adapter {} (vendor {:04x}): {:?}",
@@ -316,11 +506,20 @@ fn encoder_for(ffmpeg_path: &Path, out: &Output) -> Option<GpuEncoder> {
 
 // A few real frames through the exact chain and encoder a recording would use - including a
 // downscale where the path has a GPU scaler, since that is a separate piece of hardware support.
-fn probe(ffmpeg_path: &Path, out: &Output, encoder: GpuEncoder) -> bool {
+enum Probe {
+    Works,
+    Fails,
+    // The desktop couldn't be duplicated at all right now - try again later.
+    Unavailable,
+}
+
+fn probe(ffmpeg_path: &Path, out: &Output, encoder: GpuEncoder) -> Probe {
     let capture = GpuCapture {
         adapter: out.adapter,
         output: out.output,
         crop: None,
+        window: None,
+        cursor: true,
         width: (out.right - out.left) & !1,
         height: (out.bottom - out.top) & !1,
         encoder,
@@ -338,18 +537,19 @@ fn probe(ffmpeg_path: &Path, out: &Output, encoder: GpuEncoder) -> bool {
     super::hide_console_window(&mut cmd);
 
     match crate::services::responsiveness::output_with_timeout(cmd, Duration::from_secs(20)) {
-        Ok(output) if output.status.success() => true,
+        Ok(output) if output.status.success() => Probe::Works,
         Ok(output) => {
-            log::debug!(
-                "GPU capture probe {:?} failed: {}",
-                encoder,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            false
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::debug!("GPU capture probe {:?} failed: {}", encoder, stderr.trim());
+            if stderr.contains("Desktop duplication access denied") {
+                Probe::Unavailable
+            } else {
+                Probe::Fails
+            }
         }
         Err(e) => {
             log::debug!("GPU capture probe {:?} could not run: {}", encoder, e);
-            false
+            Probe::Fails
         }
     }
 }
@@ -400,7 +600,7 @@ mod tests {
     use super::*;
 
     fn capture(encoder: GpuEncoder) -> GpuCapture {
-        GpuCapture { adapter: 0, output: 0, crop: None, width: 3840, height: 2160, encoder }
+        GpuCapture { adapter: 0, output: 0, crop: None, window: None, cursor: true, width: 3840, height: 2160, encoder }
     }
 
     #[test]
@@ -416,9 +616,11 @@ mod tests {
     #[test]
     fn qsv_stays_on_the_gpu_unless_asked_not_to() {
         let c = capture(GpuEncoder::Qsv);
-        assert_eq!(c.chain((3840, 2160), false), ("hwmap=derive_device=qsv,format=qsv,vpp_qsv=format=nv12".to_string(), false));
+        assert_eq!(c.chain((3840, 2160), false), ("hwmap=derive_device=qsv,format=qsv".to_string(), false));
         let (chain, cpu) = c.chain((1920, 1080), true);
-        assert!(chain.contains("w=1920:h=1080") && chain.ends_with("hwdownload,format=nv12"));
+        assert!(chain.contains("vpp_qsv=w=1920:h=1080") && chain.ends_with("hwdownload,format=bgra"));
+        // NV12 output from vpp_qsv fails on pre-oneVPL Intel drivers with ffmpeg 8+.
+        assert!(!chain.contains("nv12"));
         assert!(cpu);
     }
 
@@ -442,5 +644,39 @@ mod tests {
         let src = c.source_filter(60);
         assert!(src.contains("offset_x=100:offset_y=50:video_size=1280x720"));
         assert!(src.contains("framerate=60"));
+        assert!(src.contains("draw_mouse=1"));
+    }
+
+    #[test]
+    fn only_screen_failures_are_retried_differently() {
+        // ffmpeg 9's own words for an empty `-i audio=` (no microphone picked).
+        let empty = "[in#0 @ 0000024450b40500] Malformed dshow input string.
+[in#0 @ 0000024450b40200] Error opening input: I/O error
+Error opening input file audio=.";
+        assert!(!blames_screen(empty));
+        // ffmpeg's own words when the microphone named in `-i audio=...` doesn't exist.
+        let mic = "[dshow @ 0000020f] Could not find audio only device with name [] among source devices of type audio.
+[in#1 @ 0000020f] Error opening input: I/O error
+Error opening input file audio=.";
+        assert!(!blames_screen(mic));
+        assert!(blames_screen("[Parsed_gfxcapture_0 @ 0000020b] Failed to setup graphics capture"));
+        assert!(blames_screen("[Parsed_ddagrab_0 @ 0000024d] Desktop duplication access denied"));
+        assert!(blames_screen(""));
+    }
+
+    #[test]
+    fn a_window_is_captured_on_its_own_at_a_fixed_size() {
+        let c = GpuCapture {
+            window: Some(WindowSource { hwnd: 0x1234, title_bar: false }),
+            cursor: false,
+            width: 1600,
+            height: 900,
+            ..capture(GpuEncoder::Qsv)
+        };
+        let src = c.source_filter(30);
+        assert!(src.starts_with("gfxcapture=hwnd=4660:max_framerate=30"), "{src}");
+        assert!(src.contains("capture_cursor=0") && src.contains("capture_border=0"));
+        assert!(src.contains("resize_mode=scale_aspect") && src.contains("width=1600:height=900"));
+        assert!(src.contains("display_border=0"));
     }
 }

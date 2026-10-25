@@ -222,6 +222,48 @@ export function resolveNodeFill(node: { fillColor: string | null; fillOpacity?: 
   return `#${full}${Math.round(opacity * 255).toString(16).padStart(2, "0")}`;
 }
 
+// ---- Fill paint (gradient / image / pattern) -------------------------------------------------------
+
+export type AxisPlacement = "origin" | "edge" | "box" | "none";
+
+export type WhiteboardFillType ="solid" | "linear" | "radial" | "image";
+export type WhiteboardFillPattern = "none" | "grid" | "dots" | "lines" | "diagonal";
+
+export interface WhiteboardGradientStop {
+  offset: number; // 0-1
+  color: string;
+}
+
+export const DEFAULT_FILL_PATTERN_SPACING = 16;
+export const DEFAULT_FILL_PATTERN_OPACITY = 0.35;
+export const DEFAULT_GRADIENT_ANGLE = 90;
+
+// The fill type a node actually paints with - "image" without a picked asset degrades to "solid"
+// (the picker may still be open, or the asset was cleared) rather than leaving the shape hollow.
+export function resolveFillType(node: Pick<WhiteboardNode, "fillType" | "fillImageAsset">): WhiteboardFillType {
+  const type = node.fillType ?? "solid";
+  if (type === "image" && !node.fillImageAsset) return "solid";
+  return type;
+}
+
+// Sorted, clamped stops - every renderer goes through this so an out-of-order or out-of-range stop
+// list (a dragged stop crossing its neighbor) can't make the SVG, CSS and Canvas2D gradients
+// disagree, which each handle unsorted stops differently.
+export function resolveGradientStops(node: Pick<WhiteboardNode, "fillGradientStops" | "fillColor">): WhiteboardGradientStop[] {
+  const raw = node.fillGradientStops;
+  if (!raw || raw.length < 2) return [{ offset: 0, color: node.fillColor ?? "#3b82f6" }, { offset: 1, color: "#ffffff" }];
+  return raw.map((s) => ({ offset: Math.max(0, Math.min(1, s.offset)), color: s.color })).sort((a, b) => a.offset - b.offset);
+}
+
+// True when a node paints SOMETHING inside its outline - a solid color, a gradient, an image, or a
+// pattern on its own over no fill.
+export function nodeHasFill(node: Pick<WhiteboardNode, "fillType" | "fillImageAsset" | "fillColor" | "fillOpacity" | "fillPattern">): boolean {
+  if ((node.fillPattern ?? "none") !== "none") return true;
+  const type = resolveFillType(node);
+  if (type === "solid") return resolveNodeFill(node) !== null;
+  return (node.fillOpacity ?? 1) > 0;
+}
+
 export const DEFAULT_CHART_DATA: number[] = [4, 7, 3, 9, 5];
 
 // "latticeGauge" node fields (WhiteboardNode.latticeSize/latticeSiteSpacing/latticeSiteRadius/
@@ -262,6 +304,11 @@ export const MAX_LATTICE_LINK_WIDTH = 0.25;
 export const DEFAULT_LATTICE_SPIN_ARROW_SIZE = 0.45;
 export const MIN_LATTICE_SPIN_ARROW_SIZE = 0.1;
 export const MAX_LATTICE_SPIN_ARROW_SIZE = 1.5;
+
+export const DEFAULT_LATTICE_LABEL_TITLE = "LATTICE::GAUGE";
+export const DEFAULT_LATTICE_LABEL_BODY = "drag to orbit · scroll to zoom · right-drag to pan";
+export const DEFAULT_LATTICE_ROTATE_SPEED = 20;
+export const MAX_LATTICE_ROTATE_SPEED = 180;
 
 // "table" node fields (WhiteboardNode.tableRows/tableCols/tableColWidths/tableRowHeights) - shared
 // here (rather than living only in WhiteboardTable.tsx/WhiteboardStylePanel.tsx) so
@@ -595,11 +642,41 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // over an image or plot it's annotating without losing its border. Absent - resolves to 1. Always
   // read through resolveNodeFill, never applied to fillColor by hand.
   fillOpacity?: number;
+  // What paints the interior. "solid" (the default, and what every node predating this field is)
+  // uses fillColor; "linear"/"radial" use fillGradientStops; "image" uses fillImageAsset. fillOpacity
+  // fades whichever one is active. Always read through resolveFillType rather than directly, so an
+  // "image" fill whose asset was never picked falls back to solid instead of painting nothing.
+  fillType?: WhiteboardFillType;
+  // "linear"/"radial" only - two or more color stops, offsets 0-1. Absent - resolves to a two-stop
+  // ramp from fillColor to white (see resolveGradientStops), so switching a filled shape to a
+  // gradient starts from its own color rather than an unrelated preset.
+  fillGradientStops?: WhiteboardGradientStop[];
+  // "linear" only - direction in degrees, clockwise, 0 = left-to-right, 90 = top-to-bottom. Absent - 90.
+  fillGradientAngle?: number;
+  // "image" only - an asset file name in this whiteboard's assets/ folder, the same storage
+  // convention (and the same import commands) as an "image" node's own assetFileName.
+  fillImageAsset?: string;
+  // "image" only - same meanings as an image node's own imageFit: "cover" crops to fill the shape,
+  // "contain" fits the whole picture inside it (fillColor shows in the margin), "fill" stretches.
+  // Absent - "cover".
+  fillImageFit?: "cover" | "contain" | "fill";
+  // A line/dot pattern drawn OVER the fill (whatever its type), clipped to the shape - graph-paper
+  // grids, ruled lines, hatching. Independent of the fill so a gradient or photo can carry a grid
+  // too. Absent/"none" - no pattern.
+  fillPattern?: WhiteboardFillPattern;
+  // Pattern ink color. Absent - resolves to the node's own strokeColor, so a fresh grid matches the
+  // outline it sits inside.
+  fillPatternColor?: string;
+  // 0-1, independent of fillOpacity so a faint grid can sit on a fully opaque fill. Absent - 0.35.
+  fillPatternOpacity?: number;
+  // Distance between pattern lines/dots in document units. Absent - DEFAULT_FILL_PATTERN_SPACING.
+  fillPatternSpacing?: number;
   strokeColor: string;
   strokeWidth: number;
-  // "rectangle" only - lets the same shapeType cover both a square-cornered box and a rounded one
-  // (the toolbar's "Rounded Rectangle" quick-add is just this at a nonzero default), same
-  // parameterized-shapeType convention boardTypes.ts's BoardShape uses for its polygon/star fields.
+  // Rounds the shape's corners. Every shape whose outline is a straight-edged polygon (triangle,
+  // diamond, hexagon, star, trapezoid, callout, ...) honors it, not just rectangles - see
+  // whiteboardHandlers.ts's supportsCornerRadius/roundedPolygonD - and an "image" node uses it for
+  // its "rounded" mask. The toolbar's "Rounded" rectangle quick-add is just this at a nonzero default.
   cornerRadius?: number;
   // "polygon" only, 3-12 sides - a pentagon, heptagon, octagon etc. are all this one shapeType at
   // a different `sides`, not their own separate shapeType values (see boardTypes.ts's BoardShape
@@ -705,6 +782,25 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // functionPlot's off-by-default, a typed-formula graph reads more like reference graph paper by
   // default).
   graphShowGrid?: boolean;
+  // "graph"/"functionPlot" axis styling (whiteboardHandlers.ts's resolvePlotAxisStyle resolves the
+  // defaults). axisPlacement: "origin" - axes cross at x=0/y=0, the classic math look (default, and
+  // how every graph looked before this field); "edge" - an L of axes along the left and bottom of
+  // the plot, the journal-figure look; "box" - a full frame around the plot; "none" - no axis lines.
+  axisPlacement?: AxisPlacement;
+  // Where the x numbers sit: "auto" follows the axis line for "origin" and the bottom edge
+  // otherwise; "bottom"/"top" pin them outside the plot box at that edge (with or without the
+  // grid), reserving room so they never clip.
+  xLabelSide?: "auto" | "bottom" | "top";
+  // Same for the y numbers: "auto", or pinned "left"/"right" outside the plot box.
+  yLabelSide?: "auto" | "left" | "right";
+  // Short tick marks at every tick on the labeled sides. Absent - "outside" for the framed
+  // placements, "none" for "origin".
+  tickMarks?: "none" | "outside" | "inside";
+  // Axis line color. Absent - a light gray for "origin", near-black for the framed placements.
+  axisColor?: string;
+  // Gridline color and opacity (0-1). Absent - #e5e7eb at full opacity, the original look.
+  gridColor?: string;
+  gridOpacity?: number;
   // "graph" only - explicit tick spacing per axis, same "0/absent picks an automatic 5-tick spacing"
   // convention as functionPlot's plotXTickInterval/plotYTickInterval.
   graphXTickInterval?: number;
@@ -938,6 +1034,22 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // thermal flip dynamics - a cheap illustrative animation (see LatticeGaugeWidget.tsx's spin-
   // animation effect), not an actual Metropolis/Monte-Carlo simulation. Absent - resolves to false.
   latticeAnimateSpins?: boolean;
+  // The caption card in the widget's bottom-left corner. Editable because the same 3D lattice is
+  // used to teach more than gauge theory (crystal structures, spin models, cubic unit cells...), and
+  // a fixed "LATTICE::GAUGE" heading would mislabel every one of those. latticeShowLabel absent -
+  // shown. Title/body absent - the original heading and orbit/zoom/pan hint. latticeLabelShowStats
+  // (absent - true) appends the live "N×N×N · M sites" readout to the heading.
+  latticeShowLabel?: boolean;
+  latticeLabelTitle?: string;
+  latticeLabelBody?: string;
+  latticeLabelShowStats?: boolean;
+  // Continuous auto-rotation of the view - about one axis, or "tumble" (all three at different
+  // rates, so every face comes round in turn). A view animation only: the camera moves, the lattice
+  // and every other field stay put, and a drag to orbit still works (rotation pauses while
+  // dragging). Absent - "off". latticeRotateSpeed is degrees per second, negative reverses
+  // direction; absent - DEFAULT_LATTICE_ROTATE_SPEED.
+  latticeAutoRotate?: "off" | "x" | "y" | "z" | "tumble";
+  latticeRotateSpeed?: number;
   // "table" only - grid dimensions and content (see WhiteboardTable.tsx). Absent - resolves to
   // DEFAULT_TABLE_ROWS/DEFAULT_TABLE_COLS (see resolveTableGrid below, the single place every
   // reader of these fields - the live widget, the style panel, the Canvas2D export - resolves them,

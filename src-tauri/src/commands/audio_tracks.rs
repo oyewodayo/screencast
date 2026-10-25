@@ -302,10 +302,11 @@ fn parse_progress(line: &str) -> Option<(u32, f64)> {
 }
 
 // Runs a separation engine, emitting "separation-progress" {percent} as the overall average of
-// every worker's own progress (`workers` = how many report; 1 for Python's single bar). Output
-// is split on '\r' as well as '\n' because tqdm redraws its bar in place. Honors
-// cancel_voice_music_separation by killing the engine.
-fn run_with_progress(mut cmd: Command, what: &str, window: &Window, workers: u32, progress_on_stderr: bool) -> Result<(), String> {
+// every worker's own progress (`workers` = how many report; 1 for Python's single bar), mapped onto
+// `share` = (where this run starts, how much it covers) of the whole job in percent - one chunk of a
+// long file is one share. Output is split on '\r' as well as '\n' because tqdm redraws its bar in
+// place. Honors cancel_voice_music_separation by killing the engine.
+fn run_with_progress(mut cmd: Command, what: &str, window: &Window, workers: u32, progress_on_stderr: bool, share: (f64, f64)) -> Result<(), String> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Failed to start {}: {}", what, e))?;
     let (progress_pipe, other_pipe): (Box<dyn Read + Send>, Box<dyn Read + Send>) = if progress_on_stderr {
         (Box::new(child.stderr.take().ok_or("no stderr")?), Box::new(child.stdout.take().ok_or("no stdout")?))
@@ -341,7 +342,8 @@ fn run_with_progress(mut cmd: Command, what: &str, window: &Window, workers: u32
                 let percent = per_worker.values().sum::<f64>() / workers.max(1) as f64;
                 if percent - last_emitted >= 0.5 {
                     last_emitted = percent;
-                    let _ = window.emit("separation-progress", SeparationProgress { percent: percent.min(99.0) });
+                    let overall = share.0 + percent.min(100.0) / 100.0 * share.1;
+                    let _ = window.emit("separation-progress", SeparationProgress { percent: overall.min(99.0) });
                 }
             } else if !text.trim().is_empty() {
                 tail.push_str(&text);
@@ -386,14 +388,99 @@ pub struct SeparatedStems {
     pub engine: String,
 }
 
+// The engine on one 44.1 kHz stereo WAV in `work`: its voice and music stems (in `work` too).
+// `share`: this run's part of the whole job's progress (see run_with_progress).
+fn separate_one(engine: &Engine, ffmpeg: &Path, normalized: &Path, work: &Path, window: &Window, share: (f64, f64)) -> Result<(PathBuf, PathBuf), String> {
+    match engine {
+        Engine::Native { exe, model, multithreaded } => {
+            let mut cmd = new_command(exe);
+            // demucs.cpp wants a trailing separator on the output dir.
+            let mut dir_arg = path_to_str(work)?.to_string();
+            dir_arg.push(std::path::MAIN_SEPARATOR);
+            cmd.arg(path_to_str(model)?).arg(path_to_str(normalized)?).arg(dir_arg);
+            let mut workers = 1;
+            if *multithreaded {
+                // demucs_mt's 4th arg: worker threads, each taking a slice of the track.
+                let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+                cmd.arg(threads.to_string());
+                workers = threads as u32;
+            }
+            // demucs_mt already parallelizes across the track; letting OpenBLAS spin up its
+            // own thread pool per worker on top of that oversubscribes the CPU.
+            cmd.env("OPENBLAS_NUM_THREADS", "1");
+            run_with_progress(cmd, "Voice/music separation", window, workers, false, share)?;
+            // 4-stem model: target_0_drums, target_1_bass, target_2_other, target_3_vocals.
+            // Music = everything that isn't vocals, summed back at unity gain.
+            let music = work.join("music.wav");
+            let mut cmd = new_command(ffmpeg);
+            cmd.arg("-y");
+            for name in ["target_0_drums.wav", "target_1_bass.wav", "target_2_other.wav"] {
+                cmd.arg("-i").arg(path_to_str(&work.join(name))?);
+            }
+            cmd.args(["-filter_complex", "amix=inputs=3:normalize=0", "-c:a", "pcm_s16le"]).arg(path_to_str(&music)?);
+            run_checked(cmd, "Music stem mixdown")?;
+            Ok((work.join("target_3_vocals.wav"), music))
+        }
+        Engine::Python { program, prefix_args } => {
+            let mut cmd = new_command(program);
+            cmd.args(prefix_args)
+                .args(["--two-stems", "vocals", "-n", "htdemucs", "-o"])
+                .arg(path_to_str(work)?)
+                .arg(path_to_str(normalized)?);
+            run_with_progress(cmd, "Voice/music separation", window, 1, true, share)?;
+            // Output layout: <out>/<model>/<input file stem>/{vocals,no_vocals}.wav
+            let stem = normalized.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
+            let result_dir = work.join("htdemucs").join(stem);
+            Ok((result_dir.join("vocals.wav"), result_dir.join("no_vocals.wav")))
+        }
+    }
+}
+
+// Long files are separated a chunk at a time: the engines hold a whole track in memory (a long
+// recording would need tens of GB) and the plain WAV they're handed can't pass 4 GB. Each chunk is
+// cut with SEPARATION_OVERLAP_SEC of context either side, its stems trimmed back to the chunk and
+// joined to the last over SEPARATION_CROSSFADE_SEC - written straight into the output files
+// (audio_stream::WavWriter, RF64 past 4 GB), so memory is a chunk's worth however long the file.
+const SEPARATION_CHUNK_SEC: f64 = 600.0;
+const SEPARATION_OVERLAP_SEC: f64 = 3.0;
+const SEPARATION_CROSSFADE_SEC: f64 = 0.5;
+const STEM_RATE: u32 = 44100;
+
+fn probe_seconds(ffprobe: &Path, path: &str) -> f64 {
+    new_command(ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(0.0)
+}
+
+// A stem as interleaved 16-bit stereo at STEM_RATE, whatever the engine wrote.
+fn read_stem(ffmpeg: &Path, path: &Path) -> Result<Vec<i16>, String> {
+    let out = new_command(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path_to_str(path)?)
+        .args(["-ac", "2", "-ar", &STEM_RATE.to_string(), "-f", "s16le", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Couldn't read a stem: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("Couldn't read a stem: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown error")));
+    }
+    Ok(out.stdout.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
 // Splits `input_path` (any audio file ffmpeg can read) into `<output_dir>/<stem>-voice.wav` and
 // `<output_dir>/<stem>-music.wav`. Both stems keep the input's exact length, so they can be laid
 // on the timeline at the same position the mixed audio occupied. Errors with NOT_INSTALLED when
 // no engine is available, which the frontend turns into setup instructions. Emits
-// "separation-progress" {percent} while the engine runs.
+// "separation-progress" {percent} for the whole job (every chunk of a long file included).
 #[tauri::command]
 pub async fn separate_voice_music(app_handle: AppHandle, window: Window, input_path: String, output_dir: String) -> Result<SeparatedStems, String> {
     let ffmpeg = get_ffmpeg_path(&app_handle)?;
+    let ffprobe = get_ffprobe_path(&app_handle)?;
     SEPARATION_CANCELLED.store(false, Ordering::SeqCst);
     tauri::async_runtime::spawn_blocking(move || {
         let engine = resolve_engine(&app_handle).ok_or_else(|| NOT_INSTALLED.to_string())?;
@@ -402,63 +489,86 @@ pub async fn separate_voice_music(app_handle: AppHandle, window: Window, input_p
         let stem = Path::new(&input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("audio").to_string();
         let work = out_dir.join(format!("{stem}-separation"));
         std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create work folder: {}", e))?;
-
-        // Both engines are trained on 44.1kHz stereo; normalizing up front avoids relying on each
-        // engine's own resampling/mono handling.
-        let normalized = work.join("input.wav");
-        let mut cmd = new_command(&ffmpeg);
-        cmd.args(["-y", "-i", &input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]).arg(path_to_str(&normalized)?);
-        run_checked(cmd, "Audio preparation")?;
-
         let voice_out = out_dir.join(format!("{stem}-voice.wav"));
         let music_out = out_dir.join(format!("{stem}-music.wav"));
+        let duration = probe_seconds(&ffprobe, &input_path);
 
         let result = (|| -> Result<(), String> {
-            match &engine {
-                Engine::Native { exe, model, multithreaded } => {
-                    let mut cmd = new_command(exe);
-                    // demucs.cpp wants a trailing separator on the output dir.
-                    let mut dir_arg = path_to_str(&work)?.to_string();
-                    dir_arg.push(std::path::MAIN_SEPARATOR);
-                    cmd.arg(path_to_str(model)?).arg(path_to_str(&normalized)?).arg(dir_arg);
-                    let mut workers = 1;
-                    if *multithreaded {
-                        // demucs_mt's 4th arg: worker threads, each taking a slice of the track.
-                        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
-                        cmd.arg(threads.to_string());
-                        workers = threads as u32;
-                    }
-                    // demucs_mt already parallelizes across the track; letting OpenBLAS spin up its
-                    // own thread pool per worker on top of that oversubscribes the CPU.
-                    cmd.env("OPENBLAS_NUM_THREADS", "1");
-                    run_with_progress(cmd, "Voice/music separation", &window, workers, false)?;
-                    // 4-stem model: target_0_drums, target_1_bass, target_2_other, target_3_vocals.
-                    // Music = everything that isn't vocals, summed back at unity gain.
-                    std::fs::copy(work.join("target_3_vocals.wav"), &voice_out).map_err(|e| format!("Voice stem missing: {}", e))?;
-                    let mut cmd = new_command(&ffmpeg);
-                    cmd.arg("-y");
-                    for name in ["target_0_drums.wav", "target_1_bass.wav", "target_2_other.wav"] {
-                        cmd.arg("-i").arg(path_to_str(&work.join(name))?);
-                    }
-                    cmd.args(["-filter_complex", "amix=inputs=3:normalize=0", "-c:a", "pcm_s16le"]).arg(path_to_str(&music_out)?);
-                    run_checked(cmd, "Music stem mixdown")
-                }
-                Engine::Python { program, prefix_args } => {
-                    let mut cmd = new_command(program);
-                    cmd.args(prefix_args)
-                        .args(["--two-stems", "vocals", "-n", "htdemucs", "-o"])
-                        .arg(path_to_str(&work)?)
-                        .arg(path_to_str(&normalized)?);
-                    run_with_progress(cmd, "Voice/music separation", &window, 1, true)?;
-                    // Output layout: <out>/<model>/<input file stem>/{vocals,no_vocals}.wav
-                    let result_dir = work.join("htdemucs").join("input");
-                    std::fs::copy(result_dir.join("vocals.wav"), &voice_out).map_err(|e| format!("Voice stem missing: {}", e))?;
-                    std::fs::copy(result_dir.join("no_vocals.wav"), &music_out).map_err(|e| format!("Music stem missing: {}", e))?;
-                    Ok(())
-                }
+            if duration <= SEPARATION_CHUNK_SEC + 2.0 * SEPARATION_OVERLAP_SEC {
+                // Short enough to take whole. Both engines are trained on 44.1kHz stereo;
+                // normalizing up front avoids relying on each engine's own resampling/mono handling.
+                let normalized = work.join("input.wav");
+                let mut cmd = new_command(&ffmpeg);
+                cmd.args(["-y", "-i", &input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]).arg(path_to_str(&normalized)?);
+                run_checked(cmd, "Audio preparation")?;
+                let (voice, music) = separate_one(&engine, &ffmpeg, &normalized, &work, &window, (0.0, 100.0))?;
+                std::fs::copy(&voice, &voice_out).map_err(|e| format!("Voice stem missing: {}", e))?;
+                std::fs::copy(&music, &music_out).map_err(|e| format!("Music stem missing: {}", e))?;
+                return Ok(());
             }
+            let chunks = (duration / SEPARATION_CHUNK_SEC).ceil() as usize;
+            let mut voice_writer = crate::commands::audio_stream::WavWriter::create(voice_out.clone(), 2, STEM_RATE, 16)?;
+            let mut music_writer = crate::commands::audio_stream::WavWriter::create(music_out.clone(), 2, STEM_RATE, 16)?;
+            let fade = (SEPARATION_CROSSFADE_SEC * STEM_RATE as f64).round() as usize * 2; // interleaved
+            let mut tails: Option<(Vec<i16>, Vec<i16>)> = None;
+            for k in 0..chunks {
+                if SEPARATION_CANCELLED.load(Ordering::SeqCst) {
+                    return Err(SEPARATION_CANCELLED_ERR.to_string());
+                }
+                let core = (k as f64 * SEPARATION_CHUNK_SEC, ((k + 1) as f64 * SEPARATION_CHUNK_SEC).min(duration));
+                let from = (core.0 - SEPARATION_OVERLAP_SEC).max(0.0);
+                let to = (core.1 + SEPARATION_OVERLAP_SEC).min(duration);
+                let chunk_dir = work.join(format!("chunk{k}"));
+                std::fs::create_dir_all(&chunk_dir).map_err(|e| format!("Failed to create work folder: {}", e))?;
+                let normalized = chunk_dir.join("input.wav");
+                let mut cmd = new_command(&ffmpeg);
+                cmd.args(["-y", "-ss", &format!("{from:.6}"), "-t", &format!("{:.6}", to - from), "-i", &input_path, "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"])
+                    .arg(path_to_str(&normalized)?);
+                run_checked(cmd, "Audio preparation")?;
+                let share = (k as f64 / chunks as f64 * 100.0, 100.0 / chunks as f64);
+                let (voice, music) = separate_one(&engine, &ffmpeg, &normalized, &chunk_dir, &window, share)?;
+                let last = k + 1 == chunks;
+                // This chunk's own stretch - plus, before the last, a crossfade's worth into the next.
+                let keep = |samples: Vec<i16>| -> Vec<i16> {
+                    let a = (((core.0 - from) * STEM_RATE as f64).round() as usize * 2).min(samples.len());
+                    let b = ((((core.1 - from) * STEM_RATE as f64).round() as usize * 2) + if last { 0 } else { fade }).min(samples.len()).max(a);
+                    samples[a..b].to_vec()
+                };
+                let mut v = keep(read_stem(&ffmpeg, &voice)?);
+                let mut m = keep(read_stem(&ffmpeg, &music)?);
+                if let Some((tv, tm)) = tails.take() {
+                    for (cur, tail) in [(&mut v, tv), (&mut m, tm)] {
+                        let n = tail.len().min(cur.len());
+                        for i in 0..n {
+                            let x = ((i / 2) as f32 + 0.5) / (n / 2).max(1) as f32;
+                            cur[i] = (tail[i] as f32 * (1.0 - x) + cur[i] as f32 * x).round().clamp(-32768.0, 32767.0) as i16;
+                        }
+                    }
+                }
+                let split = |x: &mut Vec<i16>| -> Vec<i16> {
+                    if last || x.len() <= fade {
+                        Vec::new()
+                    } else {
+                        x.split_off(x.len() - fade)
+                    }
+                };
+                let (tv, tm) = (split(&mut v), split(&mut m));
+                if !last {
+                    tails = Some((tv, tm));
+                }
+                voice_writer.append(&v.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+                music_writer.append(&m.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+                let _ = std::fs::remove_dir_all(&chunk_dir);
+            }
+            voice_writer.finish()?;
+            music_writer.finish()?;
+            Ok(())
         })();
         let _ = std::fs::remove_dir_all(&work);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&voice_out);
+            let _ = std::fs::remove_file(&music_out);
+        }
         result?;
 
         Ok(SeparatedStems {
@@ -492,4 +602,37 @@ mod tests {
         assert_eq!(parse_progress("Loading weights from model_file"), None);
         assert_eq!(parse_progress("Writing wav file \"out/target_3_vocals.wav\""), None);
     }
+}
+
+// A take recorded in the editor's Record tab (VoiceRecorder.tsx) - a finished WAV, sent as the raw
+// request body (a few minutes of 48 kHz audio is tens of MB: as JSON it would inflate several-fold
+// and be parsed whole on both sides). Saved into the library's "Voice-overs" folder under a dated
+// name, written to a dot-file first and renamed into place, so a failed write never leaves a broken
+// take where the library lists it.
+#[tauri::command]
+pub async fn save_voice_recording(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        tauri::ipc::InvokeBody::Json(_) => return Err("The recording arrived as JSON rather than raw bytes.".to_string()),
+    };
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("The recording isn't a WAV file.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = crate::services::utility::briefcast_dir()?.join("Voice-overs");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create the Voice-overs folder: {e}"))?;
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+        let mut path = dir.join(format!("Voice-over {stamp}.wav"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("Voice-over {stamp} ({n}).wav"));
+            n += 1;
+        }
+        let part = dir.join(format!(".{stamp}.part"));
+        std::fs::write(&part, &bytes).map_err(|e| format!("Couldn't save the recording: {e}"))?;
+        std::fs::rename(&part, &path).map_err(|e| format!("Couldn't save the recording: {e}"))?;
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Saving the recording failed: {e}"))?
 }

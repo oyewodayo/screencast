@@ -9,10 +9,13 @@ use std::env::consts::OS;
 use tauri::Manager;
 
 mod commands {
+    pub mod audio_stream;
+    pub mod bleed_removal;
     pub mod audio_tracks;
     pub mod background_removal;
     pub mod camera_effects;
     pub mod conversion;
+    pub mod derived_images;
     pub mod embedded_scan;
     pub mod file_info;
     pub mod motion_tracking;
@@ -26,6 +29,9 @@ mod commands {
 }
 mod services {
     pub mod asset_download;
+    pub mod bleed;
+    pub mod transition_graphs;
+    pub mod clip_fx;
     pub mod audio_fx;
     pub mod beat_detect;
     pub mod subject_track;
@@ -41,6 +47,14 @@ mod services {
     // comment for why a webcam driver (DroidCam/Iriun/Camo) is otherwise the only way to get a
     // phone into a DirectShow device list, and why this needs to be an HTTPS server to avoid one.
     pub mod phone_camera;
+    // "Transfer to phone" - sends files to a phone's browser over the LAN, pairing once by QR.
+    // Builds on phone_camera's address/QR helpers; see the module's own doc comment.
+    pub mod phone_transfer;
+    // A real HTTPS certificate per install for phone transfers - see the module comment.
+    pub mod lan_tls;
+    // Phones on a USB cable: send to Android, import photos/videos from Android or iPhone, via
+    // Windows Portable Devices. Commands exist everywhere; only Windows has a worker behind them.
+    pub mod usb_phone;
     // Carries the live recording preview from ffmpeg's stdout to the UI without touching the
     // disk - see the module's own doc comment for the file-based approach this replaced and why.
     pub mod preview_stream;
@@ -74,6 +88,9 @@ mod services {
     // Cargo dependency at all.
     #[cfg(target_os = "windows")]
     pub mod click_tracker;
+    // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
+    #[cfg(target_os = "windows")]
+    pub mod input_tracker;
     // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
     // process dies for any reason (including a force-kill), so they can't outlive it holding the
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
@@ -361,6 +378,7 @@ fn main() {
         .manage(commands::native_playback::NativePlaybackState::default())
         .manage(services::file_watcher::FileWatcherState::default())
         .manage(services::phone_camera::PhoneCameraState::default())
+        .manage(services::phone_transfer::PhoneTransferState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -375,6 +393,10 @@ fn main() {
             }
 
             services::telemetry::init(app.handle());
+            // Only if a phone was paired before - lets a phone that still has the page open
+            // reconnect without anyone opening the Transfer dialog first.
+            services::phone_transfer::autostart(app.handle().clone());
+            services::usb_phone::start(app.handle());
             services::responsiveness::start_ui_watchdog(app.handle());
             #[cfg(target_os = "windows")]
             services::webview_recovery::install(app.handle());
@@ -408,6 +430,7 @@ fn main() {
             commands::recording::stop_recording,
             commands::recording::get_recording_status,
             commands::recording::load_click_sidecar,
+            commands::recording::load_pointer_sidecar,
             commands::recording::load_view_switch_sidecar,
             commands::recording::record_view_switch,
             commands::recording::get_webcam_sidecar_path,
@@ -418,6 +441,23 @@ fn main() {
             services::phone_camera::stop_phone_camera_server,
             services::phone_camera::phone_camera_status,
             services::phone_camera::phone_camera_send_signal,
+            services::phone_transfer::start_phone_transfer_server,
+            services::phone_transfer::phone_transfer_send,
+            services::phone_transfer::phone_transfer_devices,
+            services::phone_transfer::phone_transfer_forget,
+            services::phone_transfer::phone_transfer_rename,
+            services::phone_transfer::phone_transfer_set_timeline,
+            services::phone_transfer::phone_transfer_placed,
+            services::phone_transfer::phone_transfer_broadcast,
+            services::phone_transfer::phone_transfer_answer_pair,
+            services::phone_transfer::phone_transfer_history,
+            services::usb_phone::usb_phones,
+            services::usb_phone::usb_phone_scan,
+            services::usb_phone::usb_phone_browse,
+            services::usb_phone::usb_phone_thumbnail,
+            services::usb_phone::usb_phone_send,
+            services::usb_phone::usb_phone_import,
+            services::usb_phone::usb_transfer_cancel,
             commands::recording::pause_recording,
             commands::recording::resume_recording,
             commands::recording::take_screenshot,
@@ -429,10 +469,13 @@ fn main() {
             commands::window_capture::capture_window_screenshots_by_title_command,
             commands::window_capture::cleanup_screenshot_files,
             commands::window_capture::activate_and_open_window,
+            commands::window_capture::get_capture_capabilities,
+            commands::window_capture::get_monitor_previews,
             commands::conversion::convert_to_mp4,
             commands::conversion::get_playable_preview,
             commands::conversion::get_image_clip_proxy,
             commands::conversion::get_video_canvas_proxy,
+            commands::conversion::get_blank_frame_image,
             commands::conversion::stabilized_clip_preview,
             commands::conversion::extract_frame_still,
             commands::conversion::render_reversed_clip,
@@ -487,7 +530,18 @@ fn main() {
             commands::background_removal::remove_video_background,
             commands::background_removal::cancel_background_removal,
             commands::conversion::extract_clip_audio,
+            commands::conversion::clean_audio_track,
+            commands::conversion::render_timeline_audio,
             commands::audio_tracks::probe_audio_streams,
+            commands::audio_tracks::save_voice_recording,
+            commands::audio_stream::wav_writer_open,
+            commands::audio_stream::wav_writer_append,
+            commands::audio_stream::wav_writer_close,
+            commands::audio_stream::wav_writer_discard,
+            commands::audio_stream::audio_range,
+            commands::bleed_removal::remove_bleed,
+            commands::bleed_removal::cancel_bleed,
+            commands::audio_stream::audio_peaks,
             commands::file_info::get_file_info,
             commands::file_info::get_library_item_info,
             commands::audio_tracks::get_separation_engine,
@@ -499,6 +553,8 @@ fn main() {
             commands::music_library::get_music_track_file,
             commands::music_library::restore_music_track,
             commands::music_library::save_music_track,
+            commands::music_library::store_builtin_sound,
+            commands::derived_images::store_derived_still,
             commands::conversion::detect_silence,
             commands::conversion::read_image_data_url,
             commands::conversion::read_file_bytes,

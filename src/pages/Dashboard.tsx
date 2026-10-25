@@ -18,9 +18,9 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import MoveCopyMenu, { FileTransferOptions, FileTransferRequest } from "../components/docker/MoveCopyMenu";
 import type { PopoverAnchor } from "../hooks/useClampedPopoverPosition";
-import BottomDocker from "../components/BottomDocker";
+import BottomDocker, { SHOW_DOCKER_EVENT } from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
-import { WindowInfo } from "../Types";
+import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
 import { fadeTotalMs } from '../utils/annotationStyles';
@@ -33,6 +33,9 @@ import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
 import PipOverlayLayer from "../components/video/PipOverlayLayer";
+import { setMasterBus } from "../utils/mixerGraph";
+import { isNeutralMaster } from "../utils/masterBus";
+import AudioOnlyStage from "../components/video/AudioOnlyStage";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
@@ -61,15 +64,41 @@ import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
 import { useGradeLut } from "../utils/gradeLuts";
-import { clipOutputDuration, sourceToOutputOffset } from "../utils/clipTiming";
+import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import ClipFxLayer from "../components/video/ClipFxLayer";
+import { forgetTimelineBootstrap } from "../components/docker/VideoTimelineDocker";
 import ClipHandoffLayer, { ClipHandoffApi } from "../components/video/ClipHandoffLayer";
 import ReframePreviewLayer, { type ReframePreview } from "../components/video/ReframePreviewLayer";
+import PointerLayer from "../components/video/PointerLayer";
+import KeystrokeLayer from "../components/video/KeystrokeLayer";
+import ScreenBackdropLayer from "../components/video/ScreenBackdropLayer";
+import { useClipRecordings } from "../hooks/useClipRecordings";
+import { pointerStyleOf } from "../utils/pointerTrack";
+import { buildKeyChips, keystrokeStyleOf } from "../utils/keystrokes";
+import { screenContentRect } from "../utils/screenStyle";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
+import { PhoneTransferHost } from "../components/Modals/PhoneTransferModal";
+import {
+  broadcastToPhones,
+  IncomingStatus,
+  onPhoneClip,
+  onPhoneFileArrived,
+  onPhoneRemote,
+  onPhoneTimelineFile,
+  PhoneRemoteCommand,
+  openPhoneReceive,
+  openPhoneTransfer,
+  reportPhonePlacement,
+  setPhoneTimeline,
+} from "../services/phoneTransfer";
+import PhoneIncomingTray from "../components/PhoneIncomingTray";
+import UsbPhoneTray from "../components/UsbPhoneTray";
+import { UsbImportHost } from "../components/Modals/UsbImportModal";
 import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
@@ -80,12 +109,16 @@ import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
 const CAMERA_ONLY_RECORD_TYPES = ["va", "v"];
 import {
+  getPhoneCameraState,
+  listenForPhoneCamera,
   PHONE_CAMERA_DEVICE,
   startPhoneCapture,
   subscribePhoneCamera,
   type PhoneCaptureHandle,
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
+import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
+import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
 import TelemetryNotice from "../components/custom/TelemetryNotice";
 import type { RecordingStatus } from "../utils/recordingStatus";
@@ -103,7 +136,8 @@ import {
   repathFile,
   forgetFile,
 } from "../utils/homeScreenFiles";
-import { getOpenedAt, recordItemOpened } from "../utils/homeScreenFiles";
+import { getArrivals, getOpenedAt, recordFileArrived, recordItemOpened } from "../utils/homeScreenFiles";
+import { onUsbImported } from "../services/usbPhone";
 import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../utils/homeLibraryItems";
 import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
 import type { WhiteboardSummary } from "../utils/whiteboardTypes";
@@ -155,6 +189,7 @@ import {
   IoImagesOutline,
   IoFolderOpenOutline,
   IoImageOutline,
+  IoPhonePortraitOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -416,6 +451,14 @@ const Dashboard = () => {
   // as resolutionWidth above.
   const [framerate, setFramerate] = useState<number | null>(() => loadSettings().defaultFramerate);
   const [windowTitles, setWindowTitles] = useState<WindowInfo[]>([]);
+  // Whether a picked window is captured on its own (covered or not) - asked once; until it
+  // answers, the cautious answer (it isn't) keeps the bring-it-forward steps in place.
+  const captureCapsRef = useRef<CaptureCapabilities>({ window_isolated: false });
+  useEffect(() => {
+    invoke<CaptureCapabilities>('get_capture_capabilities')
+      .then((caps) => { captureCapsRef.current = caps; })
+      .catch((err) => console.error('Failed to read capture capabilities:', err));
+  }, []);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
@@ -452,6 +495,24 @@ const Dashboard = () => {
   const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
   const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
   const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
+  // Files that came in from a phone - tagged on the home screen with where from (homeScreenFiles.ts).
+  const [arrivals, setArrivals] = useState(() => getArrivals());
+  useEffect(() => {
+    const arrive = (paths: string[], from: string, batch: string) => {
+      if (!paths.length) return;
+      let recent: string[] = [];
+      for (const path of paths) ({ recent } = recordFileArrived(path, from, batch));
+      setRecentPaths(recent);
+      setArrivals(getArrivals());
+      setOpenedAt(getOpenedAt());
+    };
+    const stopWifi = onPhoneFileArrived((file) => arrive(file.path ? [file.path] : [], file.device_name, file.batch ?? file.id));
+    const stopUsb = onUsbImported((t) => arrive(t.paths, t.device_name || "Phone", `usb:${t.id}`));
+    return () => {
+      stopWifi();
+      stopUsb();
+    };
+  }, []);
   // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
   // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
   // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
@@ -551,6 +612,11 @@ const Dashboard = () => {
     }
     setDraggingFiles(null);
     setDragPoint(null);
+    const phone = phoneDropAt(e.clientX, e.clientY);
+    if (phone) {
+      void dropOnPhone(phone, [file.path]);
+      return;
+    }
     const el = document.elementFromPoint(e.clientX, e.clientY);
     // A drop zone that takes a file itself (a split screen's shot rows).
     const zone = el?.closest("[data-media-drop]");
@@ -590,6 +656,11 @@ const Dashboard = () => {
     return null;
   };
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number; over: "timeline" | "video" | "zone" | null } | null>(null);
+  // The phone shelf (PhoneShelf.tsx): where the pointer is during a drag the shelf should follow -
+  // a library file dragged the browser's own way, or files dragged in from Explorer.
+  const [externalDrag, setExternalDrag] = useState(false);
+  const [shelfPoint, setShelfPoint] = useState<{ x: number; y: number } | null>(null);
+  const shelfPointRef = useRef<{ x: number; y: number } | null>(null);
   // Multi-select for bulk move — a set of file.path values, spanning whichever folders are
   // currently visible under the active category. Cleared whenever the category tab changes so
   // a stale selection from "Video" doesn't silently carry over into "Audio".
@@ -613,13 +684,17 @@ const Dashboard = () => {
   );
   // The mixer's session state (open for its meters, solo) - mixerState.ts.
   const mixerSession = useMixerSession();
+  // The open project's master bus drives the preview's (mixerGraph.ts) - none outside the editor.
+  const editingMaster = selectedFile && getFileCategory(selectedFile.name) === "video" ? editStore.master : undefined;
+  useEffect(() => setMasterBus(editingMaster), [editingMaster]);
   // The assembled/output timeline's own total length - a clip's own contribution is
   // (end-start)/speed, not just (end-start), once it has a speed edit (Clip.speed's own doc
   // comment, videoEditTypes.ts): a sped-up clip plays back in LESS output time than its source
   // range spans. Fed to VideoOverlayLayer/PipOverlayLayer below so a freshly-placed overlay's own
   // default end time clamps against the timeline's REAL length instead of a stale, too-long value
   // that ignores every sped-up clip already on it.
-  const totalOutputDuration = editStore.clips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
+  // playbackClips: an audio-only project runs as long as its audio (blankClipsFor).
+  const totalOutputDuration = editStore.playbackClips.reduce((sum, c) => sum + clipOutputDuration(c), 0);
   // Burned-in captions preview (CaptionOverlayLayer) - the same lines Save exports.
   const captionLines = useMemo(() => buildCaptionLines(editStore.clips, editStore.captions), [editStore.clips, editStore.captions]);
   // Gated to image files only so selecting a pdf/audio/video never triggers a wasted
@@ -646,6 +721,19 @@ const Dashboard = () => {
   const activeGradeLut = useGradeLut(activeClipEffects?.grade);
   // Export's Fill window, shown on the player while the export options are open.
   const [reframePreview, setReframePreview] = useState<ReframePreview | null>(null);
+  // Screen-recording polish (Screen Style panel): each source's recorded pointer and shortcuts, the
+  // shortcut chips on the output timeline, and the frame's content rectangle (fractions of the
+  // project frame) the edited picture is laid out in.
+  const clipRecordings = useClipRecordings(editStore.clips);
+  const pointerStyle = useMemo(() => pointerStyleOf(editStore.pointerStyle), [editStore.pointerStyle]);
+  const keystrokeStyle = useMemo(() => keystrokeStyleOf(editStore.keystrokeStyle), [editStore.keystrokeStyle]);
+  const keyChips = useMemo(() => buildKeyChips(editStore.clips, clipRecordings), [editStore.clips, clipRecordings]);
+  const projectFrame = activeClipEffects?.frame ?? null;
+  const screenContentInset = useMemo(() => {
+    if (!editStore.screenStyle || !projectFrame) return null;
+    const r = screenContentRect(projectFrame.width, projectFrame.height, editStore.screenStyle);
+    return { x: r.x / projectFrame.width, y: r.y / projectFrame.height, width: r.width / projectFrame.width, height: r.height / projectFrame.height };
+  }, [editStore.screenStyle, projectFrame?.width, projectFrame?.height]);
 
   // Moving a keyframed overlay sets its keyframe at the playhead rather than its base x/y (which
   // the keyframes have replaced): the move is added to where the keyframes put it there.
@@ -856,6 +944,10 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // timeline show an accurate Play/Pause icon and toggle real playback from its own transport
   // button, the same way its playhead already tracks and drives the real player.
   const [playerIsPlaying, setPlayerIsPlaying] = useState<boolean>(false);
+  // Floating panels drop their backdrop blur while the video plays (index.css) - it costs a frame.
+  useEffect(() => {
+    document.body.classList.toggle("media-playing", playerIsPlaying);
+  }, [playerIsPlaying]);
   useEffect(() => {
     setPlayerCurrentTime(0);
     setPlayerIsPlaying(false);
@@ -950,6 +1042,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // During a clip handoff, the standby stands in for the player; mid-switch without one, the player's
   // own report still belongs to the clip it's leaving, so it reads as "not there yet".
   const getMainPlaybackState = useCallback(() => videoPlayerRef.current?.getPlaybackState() ?? null, []);
+  const getMainVideoElement = useCallback(() => videoPlayerRef.current?.getVideoElement() ?? null, []);
   const getPlayerPlaybackState = useCallback(() => {
     const handoff = handoffRef.current;
     if (handoff?.isActive()) return handoff.state();
@@ -972,7 +1065,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // into it, read from the <video> itself. For per-frame preview (keyframed overlays); the
   // timeline's own currentOutputTime only updates a few times a second.
   const outputTimingRef = useRef<{ clips: Clip[]; activeId: string | null }>({ clips: [], activeId: null });
-  outputTimingRef.current = { clips: editStore.clips, activeId: activeClipEffects?.id ?? null };
+  outputTimingRef.current = { clips: editStore.playbackClips, activeId: activeClipEffects?.id ?? null };
   const getExactOutputTime = useCallback((): number | null => {
     const playback = getPlayerPlaybackState();
     const { clips, activeId } = outputTimingRef.current;
@@ -1121,6 +1214,92 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     }
   };
   const [addMenuFor, setAddMenuFor] = useState<string | null>(null);
+
+  // ---- From a phone: its "Add to timeline" button and Android's share sheet (see
+  // phone_transfer_page.html). Phones are told which video is open, and offer "Add to timeline"
+  // while there is one. Files arrive one at a time; a batch goes in after the clip at the playhead
+  // in the order it was picked - each after the one before - and sound lines up on its own track
+  // from the playhead. Every file gets an answer, so the phone can say where it really landed.
+  const phoneTimelineName =
+    selectedFile && getFileCategory(selectedFile.name) === "video" && dockerMode === "file-tools" ? selectedFile.name : null;
+  useEffect(() => {
+    void setPhoneTimeline(phoneTimelineName);
+  }, [phoneTimelineName]);
+  const phoneBatchRef = useRef<{ batch: string; index: number; audioAt: number; added: number } | null>(null);
+  // Voice-over takes on the timeline, by the upload that brought them - a Retake swaps one out.
+  const voiceTakesRef = useRef(new Map<string, string>());
+  const placeFromPhoneRef = useRef<(file: IncomingStatus) => Promise<void>>(async () => {});
+  placeFromPhoneRef.current = async (file) => {
+    const keep = (why: string) => void reportPhonePlacement(file, false, why);
+    if (!editingVideoRef.current || !file.path) return keep("No video is open in Briefcast — saved to your library");
+    if (file.target === "voiceover") {
+      let d = file.duration ?? NaN;
+      if (!Number.isFinite(d) || d <= 0) {
+        const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: file.path }).catch(() => ({} as Record<string, string>));
+        d = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+      }
+      if (!Number.isFinite(d) || d <= 0) return keep("Briefcast couldn't read this take — saved to your library");
+      const at = Math.max(0, Math.min(file.at ?? currentOutputTime, totalOutputDuration));
+      const replaced = file.replaces ? voiceTakesRef.current.get(file.replaces) : undefined;
+      if (replaced) {
+        editStore.deleteAudioOverlay(replaced);
+        voiceTakesRef.current.delete(file.replaces!);
+      }
+      const end = Math.max(at + 0.1, Math.min(totalOutputDuration, at + d));
+      voiceTakesRef.current.set(file.id, editStore.addAudioOverlay(file.path, d, at, end));
+      setMessage(`${replaced ? "Retake" : "Voice-over"} from ${file.device_name} placed on its own track`);
+      void reportPhonePlacement(file, true);
+      return;
+    }
+    const category = getFileCategory(file.name);
+    if (category !== "video" && category !== "image" && category !== "audio") {
+      return keep("Not a picture, video or sound — saved to your library");
+    }
+    const batch = file.batch ?? file.id;
+    let cursor = phoneBatchRef.current;
+    if (!cursor || cursor.batch !== batch) {
+      const t = Math.max(0, Math.min(currentOutputTime, totalOutputDuration));
+      let end = 0;
+      let index = editStore.clips.findIndex((c) => (end += clipOutputDuration(c)) > t + 1e-3) + 1;
+      if (index <= 0) index = editStore.clips.length;
+      cursor = phoneBatchRef.current = { batch, index, audioAt: t, added: 0 };
+    }
+    try {
+      if (category === "audio") {
+        const info = await invoke<Record<string, string>>("get_conversion_info", { inputPath: file.path });
+        const d = parseFloat(info.duration?.match(/[\d.]+/)?.[0] ?? "");
+        if (!Number.isFinite(d) || d <= 0) return keep("Briefcast couldn't read this sound — saved to your library");
+        const total = Math.max(totalOutputDuration, cursor.audioAt + d);
+        editStore.addAudioOverlay(file.path, d, cursor.audioAt, Math.min(total, cursor.audioAt + d));
+        cursor.audioAt += d;
+      } else {
+        if (!(await editStore.insertClipAt(file.path, cursor.index))) {
+          return keep("Briefcast couldn't open this file — saved to your library");
+        }
+        cursor.index += 1;
+      }
+      cursor.added += 1;
+      setMessage(
+        cursor.added === 1
+          ? `Added ${file.name} from ${file.device_name}`
+          : `Added ${cursor.added} files from ${file.device_name} to the timeline`
+      );
+      void reportPhonePlacement(file, true);
+    } catch (err) {
+      keep(`Couldn't add it (${err instanceof Error ? err.message : String(err)}) — saved to your library`);
+    }
+  };
+  // One at a time, in arrival order - a batch's files must not race each other into the timeline.
+  useEffect(() => {
+    let chain = Promise.resolve();
+    const stop = onPhoneTimelineFile((file) => {
+      chain = chain.then(() => placeFromPhoneRef.current(file)).catch(() => {});
+    });
+    return () => {
+      stop();
+      void setPhoneTimeline(null);
+    };
+  }, []);
 
   // Ctrl+V in the video editor: what was copied on the timeline (timelineClipboard.ts), pasted at
   // the playhead - or, when something else was copied since, that: files copied in Explorer
@@ -1341,7 +1520,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     const primaryPath = selectedFile?.sourcePath;
     if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
-    const imagePaths = Array.from(new Set(editStore.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    const imagePaths = Array.from(new Set(editStore.playbackClips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
     let cancelled = false;
     (async () => {
       for (const imagePath of imagePaths) {
@@ -1354,7 +1533,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFile?.sourcePath, editStore.clips, resolveImageClipProxyUrl]);
+  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1581,14 +1760,20 @@ const setScreen = () => {
     setSelectScreen(false);
   };
 
-  // Window-targeted *recording* still auto-raises its target: Windows' SetForegroundWindow
-  // restriction (see openScreenshotOverlay below for the full explanation) applies here too and
-  // can just as easily no-op, but a multi-second recording has room to be manually corrected
-  // (switch to the window yourself once it starts) in a way a single-shot screenshot doesn't —
-  // so recording keeps this best-effort auto-focus rather than also gaining an overlay step.
-  const activateTargetWindowIfNeeded = async (): Promise<void> => {
-    if (!screenSize.startsWith('window:')) return;
-    await invoke('activate_and_open_window', { title: selectedScreen });
+  // A window captured on its own needs nothing done to it - it's recorded wherever it is, so
+  // focus stays where the user has it. Only when a window is recorded as the screen area it covers
+  // is it raised first (best effort: Windows' SetForegroundWindow restriction - see
+  // openScreenshotOverlay below - can no-op, and the user can bring it forward themselves).
+  const windowHwnd = (formData: any): number | null => {
+    const raw = typeof formData.screen_size === 'string' && formData.screen_size.startsWith('window:')
+      ? Number(formData.screen_size.slice('window:'.length))
+      : NaN;
+    return Number.isFinite(raw) && raw !== 0 ? raw : null;
+  };
+  const activateTargetWindowIfNeeded = async (formData: any): Promise<void> => {
+    const hwnd = windowHwnd(formData);
+    if (hwnd === null || captureCapsRef.current.window_isolated) return;
+    await invoke('activate_and_open_window', { title: formData.window_title ?? '', hwnd });
     await new Promise(resolve => setTimeout(resolve, 500));
   };
 
@@ -1603,10 +1788,15 @@ const setScreen = () => {
   // same synchronous tick (e.g. clicking a window thumbnail), in which case reading the state
   // directly here would still see the *previous* selection.
   const handleTakeScreenshot = async (formData: any) => {
-    if (formData.screen_size !== 'fullscreen') {
+    // A window captured on its own is taken straight away, wherever it is - Briefcast's own
+    // window included. The short wait lets the options dialog that was just closed leave the
+    // screen first, so a screenshot of Briefcast shows Briefcast, not the dialog.
+    const isolatedWindow = windowHwnd(formData) !== null && captureCapsRef.current.window_isolated;
+    if (formData.screen_size !== 'fullscreen' && !isolatedWindow) {
       await openScreenshotOverlay(formData);
       return;
     }
+    if (isolatedWindow) await new Promise(resolve => setTimeout(resolve, 250));
     try {
       const playShutterSound = () => {
         return new Promise<void>((resolve) => {
@@ -1673,6 +1863,11 @@ const setScreen = () => {
       enhance_audio: recordingPrefs.autoEnhanceAudio,
       overlay_border: recordingPrefs.cameraBorder,
       overlay_border_color: recordingPrefs.cameraBorderColor,
+      capture_cursor: recordingPrefs.captureCursor,
+      window_title_bar: recordingPrefs.windowTitleBar,
+      // The pointer and shortcuts for the editor's Screen Style (services/input_tracker.rs).
+      track_pointer: recordingPrefs.editablePointer,
+      track_keys: recordingPrefs.recordShortcuts,
       // Live background behind the person in a bubble recorded into the screen (camera_effects.rs) -
       // a separately recorded webcam gets it in the editor instead, at full quality.
       camera_effect: formData.record_type === "sva" && !formData.separate_webcam_capture ? cameraEffectSpec(recordingPrefs.cameraBackground) : null,
@@ -1702,7 +1897,7 @@ const setScreen = () => {
       if (!go) return;
     }
     try {
-        await activateTargetWindowIfNeeded();
+        await activateTargetWindowIfNeeded(formData);
 
         // Play audio notification
         const playAudioNotification = () => {
@@ -2604,6 +2799,169 @@ const setScreen = () => {
 		};
 	}, [handleRecordingToggleHotkey]);
 
+	// ---- The phone app's Remote, Voice-over and Beam (phone_transfer_page.html). Phones mirror this
+	// window's state: recording (with a pause-aware elapsed snapshot the phone ticks on from, so the
+	// two clocks never have to agree), the screen/camera view, and the open video's playback. It goes
+	// out when something meaningful changes - checked twice a second, a few bytes each time.
+	const remoteSnapshotRef = useRef<() => Record<string, unknown>>(() => ({}));
+	remoteSnapshotRef.current = () => {
+		const now = Date.now();
+		const elapsedMs =
+			isRecording && recordingStartTime
+				? Math.max(0, (isPaused && pauseStartedAt ? pauseStartedAt : now) - recordingStartTime - pausedAccumulatedMs)
+				: 0;
+		const playback = phoneTimelineName ? videoPlayerRef.current?.getPlaybackState() : null;
+		return {
+			recording: isRecording,
+			paused: isPaused,
+			elapsedMs,
+			canSwitchView: isRecording && canSwitchView,
+			view: viewMode,
+			editing: phoneTimelineName,
+			playing: !!playback && !playback.paused,
+			time: Math.round(currentOutputTime * 10) / 10,
+			duration: Math.round(totalOutputDuration * 10) / 10,
+			canUndo: !!phoneTimelineName && editStore.canUndo,
+			canRedo: !!phoneTimelineName && editStore.canRedo,
+			// What a Record press will capture, and with which camera - the phone's Remote picks both.
+			mode: recordType,
+			cameraSource: videoDevices.includes(PHONE_CAMERA_DEVICE) ? "phone" : videoDevices.length ? "pc" : "none",
+			phoneCam: getPhoneCameraState().status,
+		};
+	};
+	useEffect(() => {
+		let last = "";
+		const send = () => {
+			const state = remoteSnapshotRef.current();
+			// The elapsed time ticks on by itself on the phone - only a change of state is news.
+			const key = JSON.stringify({ ...state, elapsedMs: 0 });
+			if (key === last) return;
+			last = key;
+			void broadcastToPhones("remote_state", state);
+		};
+		send();
+		const timer = window.setInterval(send, 500);
+		return () => window.clearInterval(timer);
+	}, []);
+
+	// Timeline time -> the clip and source time under it, for the remote's Retake (which goes back to
+	// where the take it replaces began).
+	const seekOutputTime = (t: number) => {
+		let acc = 0;
+		for (const clip of editStore.clips) {
+			const d = clipOutputDuration(clip);
+			if (acc + d > t + 1e-3) {
+				handleSeekActiveFile(clip.sourcePath, outputOffsetToSource(clip, t - acc));
+				return;
+			}
+			acc += d;
+		}
+	};
+
+	// Studio Silence: while a voice-over take rolls, everything this window plays is muted, so the
+	// phone's mic hears only the voice - then each element goes back to exactly how it was. If the
+	// phone vanishes mid-take, a failsafe brings the sound back.
+	const studioSilenceRef = useRef<{ muted: Map<HTMLMediaElement, boolean>; failsafe: number } | null>(null);
+	const endStudioSilence = () => {
+		const s = studioSilenceRef.current;
+		if (!s) return;
+		studioSilenceRef.current = null;
+		window.clearTimeout(s.failsafe);
+		s.muted.forEach((was, el) => {
+			el.muted = was;
+		});
+		const playback = videoPlayerRef.current?.getPlaybackState();
+		if (playback && !playback.paused) videoPlayerRef.current?.togglePlay();
+		void broadcastToPhones("voiceover", { state: "idle" });
+	};
+	const startStudioSilence = async (requestedAt: unknown) => {
+		if (!editingVideoRef.current) {
+			void broadcastToPhones("voiceover", { state: "unavailable" });
+			return;
+		}
+		endStudioSilence();
+		const retakeAt = typeof requestedAt === "number" && Number.isFinite(requestedAt) ? requestedAt : null;
+		if (retakeAt !== null) {
+			seekOutputTime(retakeAt);
+			await new Promise((r) => window.setTimeout(r, 300));
+		}
+		const at = retakeAt ?? Math.max(0, Math.min(currentOutputTime, totalOutputDuration));
+		const muted = new Map<HTMLMediaElement, boolean>();
+		document.querySelectorAll<HTMLMediaElement>("video, audio").forEach((el) => {
+			muted.set(el, el.muted);
+			el.muted = true;
+		});
+		studioSilenceRef.current = { muted, failsafe: window.setTimeout(endStudioSilence, 15 * 60_000) };
+		videoPlayerRef.current?.play();
+		void broadcastToPhones("voiceover", { state: "rolling", at, startedAt: Date.now() });
+	};
+
+	// The computer cameras that were picked before the phone took over, so "Computer camera" on the
+	// Remote goes back to exactly those.
+	const pcCamerasRef = useRef<string[]>([]);
+	const remoteActionRef = useRef<(command: PhoneRemoteCommand) => void>(() => {});
+	remoteActionRef.current = (command) => {
+		const editing = editingVideoRef.current;
+		switch (command.action) {
+			case "record.mode":
+				if (!isRecording && ["sva", "sa", "s", "va", "v", "a"].includes(String(command.value))) setRecordType(String(command.value));
+				break;
+			case "camera.source":
+				if (isRecording) break;
+				if (command.value === "phone") {
+					// The phone app is about to offer its camera over its own connection.
+					void listenForPhoneCamera();
+					const pc = videoDevices.filter((d) => d !== PHONE_CAMERA_DEVICE);
+					if (pc.length) pcCamerasRef.current = pc;
+					setVideoDevices([PHONE_CAMERA_DEVICE]);
+				} else {
+					setVideoDevices((prev) => {
+						const pc = prev.filter((d) => d !== PHONE_CAMERA_DEVICE);
+						return pc.length ? pc : pcCamerasRef.current;
+					});
+				}
+				break;
+			case "record.toggle":
+				handleRecordingToggleHotkey();
+				break;
+			case "record.pause":
+				if (isRecording) void (isPaused ? handleResumeRecording() : handlePauseRecording());
+				break;
+			case "view.toggle":
+				void switchViewRef.current("toggle");
+				break;
+			case "play.toggle":
+				if (editing) videoPlayerRef.current?.togglePlay();
+				break;
+			case "seek":
+				// The same arrow keys the keyboard uses, so it behaves exactly as they do in every mode.
+				if (editing) document.dispatchEvent(new KeyboardEvent("keydown", { key: Number(command.value) < 0 ? "ArrowLeft" : "ArrowRight", bubbles: true }));
+				break;
+			case "undo":
+				if (editing && editStore.canUndo) editStore.undo();
+				break;
+			case "redo":
+				if (editing && editStore.canRedo) editStore.redo();
+				break;
+			case "voiceover.start":
+				void startStudioSilence(command.value);
+				break;
+			case "voiceover.stop":
+				endStudioSilence();
+				break;
+		}
+	};
+	useEffect(() => {
+		const stopRemote = onPhoneRemote((command) => remoteActionRef.current(command));
+		const stopClip = onPhoneClip((clip) =>
+			setMessage(clip.opened ? `Opened a link from ${clip.device_name}` : `Copied from ${clip.device_name}: “${clip.text.slice(0, 60)}${clip.text.length > 60 ? "…" : ""}”`)
+		);
+		return () => {
+			stopRemote();
+			stopClip();
+		};
+	}, []);
+
 	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
 	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).
 	useEffect(() => {
@@ -2645,7 +3003,7 @@ const setScreen = () => {
 	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
 	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
 	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
-		const state = createProjectState(request.imagePaths, request.options);
+		const state = request.state ?? createProjectState(request.imagePaths, request.options);
 		const projectPath = await invoke<string>("create_video_project", {
 			name: request.name,
 			width: request.frame.width,
@@ -2741,6 +3099,16 @@ const setScreen = () => {
 		// clip to clip is ordinary editing); opening anything it can't edit - an image, a PDF -
 		// leaves it, since the tool has nothing to do with what's now on screen.
 		setVideoEditorScreen((prev) => (prev && getFileCategory(fileName) === "video" ? { mode: "editing" } : null));
+		// The player starts over on the file's own picture - the timeline must re-seat playback on
+		// its first clip (see forgetTimelineBootstrap).
+		forgetTimelineBootstrap(filePath);
+		// A project has nothing to show but its timeline (its own picture is a blank canvas), so it
+		// always opens in the editor.
+		if (isVideoProjectPath(filePath)) {
+			setVideoEditorScreen({ mode: "editing" });
+			setDockerMode("file-tools");
+			window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+		}
 		setRecentPaths(recordFileOpened(filePath));
 		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
 		// bring this file back later (see restoreLastOpenedForCategory below), rather than leaving
@@ -3470,6 +3838,11 @@ const setScreen = () => {
 	const resolveExternalDropClientX = async (): Promise<number | null> => {
 		try {
 			const [clientX, clientY] = await invoke<[number, number]>("get_cursor_position_in_window");
+			if (phonesPaired()) {
+				shelfPointRef.current = { x: clientX, y: clientY };
+				setShelfPoint(shelfPointRef.current);
+				setExternalDrag(true);
+			}
 			const el = document.elementFromPoint(clientX, clientY);
 			const overTimeline = !!el?.closest("[data-timeline-track]");
 			// Temporary diagnostic - if clientX/clientY now land on the timeline while it's visibly
@@ -3497,6 +3870,19 @@ const setScreen = () => {
 				if (hoverTokenRef.current === token) dragOverTimelineXRef.current = clientX;
 				return;
 			}
+			if (event.payload.type === "drop" || event.payload.type === "leave") {
+				const at = shelfPointRef.current;
+				shelfPointRef.current = null;
+				setExternalDrag(false);
+				setShelfPoint(null);
+				// Dropped on a phone (the shelf, or a card in the Phones panel): it's sent, not imported.
+				const phone = event.payload.type === "drop" && at ? phoneDropAt(at.x, at.y) : null;
+				if (phone && event.payload.type === "drop") {
+					dragOverTimelineXRef.current = null;
+					void dropOnPhone(phone, event.payload.paths);
+					return;
+				}
+			}
 			if (event.payload.type === "drop") {
 				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
 				if (dragOverTimelineXRef.current !== null) {
@@ -3517,6 +3903,34 @@ const setScreen = () => {
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
+
+	useEffect(() => {
+		if (!draggingFiles) return;
+		const over = (e: DragEvent) => {
+			setShelfPoint({ x: e.clientX, y: e.clientY });
+			if ((e.target as Element | null)?.closest?.("[data-phone-drop]")) {
+				e.preventDefault();
+				if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+			}
+		};
+		const drop = (e: DragEvent) => {
+			const phone = (e.target as Element | null)?.closest?.<HTMLElement>("[data-phone-drop]")?.dataset.phoneDrop;
+			if (!phone) return;
+			e.preventDefault();
+			void dropOnPhone(phone, draggingFiles.map((f) => f.path));
+			setDraggingFiles(null);
+		};
+		document.addEventListener("dragover", over);
+		document.addEventListener("drop", drop);
+		return () => {
+			document.removeEventListener("dragover", over);
+			document.removeEventListener("drop", drop);
+			setShelfPoint(null);
+		};
+	}, [draggingFiles]);
+	const shelfDragging = !!draggingFiles || externalDrag;
+	const shelfAt = dragPoint ?? shelfPoint;
+	const phoneHover = shelfDragging && shelfAt ? phoneDropAt(shelfAt.x, shelfAt.y) : null;
 
 	const handleDeleteFolder = async (folder: string) => {
 		try {
@@ -3894,6 +4308,16 @@ const setScreen = () => {
                     >
                       <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
                     </button>
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        title="Get files from phone"
+                        onClick={openPhoneReceive}
+                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                      >
+                        <IoPhonePortraitOutline size={15} />
+                      </button>
+                    )}
                     {activeFileCategory !== "trash" && (
                       <button
                         type="button"
@@ -4599,6 +5023,23 @@ const setScreen = () => {
                                         </span>
                                         <IoChevronForward size={12} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                                       </button>
+                                      {/* A project file is an edit list, not media a phone can play -
+                                          Save renders it first. */}
+                                      {!isVideoProjectPath(file.path) && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openPhoneTransfer(filesToActOn(file).filter((f) => !isVideoProjectPath(f.path)));
+                                            setOpenMenu(null);
+                                          }}
+                                        >
+                                          <IoPhonePortraitOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">
+                                            {filesToActOn(file).length > 1 ? `Transfer ${filesToActOn(file).length} to phone` : "Transfer to phone"}
+                                          </span>
+                                        </button>
+                                      )}
                                       {getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path) && (
                                         <button
                                           className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
@@ -4762,7 +5203,9 @@ const setScreen = () => {
           {isNewVideoProjectOpen && (
             <NewVideoProjectDialog
               libraryImages={allLibraryFiles.filter((file) => isImageClipPath(file.path))}
+              libraryVideos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path))}
               resolveThumbnailUrl={resolveImageThumbnailUrl}
+              resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
               onCreate={handleCreateVideoProject}
               onClose={() => setIsNewVideoProjectOpen(false)}
             />
@@ -4868,18 +5311,42 @@ const setScreen = () => {
                 onPrevious={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(-1) : navigateVideo(-1)) : undefined}
                 onNext={hasSiblingMedia ? () => (isAudioSelected ? navigateAudio(1) : navigateVideo(1)) : undefined}
                 autoplayNext={isAudioSelected ? audioAutoplayNext : videoAutoplayNext}
+                onEditVideo={
+                  getFileCategory(selectedFile.name) === "video"
+                    ? () => {
+                        if (dockerMode === "file-tools") return setDockerMode("record");
+                        setDockerMode("file-tools");
+                        window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+                      }
+                    : undefined
+                }
+                isEditingVideo={dockerMode === "file-tools"}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
                 }
                 overlay={
                   getFileCategory(selectedFile.name) === "video"
-                    ? (frameRect) => (
+                    ? (fullFrame) => {
+                        // With a Screen Style the edited picture - and every layer placed on it - is laid
+                        // out in the frame's content rectangle with the wallpaper around it; only the
+                        // shortcut chips and captions sit on the whole frame, as export composites them.
+                        const inset = screenContentInset;
+                        const frameRect = inset
+                          ? { left: fullFrame.left + inset.x * fullFrame.width, top: fullFrame.top + inset.y * fullFrame.height, width: inset.width * fullFrame.width, height: inset.height * fullFrame.height }
+                          : fullFrame;
+                        const contentBox = { left: (inset?.x ?? 0) * fullFrame.width, top: (inset?.y ?? 0) * fullFrame.height, width: frameRect.width, height: frameRect.height };
+                        return (
                         <>
+                          <div className="absolute pointer-events-none" style={contentBox}>
+                          {/* A project that is only sound: its live waveform over the blank picture. */}
+                          {isVideoProjectPath(selectedFile.sourcePath) && editStore.clips.length === 0 && editStore.audioOverlays.length > 0 && (
+                            <AudioOnlyStage audioOverlays={editStore.audioOverlays} isPlaying={playerIsPlaying} currentOutputTime={currentOutputTime} />
+                          )}
                           {/* The next clip, covering the player while it switches to it. Under
                               the transition preview, which draws the outgoing clip over it. */}
                           <ClipHandoffLayer
                             frameRect={frameRect}
-                            clips={editStore.clips}
+                            clips={editStore.playbackClips}
                             activeClipId={activeClipEffects?.id ?? null}
                             apiRef={handoffRef}
                             resolveClipUrl={resolveTimelineClipUrl}
@@ -4888,6 +5355,24 @@ const setScreen = () => {
                             seekMain={seekMainPlayer}
                             onTime={setPlayerCurrentTime}
                           />
+                          {/* The clip's effect (echo, RGB split...) over its picture (clipFx.ts). */}
+                          <ClipFxLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            getPlaybackState={getPlayerPlaybackState}
+                            getVideoElement={getMainVideoElement}
+                          />
+                          {/* The recorded pointer, drawn on the clip's own picture (pointerTrack.ts). */}
+                          <PointerLayer
+                            frameRect={frameRect}
+                            clips={editStore.clips}
+                            activeClipId={activeClipEffects?.id ?? null}
+                            recordings={clipRecordings}
+                            style={pointerStyle}
+                            frame={projectFrame}
+                            getPlaybackState={getPlayerPlaybackState}
+                          />
                           {/* First, so it sits under every overlay - export composites the
                               transition into the base video before any overlay too. */}
                           <TransitionPreviewLayer
@@ -4895,6 +5380,7 @@ const setScreen = () => {
                             clips={editStore.clips}
                             activeClipId={activeClipEffects?.id ?? null}
                             getPlaybackState={getPlayerPlaybackState}
+                            getVideoElement={getMainVideoElement}
                             resolveClipUrl={resolveTimelineClipUrl}
                           />
                           {/* Adjustment layers on the video itself - beneath blur regions and every
@@ -4965,6 +5451,24 @@ const setScreen = () => {
                           totalOutputDuration={totalOutputDuration}
                         />
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
+                        </div>
+                        {/* The frame around the edited picture, then what sits on the frame itself. */}
+                        {editStore.screenStyle && projectFrame && <ScreenBackdropLayer style={editStore.screenStyle} frame={projectFrame} />}
+                        <KeystrokeLayer frameRect={fullFrame} chips={keyChips} style={keystrokeStyle} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />
+                        {/* Above PiP and every other overlay - same stacking as the export, where the
+                            captions are the last video stage (export_trimmed_video). */}
+                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
+                          <CaptionOverlayLayer
+                            frameRect={fullFrame}
+                            lines={captionLines}
+                            settings={editStore.captions.settings}
+                            currentOutputTime={currentOutputTime}
+                            isPlaying={playerIsPlaying}
+                            clipSpeed={activeClipEffects?.speed ?? 1}
+                          />
+                        )}
+                        {/* Tools that work on the picture itself, laid out with it. */}
+                        <div className="absolute pointer-events-none" style={contentBox}>
                         {isFinding && (
                           <FindHideTool
                             frameRect={frameRect}
@@ -4988,18 +5492,6 @@ const setScreen = () => {
                             sourcePath={activeClipEffects?.sourcePath ?? selectedFile.sourcePath}
                             onConfirm={(region) => handleBubbleMarked(activeClipEffects?.sourcePath ?? selectedFile.sourcePath, region)}
                             onCancel={() => setIsMarkingBubble(false)}
-                          />
-                        )}
-                        {/* Above PiP and every other overlay - same stacking as the export, where the
-                            captions are the last video stage (export_trimmed_video). */}
-                        {editStore.captions?.settings.enabled && captionLines.length > 0 && (
-                          <CaptionOverlayLayer
-                            frameRect={frameRect}
-                            lines={captionLines}
-                            settings={editStore.captions.settings}
-                            currentOutputTime={currentOutputTime}
-                            isPlaying={playerIsPlaying}
-                            clipSpeed={activeClipEffects?.speed ?? 1}
                           />
                         )}
                         <AdjustmentLayersLayer
@@ -5043,16 +5535,20 @@ const setScreen = () => {
                             onLivePreview={(crop) => videoPlayerRef.current?.previewCropLive(crop)}
                           />
                         )}
+                        </div>
                       </>
-                      )
+                        );
+                      }
                     : undefined
                 }
+                contentInset={screenContentInset}
                 controlsLeading={playerBackButton}
                 onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted || silencedBySolo(mixerSession, VIDEO_CHANNEL)}
                 trackFx={editStore.videoAudioFx}
-                meterTrack={mixerSession.open}
+                // The master bus in use takes every sound through it - this one included.
+                meterTrack={mixerSession.open || !isNeutralMaster(editStore.master)}
                 activeClipEffects={activeClipEffects}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
@@ -5248,7 +5744,18 @@ const setScreen = () => {
                             {file ? truncateFileName(file.name) : item.name}
                           </span>
                           <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
-                            {file ? (
+                            {file && arrivals[file.path] ? (
+                              <span
+                                className="flex items-center gap-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 px-2 py-0.5"
+                                title={`Sent from ${arrivals[file.path].from} ${relativeTime(arrivals[file.path].at)}`}
+                              >
+                                <IoPhonePortraitOutline size={12} />
+                                <span className="max-w-[9rem] truncate">{arrivals[file.path].from}</span>
+                                {arrivals[file.path].count > 1 && <span>· +{arrivals[file.path].count - 1} more</span>}
+                                <span aria-hidden>·</span>
+                                <span>{relativeTime(arrivals[file.path].at)}</span>
+                              </span>
+                            ) : file ? (
                               <>
                                 {libraryPreviewDurations.has(file.path) && (
                                   <>
@@ -5415,6 +5922,10 @@ const setScreen = () => {
       />
       )}
 
+      <PhoneTransferHost />
+      <PhonesHubHost dropHover={phoneHover} />
+      <PhoneShelf dragging={shelfDragging} point={shelfAt} />
+      <UsbImportHost />
       {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
       {showPhoneCamera && (
         <PhoneCameraModal
@@ -5452,6 +5963,8 @@ const setScreen = () => {
             </span>
           </div>
         )}
+        <PhoneIncomingTray onOpen={(path, name) => void loadFileForPlayback(path, name)} />
+        <UsbPhoneTray />
         <ExportQueueChip
           onOpen={(job) => job.resultPath && void loadFileForPlayback(job.resultPath, job.resultPath.split(/[\\/]/).pop() ?? job.title)}
           onShare={setShareJob}

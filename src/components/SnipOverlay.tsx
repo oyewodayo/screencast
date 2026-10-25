@@ -7,12 +7,15 @@
 //
 // The page loads the frozen image itself (on mount, and on every "snip-armed") and only then shows
 // its window, so there's never a black frame between Briefcast hiding and the picker appearing.
+//
+// "Briefcast" (B) swaps in the desktop as it was just before Briefcast hid, with its windows
+// clickable - for screenshots of Briefcast itself.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { PhysicalPosition, PhysicalSize, getCurrentWindow } from "@tauri-apps/api/window";
-import { IoClose, IoCopyOutline, IoCropOutline, IoDesktopOutline, IoTimerOutline } from "react-icons/io5";
+import { IoClose, IoCopyOutline, IoCropOutline, IoDesktopOutline, IoTimerOutline, IoAppsOutline } from "react-icons/io5";
 
 interface Rect {
     x: number;
@@ -28,18 +31,19 @@ interface SnipInfo {
     windows: { title: string; rect: Rect }[];
     monitors: Rect[];
     primary: number;
+    app_windows: { title: string; rect: Rect }[];
 }
 
 type Mode = "area" | "screen";
 type Format = "png" | "jpeg";
 
 const PREFS_KEY = "briefcast.snip";
-const loadPrefs = (): { format: Format; copy: boolean } => {
+const loadPrefs = (): { format: Format; copy: boolean; includeApp: boolean } => {
     try {
         const p = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
-        return { format: p.format === "jpeg" ? "jpeg" : "png", copy: p.copy !== false };
+        return { format: p.format === "jpeg" ? "jpeg" : "png", copy: p.copy !== false, includeApp: p.includeApp === true };
     } catch {
-        return { format: "png", copy: true };
+        return { format: "png", copy: true, includeApp: false };
     }
 };
 
@@ -76,18 +80,24 @@ const SnipOverlay = () => {
     }, []);
     const scale = info ? info.width / viewWidth : 1;
 
+    // Puts one of the two frozen pictures on the canvas (see the header).
+    const draw = useCallback(async (next: SnipInfo, includeApp: boolean) => {
+        const bytes = await invoke<ArrayBuffer>("snip_frame", { includeApp: includeApp && next.app_windows.length > 0 });
+        const canvas = canvasRef.current;
+        if (!canvas || bytes.byteLength !== next.width * next.height * 4) return false;
+        canvas.width = next.width;
+        canvas.height = next.height;
+        canvas.getContext("2d")?.putImageData(new ImageData(new Uint8ClampedArray(bytes), next.width, next.height), 0, 0);
+        return true;
+    }, []);
+
     const load = useCallback(async () => {
         setDrag(null);
         setBusy(false);
         setDelayOpen(false);
         const next = await invoke<SnipInfo | null>("snip_info");
         if (!next) return;
-        const bytes = await invoke<ArrayBuffer>("snip_frame");
-        const canvas = canvasRef.current;
-        if (!canvas || bytes.byteLength !== next.width * next.height * 4) return;
-        canvas.width = next.width;
-        canvas.height = next.height;
-        canvas.getContext("2d")?.putImageData(new ImageData(new Uint8ClampedArray(bytes), next.width, next.height), 0, 0);
+        if (!(await draw(next, loadPrefs().includeApp))) return;
         // Cover the whole virtual desktop (every monitor), then wait for the page to see its new
         // size before showing, so pointer positions map onto the right pixels from the first move.
         const win = getCurrentWindow();
@@ -110,7 +120,15 @@ const SnipOverlay = () => {
         setInfo(next);
         await win.show();
         await win.setFocus();
-    }, []);
+    }, [draw]);
+
+    const includeApp = prefs.includeApp && !!info && info.app_windows.length > 0;
+    const toggleIncludeApp = () => {
+        if (!info || info.app_windows.length === 0) return;
+        const next = !prefs.includeApp;
+        setPrefs((p) => ({ ...p, includeApp: next }));
+        void draw(info, next);
+    };
 
     useEffect(() => {
         void load();
@@ -158,6 +176,7 @@ const SnipOverlay = () => {
                     y: Math.round(rect.y),
                     width: Math.round(rect.width),
                     height: Math.round(rect.height),
+                    include_app: includeApp,
                 },
                 format: prefs.format,
                 fileName: fileNameNow(),
@@ -187,7 +206,9 @@ const SnipOverlay = () => {
         if (mode === "screen") return screen;
         // The desktop itself ("Program Manager", spanning every monitor) isn't a window anyone
         // means to capture - clicking it takes the screen under the cursor instead.
-        const win = info.windows.find((w) => w.title !== "Program Manager" && contains(w.rect, pointer.x, pointer.y));
+        // Briefcast was in front of everything, so its windows are hit first when it's shown.
+        const windows = includeApp ? [...info.app_windows, ...info.windows] : info.windows;
+        const win = windows.find((w) => w.title !== "Program Manager" && contains(w.rect, pointer.x, pointer.y));
         return win?.rect ?? screen;
     })();
 
@@ -215,6 +236,7 @@ const SnipOverlay = () => {
             }
             if (e.key.toLowerCase() === "a") setMode("area");
             if (e.key.toLowerCase() === "s") setMode("screen");
+            if (e.key.toLowerCase() === "b") toggleIncludeApp();
         };
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
@@ -298,6 +320,22 @@ const SnipOverlay = () => {
                                 {label}
                             </button>
                         ))}
+
+                        {info.app_windows.length > 0 && (
+                            <button
+                                type="button"
+                                role="switch"
+                                aria-checked={includeApp}
+                                data-tip="Include Briefcast in the screenshot (B)"
+                                onClick={toggleIncludeApp}
+                                className={`flex items-center gap-2 h-9 px-3 rounded-xl text-[13px] font-medium transition-colors ${
+                                    includeApp ? "bg-blue-500 text-white" : "hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                                }`}
+                            >
+                                <IoAppsOutline size={17} />
+                                Briefcast
+                            </button>
+                        )}
 
                         <span className="w-px h-6 mx-1 bg-neutral-200 dark:bg-neutral-700" />
 

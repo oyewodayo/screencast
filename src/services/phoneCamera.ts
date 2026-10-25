@@ -214,7 +214,10 @@ const handleSignal = async (raw: string) => {
 
 // Starts (or re-attaches to) the pairing server. Safe to call repeatedly - the Rust side is
 // idempotent, so reopening the pairing panel never disturbs a phone that's already streaming.
-export const startPhoneCamera = async (): Promise<PhoneCameraInfo> => {
+// Listens for a phone camera's signalling without starting this module's own pairing server: the
+// Briefcast phone app (phone_transfer.rs, its Remote tab's "This phone") connects as the camera over
+// the connection it already has. Safe to call repeatedly.
+export const listenForPhoneCamera = async (): Promise<void> => {
     if (!unlistenSignal) {
         unlistenSignal = await listen<string>("phone-camera-signal", (e) => {
             void handleSignal(e.payload);
@@ -232,6 +235,10 @@ export const startPhoneCamera = async (): Promise<PhoneCameraInfo> => {
             }
         });
     }
+};
+
+export const startPhoneCamera = async (): Promise<PhoneCameraInfo> => {
+    await listenForPhoneCamera();
 
     try {
         const info = await invoke<PhoneCameraInfo>("start_phone_camera_server");

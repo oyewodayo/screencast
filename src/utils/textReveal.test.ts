@@ -101,3 +101,17 @@ describe("textReveal controls", () => {
     expect(textRevealState(TEXT, "words", 3, D).underline).toBe(0);
   });
 });
+
+describe("roll", () => {
+  it("spins digits through other digits, then lands on the real ones, left to right", () => {
+    const mid = textRevealState("22 OCT", "roll", 0.25, 4, { exit: "none" });
+    const c0 = mid.char(0);
+    expect(c0.clip).toBe(true);
+    if (c0.glyph !== undefined) expect(c0.glyph).toMatch(/\d/);
+    // The space never rolls.
+    expect(mid.char(2).glyph).toBeUndefined();
+    const done = textRevealState("22 OCT", "roll", 3.5, 4, { exit: "none" });
+    for (let i = 0; i < 6; i++) expect(done.char(i)).toMatchObject({ opacity: 1, dy: 0 });
+    expect(done.settled).toBe(true);
+  });
+});

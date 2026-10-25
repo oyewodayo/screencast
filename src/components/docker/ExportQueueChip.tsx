@@ -3,11 +3,15 @@
 // The background export queue on screen (exportQueue.ts): a small chip in the corner while
 // anything is queued, rendering or freshly done - the frame being rendered right now, how far it
 // has got, how long is left - and, opened, every job with what can be done with it: cancel a
-// render, retry a failed one, open / show / share a finished file.
+// render, retry a failed one, open / show / share a finished file, or put it on a phone - over the
+// USB cable in one click when an Android phone is plugged in, or through Transfer to phone.
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IoAlertCircleOutline, IoCheckmarkCircle, IoClose, IoCloudUploadOutline, IoFilmOutline, IoFolderOpenOutline, IoPlayOutline, IoRefreshOutline } from "react-icons/io5";
+import { IoAlertCircleOutline, IoCheckmarkCircle, IoClose, IoCloudUploadOutline, IoFilmOutline, IoFolderOpenOutline, IoPhonePortraitOutline, IoPlayOutline, IoRefreshOutline } from "react-icons/io5";
+import { MdUsb } from "react-icons/md";
 import { ExportJob, cancel, clearFinished, formatEta, isActive, remove, retry, useExportQueue } from "../../utils/exportQueue";
+import { openPhoneTransfer } from "../../services/phoneTransfer";
+import { getUsbState, sendOverUsb, subscribeUsb, type UsbPhone } from "../../services/usbPhone";
 
 interface Props {
   onOpen: (job: ExportJob) => void;
@@ -49,7 +53,7 @@ const statusLine = (job: ExportJob): string => {
   }
 };
 
-const JobRow: React.FC<{ job: ExportJob } & Props> = ({ job, onOpen, onShare }) => {
+const JobRow: React.FC<{ job: ExportJob; usbPhone?: UsbPhone } & Props> = ({ job, usbPhone, onOpen, onShare }) => {
   const btn = "flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-white/75 hover:text-white hover:bg-white/10";
   return (
     <div className="flex gap-2.5 p-2 rounded-lg hover:bg-white/[0.04]">
@@ -85,7 +89,25 @@ const JobRow: React.FC<{ job: ExportJob } & Props> = ({ job, onOpen, onShare }) 
             <button type="button" className={btn} onClick={() => onShare(job)} title="Upload to YouTube or make a share link">
               <IoCloudUploadOutline size={12} /> Share
             </button>
+            <button
+              type="button"
+              className={btn}
+              onClick={() => openPhoneTransfer([{ path: job.resultPath!, name: fileName(job.resultPath!) }])}
+              title="Send it to a phone over Wi-Fi or a USB cable"
+            >
+              <IoPhonePortraitOutline size={12} /> Phone
+            </button>
           </div>
+        )}
+        {job.status === "done" && job.resultPath && usbPhone && (
+          <button
+            type="button"
+            onClick={() => void sendOverUsb(usbPhone.id, [{ path: job.resultPath!, name: fileName(job.resultPath!) }])}
+            title="Copy it to the phone on the USB cable - progress shows in the phone's card"
+            className="self-start mt-1 flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+          >
+            <MdUsb size={12} /> Send to {usbPhone.name}
+          </button>
         )}
         {(job.status === "failed" || job.status === "cancelled") && (
           <div className="flex items-center gap-0.5 -ml-1.5 mt-0.5">
@@ -101,6 +123,10 @@ const JobRow: React.FC<{ job: ExportJob } & Props> = ({ job, onOpen, onShare }) 
 
 const ExportQueueChip: React.FC<Props> = (props) => {
   const jobs = useExportQueue();
+  // An Android phone ready on the USB cable gets a one-click "Send to" on every finished export.
+  const [usbPhones, setUsbPhones] = useState<UsbPhone[]>(getUsbState().phones);
+  useEffect(() => subscribeUsb((s) => setUsbPhones(s.phones)), []);
+  const usbPhone = usbPhones.find((p) => p.state === "ready" && p.can_receive);
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   // Opens by itself when a job is added, so Save visibly "goes somewhere".
@@ -153,7 +179,7 @@ const ExportQueueChip: React.FC<Props> = (props) => {
             <span className="text-[10px] text-white/35">Keep editing - these render in the background</span>
           </div>
           {[...jobs].reverse().map((job) => (
-            <JobRow key={job.id} job={job} {...props} />
+            <JobRow key={job.id} job={job} usbPhone={usbPhone} {...props} />
           ))}
           {jobs.some((j) => !isActive(j)) && (
             <button type="button" onClick={clearFinished} className="self-end m-1 px-2 py-0.5 rounded text-[10px] text-white/40 hover:text-white/80">

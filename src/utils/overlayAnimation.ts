@@ -21,7 +21,20 @@ export interface OverlayAnimationStyle {
   translateXPx: number;
   translateYPx: number;
   scale: number;
+  // Horizontal squash on top of `scale` - a flip turning edge-on. Undefined = 1.
+  scaleX?: number;
 }
+
+// How far a "drop" falls from, as a fraction of the frame height.
+const DROP_DISTANCE_FRACTION = 0.3;
+const easeOutBounce = (t: number): number => {
+  const n1 = 7.5625;
+  const d1 = 2.75;
+  if (t < 1 / d1) return n1 * t * t;
+  if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+  if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+  return n1 * (t -= 2.625 / d1) * t + 0.984375;
+};
 
 // Standard ease-out-back overshoot curve (t:0..1 -> slightly past 1, settling back to 1) - the
 // "pop" animation's whole visual identity is that overshoot, so a plain ease-out wouldn't read as
@@ -57,6 +70,20 @@ export const overlayAnimationStyle = (
     const scale = progress >= 1 ? 1 : easeOutBack(progress);
     return { opacity: 1, translateXPx: 0, translateYPx: 0, scale };
   }
+
+  // Flip: a pop that spins in like a tossed coin - one and a half turns about the vertical axis,
+  // shown as the box squashing edge-on and back (export: overlay_flip_sx_expr).
+  if (animation === "flip") {
+    const scale = progress >= 1 ? 1 : easeOutBack(progress);
+    const scaleX = progress >= 1 ? 1 : Math.max(0.02, Math.abs(Math.cos(Math.pow(1 - progress, 3) * 3 * Math.PI)));
+    return { opacity: 1, translateXPx: 0, translateYPx: 0, scale, scaleX };
+  }
+
+  // Zoom: rushes in from 2.5x while fading in (and back out the same way).
+  if (animation === "zoom") return { opacity: progress, translateXPx: 0, translateYPx: 0, scale: 1 + 1.5 * Math.pow(1 - progress, 3) };
+
+  // Drop: falls from above and bounces to rest; rises back out.
+  if (animation === "drop") return { opacity: 1, translateXPx: 0, translateYPx: -(1 - easeOutBounce(progress)) * frameHeight * DROP_DISTANCE_FRACTION, scale: 1 };
 
   // Slide keeps full opacity throughout - only its position ramps. `remaining` is "how far from
   // fully in place" (1 at either edge, 0 once arrived), so multiplying it by the travel distance

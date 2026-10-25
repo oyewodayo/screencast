@@ -16,7 +16,11 @@ name: Release
 #   BRIEFCAST_SENTRY_DSN                optional - crash reports (same file)
 #   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
 #                                       optional - Windows code signing via Azure Trusted Signing
-# Variables (same page, Variables tab), only for code signing:
+# Variables (same page, Variables tab):
+#   BRIEFCAST_LAN_TLS_API               optional - base URL of server/lan-certs, e.g.
+#                                       https://withbriefs.com/briefcast-lan. Unset = phone transfer
+#                                       stays on plain HTTP (src-tauri/src/services/lan_tls.rs)
+# Variables only for code signing:
 #   AZURE_SIGNING_ENDPOINT              e.g. https://eus.codesigning.azure.net
 #   AZURE_SIGNING_ACCOUNT               the Trusted Signing account name
 #   AZURE_SIGNING_PROFILE               the certificate profile name
@@ -130,6 +134,8 @@ jobs:
           # Only for an EU PostHog project: set the variable to https://eu.i.posthog.com
           BRIEFCAST_POSTHOG_HOST: ${{ vars.BRIEFCAST_POSTHOG_HOST }}
           BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
+          # Phone transfer's trusted HTTPS certificates (server/lan-certs) - unset compiles it out.
+          BRIEFCAST_LAN_TLS_API: ${{ vars.BRIEFCAST_LAN_TLS_API }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}

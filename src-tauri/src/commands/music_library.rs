@@ -512,6 +512,34 @@ pub async fn restore_music_track(app_handle: AppHandle, window: Window, track_id
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+// Briefcast's own synthesized sound effects (builtinSfx.ts): the stored WAV for `name`, written from
+// `wav_base64` the first time. Called without the bytes, it just says whether one is already there
+// (None when not), so a sound is only made once. Names are a plain, short alphabet - they become
+// file names under the library's own folder, nowhere else.
+#[tauri::command]
+pub async fn store_builtin_sound(app_handle: AppHandle, name: String, wav_base64: Option<String>) -> Result<Option<String>, String> {
+    if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return Err("Invalid sound name".into());
+    }
+    let dir = music_dir(&app_handle)?.join("builtin");
+    let path = dir.join(format!("{name}.wav"));
+    if path.is_file() {
+        return Ok(Some(path.to_string_lossy().into_owned()));
+    }
+    let Some(encoded) = wav_base64 else { return Ok(None) };
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()).map_err(|e| format!("Bad sound data: {e}"))?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("Not a WAV file".into());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create {}: {}", dir.display(), e))?;
+    // Written beside it first, then moved into place - never a half-written sound under the name.
+    let tmp = dir.join(format!("{name}.wav.part"));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("Couldn't save the sound: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Couldn't save the sound: {e}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 // Saves a library track to a place the user picked (the panel's Download - a save dialog chooses
 // `dest_path`), fetching it first if it isn't on disk yet. Returns the path written.
 #[tauri::command]

@@ -104,7 +104,7 @@ export const useCameraStreams = (labels: string[], quality: CameraQuality = "pre
                 try {
                     const deviceId = await resolveDeviceId(label);
                     if (!deviceId) throw new Error("Camera not found by the browser");
-                    const stream = await navigator.mediaDevices.getUserMedia({
+                    const constraints: MediaStreamConstraints = {
                         video:
                             quality === "hd"
                                 ? {
@@ -114,7 +114,21 @@ export const useCameraStreams = (labels: string[], quality: CameraQuality = "pre
                                       frameRate: { ideal: 30 },
                                   }
                                 : { deviceId: { exact: deviceId } },
-                    });
+                    };
+                    // A camera another part of the app is just handing over (the live-background
+                    // feed releasing it, a recording ending) is "in use" for a moment - asked again a
+                    // few times over ~4s rather than shown as taken on the first refusal.
+                    let stream: MediaStream | null = null;
+                    for (let attempt = 0; ; attempt++) {
+                        try {
+                            stream = await navigator.mediaDevices.getUserMedia(constraints);
+                            break;
+                        } catch (err) {
+                            const busy = err instanceof DOMException && (err.name === "NotReadableError" || err.name === "TrackStartError");
+                            if (!busy || attempt >= 8 || cancelled) throw err;
+                            await new Promise((resolve) => setTimeout(resolve, 500));
+                        }
+                    }
                     if (cancelled) {
                         stream.getTracks().forEach((t) => t.stop());
                         return;

@@ -9,12 +9,26 @@
 // While it's open every channel is routed through Web Audio so the meters can read it.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoClose, IoChevronDown, IoChevronForward } from "react-icons/io5";
+import { IoClose, IoChevronDown, IoChevronForward, IoPause, IoPlay } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost } from "./ToolPanelHost";
 import AudioFxEditor from "./AudioFxEditor";
 import { isNeutralFx, linearToDb, type AudioFx } from "../../utils/audioFx";
-import { readLevel } from "../../utils/mixerGraph";
+import { channelAnalyser, readLevel } from "../../utils/mixerGraph";
+import type { MasterBus } from "../../utils/masterBus";
+import LiveScope from "./LiveScope";
+import KnobSlider from "./KnobSlider";
+import MasterStrip from "./MasterStrip";
+
+// A strip's scope source: the piece that's sounding now, else any of its pieces that's routed.
+const stripAnalyser = (meterIds: string[]): AnalyserNode | null => {
+  const sounding = meterIds.find((id) => readLevel(id).l + readLevel(id).r > 0);
+  for (const id of sounding ? [sounding, ...meterIds] : meterIds) {
+    const analyser = channelAnalyser(id);
+    if (analyser) return analyser;
+  }
+  return null;
+};
 import { setMixerOpen, toggleSolo, useMixerSession } from "../../utils/mixerState";
 
 export interface MixerChannel {
@@ -38,8 +52,21 @@ interface MixerPanelProps {
   onVolume: (key: string, volume: number) => void;
   onMute: (key: string, muted: boolean) => void;
   onFx: (key: string, fx: AudioFx | undefined) => void;
+  // The master bus and the delivery target (the export's loudness target) - MasterStrip.
+  master: MasterBus | undefined;
+  onMasterChange: (master: MasterBus | undefined) => void;
+  loudnessTarget: number | null;
+  onLoudnessTargetChange: (lufs: number | null) => void;
+  // Plays just the audio selected on the timeline (Ctrl-click for more) - everything else silent -
+  // so what's being mixed can be heard on its own. null selection = nothing to play.
+  isPlaying: boolean;
+  onTogglePlay: () => void;
+  currentTime: number;
+  selection: { label: string; from: number; to: number } | null;
   onClose: () => void;
 }
+
+const clock = (sec: number) => `${Math.floor(sec / 60)}:${Math.floor(sec % 60).toString().padStart(2, "0")}`;
 
 const METER_FLOOR_DB = -60;
 const meterFraction = (v: number) => Math.max(0, Math.min(1, (linearToDb(v) - METER_FLOOR_DB) / -METER_FLOOR_DB));
@@ -92,7 +119,7 @@ const levelLabel = (v: number) => (v <= 0.0005 ? "-∞" : `${linearToDb(v) > 0 ?
 
 const KIND_LABEL: Record<MixerChannel["kind"], string> = { video: "Video", audio: "Track", pip: "PiP" };
 
-const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onVolume, onMute, onFx, onClose }) => {
+const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onVolume, onMute, onFx, master, onMasterChange, loudnessTarget, onLoudnessTargetChange, isPlaying, onTogglePlay, currentTime, selection, onClose }) => {
   const dockHost = useToolPanelHost();
   const { ref: panelRef, position } = useClampedPopoverPosition(anchor);
   useFloatingDismiss("[data-mixer-panel], [data-mixer-button]", onClose, !!dockHost);
@@ -118,11 +145,37 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium">Mixer</span>
+        <span className="ml-auto flex items-center gap-2">
+          {selection && (
+            <span className="text-[10px] tabular-nums text-white/50" title={`Plays ${selection.label} on its own, ${clock(selection.from)} to ${clock(selection.to)}`}>
+              {clock(Math.max(selection.from, Math.min(currentTime, selection.to)))} / {clock(selection.to)}
+            </span>
+          )}
+          <button
+            type="button"
+            disabled={!selection && !isPlaying}
+            onClick={onTogglePlay}
+            title={isPlaying ? "Pause" : selection ? `Play ${selection.label} on its own` : "Select audio on the timeline to play it here - Ctrl-click for more"}
+            className={`h-6 w-6 flex items-center justify-center rounded-full text-white transition-colors disabled:opacity-35 ${isPlaying ? "bg-teal-500 hover:bg-teal-400 shadow-[0_0_10px_rgba(45,212,191,0.55)]" : "bg-white/15 hover:bg-white/25"}`}
+          >
+            {isPlaying ? <IoPause size={12} /> : <IoPlay size={12} className="ml-px" />}
+          </button>
+        </span>
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
         </button>
       </div>
-      <p className="text-[10px] leading-snug text-white/45">Levels, EQ and compression for every sound - the saved video sounds exactly like this. Solo is just for listening.</p>
+      <p className="text-[10px] leading-snug text-white/45">Levels, EQ and compression for every sound, then the master bus - the saved video sounds like this. Solo is just for listening.</p>
+      <div className={`-mt-0.5 flex items-center gap-1.5 px-2 py-1 rounded text-[10px] ${selection ? "bg-teal-500/10 text-teal-100/85" : "bg-white/[0.04] text-white/45"}`}>
+        <span className={`h-1.5 w-1.5 rounded-full ${selection ? "bg-teal-300" : "bg-white/25"}`} />
+        {selection ? (
+          <span className="truncate">
+            ▶ plays <span className="font-medium">{selection.label}</span> on its own · {clock(selection.from)}–{clock(selection.to)}
+          </span>
+        ) : (
+          <span>Select audio on the timeline to play it here - Ctrl-click for more</span>
+        )}
+      </div>
       <div className={`flex flex-col gap-1 overflow-y-auto -mx-1 px-1 ${dockHost ? "max-h-[70vh]" : "min-h-0"}`}>
         {channels.map((ch) => {
           const isOpen = expanded === ch.key;
@@ -165,22 +218,14 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
                 </div>
                 <Meter ids={ch.meterIds} />
                 <label className="flex items-center gap-2 text-[11px]">
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.005}
-                    value={ch.volume}
-                    onChange={(e) => onVolume(ch.key, Number(e.target.value))}
-                    onDoubleClick={() => onVolume(ch.key, 1)}
-                    title="Level - double-click for 0 dB"
-                    className="flex-1 min-w-0 accent-teal-400"
-                  />
+                  <KnobSlider min={0} max={1} step={0.005} value={ch.volume} onChange={(v) => onVolume(ch.key, v)} resetTo={1} title="Level - double-click for 0 dB" />
                   <span className="w-11 shrink-0 text-right tabular-nums text-white/60">{levelLabel(ch.volume)} dB</span>
                 </label>
               </div>
               {isOpen && (
-                <div className="px-2 pb-2 pt-1 border-t border-white/10">
+                <div className="px-2 pb-2 pt-1.5 border-t border-white/10 flex flex-col gap-2">
+                  {/* The strip's sound after its effects - whichever of its pieces is playing. */}
+                  <LiveScope getAnalyser={() => stripAnalyser(ch.meterIds)} active height={40} />
                   <AudioFxEditor fx={ch.fx} onChange={(fx) => onFx(ch.key, fx)} />
                 </div>
               )}
@@ -189,6 +234,7 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
         })}
         {channels.length === 0 && <p className="text-[11px] text-white/50 py-2">Nothing in this edit makes a sound yet.</p>}
       </div>
+      <MasterStrip master={master} onChange={onMasterChange} target={loudnessTarget} onTargetChange={onLoudnessTargetChange} />
     </div>,
     dockHost ?? document.body
   );
