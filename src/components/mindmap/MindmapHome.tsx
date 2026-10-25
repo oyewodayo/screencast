@@ -6,9 +6,10 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { IoAddOutline, IoCopyOutline, IoEllipsisHorizontal, IoTrashOutline } from "react-icons/io5";
+import { IoAddOutline, IoCopyOutline, IoEllipsisHorizontal, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
 import { MindmapSummary, createEmptyMindmapDocument } from "../../utils/mindmapTypes";
 import { createStarterMindmapDocument } from "../../utils/mindmapTemplate";
+import FileInfoModal from "../Modals/FileInfoModal";
 
 interface MindmapHomeProps {
   onOpenMindmap: (id: string) => void;
@@ -16,6 +17,8 @@ interface MindmapHomeProps {
 
 const MindmapHome: React.FC<MindmapHomeProps> = ({ onOpenMindmap }) => {
   const [summaries, setSummaries] = useState<MindmapSummary[]>([]);
+  // Item whose Info panel (FileInfoModal) is open.
+  const [infoItem, setInfoItem] = useState<{ id: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
@@ -161,6 +164,17 @@ const MindmapHome: React.FC<MindmapHomeProps> = ({ onOpenMindmap }) => {
                   </button>
                   <button
                     type="button"
+                    onClick={() => {
+                      setInfoItem({ id: summary.id, name: summary.name || "Untitled mindmap" });
+                      setMenuFor(null);
+                    }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                  >
+                    <IoInformationCircleOutline size={13} />
+                    Info
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => handleDelete(summary)}
                     className="w-full flex items-center gap-2 px-2.5 py-1.5 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
                   >
@@ -171,6 +185,9 @@ const MindmapHome: React.FC<MindmapHomeProps> = ({ onOpenMindmap }) => {
             </div>
           ))}
         </div>
+      )}
+      {infoItem && (
+        <FileInfoModal item={{ kind: "mindmap", id: infoItem.id }} fileName={infoItem.name} onClose={() => setInfoItem(null)} />
       )}
     </div>
   );

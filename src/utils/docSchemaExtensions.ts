@@ -14,8 +14,8 @@ import Underline from "@tiptap/extension-underline";
 import Image, { ImageOptions } from "@tiptap/extension-image";
 import Table from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
-import TableHeader from "@tiptap/extension-table-header";
-import TableCell from "@tiptap/extension-table-cell";
+import TaskList from "@tiptap/extension-task-list";
+import TaskItem from "@tiptap/extension-task-item";
 import TextAlign from "@tiptap/extension-text-align";
 import TextStyle from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
@@ -29,9 +29,15 @@ import DocImageView from "../components/docs/DocImageView";
 import FontSize from "./docFontSizeExtension";
 import LineSpacing from "./docLineSpacingExtension";
 import DocIndent from "./docIndentExtension";
+import DocBlockFormat from "./docBlockFormat";
+import DocPdfPage from "./docPdfPage";
+import DocTextOverrides from "./docTextOverrides";
 import CommentMark from "./docCommentMark";
 import DocPageBreak from "./docPageBreakExtension";
 import DocLink from "./docLinkExtension";
+import { MathBlock, MathInline } from "./docMathExtension";
+import { Bibliography, Caption, Citation, CrossRef, TableOfContents } from "./docStructureNodes";
+import { ShadedTableCell, ShadedTableHeader } from "./docTableCellShading";
 
 // `common` (not `all`) - covers every mainstream language (JS/TS, Python, Rust, Go, JSON, etc.)
 // without bundling lowlight's full ~190-grammar set, which this doc editor has no need for.
@@ -107,22 +113,42 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     DocImage.configure({ inline: true, docId: docId ?? null }),
     Table.configure({ resizable: true, lastColumnResizable: false, allowTableNodeSelection: true }),
     TableRow,
-    TableHeader,
-    TableCell,
-    TextAlign.configure({ types: ["heading", "paragraph", "tableCell", "tableHeader"] }),
+    // Plain header/cell plus a `background` (cell shading) attribute - see docTableCellShading.ts.
+    ShadedTableHeader,
+    ShadedTableCell,
+    // Checklists (action items, procedures). nested: sub-tasks indent under a task like list items.
+    TaskList,
+    TaskItem.configure({ nested: true }),
+    TextAlign.configure({ types: ["heading", "paragraph", "caption", "tableCell", "tableHeader"] }),
     TextStyle,
     Color,
     FontFamily,
     FontSize,
+    // "Not bold" / "not italic" direct formatting over a style that is (a heading, a caption).
+    DocTextOverrides,
     // multicolor: true - without it, Highlight has no `color` attribute at all (a single fixed
     // highlight color, not a picker) - see @tiptap/extension-highlight's own addAttributes().
     Highlight.configure({ multicolor: true }),
     LineSpacing,
     DocIndent,
+    // Column spanning, block spacing, first-line indent control, table rule styles.
+    DocBlockFormat,
     Subscript,
     Superscript,
     CommentMark,
     DocPageBreak,
+    MathInline,
+    MathBlock,
+    // Captions, cross-references, citations, reference list, table of contents - numbered by
+    // docStructure.ts's plugin (added by the editors themselves, since it needs the document's
+    // reference library).
+    Caption,
+    CrossRef,
+    Citation,
+    Bibliography,
+    TableOfContents,
+    // A PDF page kept exactly as printed (PDF import, "Exact pages").
+    DocPdfPage,
   ];
 }
 
@@ -164,15 +190,18 @@ export const docProseClassName = [
   // ProseMirror-selectednode lands on the NodeView's own wrapper element rather than the raw
   // <img> once a NodeView owns it.
   //
-  // Manual page break (docPageBreakExtension.ts): a dashed rule with a small floating "Page break"
-  // label on screen; on print, the rule/label disappear and `break-after: page` (plus the older
-  // `page-break-after` for broader Chromium-version coverage) takes over, which is what actually
-  // forces a new page in the printed/PDF output.
-  "[&_[data-page-break]]:relative [&_[data-page-break]]:h-0 [&_[data-page-break]]:my-4",
-  "[&_[data-page-break]]:border-t [&_[data-page-break]]:border-dashed [&_[data-page-break]]:border-neutral-300 dark:[&_[data-page-break]]:border-neutral-600",
-  "[&_[data-page-break]::after]:content-['Page_break'] [&_[data-page-break]::after]:absolute [&_[data-page-break]::after]:left-1/2 [&_[data-page-break]::after]:-translate-x-1/2 [&_[data-page-break]::after]:-top-2.5",
-  "[&_[data-page-break]::after]:bg-white dark:[&_[data-page-break]::after]:bg-neutral-900 [&_[data-page-break]::after]:px-2 [&_[data-page-break]::after]:text-[10px] [&_[data-page-break]::after]:uppercase [&_[data-page-break]::after]:tracking-wide [&_[data-page-break]::after]:text-neutral-400",
-  "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:border-none print:[&_[data-page-break]::after]:hidden",
+  // Manual page break (docPageBreakExtension.ts): on screen just a small "Page break" tag where the
+  // page ends - in the live editor docAutoPaginate.ts already draws the new page right after it, so
+  // the old full-width dashed rule on top of that gap said the same thing twice. The tag is the
+  // handle for selecting (click it, then Delete) the break and turns blue while selected. On print
+  // the tag disappears and `break-after: page` (plus the older `page-break-after`) forces the new
+  // page in the printed/PDF output.
+  "[&_[data-page-break]]:relative [&_[data-page-break]]:h-6 [&_[data-page-break]]:my-1 [&_[data-page-break]]:flex [&_[data-page-break]]:items-center [&_[data-page-break]]:justify-center",
+  "[&_[data-page-break]::after]:content-['Page_break'] [&_[data-page-break]::after]:px-2 [&_[data-page-break]::after]:py-0.5 [&_[data-page-break]::after]:rounded-full",
+  "[&_[data-page-break]::after]:border [&_[data-page-break]::after]:border-neutral-200 dark:[&_[data-page-break]::after]:border-neutral-700 [&_[data-page-break]::after]:bg-neutral-50 dark:[&_[data-page-break]::after]:bg-neutral-800",
+  "[&_[data-page-break]::after]:text-[10px] [&_[data-page-break]::after]:font-medium [&_[data-page-break]::after]:uppercase [&_[data-page-break]::after]:tracking-wide [&_[data-page-break]::after]:text-neutral-400",
+  "[&_[data-page-break].ProseMirror-selectednode::after]:border-blue-500 [&_[data-page-break].ProseMirror-selectednode::after]:text-blue-600 [&_[data-page-break].ProseMirror-selectednode]:outline-none",
+  "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:h-0 print:[&_[data-page-break]]:my-0 print:[&_[data-page-break]::after]:hidden",
   "[&_.tableWrapper]:overflow-x-auto [&_.tableWrapper]:w-full [&_.tableWrapper]:my-4 [&_.tableWrapper]:pb-1",
   "[&_.ProseMirror_table]:table-fixed [&_.ProseMirror_table]:border-collapse [&_.ProseMirror_table]:w-full [&_.ProseMirror_table]:min-w-[28rem]",
   "[&_.ProseMirror_th]:relative [&_.ProseMirror_th]:border [&_.ProseMirror_th]:border-neutral-300 dark:[&_.ProseMirror_th]:border-neutral-700 [&_.ProseMirror_th]:bg-neutral-100 dark:[&_.ProseMirror_th]:bg-neutral-800 [&_.ProseMirror_th]:px-3 [&_.ProseMirror_th]:py-2 [&_.ProseMirror_th]:align-top",

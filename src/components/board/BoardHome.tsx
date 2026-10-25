@@ -7,10 +7,11 @@
 // the user wants.
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoSearchOutline, IoTrashOutline } from "react-icons/io5";
+import { IoAdd, IoChevronDown, IoCopyOutline, IoEllipsisVertical, IoImagesOutline, IoSearchOutline, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
 import { BoardSummary, createEmptyBoardDocument, DEFAULT_BOARD_HEIGHT, DEFAULT_BOARD_WIDTH } from "../../utils/boardTypes";
 import { applyBoardTemplate, BOARD_TEMPLATES, BoardTemplate } from "../../utils/boardTemplates";
 import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS, BoardSizePreset } from "../../utils/boardCanvasSizes";
+import FileInfoModal from "../Modals/FileInfoModal";
 
 // Small CSS-only preview swatch for a template card - no need for a real canvas render just to
 // preview a background choice, since a template only ever sets background/padding fields.
@@ -41,6 +42,8 @@ function formatUpdatedAt(iso: string): string {
 
 const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
   const [boards, setBoards] = useState<BoardSummary[] | null>(null);
+  // Item whose Info panel (FileInfoModal) is open.
+  const [infoItem, setInfoItem] = useState<{ id: string; name: string } | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Which card's 3-dot menu is open, if any - and, within that menu, whether "Delete" has already
@@ -327,6 +330,17 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                         <IoCopyOutline size={14} />
                         {duplicatingId === board.id ? "Duplicating…" : "Duplicate board"}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInfoItem({ id: board.id, name: board.name || "Untitled board" });
+                          setOpenMenuId(null);
+                        }}
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                      >
+                        <IoInformationCircleOutline size={14} />
+                        Info
+                      </button>
                       <div className="border-t border-gray-100 dark:border-neutral-700/70" />
                       <button
                         type="button"
@@ -357,6 +371,9 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
             );
           })()}
         </div>
+      )}
+      {infoItem && (
+        <FileInfoModal item={{ kind: "board", id: infoItem.id }} fileName={infoItem.name} onClose={() => setInfoItem(null)} />
       )}
     </div>
   );

@@ -27,8 +27,47 @@ interface ExportOptionsPopoverProps {
   customOutputName: string | null;
   onChooseLocation: () => void;
   onResetLocation: () => void;
+  format: ExportFormat;
+  onFormatChange: (format: ExportFormat) => void;
+  framing: ExportFraming;
+  onFramingChange: (framing: ExportFraming) => void;
+  loudness: number | null;
+  onLoudnessChange: (lufs: number | null) => void;
+  // Fill's crop position, 0..1 each way (0.5 = centred).
+  fillAnchor: { x: number; y: number };
+  onFillAnchorChange: (anchor: { x: number; y: number }) => void;
+  // Fill following the subject (auto-reframe) instead of a fixed position, and how its analysis
+  // is going (null = idle/ready).
+  followSubject: boolean;
+  onFollowSubjectChange: (follow: boolean) => void;
+  reframeStatus: string | null;
   onClose: () => void;
 }
+
+export type ExportFormat = "original" | "16:9" | "9:16" | "1:1" | "4:5";
+export type ExportFraming = "fit-blur" | "fit" | "fill";
+
+// Pixel sizes for each platform format - 1080p-class, what each platform recommends uploading.
+export const EXPORT_FORMATS: { value: ExportFormat; label: string; hint: string; size?: { width: number; height: number } }[] = [
+  { value: "original", label: "Original", hint: "The timeline's own frame" },
+  { value: "16:9", label: "16:9", hint: "YouTube, presentations", size: { width: 1920, height: 1080 } },
+  { value: "9:16", label: "9:16", hint: "Shorts, Reels, TikTok", size: { width: 1080, height: 1920 } },
+  { value: "1:1", label: "1:1", hint: "Square posts", size: { width: 1080, height: 1080 } },
+  { value: "4:5", label: "4:5", hint: "Instagram & LinkedIn feed", size: { width: 1080, height: 1350 } },
+];
+
+const FRAMING_OPTIONS: { value: ExportFraming; label: string; hint: string }[] = [
+  { value: "fit-blur", label: "Fit, blurred background", hint: "Whole picture, edges filled with a soft blur of itself" },
+  { value: "fit", label: "Fit, black bars", hint: "Whole picture, bars where the shapes differ" },
+  { value: "fill", label: "Fill", hint: "Cropped to fill the frame - following the subject, or at a position you set" },
+];
+
+const LOUDNESS_OPTIONS: { value: number | null; label: string; hint: string }[] = [
+  { value: null, label: "As mixed", hint: "No change" },
+  { value: -14, label: "-14 LUFS", hint: "YouTube, Spotify, most streaming" },
+  { value: -16, label: "-16 LUFS", hint: "Podcasts, Apple" },
+  { value: -23, label: "-23 LUFS", hint: "Broadcast (EBU R128)" },
+];
 
 const ExportOptionsPopover: React.FC<ExportOptionsPopoverProps> = ({
   anchor,
@@ -37,6 +76,17 @@ const ExportOptionsPopover: React.FC<ExportOptionsPopoverProps> = ({
   customOutputName,
   onChooseLocation,
   onResetLocation,
+  format,
+  onFormatChange,
+  framing,
+  onFramingChange,
+  loudness,
+  onLoudnessChange,
+  fillAnchor,
+  followSubject,
+  onFollowSubjectChange,
+  reframeStatus,
+  onFillAnchorChange,
   onClose,
 }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
@@ -62,6 +112,84 @@ const ExportOptionsPopover: React.FC<ExportOptionsPopoverProps> = ({
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
         </button>
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <span className="text-[10px] uppercase tracking-wide text-white/40">Format</span>
+        <div className="grid grid-cols-5 gap-1">
+          {EXPORT_FORMATS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              title={opt.hint}
+              onClick={() => onFormatChange(opt.value)}
+              className={`px-1 py-1 rounded text-[10px] transition-colors ${
+                format === opt.value ? "text-blue-400 bg-blue-500/10 ring-1 ring-blue-400/40" : "text-white/70 hover:text-white hover:bg-white/10"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <span className="text-[10px] text-white/40">{EXPORT_FORMATS.find((f) => f.value === format)?.hint}</span>
+        {format !== "original" && (
+          <div className="flex flex-col gap-0.5 pt-1">
+            {FRAMING_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                title={opt.hint}
+                onClick={() => onFramingChange(opt.value)}
+                className={`text-left px-2 py-1 rounded text-[11px] transition-colors ${
+                  framing === opt.value ? "text-blue-400 bg-blue-500/10 ring-1 ring-blue-400/40" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+            {framing === "fill" && (
+              <div className="flex flex-col gap-1 pt-1 text-[10px] text-white/60">
+                <label className="flex items-center gap-2 cursor-pointer" title="The crop moves to keep the action in frame - holding still, easing to new spots, recentring at cuts. Uses recorded clicks too.">
+                  <input type="checkbox" checked={followSubject} onChange={(e) => onFollowSubjectChange(e.target.checked)} className="accent-blue-400" />
+                  <span className="text-white/80">Follow the subject</span>
+                </label>
+                {followSubject && <span className="text-white/40">{reframeStatus ?? "The highlighted window on the player is what's kept."}</span>}
+              </div>
+            )}
+            {framing === "fill" && !followSubject && (
+              <div className="flex flex-col gap-1 pt-1 text-[10px] text-white/60">
+                <label className="flex items-center gap-2">
+                  <span className="w-12 shrink-0">Left ↔ right</span>
+                  <input type="range" min={0} max={1} step={0.01} value={fillAnchor.x} onChange={(e) => onFillAnchorChange({ ...fillAnchor, x: Number(e.target.value) })} className="flex-1 accent-blue-400" />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="w-12 shrink-0">Top ↔ bottom</span>
+                  <input type="range" min={0} max={1} step={0.01} value={fillAnchor.y} onChange={(e) => onFillAnchorChange({ ...fillAnchor, y: Number(e.target.value) })} className="flex-1 accent-blue-400" />
+                </label>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <span className="text-[10px] uppercase tracking-wide text-white/40">Loudness</span>
+        <div className="grid grid-cols-3 gap-1">
+          {LOUDNESS_OPTIONS.map((opt) => (
+            <button
+              key={String(opt.value)}
+              type="button"
+              title={opt.hint}
+              onClick={() => onLoudnessChange(opt.value)}
+              className={`px-1 py-1 rounded text-[10px] transition-colors ${
+                loudness === opt.value ? "text-blue-400 bg-blue-500/10 ring-1 ring-blue-400/40" : "text-white/70 hover:text-white hover:bg-white/10"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <span className="text-[10px] text-white/40">{LOUDNESS_OPTIONS.find((o) => o.value === loudness)?.hint}</span>
       </div>
 
       <div className="flex flex-col gap-1">

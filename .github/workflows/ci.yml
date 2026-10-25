@@ -41,13 +41,13 @@ jobs:
       # Those binaries are gitignored (`binaries/*` in .gitignore), so a CI checkout never has
       # them - which broke `cargo test` on every platform, inside the build script, before a
       # single test compiled or ran. Nothing in CI bundles, so one placeholder file per folder is
-      # all the glob needs. The filename must NOT start with a dot, and `shell: bash` is explicit
+      # all the glob needs - named to match the exact files tauri.conf.json lists, not just its folders. The filename must NOT start with a dot, and `shell: bash` is explicit
       # because windows-latest defaults to pwsh, where `mkdir -p` and `touch` don't exist.
       - name: Satisfy bundle.resources globs (binaries/ are gitignored)
         shell: bash
         run: |
-          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
-          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper binaries/rnnoise
+          touch binaries/ffmpeg/ffmpeg.exe binaries/ffmpeg/ffprobe.exe binaries/heif/placeholder             binaries/whisper/whisper-cli.exe binaries/whisper/placeholder.dll binaries/rnnoise/placeholder
       # Not `tauri build`/`--features custom-protocol` - that needs the bundled ffmpeg/heif binary
       # resources and the full Tauri bundling toolchain, neither of which this test suite (pure
       # unit tests only, see conversion.rs's own #[cfg(test)] module) actually needs.
@@ -96,8 +96,8 @@ jobs:
       - name: Satisfy bundle.resources globs (binaries/ are gitignored)
         shell: bash
         run: |
-          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
-          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper binaries/rnnoise
+          touch binaries/ffmpeg/ffmpeg.exe binaries/ffmpeg/ffprobe.exe binaries/heif/placeholder             binaries/whisper/whisper-cli.exe binaries/whisper/placeholder.dll binaries/rnnoise/placeholder
       - run: cargo test
 
   rust-macos:
@@ -122,6 +122,6 @@ jobs:
       - name: Satisfy bundle.resources globs (binaries/ are gitignored)
         shell: bash
         run: |
-          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper
-          touch binaries/ffmpeg/placeholder binaries/heif/placeholder binaries/whisper/placeholder
+          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper binaries/rnnoise
+          touch binaries/ffmpeg/ffmpeg.exe binaries/ffmpeg/ffprobe.exe binaries/heif/placeholder             binaries/whisper/whisper-cli.exe binaries/whisper/placeholder.dll binaries/rnnoise/placeholder
       - run: cargo test

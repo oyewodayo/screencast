@@ -11,9 +11,49 @@
 // Each render targets a canvas sized to just the overlay's own box (not the whole video frame) -
 // far cheaper than a full-frame canvas per overlay, and ffmpeg positions it via the returned
 // xPx/yPx either way.
+import { drawLayerMask, drawRevealCoverage, revealCoverageKey, revealMaskCanvas } from "./layerMask";
 import { invoke } from "@tauri-apps/api/core";
 import { BlurOverlay, ImageOverlay, TextOverlay, TextOverlayCornerStyle } from "./videoEditTypes";
-import { TEXT_FONT_FAMILY, measureTextBlock } from "../handlers/pdfAnnotationHandlers";
+import { measureTextBlock } from "../handlers/pdfAnnotationHandlers";
+import { titleFontCss } from "./titleFonts";
+import { CANVAS_TEXT_REVEALS, TextRevealState, isTextReveal, textRevealFrameKey, textRevealState } from "./textReveal";
+import { IMAGE_REVEAL_FPS, ImageRevealSettings, ImageRevealState, imageRevealState, wipeAxis } from "./imageReveal";
+
+// A text overlay with a title reveal (textReveal.ts) as the PNG frame sequence export burns in
+// (OverlayFrames, conversion.rs) - each distinct moment once, the fully-typed title once.
+export async function renderTextRevealFrames(
+  overlay: TextOverlay,
+  framePixelWidth: number,
+  framePixelHeight: number
+): Promise<{ unique: string[]; sequence: number[]; xPx: number; yPx: number } | null> {
+  if (!isTextReveal(overlay.animation)) return null;
+  const kind = overlay.animation;
+  const duration = overlay.endTime - overlay.startTime;
+  if (duration <= 0) return null;
+  const fps = 30;
+  const total = Math.max(1, Math.ceil(duration * fps));
+  const unique: string[] = [];
+  const sequence: number[] = [];
+  const keyIndex = new Map<string, number>();
+  let origin: { xPx: number; yPx: number } | null = null;
+  for (let k = 0; k < total; k++) {
+    const state = textRevealState(overlay.text, kind, k / fps, duration, overlay.reveal);
+    const key = textRevealFrameKey(state, k);
+    let idx = keyIndex.get(key);
+    if (idx === undefined) {
+      const rendered = renderTextOverlayToPng(overlay, framePixelWidth, framePixelHeight, state);
+      if (!rendered) return null;
+      origin = origin ?? { xPx: rendered.xPx, yPx: rendered.yPx };
+      idx = unique.length;
+      unique.push(rendered.dataUrl);
+      keyIndex.set(key, idx);
+      // eslint-disable-next-line no-await-in-loop
+      if (idx % 12 === 11) await new Promise((r) => setTimeout(r, 0));
+    }
+    sequence.push(idx);
+  }
+  return origin ? { unique, sequence, ...origin } : null;
+}
 
 export interface RenderedOverlayPng {
   dataUrl: string;
@@ -54,18 +94,82 @@ function cornerRadiusPx(style: TextOverlayCornerStyle | undefined, heightPx: num
   return 0;
 }
 
-// Mirrors VideoOverlayLayer's read-only text rendering (stroke, background+corner-radius,
-// per-character color/bold/italic, textAlign) as closely as canvas primitives allow. "justify" has
-// no simple canvas equivalent - same documented fallback-to-left as pdfAnnotationHandlers.ts's own
-// renderTextObject, for the same reason (would need to redistribute space between words per line,
-// which the per-formatting-segment draw loop below isn't built for).
-export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number): RenderedOverlayPng | null {
+// A text stroke's width in pixels on a frame `frameHeightPx` tall - TextOverlay.strokeWidth is
+// pixels at 1080 tall, so an outline keeps its weight from the small preview to a 4K export.
+export const textStrokePx = (strokeWidth: number, frameHeightPx: number): number => (strokeWidth * frameHeightPx) / 1080;
+
+// Whether the live preview draws this overlay with drawTextOverlay rather than as DOM text: its
+// face, tracking, gradient, glow, shadow or a scaling/masking reveal only exist there.
+export const usesCanvasText = (o: TextOverlay): boolean =>
+  !!(o.fontFamily || o.letterSpacing || o.fill || o.glow || o.shadow || o.rotation) || (!!o.animation && CANVAS_TEXT_REVEALS.has(o.animation));
+
+export interface DrawnTextOverlay {
+  canvas: HTMLCanvasElement;
+  // Where the canvas's top-left sits in the frame, in frame pixels.
+  xPx: number;
+  yPx: number;
+}
+
+// Draws a text overlay as the preview shows it - face (titleFonts.ts), tracking, gradient fill,
+// glow, drop shadow, stroke, background box with its corner shape, per-character colour/bold/
+// italic, alignment - onto a canvas sized to just its box plus room for effects that spill past it.
+// `reveal` draws one moment of a letter-by-letter title reveal (textReveal.ts) - letters at their
+// own opacity/offset/scale/turn/mask, plus the typewriter caret - instead of the finished text.
+// `into` reuses a canvas (the live preview redraws every frame). A rotated title comes back turned
+// about its box's centre, on a canvas big enough for it - unless `level`, for a preview that turns
+// the box itself. "justify" falls back to left, as pdfAnnotationHandlers.ts's renderTextObject does.
+export function drawTextOverlay(
+  overlay: TextOverlay,
+  framePixelWidth: number,
+  framePixelHeight: number,
+  reveal?: TextRevealState,
+  into?: HTMLCanvasElement,
+  level = false
+): DrawnTextOverlay | null {
+  const turn = level ? 0 : ((overlay.rotation ?? 0) % 360) * (Math.PI / 180);
+  const drawn = drawLevelText(overlay, framePixelWidth, framePixelHeight, reveal, turn ? levelCanvasFor(into) : into);
+  if (!drawn || !turn) return drawn;
+  // Turned about the centre of what was drawn (the box, with room round it on every side).
+  const src = drawn.canvas;
+  const cos = Math.abs(Math.cos(turn));
+  const sin = Math.abs(Math.sin(turn));
+  const bw = Math.ceil(src.width * cos + src.height * sin);
+  const bh = Math.ceil(src.width * sin + src.height * cos);
+  const out = into ?? document.createElement("canvas");
+  if (out.width !== bw || out.height !== bh) {
+    out.width = bw;
+    out.height = bh;
+  }
+  const ctx = out.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, bw, bh);
+  ctx.translate(bw / 2, bh / 2);
+  ctx.rotate(turn);
+  ctx.drawImage(src, -src.width / 2, -src.height / 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return { canvas: out, xPx: Math.round(drawn.xPx + src.width / 2 - bw / 2), yPx: Math.round(drawn.yPx + src.height / 2 - bh / 2) };
+}
+
+// The level drawing a turned title is made from - one per reused output canvas.
+const levelCanvases = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
+function levelCanvasFor(into: HTMLCanvasElement | undefined): HTMLCanvasElement | undefined {
+  if (!into) return undefined;
+  let c = levelCanvases.get(into);
+  if (!c) levelCanvases.set(into, (c = document.createElement("canvas")));
+  return c;
+}
+
+function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number, reveal?: TextRevealState, into?: HTMLCanvasElement): DrawnTextOverlay | null {
   const text = overlay.text.trim();
   if (!text) return null;
 
   const fontSizePx = overlay.fontSize * framePixelHeight;
   const maxWidthPx = overlay.width * framePixelWidth;
-  const { lines, lineHeight, height: textHeightPx } = measureTextBlock(overlay.text, fontSizePx, maxWidthPx);
+  const fontFor = (run: { bold?: boolean; italic?: boolean } = {}) => titleFontCss(overlay.fontFamily, fontSizePx, run);
+  const baseFont = fontFor();
+  const spacingPx = (overlay.letterSpacing ?? 0) * fontSizePx;
+  const { lines, lineHeight, height: textHeightPx } = measureTextBlock(overlay.text, fontSizePx, maxWidthPx, { font: baseFont, letterSpacing: spacingPx });
   if (maxWidthPx <= 0 || textHeightPx <= 0) return null;
 
   // Mirrors VideoOverlayLayer's own read-only render: undefined means the pre-existing fixed 2px
@@ -73,45 +177,147 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
   // own doc comment.
   const padding = overlay.padding !== undefined ? overlay.padding * framePixelHeight : 2;
   const canvasWidth = Math.max(1, Math.ceil(maxWidthPx + padding * 2));
-  const canvasHeight = Math.max(1, Math.ceil(textHeightPx + padding * 2));
+  const boxHeight = Math.max(1, Math.ceil(textHeightPx + padding * 2));
+  // Room below the box for a reveal's accent underline (it hangs just under the box - RevealText).
+  const underlineColor = reveal && overlay.reveal?.underline;
+  const canvasHeight = underlineColor ? Math.ceil(boxHeight + fontSizePx * 0.25) : boxHeight;
 
-  const canvas = document.createElement("canvas");
-  canvas.width = canvasWidth;
-  canvas.height = canvasHeight;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-
-  const baseFont = `${fontSizePx}px ${TEXT_FONT_FAMILY}`;
-  ctx.font = baseFont;
-  ctx.textBaseline = "top";
-
-  if (overlay.backgroundColor) {
-    ctx.fillStyle = overlay.backgroundColor;
-    roundedRectPath(ctx, 0, 0, canvasWidth, canvasHeight, cornerRadiusPx(overlay.cornerStyle, canvasHeight));
-    ctx.fill();
+  // Letters travel outside the box as they come in (scatter, drop, rise, zoom), and glow, shadows
+  // and outlines spill past it - room for all of it all round.
+  const strokePx = overlay.strokeColor && overlay.strokeWidth ? textStrokePx(overlay.strokeWidth, framePixelHeight) : 0;
+  const bleed = Math.ceil(
+    Math.max(
+      reveal ? fontSizePx * (overlay.animation && CANVAS_TEXT_REVEALS.has(overlay.animation) ? 2.5 : 1.5) : 0,
+      overlay.glow ? overlay.glow.size * fontSizePx * 2.5 : 0,
+      overlay.shadow ? (Math.max(Math.abs(overlay.shadow.x), Math.abs(overlay.shadow.y)) + overlay.shadow.blur * 2) * fontSizePx : 0,
+      strokePx
+    )
+  );
+  const canvas = into ?? document.createElement("canvas");
+  const cw = canvasWidth + 2 * bleed;
+  const ch = canvasHeight + 2 * bleed;
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw;
+    canvas.height = ch;
   }
+  const out = canvas.getContext("2d");
+  if (!out) return null;
+  out.setTransform(1, 0, 0, 1, 0, 0);
+  out.globalAlpha = 1;
+  out.clearRect(0, 0, cw, ch);
+  if (overlay.backgroundColor) {
+    out.globalAlpha = reveal ? reveal.fade : 1;
+    out.fillStyle = overlay.backgroundColor;
+    out.translate(bleed, bleed);
+    roundedRectPath(out, 0, 0, canvasWidth, boxHeight, cornerRadiusPx(overlay.cornerStyle, boxHeight));
+    out.fill();
+    out.setTransform(1, 0, 0, 1, 0, 0);
+    out.globalAlpha = 1;
+  }
+
+  // The letters (outline and fill) go onto a layer of their own; shadow and glow are then cast by
+  // that whole layer at once - a few blurs per frame however many letters are moving, not a few
+  // per letter.
+  const layer = glyphLayer(canvas, cw, ch);
+  const ctx = layer.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.translate(bleed, bleed);
+
+  ctx.font = baseFont;
+  ctx.letterSpacing = `${spacingPx}px`;
+  ctx.textBaseline = "top";
+  if (reveal) ctx.globalAlpha = reveal.fade;
 
   const colorRuns = overlay.colorRuns ?? [];
   const boldRuns = overlay.boldRuns ?? [];
   const italicRuns = overlay.italicRuns ?? [];
   const hasFormatting = colorRuns.length > 0 || boldRuns.length > 0 || italicRuns.length > 0;
   const align = overlay.textAlign === "justify" ? "left" : overlay.textAlign ?? "left";
-  const hasStroke = !!(overlay.strokeColor && overlay.strokeWidth);
-  if (hasStroke) {
-    ctx.lineJoin = "round";
-    ctx.miterLimit = 2;
+  ctx.lineJoin = "round";
+  ctx.miterLimit = 2;
+
+  // The gradient runs across the whole text block, so every letter takes its colour from where it
+  // sits - letters revealed one at a time still read as one gradient.
+  let gradient: CanvasGradient | null = null;
+  if (overlay.fill) {
+    const a = ((overlay.fill.angle ?? 0) * Math.PI) / 180;
+    const gx = canvasWidth / 2;
+    const gy = padding + textHeightPx / 2;
+    const half = Math.abs(Math.sin(a)) * (maxWidthPx / 2) + Math.abs(Math.cos(a)) * (textHeightPx / 2);
+    gradient = ctx.createLinearGradient(gx - Math.sin(a) * half, gy - Math.cos(a) * half, gx + Math.sin(a) * half, gy + Math.cos(a) * half);
+    gradient.addColorStop(0, overlay.fill.from);
+    gradient.addColorStop(1, overlay.fill.to);
   }
 
-  const drawSegment = (segment: string, x: number, y: number, font: string, fillColor: string): number => {
-    ctx.font = font;
-    if (hasStroke) {
-      ctx.lineWidth = overlay.strokeWidth!;
+  // The outline, then the letters on top of it.
+  const drawPlain = (segment: string, x: number, y: number, fillColor: string): void => {
+    const fill = gradient && fillColor === overlay.color ? gradient : fillColor;
+    if (strokePx) {
+      ctx.lineWidth = strokePx;
       ctx.strokeStyle = overlay.strokeColor!;
       ctx.strokeText(segment, x, y);
     }
-    ctx.fillStyle = fillColor;
+    ctx.fillStyle = fill;
     ctx.fillText(segment, x, y);
-    return ctx.measureText(segment).width;
+  };
+  // Same shapes as the preview's Caret (textFormatting.tsx).
+  const drawCaret = (x: number, y: number, color: string): void => {
+    ctx.save();
+    ctx.fillStyle = color;
+    const f = fontSizePx;
+    const style = overlay.reveal?.caretStyle ?? "bar";
+    if (style === "block") {
+      ctx.globalAlpha *= 0.8;
+      ctx.fillRect(x, y, f * 0.55, f);
+    } else if (style === "underscore") ctx.fillRect(x, y + f * 0.85, f * 0.55, f * 0.1);
+    else ctx.fillRect(x - Math.max(0.75, f * 0.04), y, Math.max(1.5, f * 0.08), f);
+    ctx.restore();
+  };
+  // `absStart` is the segment's first character's index in overlay.text - what reveal states key on.
+  const drawSegment = (segment: string, x: number, y: number, font: string, fillColor: string, absStart: number): number => {
+    ctx.font = font;
+    if (!reveal) {
+      drawPlain(segment, x, y, fillColor);
+      return ctx.measureText(segment).width;
+    }
+    const fade = reveal.fade;
+    let cx = x;
+    for (let j = 0; j < segment.length; j++) {
+      if (reveal.caretAt === absStart + j) drawCaret(cx, y, fillColor);
+      const ch = segment[j];
+      const w = ctx.measureText(ch).width;
+      const { opacity, dy, dx = 0, blur = 0, scale = 1, rotate = 0, clip = false, glyph } = reveal.char(absStart + j);
+      if (opacity > 0 && scale > 0.001) {
+        ctx.save();
+        ctx.globalAlpha = fade * opacity;
+        if (clip) {
+          // Hidden below the line it belongs to - the letter rises out of that edge.
+          ctx.beginPath();
+          ctx.rect(cx - fontSizePx, y - lineHeight, w + 2 * fontSizePx, lineHeight + (lineHeight + fontSizePx) / 2);
+          ctx.clip();
+        }
+        if (blur > 0.001) ctx.filter = `blur(${blur * fontSizePx}px)`;
+        if (scale !== 1 || rotate) {
+          const ox = cx + w / 2;
+          const oy = y + fontSizePx * 0.55;
+          ctx.translate(ox, oy);
+          if (rotate) ctx.rotate((rotate * Math.PI) / 180);
+          ctx.scale(scale, scale);
+          ctx.translate(-ox, -oy);
+        }
+        // A rolling stand-in is centred in the real letter's room.
+        const shown = glyph ?? ch;
+        const off = glyph ? (w - ctx.measureText(glyph).width) / 2 : 0;
+        drawPlain(shown, cx + off + dx * fontSizePx, y + dy * fontSizePx, fillColor);
+        ctx.restore();
+      }
+      cx += w;
+    }
+    if (reveal.caretAt === overlay.text.length && absStart + segment.length === overlay.text.length) drawCaret(cx, y, fillColor);
+    return cx - x;
   };
 
   lines.forEach((line, i) => {
@@ -119,9 +325,10 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
 
     if (!hasFormatting) {
       ctx.font = baseFont;
-      const lineWidth = ctx.measureText(line.text).width;
+      // Tracking adds space after the last letter too - leave it out when centring.
+      const lineWidth = Math.max(0, ctx.measureText(line.text).width - (line.text ? spacingPx : 0));
       const xOffset = align === "center" ? (maxWidthPx - lineWidth) / 2 : align === "right" ? maxWidthPx - lineWidth : 0;
-      drawSegment(line.text, padding + xOffset, y, baseFont, overlay.color);
+      drawSegment(line.text, padding + xOffset, y, baseFont, overlay.color, line.startOffset);
       return;
     }
 
@@ -142,7 +349,7 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
 
     // Two passes: measure the line's natural width first (center/right need it before drawing
     // starts), then draw - same shape as pdfAnnotationHandlers.ts's renderTextObject.
-    const segments: { text: string; font: string; color: string; width: number }[] = [];
+    const segments: { text: string; font: string; color: string; width: number; start: number }[] = [];
     let naturalWidth = 0;
     for (let s = 0; s < cuts.length - 1; s++) {
       const segStart = cuts[s];
@@ -154,25 +361,71 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
       const coveringColor = colorRuns.find((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
       const isBold = boldRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
       const isItalic = italicRuns.some((run) => run.start <= absoluteStart && run.end >= absoluteEnd);
-      const font = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}${baseFont}`;
+      const font = fontFor({ bold: isBold, italic: isItalic });
       ctx.font = font;
       const width = ctx.measureText(segment).width;
-      segments.push({ text: segment, font, color: coveringColor?.color ?? overlay.color, width });
+      segments.push({ text: segment, font, color: coveringColor?.color ?? overlay.color, width, start: absoluteStart });
       naturalWidth += width;
     }
+    if (line.text) naturalWidth -= spacingPx;
 
     const xOffset = align === "center" ? (maxWidthPx - naturalWidth) / 2 : align === "right" ? maxWidthPx - naturalWidth : 0;
     let x = padding + xOffset;
     for (const seg of segments) {
-      x += drawSegment(seg.text, x, y, seg.font, seg.color);
+      x += drawSegment(seg.text, x, y, seg.font, seg.color, seg.start);
     }
   });
 
-  return {
-    dataUrl: canvas.toDataURL("image/png"),
-    xPx: Math.round(overlay.x * framePixelWidth - padding),
-    yPx: Math.round(overlay.y * framePixelHeight - padding),
+  if (underlineColor && reveal.underline > 0) {
+    ctx.globalAlpha = reveal.fade;
+    ctx.fillStyle = underlineColor;
+    roundedRectPath(ctx, padding, boxHeight + fontSizePx * 0.08, maxWidthPx * reveal.underline, fontSizePx * 0.09, fontSizePx * 0.05);
+    ctx.fill();
+  }
+  ctx.letterSpacing = "0px";
+
+  // Shadow, then glow (a wide soft halo and a tight bright one - a neon tube's light, not a
+  // smudge), then the letters. Each pass draws the layer far off the canvas and moves only its
+  // shadow back into place, so the pass leaves just the shadow.
+  const OFF = cw + ch + 1000;
+  const cast = (color: string, blur: number, dx: number, dy: number) => {
+    out.save();
+    out.shadowColor = color;
+    out.shadowBlur = blur;
+    out.shadowOffsetX = dx + OFF;
+    out.shadowOffsetY = dy;
+    out.drawImage(layer, -OFF, 0);
+    out.restore();
   };
+  if (overlay.shadow) cast(overlay.shadow.color, overlay.shadow.blur * fontSizePx, overlay.shadow.x * fontSizePx, overlay.shadow.y * fontSizePx);
+  if (overlay.glow) for (const k of [1, 0.35]) cast(overlay.glow.color, overlay.glow.size * fontSizePx * k, 0, 0);
+  out.drawImage(layer, 0, 0);
+
+  // The box's top-left is the overlay's x/y, padding inside it - as the preview lays it out.
+  return {
+    canvas,
+    xPx: Math.round(overlay.x * framePixelWidth) - bleed,
+    yPx: Math.round(overlay.y * framePixelHeight) - bleed,
+  };
+}
+
+// The letters' own layer for drawTextOverlay - one per output canvas, reused frame to frame.
+const glyphLayers = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
+function glyphLayer(canvas: HTMLCanvasElement, w: number, h: number): HTMLCanvasElement {
+  let layer = glyphLayers.get(canvas);
+  if (!layer) glyphLayers.set(canvas, (layer = document.createElement("canvas")));
+  if (layer.width !== w || layer.height !== h) {
+    layer.width = w;
+    layer.height = h;
+  }
+  return layer;
+}
+
+// drawTextOverlay as a standalone transparent PNG, for export burn-in. Export first makes sure the
+// overlays' faces are loaded (loadTitleFonts) - a canvas draws the fallback face otherwise.
+export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number, reveal?: TextRevealState): RenderedOverlayPng | null {
+  const drawn = drawTextOverlay(overlay, framePixelWidth, framePixelHeight, reveal);
+  return drawn ? { dataUrl: drawn.canvas.toDataURL("image/png"), xPx: drawn.xPx, yPx: drawn.yPx } : null;
 }
 
 // Mirrors VideoOverlayLayer's image rendering (rotation, corner-radius clip, border, drop shadow,
@@ -181,10 +434,58 @@ export function renderTextOverlayToPng(overlay: TextOverlay, framePixelWidth: nu
 // visual center the unrotated box would have had - ffmpeg's overlay=x:y positions this PNG's own
 // top-left, not its center.
 export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelWidth: number, framePixelHeight: number): Promise<RenderedOverlayPng | null> {
-  const w = overlay.width * framePixelWidth;
-  const h = overlay.height * framePixelHeight;
-  if (w <= 0 || h <= 0) return null;
+  const img = await loadOverlayImage(overlay.src);
+  return img ? drawImageOverlayPng(overlay, img, framePixelWidth, framePixelHeight) : null;
+}
 
+// Whether a picture overlay changes over its time on screen - a reveal (imageReveal.ts) or a mask
+// that opens (layerMask.ts reveals) - and so exports as a frame sequence.
+export const imageOverlayAnimates = (o: ImageOverlay): boolean => !!o.reveal || (!o.asset && !!o.mask?.reveal);
+
+// A picture overlay's reveal (imageReveal.ts) and/or opening mask, as the PNG frame sequence export
+// burns in - the image decoded once, each distinct moment drawn once (the settled picture, and each
+// shine phase, are shared by every frame that shows them).
+export async function renderImageRevealFrames(
+  overlay: ImageOverlay,
+  framePixelWidth: number,
+  framePixelHeight: number
+): Promise<{ unique: string[]; sequence: number[]; xPx: number; yPx: number } | null> {
+  const settings = overlay.reveal;
+  const duration = overlay.endTime - overlay.startTime;
+  if (!imageOverlayAnimates(overlay) || duration <= 0) return null;
+  const img = await loadOverlayImage(overlay.src);
+  if (!img) return null;
+  // An opening mask: its picture drawn once at the box's export size, placed per frame.
+  const mask = !overlay.asset && overlay.mask?.reveal ? overlay.mask : null;
+  const boxW = Math.max(1, Math.round(overlay.width * framePixelWidth));
+  const boxH = Math.max(1, Math.round(overlay.height * framePixelHeight));
+  const pic = mask ? revealMaskCanvas(mask, boxW, boxH, false) : null;
+  const total = Math.max(1, Math.ceil(duration * IMAGE_REVEAL_FPS));
+  const unique: string[] = [];
+  const sequence: number[] = [];
+  const keyIndex = new Map<string, number>();
+  let origin: { xPx: number; yPx: number } | null = null;
+  for (let k = 0; k < total; k++) {
+    const t = k / IMAGE_REVEAL_FPS;
+    const state = settings ? imageRevealState(settings, t, duration) : undefined;
+    const key = `${state?.key ?? "still"}|${mask ? revealCoverageKey(mask, t, duration, boxW, boxH) : ""}`;
+    let idx = keyIndex.get(key);
+    if (idx === undefined) {
+      const rendered = drawImageOverlayPng(overlay, img, framePixelWidth, framePixelHeight, state, mask && pic ? { pic, local: t, span: duration } : undefined);
+      if (!rendered) return null;
+      origin = origin ?? { xPx: rendered.xPx, yPx: rendered.yPx };
+      idx = unique.length;
+      unique.push(rendered.dataUrl);
+      keyIndex.set(key, idx);
+      // eslint-disable-next-line no-await-in-loop
+      if (idx % 12 === 11) await new Promise((r) => setTimeout(r, 0));
+    }
+    sequence.push(idx);
+  }
+  return origin ? { unique, sequence, ...origin } : null;
+}
+
+async function loadOverlayImage(src: string): Promise<HTMLImageElement | null> {
   // Loaded via a data: URL (read_image_data_url, Rust-side) rather than convertFileSrc's asset://
   // protocol + plain <img src> - that works fine for on-screen display, but the browser treats
   // asset:// as cross-origin, and drawing a cross-origin image into a canvas taints it, which
@@ -192,7 +493,7 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
   // has no origin of its own, so it never triggers that.
   let dataUrl: string;
   try {
-    dataUrl = await invoke<string>("read_image_data_url", { path: overlay.src });
+    dataUrl = await invoke<string>("read_image_data_url", { path: src });
   } catch (err) {
     console.error("Failed to read image overlay for export:", err);
     return null;
@@ -204,13 +505,31 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
     img.onerror = () => resolve(false);
     img.src = dataUrl;
   });
-  if (!loaded) return null;
+  return loaded ? img : null;
+}
+
+// Draws a picture overlay - at one moment of its reveal when `reveal` is given, and of its opening
+// mask when `maskReveal` is - to its own PNG.
+function drawImageOverlayPng(
+  overlay: ImageOverlay,
+  img: HTMLImageElement,
+  framePixelWidth: number,
+  framePixelHeight: number,
+  reveal?: ImageRevealState,
+  maskReveal?: { pic: ReturnType<typeof revealMaskCanvas>; local: number; span: number }
+): RenderedOverlayPng | null {
+  const w = overlay.width * framePixelWidth;
+  const h = overlay.height * framePixelHeight;
+  if (w <= 0 || h <= 0) return null;
 
   const rotationRad = ((overlay.rotation ?? 0) * Math.PI) / 180;
   const cos = Math.abs(Math.cos(rotationRad));
   const sin = Math.abs(Math.sin(rotationRad));
-  const boundingWidth = Math.max(1, Math.ceil(w * cos + h * sin));
-  const boundingHeight = Math.max(1, Math.ceil(w * sin + h * cos));
+  // A thick frame sits outside the box, and a shadow spills past it - room for both all round.
+  const framePx = overlay.borderColor && overlay.borderWidth ? overlay.borderWidth * framePixelHeight : 0;
+  const pad = Math.ceil(framePx + (overlay.shadow && framePx ? 28 : 0));
+  const boundingWidth = Math.max(1, Math.ceil(w * cos + h * sin)) + 2 * pad;
+  const boundingHeight = Math.max(1, Math.ceil(w * sin + h * cos)) + 2 * pad;
 
   const canvas = document.createElement("canvas");
   canvas.width = boundingWidth;
@@ -232,7 +551,15 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
     ctx.shadowBlur = 16;
     ctx.shadowOffsetY = 6;
     ctx.fillStyle = "#000000";
-    roundedRectPath(ctx, -w / 2, -h / 2, w, h, radius);
+    roundedRectPath(ctx, -w / 2 - framePx, -h / 2 - framePx, w + 2 * framePx, h + 2 * framePx, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+  if (framePx) {
+    ctx.save();
+    ctx.globalAlpha = overlay.opacity;
+    ctx.fillStyle = overlay.borderColor!;
+    roundedRectPath(ctx, -w / 2 - framePx, -h / 2 - framePx, w + 2 * framePx, h + 2 * framePx, radius);
     ctx.fill();
     ctx.restore();
   }
@@ -256,10 +583,42 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
   const sy = (overlay.cropY ?? 0) * img.naturalHeight;
   const sWidth = (overlay.cropWidth ?? 1) * img.naturalWidth;
   const sHeight = (overlay.cropHeight ?? 1) * img.naturalHeight;
-  ctx.drawImage(img, sx, sy, sWidth, sHeight, -w / 2, -h / 2, w, h);
-  ctx.restore();
+  if (overlay.mask) {
+    // Masked (layerMask.ts): the picture on its own box-sized canvas, cut by the same mask picture
+    // the preview masks with, then placed - border and shadow stay whole, as in the preview.
+    ctx.restore();
+    const pw = Math.max(1, Math.round(w));
+    const ph = Math.max(1, Math.round(h));
+    const pic = document.createElement("canvas");
+    pic.width = pw;
+    pic.height = ph;
+    const p = pic.getContext("2d");
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = pw;
+    maskCanvas.height = ph;
+    const m = maskCanvas.getContext("2d");
+    if (p && m) {
+      roundedRectPath(p, 0, 0, pw, ph, radius);
+      p.clip();
+      p.translate(pw / 2, ph / 2);
+      if (overlay.flipHorizontal || overlay.flipVertical) p.scale(overlay.flipHorizontal ? -1 : 1, overlay.flipVertical ? -1 : 1);
+      p.drawImage(img, sx, sy, sWidth, sHeight, -pw / 2, -ph / 2, pw, ph);
+      if (maskReveal) drawRevealCoverage(m, overlay.mask, maskReveal.pic, maskReveal.local, maskReveal.span, pw, ph);
+      else drawLayerMask(m, { mask: overlay.mask }, pw, ph);
+      p.setTransform(1, 0, 0, 1, 0, 0);
+      p.globalCompositeOperation = "destination-in";
+      p.drawImage(maskCanvas, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = overlay.opacity;
+      ctx.drawImage(pic, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+  } else {
+    ctx.drawImage(img, sx, sy, sWidth, sHeight, -w / 2, -h / 2, w, h);
+    ctx.restore();
+  }
 
-  if (overlay.borderColor) {
+  if (overlay.borderColor && !framePx) {
     ctx.save();
     ctx.globalAlpha = overlay.opacity;
     ctx.strokeStyle = overlay.borderColor;
@@ -268,6 +627,8 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
     ctx.stroke();
     ctx.restore();
   }
+
+  if (reveal && overlay.reveal) applyImageReveal(ctx, canvas, reveal, overlay.reveal, w, h);
 
   ctx.restore();
 
@@ -282,6 +643,76 @@ export async function renderImageOverlayToPng(overlay: ImageOverlay, framePixelW
     yPx: Math.round(centerYPx - boundingHeight / 2),
   };
 }
+
+// Applies one moment of a picture reveal to what's already drawn on `ctx` (whose transform is the
+// box's own centred, rotated frame): the wipe's soft-edged mask, the light streak (only on the
+// picture's own pixels), and the focus pull's blur/scale and fade. Same geometry as the preview's
+// CSS (wipeMaskCss / ImageRevealWrap), so the two line up.
+function applyImageReveal(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, state: ImageRevealState, settings: ImageRevealSettings, w: number, h: number): void {
+  if (state.wipe < 1) {
+    const { length, dx, dy } = wipeAxis(settings.direction, w, h);
+    const s = state.soft * length;
+    const edge = -s + (length + s) * state.wipe;
+    // The gradient line starts at the box centre minus half its length along the direction.
+    const sx = (-dx * length) / 2;
+    const sy = (-dy * length) / 2;
+    const g = ctx.createLinearGradient(sx + dx * edge, sy + dy * edge, sx + dx * (edge + s), sy + dy * (edge + s));
+    g.addColorStop(0, "rgba(0,0,0,1)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.save();
+    ctx.globalCompositeOperation = "destination-in";
+    ctx.fillStyle = state.wipe <= 0 ? "rgba(0,0,0,0)" : g;
+    ctx.fillRect(-w, -h, w * 2, h * 2);
+    ctx.restore();
+  }
+  if (state.shine !== null) {
+    // Along the box diagonal from its top-left corner, like the preview's CSS gradient.
+    const L = Math.hypot(w, h);
+    const ux = w / L;
+    const uy = h / L;
+    const band = 0.22 * L;
+    const at = -band + (L + 2 * band) * state.shine;
+    const ox = -w / 2;
+    const oy = -h / 2;
+    const g = ctx.createLinearGradient(ox + ux * (at - band), oy + uy * (at - band), ox + ux * (at + band), oy + uy * (at + band));
+    const color = settings.shineColor ?? "#ffffff";
+    g.addColorStop(0, withAlphaHex(color, 0));
+    g.addColorStop(0.5, withAlphaHex(color, 0.85));
+    g.addColorStop(1, withAlphaHex(color, 0));
+    ctx.save();
+    ctx.globalCompositeOperation = "source-atop";
+    ctx.fillStyle = g;
+    ctx.fillRect(-w, -h, w * 2, h * 2);
+    ctx.restore();
+  }
+  if (state.blur > 0 || state.scale !== 1 || state.opacity < 1) {
+    const copy = document.createElement("canvas");
+    copy.width = canvas.width;
+    copy.height = canvas.height;
+    copy.getContext("2d")!.drawImage(canvas, 0, 0);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.globalAlpha = state.opacity;
+    if (state.blur > 0) ctx.filter = `blur(${state.blur * Math.min(w, h)}px)`;
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.scale(state.scale, state.scale);
+    ctx.drawImage(copy, -canvas.width / 2, -canvas.height / 2);
+    ctx.restore();
+  }
+}
+
+const withAlphaHex = (hex: string, alpha: number): string => {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return `rgba(255,255,255,${alpha})`;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+};
+
+// A blur region's strength as its Gaussian's standard deviation, per unit of intensity, as a
+// fraction of the frame's height - the preview's CSS blur() radius (VideoOverlayLayer) and the
+// export's Gaussian (gaussian_blur_chain, conversion.rs) both use it, so they blur the same.
+export const BLUR_SIGMA_FRACTION = 0.12;
 
 // A plain axis-aligned rectangle (the common case) needs no mask at all - export_trimmed_video's
 // crop+boxblur+overlay chain already produces exactly that shape on its own. Ellipse, rounded

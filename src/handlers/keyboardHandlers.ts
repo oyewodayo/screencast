@@ -23,6 +23,10 @@ interface KeyboardHandlers {
   // "?" for a shortcuts overlay is the same convention YouTube, Gmail, and most keyboard-driven
   // web apps share - shown here in the player rather than only buried in Settings > Help.
   toggleShortcutsOverlay?: () => void;
+  // Shift+P / Shift+N - YouTube's previous/next-video shortcut, for the player's own prev/next
+  // file buttons.
+  playPrevious?: () => void;
+  playNext?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -48,13 +52,26 @@ export const createKeyboardHandler = (
   return (e: KeyboardEvent) => {
     // Don't trigger if user is typing in an input field
     const target = e.target as HTMLElement;
-    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
       return;
     }
+    // These are all plain keys - Ctrl+C, Ctrl+V and the like belong to copy and paste.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     switch (e.key) {
-      case "k":
       case " ":
+        // Space also "clicks" whatever button has focus when it's released - the play button just
+        // clicked, a transition tile - which played and then paused again 20ms later (so Space
+        // seemed to do nothing). The shortcut takes the key: focus leaves the button first.
+        if (e.repeat) {
+          e.preventDefault();
+          break;
+        }
+        if (target !== document.body && typeof target.blur === "function") target.blur();
+        e.preventDefault();
+        handlers.togglePauseAndPlay?.();
+        break;
+      case "k":
         e.preventDefault();
         handlers.togglePauseAndPlay?.();
         break;
@@ -107,6 +124,16 @@ export const createKeyboardHandler = (
       case "?":
         e.preventDefault();
         handlers.toggleShortcutsOverlay?.();
+        break;
+      case "P":
+        if (!e.shiftKey || !handlers.playPrevious) break;
+        e.preventDefault();
+        handlers.playPrevious();
+        break;
+      case "N":
+        if (!e.shiftKey || !handlers.playNext) break;
+        e.preventDefault();
+        handlers.playNext();
         break;
       default:
         break;

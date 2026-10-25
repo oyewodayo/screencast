@@ -43,6 +43,7 @@ import { TbPointer } from "react-icons/tb";
 import useWhiteboardStore from "../../hooks/useWhiteboardStore";
 import {
   ArrowheadType,
+  createDefaultWhiteboardNode,
   createImageWhiteboardNode,
   hasImageCrop,
   LINE_ONLY_SHAPES,
@@ -55,10 +56,17 @@ import {
 import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO, SERIES_FILL_OPACITY } from "../../handlers/whiteboardHandlers";
 import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
+import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
+
+// Private OS-clipboard type written on Ctrl+C of shapes - see canvasClipboard.ts.
+const WHITEBOARD_CLIPBOARD_MARKER = "application/x-briefcast-whiteboard";
+// A pasted paragraph wraps at this width instead of producing one enormously wide text node.
+const TEXT_PASTE_MAX_WIDTH = 480;
+const TEXT_PASTE_PAD = 8;
 
 // PNG for dropping into a slide or a chat; PDF for something printed or shared as a document.
 type WhiteboardExportFormat = "png" | "pdf";
@@ -314,9 +322,9 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
             ) : part.role === "annotation" ? (
               <path key={i} d={part.d} fill={part.color} stroke="none" />
             ) : part.role === "axis" ? (
-              <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={sw} />
+              <path key={i} d={part.d} fill="none" stroke={part.color ?? "#9ca3af"} strokeOpacity={part.opacity} strokeWidth={sw} />
             ) : part.role === "grid" ? (
-              <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={sw * 0.75} />
+              <path key={i} d={part.d} fill="none" stroke={part.color ?? "#e5e7eb"} strokeOpacity={part.opacity} strokeWidth={sw * 0.75} />
             ) : (
               <path key={i} d={part.d} fill="none" stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" />
             )
@@ -403,8 +411,8 @@ function ToolbarButton({ active, disabled, onClick, title, children }: { active?
       title={title}
       disabled={disabled}
       onClick={onClick}
-      className={`p-2 rounded-md text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-        active ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-800"
+      className={`h-7 min-w-7 px-1.5 flex items-center justify-center rounded-md text-sm transition-colors active:scale-95 disabled:opacity-35 disabled:pointer-events-none ${
+        active ? "bg-blue-500/12 dark:bg-blue-500/25 text-blue-600 dark:text-blue-300" : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.05] dark:hover:bg-white/[0.07] hover:text-neutral-900 dark:hover:text-white"
       }`}
     >
       {children}
@@ -467,7 +475,7 @@ function PageTab({ page, active, canDelete, onMoveLeft, onMoveRight, onSelect, o
             setRenaming(false);
           }
         }}
-        className="h-7 w-24 px-1.5 rounded border border-blue-400 bg-white dark:bg-neutral-800 text-xs outline-none"
+        className="h-6 w-24 px-1.5 rounded-md border border-blue-400 bg-white dark:bg-neutral-800 text-xs outline-none"
       />
     );
   }
@@ -481,8 +489,8 @@ function PageTab({ page, active, canDelete, onMoveLeft, onMoveRight, onSelect, o
         setDraftName(page.name);
         setRenaming(true);
       }}
-      className={`relative flex items-center gap-1 h-7 px-3 rounded-t-md text-xs cursor-pointer select-none ${
-        active ? "bg-white dark:bg-neutral-950 text-neutral-800 dark:text-neutral-100 border border-b-0 border-gray-200 dark:border-neutral-800" : "text-gray-500 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+      className={`relative flex items-center gap-1 h-6 px-2.5 rounded-md text-xs cursor-pointer select-none transition-colors ${
+        active ? "bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 shadow-[0_0_0_1px_rgba(0,0,0,0.07),0_1px_2px_rgba(0,0,0,0.06)]" : "text-gray-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.06]"
       }`}
     >
       <span className="max-w-[120px] truncate">{page.name}</span>
@@ -934,29 +942,96 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [briefcastDir, whiteboardId, store]
   );
 
-  // A real bitmap on the system clipboard (a screenshot, an image copied out of a browser) - handled
-  // as a native paste event rather than inside the Ctrl+V keyboard shortcut below, because only the
-  // event carries clipboardData. Falls through to the shape clipboard when the paste has no image,
-  // so copying shapes and copying a picture both keep working through the same keystroke.
-  useEffect(() => {
-    const onPaste = (e: ClipboardEvent) => {
-      const active = document.activeElement;
-      if (active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      const files = Array.from(items)
-        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-        .map((item) => item.getAsFile())
-        .filter((f): f is File => f !== null);
-      if (files.length === 0) return;
-      e.preventDefault();
-      void addImagesFromBlobs(files, viewportCenterDocPoint());
-    };
-    window.addEventListener("paste", onPaste);
-    return () => window.removeEventListener("paste", onPaste);
-  }, [addImagesFromBlobs, viewportCenterDocPoint]);
+  // The Fill section's "Image" fill - same import path as Insert/Replace image, but it only returns
+  // the stored asset name; the panel applies it to every selected shape as one undo step.
+  const handlePickFillImage = useCallback(async (): Promise<string | null> => {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"] }],
+      });
+      if (!picked || Array.isArray(picked)) return null;
+      return await importImageFromPath(whiteboardId, picked);
+    } catch (err) {
+      console.error("Failed to import fill image:", err);
+      setImageError(err instanceof Error ? err.message : "Failed to import image");
+      return null;
+    }
+  }, [whiteboardId]);
 
-  // ---- Keyboard shortcuts: undo/redo/copy/paste (Delete/Escape live inside WhiteboardCanvas,
+  // Save-as for the lattice loop export (MP4/GIF) - same native-dialog + export_whiteboard_to_path
+  // route as the PNG/PDF "Save as…" menu.
+  const handleSaveExport = useCallback(
+    async (bytes: Uint8Array, extension: "mp4" | "gif"): Promise<boolean> => {
+      const destPath = await saveFileDialog({
+        defaultPath: `${doc?.name || "Whiteboard"} - lattice.${extension}`,
+        filters: [{ name: extension === "mp4" ? "MP4 video" : "GIF animation", extensions: [extension] }],
+      });
+      if (!destPath) return false;
+      await invoke("export_whiteboard_to_path", { destPath, bytes: Array.from(bytes) });
+      return true;
+    },
+    [doc?.name]
+  );
+
+  const assetUrlFor = useCallback(
+    (fileName: string): string | null => (briefcastDir ? whiteboardAssetUrl(briefcastDir, whiteboardId, fileName) : null),
+    [briefcastDir, whiteboardId]
+  );
+
+  // Plain text from the system clipboard lands as a text node at the middle of the view, its box
+  // sized to the text (wrapping past TEXT_PASTE_MAX_WIDTH) rather than the 160x40 default.
+  const addTextNode = useCallback(
+    (text: string, at: { x: number; y: number }) => {
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), "text", at.x, at.y);
+      const lineHeight = base.fontSize * 1.3;
+      const lineWidths = text.split("\n").map((line) => measureTextBlock(line, base.fontSize).width);
+      const width = Math.min(TEXT_PASTE_MAX_WIDTH, Math.max(...lineWidths)) + TEXT_PASTE_PAD * 2;
+      const wrappedLines = lineWidths.reduce((sum, w) => sum + Math.max(1, Math.ceil(w / TEXT_PASTE_MAX_WIDTH)), 0);
+      const height = wrappedLines * lineHeight + TEXT_PASTE_PAD * 2;
+      const node: WhiteboardNode = {
+        ...base,
+        text,
+        x: at.x - width / 2,
+        y: at.y - height / 2,
+        width,
+        height,
+        textAlign: lineWidths.length > 1 ? "left" : "center",
+      };
+      store.addNode(node);
+      setSelectedNodeIds(new Set([node.id]));
+      setSelectedEdgeIds(new Set());
+    },
+    [store]
+  );
+
+  // Ctrl+C / Ctrl+V go through the native copy/paste events (see canvasClipboard.ts for why), so a
+  // screenshot, copied text, and copied shapes all paste through the same keystroke - whichever was
+  // copied LAST wins. An empty clipboard (or a webview that dropped the marker type) still falls back
+  // to the in-memory shape clipboard.
+  useEffect(() => {
+    const onCopy = (e: ClipboardEvent) => {
+      if (isTypingInField() || selectedNodeIds.size === 0) return;
+      handleCopy();
+      writeInternalMarker(e, WHITEBOARD_CLIPBOARD_MARKER);
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      if (isTypingInField()) return;
+      const payload = readPastePayload(e, WHITEBOARD_CLIPBOARD_MARKER);
+      e.preventDefault();
+      if (payload.kind === "images") void addImagesFromBlobs(payload.files, viewportCenterDocPoint());
+      else if (payload.kind === "text") addTextNode(payload.text, viewportCenterDocPoint());
+      else handlePaste();
+    };
+    window.addEventListener("copy", onCopy);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("copy", onCopy);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [selectedNodeIds, handleCopy, handlePaste, addImagesFromBlobs, addTextNode, viewportCenterDocPoint]);
+
+  // ---- Keyboard shortcuts: undo/redo (copy/paste are the native events above; Delete/Escape live inside WhiteboardCanvas,
   // which owns selection-adjacent state that undo/redo doesn't need) -------------------------------
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -970,20 +1045,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
         e.preventDefault();
         store.redo();
-      } else if (mod && e.key.toLowerCase() === "c") {
-        if (selectedNodeIds.size === 0) return;
-        e.preventDefault();
-        handleCopy();
-      } else if (mod && e.key.toLowerCase() === "v") {
-        e.preventDefault();
-        handlePaste();
       } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
         deselectTools();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools, selectedNodeIds, handleCopy, handlePaste]);
+  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools]);
 
   // PNG and PDF share the one renderer - the PDF is that same canvas wrapped in a single page (see
   // canvasToPdfBytes), so the two formats can't drift into showing different diagrams.
@@ -1161,37 +1229,37 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
 
   return (
     // pb tracks --docker-height (published by BottomDocker's own ResizeObserver - see
-    // BoardStylePanel.tsx's identical comment on the same pattern) PLUS a fixed 16px buffer on top
-    // of that, so the page tab strip's own controls (its chevron menu button, in particular) always
-    // clear the app's fixed bottom icon bar with real margin to spare - sitting them exactly flush
-    // (zero gap) left the tab strip's bottom edge one ResizeObserver tick / sub-pixel DPI-rounding
-    // away from actually being covered by the docker's own click-intercepting drag-region strip,
-    // making the chevron unclickable.
-    <div className="flex flex-col w-full h-full bg-white dark:bg-neutral-950 pb-[calc(var(--docker-height,64px)+16px)]">
-      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-200 dark:border-neutral-800 flex-wrap">
+    // BoardStylePanel.tsx's identical comment on the same pattern) so the page tab strip sits flush
+    // on the app's fixed bottom icon bar. It used to add a 16px buffer on top of that (to keep the
+    // tab chevron clear of the docker's drag-region strip under sub-pixel DPI rounding), which showed
+    // up as a dead white band under the tabs; the strip now carries its own small bottom padding
+    // instead, so its controls still clear the docker by a few pixels with no visible gap. The
+    // background matches the strip so any rounding sliver is invisible too.
+    <div className="flex flex-col w-full h-full bg-gray-50 dark:bg-neutral-900 pb-[var(--docker-height,64px)]">
+      <div className="flex items-center gap-0.5 px-2 py-1 border-b border-gray-200/80 dark:border-neutral-800 flex-wrap">
         <ToolbarButton title="Back to whiteboards" onClick={() => void handleBack()}>
-          <IoArrowBack size={18} />
+          <IoArrowBack size={16} />
         </ToolbarButton>
         <input
           type="text"
           value={doc.name}
           onChange={(e) => store.renameWhiteboard(e.target.value)}
-          className="ml-1 mr-2 h-8 px-2 rounded-md border border-transparent hover:border-gray-200 dark:hover:border-neutral-700 focus:border-blue-400 dark:focus:border-blue-500 bg-transparent text-sm font-medium text-neutral-800 dark:text-neutral-100 outline-none max-w-[220px]"
+          className="ml-0.5 mr-1 h-7 px-1.5 rounded-md border border-transparent hover:border-gray-200 dark:hover:border-neutral-700 focus:border-blue-400 dark:focus:border-blue-500 bg-transparent text-sm font-medium text-neutral-800 dark:text-neutral-100 outline-none max-w-[220px]"
         />
-        <div className="w-px h-6 bg-gray-200 dark:bg-neutral-700 mx-1" />
+        <div className="w-px h-4 bg-gray-200 dark:bg-neutral-700 mx-1.5" />
         <ToolbarButton title="Undo" disabled={!store.canUndo} onClick={store.undo}>
-          <IoArrowUndo size={18} />
+          <IoArrowUndo size={16} />
         </ToolbarButton>
         <ToolbarButton title="Redo" disabled={!store.canRedo} onClick={store.redo}>
-          <IoArrowRedo size={18} />
+          <IoArrowRedo size={16} />
         </ToolbarButton>
-        <div className="w-px h-6 bg-gray-200 dark:bg-neutral-700 mx-1" />
+        <div className="w-px h-4 bg-gray-200 dark:bg-neutral-700 mx-1.5" />
         <ToolbarButton
           title="Select"
           active={armedShapeType === null && !connectorArmed && !laserArmed}
           onClick={deselectTools}
         >
-          <TbPointer size={18} />
+          <TbPointer size={16} />
         </ToolbarButton>
         <div className="relative">
           <ToolbarButton
@@ -1210,8 +1278,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             }}
           >
             <span className="flex items-center gap-0.5">
-              <IoShapesOutline size={18} />
-              <IoChevronDown size={11} />
+              <IoShapesOutline size={16} />
+              <IoChevronDown size={10} />
             </span>
           </ToolbarButton>
           {shapesMenuOpen && (
@@ -1254,7 +1322,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setArmedShapeType((prev) => (prev === "text" ? null : "text"));
           }}
         >
-          <span className="font-semibold text-sm">A</span>
+          <span className="font-semibold text-[13px] leading-none w-4 text-center">A</span>
         </ToolbarButton>
         <ToolbarButton
           title="Equation (LaTeX)"
@@ -1269,14 +1337,14 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setArmedShapeType((prev) => (prev === "equation" ? null : "equation"));
           }}
         >
-          <IoCalculatorOutline size={18} />
+          <IoCalculatorOutline size={16} />
         </ToolbarButton>
         {/* Not an armable tool like the shape/text buttons around it - an image needs a file picked
             before there is anything to place, so this acts immediately and drops the result at the
             middle of the current view. Dragging a file onto the canvas or pasting one places it at
             the drop point/view center instead (see addImagesFromBlobs). */}
         <ToolbarButton title="Insert image…" active={false} onClick={() => void handleInsertImage()}>
-          <IoImageOutline size={18} />
+          <IoImageOutline size={16} />
         </ToolbarButton>
         <ToolbarButton
           title="Pen (freehand)"
@@ -1291,7 +1359,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setArmedShapeType((prev) => (prev === "freehand" ? null : "freehand"));
           }}
         >
-          <IoPencilOutline size={18} />
+          <IoPencilOutline size={16} />
         </ToolbarButton>
         <ToolbarButton
           title="Laser pointer"
@@ -1306,8 +1374,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setLaserArmed((prev) => !prev);
           }}
         >
-          <span className="relative flex items-center justify-center w-[18px] h-[18px]">
-            <span className="w-2.5 h-2.5 rounded-full bg-red-500" />
+          <span className="relative flex items-center justify-center w-4 h-4">
+            <span className="w-2 h-2 rounded-full bg-red-500" />
             <span className="absolute inset-0 rounded-full border border-red-400 opacity-60" />
           </span>
         </ToolbarButton>
@@ -1328,8 +1396,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             }}
           >
             <span className="flex items-center gap-0.5">
-              <IoGitNetworkOutline size={18} />
-              <IoChevronDown size={11} />
+              <IoGitNetworkOutline size={16} />
+              <IoChevronDown size={10} />
             </span>
           </ToolbarButton>
           {arrowsMenuOpen && (
@@ -1357,26 +1425,26 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             </div>
           )}
         </div>
-        <div className="w-px h-6 bg-gray-200 dark:bg-neutral-700 mx-1" />
+        <div className="w-px h-4 bg-gray-200 dark:bg-neutral-700 mx-1.5" />
         <ToolbarButton title="Zoom out" onClick={() => canvasRef.current?.zoomBy(1 / 1.25)}>
-          <IoRemove size={18} />
+          <IoRemove size={16} />
         </ToolbarButton>
-        <span className="text-xs text-gray-500 dark:text-neutral-400 w-11 text-center select-none">{Math.round(zoom * 100)}%</span>
+        <span className="text-[11px] tabular-nums text-gray-500 dark:text-neutral-400 w-10 text-center select-none">{Math.round(zoom * 100)}%</span>
         <ToolbarButton title="Zoom in" onClick={() => canvasRef.current?.zoomBy(1.25)}>
-          <IoAdd size={18} />
+          <IoAdd size={16} />
         </ToolbarButton>
         <ToolbarButton title="Fit to content" onClick={() => canvasRef.current?.fitToContent(computeContentBounds(page))}>
-          <IoContractOutline size={18} />
+          <IoContractOutline size={16} />
         </ToolbarButton>
         <ToolbarButton title={doc.showGrid ? "Hide grid" : "Show grid"} active={doc.showGrid} onClick={() => store.setShowGrid(!doc.showGrid)}>
-          <IoGridOutline size={18} />
+          <IoGridOutline size={16} />
         </ToolbarButton>
         <ToolbarButton
           title={doc.snapToGrid ? "Snap to grid on (hold Alt to move freely)" : "Snap to grid off (hold Alt to snap)"}
           active={doc.snapToGrid}
           onClick={() => store.setSnapToGrid(!doc.snapToGrid)}
         >
-          <IoMagnetOutline size={18} />
+          <IoMagnetOutline size={16} />
         </ToolbarButton>
         <div className="flex-1" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
@@ -1399,15 +1467,15 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             type="button"
             disabled={isExporting}
             onClick={() => setExportMenuOpen((v) => !v)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+            className="flex items-center gap-1.5 h-7 px-2.5 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-xs font-medium hover:opacity-90 active:scale-[0.97] transition disabled:opacity-50"
           >
-            <IoDownloadOutline size={15} />
+            <IoDownloadOutline size={14} />
             {isExporting ? "Exporting…" : "Export"}
           </button>
           {exportMenuOpen && (
             <>
               <div className="fixed inset-0 z-20" onClick={() => setExportMenuOpen(false)} />
-              <div className="absolute right-0 top-9 z-30 w-52 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200">
+              <div className="absolute right-0 top-8 z-30 w-52 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200">
                 <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Save to library</p>
                 <button type="button" onClick={() => void handleExport("png")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
                   PNG image
@@ -1504,6 +1572,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onGroup={handleGroup}
           onUngroup={handleUngroup}
           onReplaceImage={(node) => void handleReplaceImage(node)}
+          onPickFillImage={handlePickFillImage}
+          assetUrlFor={assetUrlFor}
+          onSaveExport={handleSaveExport}
           croppingNodeId={croppingNodeId}
           onToggleCrop={(node) => setCroppingNodeId((prev) => (prev === node.id ? null : node.id))}
           // null ends the preview (the slider released, or the pointer left it) and lets the
@@ -1645,7 +1716,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           pb-2 gives its own controls (the active tab's chevron menu, in particular) a real gap
           below them on top of the outer container's own pb buffer - see that pb's own doc comment
           for why touching-but-not-overlapping the fixed bottom docker isn't safe to rely on. */}
-      <div className="flex items-end gap-0.5 px-2 pt-1 pb-2 bg-gray-50 dark:bg-neutral-900 border-t border-gray-200 dark:border-neutral-800 overflow-x-auto">
+      <div className="flex items-center gap-0.5 px-2 pt-1 pb-1 bg-gray-50 dark:bg-neutral-900 border-t border-gray-200 dark:border-neutral-800 overflow-x-auto">
         {doc.pages.map((p, index) => (
           <PageTab
             key={p.id}
@@ -1676,8 +1747,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             }
           />
         ))}
-        <button type="button" title="Add page" onClick={store.addPage} className="p-1.5 mb-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 text-gray-500 dark:text-neutral-400">
-          <IoAdd size={16} />
+        <button type="button" title="Add page" onClick={store.addPage} className="h-6 w-6 flex items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.08] text-gray-500 dark:text-neutral-400">
+          <IoAdd size={14} />
         </button>
       </div>
     </div>

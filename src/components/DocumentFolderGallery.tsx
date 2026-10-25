@@ -25,13 +25,16 @@
 // one and the same thing, not two parallel selection models.
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronForward, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoTrashOutline } from "react-icons/io5";
+import { IoChevronForward, IoClose, IoDocumentTextOutline, IoEllipsisVertical, IoFolderOutline, IoTrashOutline, IoPhonePortraitOutline } from "react-icons/io5";
+import { openPhoneTransfer } from "../services/phoneTransfer";
 import { formatFileSize, truncateFileName } from "../utils/Formater";
+import { useGallerySort } from "./GallerySort";
 
 interface GalleryFile {
   name: string;
   path: string;
   size: number;
+  modified?: number;
 }
 
 interface DocumentFolderGalleryProps {
@@ -39,6 +42,8 @@ interface DocumentFolderGalleryProps {
   folderLabel: string;
   onOpenDocument: (file: GalleryFile) => void;
   onDeleteFile: (file: GalleryFile) => void;
+  // Opens the file Info panel (FileInfoModal, owned by Dashboard.tsx).
+  onShowInfo: (file: GalleryFile) => void;
   // Rename is inline (matches the sidebar's own inline rename), so its state is lifted to
   // Dashboard.tsx - one rename in flight at a time, shared with the sidebar list, rather than a
   // second parallel rename state living only here.
@@ -56,11 +61,8 @@ interface DocumentFolderGalleryProps {
   onSelectOnly: (path: string) => void;
   onSelectRange: (paths: string[]) => void;
   onClearSelection: () => void;
-  // Every folder in the library, for the selection panel's "Move to" list - excludes whichever one
-  // is `currentFolder` (nothing to gain moving a selection into the folder it's already in).
-  folderOptions: { key: string; label: string }[];
-  currentFolder: string;
-  onMoveFiles: (files: GalleryFile[], destFolder: string) => void;
+  // Opens Dashboard's shared "Move or copy to..." menu (MoveCopyMenu.tsx) for these files.
+  onOpenMoveCopy: (files: GalleryFile[], anchor: { left: number; top: number }) => void;
   onBulkDelete: (files: GalleryFile[]) => void;
 }
 
@@ -79,10 +81,11 @@ const DEFAULT_EXTENSION_STYLE = "text-gray-500 dark:text-neutral-400 bg-gray-100
 const extensionOf = (name: string): string => name.split(".").pop()?.toLowerCase() ?? "";
 
 const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
-  files,
+  files: unsortedFiles,
   folderLabel,
   onOpenDocument,
   onDeleteFile,
+  onShowInfo,
   renamingFile,
   renameValue,
   onRenameValueChange,
@@ -94,14 +97,12 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
   onSelectOnly,
   onSelectRange,
   onClearSelection,
-  folderOptions,
-  currentFolder,
-  onMoveFiles,
+  onOpenMoveCopy,
   onBulkDelete,
 }) => {
+  const { sorted: files, control: sortControl } = useGallerySort(unsortedFiles, "document");
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
-  const [bulkMoveOpen, setBulkMoveOpen] = useState<boolean>(false);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Anchor for Shift-click range-select - the index of the last tile clicked WITHOUT Shift (a
   // plain or Ctrl/Cmd click). A ref, not state: it only needs to be read back on a later click,
@@ -163,9 +164,12 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
           {actionStatus}
         </div>
       )}
-      <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-3">
-        {folderLabel} — {files.length} document{files.length === 1 ? "" : "s"}
-      </p>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+          {folderLabel} — {files.length} document{files.length === 1 ? "" : "s"}
+        </p>
+        {sortControl}
+      </div>
       <div
         className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-7 gap-3"
         onClick={(e) => {
@@ -307,44 +311,26 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
               </button>
             </div>
             <div className="p-1.5 flex flex-col gap-0.5">
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setBulkMoveOpen((prev) => !prev)}
-                  className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm font-medium text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
-                >
-                  <IoFolderOutline size={16} className="text-neutral-400 dark:text-neutral-500 shrink-0" />
-                  <span className="flex-1 text-left">Move to</span>
-                  <IoChevronForward
-                    size={12}
-                    className={`text-neutral-400 dark:text-neutral-500 transition-transform ${bulkMoveOpen ? "rotate-90" : ""}`}
-                  />
-                </button>
-                {bulkMoveOpen && (
-                  <div className="mt-1 max-h-40 overflow-y-auto border border-gray-200 dark:border-neutral-700 rounded-lg bg-white dark:bg-neutral-900 shadow-inner">
-                    {folderOptions.filter((folder) => folder.key !== currentFolder).length === 0 ? (
-                      <p className="px-3 py-1.5 text-xs text-neutral-400 dark:text-neutral-500 italic">No other folders</p>
-                    ) : (
-                      folderOptions
-                        .filter((folder) => folder.key !== currentFolder)
-                        .map((folder) => (
-                          <button
-                            key={folder.key || "__root__"}
-                            type="button"
-                            title={folder.key || "Briefcast"}
-                            className="w-full text-left px-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                            onClick={() => {
-                              onMoveFiles(selectedInFolder, folder.key);
-                              setBulkMoveOpen(false);
-                            }}
-                          >
-                            {folder.label}
-                          </button>
-                        ))
-                    )}
-                  </div>
-                )}
-              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  onOpenMoveCopy(selectedInFolder, { left: rect.left, top: rect.bottom + 4 });
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm font-medium text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+              >
+                <IoFolderOutline size={16} className="text-neutral-400 dark:text-neutral-500 shrink-0" />
+                <span className="flex-1 text-left">Move or copy to…</span>
+                <IoChevronForward size={12} className="text-neutral-400 dark:text-neutral-500" />
+              </button>
+              <button
+                type="button"
+                onClick={() => openPhoneTransfer(selectedInFolder)}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm font-medium text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+              >
+                <IoPhonePortraitOutline size={16} className="text-neutral-400 dark:text-neutral-500 shrink-0" />
+                <span className="flex-1 text-left">Transfer to phone</span>
+              </button>
               <button
                 type="button"
                 onClick={() => onBulkDelete(selectedInFolder)}
@@ -394,6 +380,42 @@ const DocumentFolderGallery: React.FC<DocumentFolderGalleryProps> = ({
               }}
             >
               Rename
+            </button>
+            {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) - for the whole selection when
+                this tile is part of one, the same rule as the sidebar's own file menu. */}
+            <button
+              type="button"
+              className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
+                onOpenMoveCopy(target, { left: rect.right + 4, top: rect.top });
+                setContextMenu(null);
+              }}
+            >
+              <span className="flex-1 text-left">Move or copy to…</span>
+              <IoChevronForward size={11} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+            </button>
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={() => {
+                const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
+                openPhoneTransfer(target);
+                setContextMenu(null);
+              }}
+            >
+              Transfer to phone
+            </button>
+            <button
+              type="button"
+              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+              onClick={() => {
+                onShowInfo(contextMenu.file);
+                setContextMenu(null);
+              }}
+            >
+              Info
             </button>
             <button
               type="button"

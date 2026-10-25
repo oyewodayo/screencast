@@ -1,34 +1,20 @@
 // components/pdf/AnnotationToolbar.tsx
-import React, { useEffect, useState } from "react";
-import {
-  IoPencil,
-  IoArrowUndo,
-  IoArrowRedo,
-  IoAdd,
-  IoRemove,
-  IoCheckmarkCircle,
-  IoCloudUploadOutline,
-  IoAlertCircleOutline,
-  IoDocumentTextOutline,
-  IoText,
-  IoExpand,
-  IoGridOutline,
-  IoListOutline,
-  IoImageOutline,
-  IoDownloadOutline,
-} from "react-icons/io5";
-import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
+import React, { useLayoutEffect, useRef, useState } from "react";
+import { IoPencil, IoArrowUndo, IoArrowRedo, IoText, IoExpand, IoGridOutline, IoListOutline, IoImageOutline, IoDownloadOutline, IoChatbubblesOutline } from "react-icons/io5";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
 import { MdAutoStories } from "react-icons/md";
 import { AnnotationTool } from "../../utils/pdfAnnotationTypes";
 import { PdfSidebarView } from "./PdfSidebar";
 import ColorSwatchPicker from "./ColorSwatchPicker";
+import { CountBadge } from "./PdfViewerControls";
 
 interface AnnotationToolbarProps {
-  title?: string;
+  // The dock stays mounted while closed so it can animate both ways - `open` drives the reveal.
+  open: boolean;
   sidebarView: PdfSidebarView | null;
   onSidebarViewChange: (view: PdfSidebarView) => void;
+  commentCount: number;
   tool: AnnotationTool | null;
   onToolChange: (tool: AnnotationTool) => void;
   onDeselectTool: () => void;
@@ -37,185 +23,52 @@ interface AnnotationToolbarProps {
   onColorChange: (color: string) => void;
   strokeWidth: number;
   onStrokeWidthChange: (width: number) => void;
-  currentPageIndex: number;
-  numPages: number;
-  pageStep: number;
-  onPageChange: (pageIndex: number) => void;
-  zoom: number;
-  onZoomChange: (zoom: number) => void;
-  minZoom: number;
-  maxZoom: number;
   twoPageMode: boolean;
   onToggleTwoPageMode: () => void;
-  // No isFullscreen flag needed — this toolbar only ever renders while *not* fullscreen (see
-  // PdfAnnotator, which swaps it out for a minimal exit button instead), so this button only
-  // ever needs to say "enter".
+  // Only ever rendered while *not* fullscreen (PdfAnnotator hides all of its chrome in
+  // presentation mode), so this button only ever needs to say "enter".
   onToggleFullscreen: () => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
-  isSaving: boolean;
-  saveError: string | null;
   isExporting: boolean;
-  exportProgress: { completed: number; total: number } | null;
   onExport: () => void;
 }
 
+// Every tooltip in this dock goes through TooltipLayer (data-tip / data-tip-kbd) rather than a
+// native `title`, so shortcuts show as keys instead of being buried in parentheses.
 const TOOL_BUTTONS: { tool: AnnotationTool; label: string; shortcut: string; icon: React.ReactNode }[] = [
-  { tool: "pen", label: "Pen", shortcut: "P", icon: <IoPencil size={16} /> },
-  { tool: "highlighter", label: "Highlighter", shortcut: "H", icon: <BsHighlighter size={15} /> },
-  { tool: "text", label: "Text note", shortcut: "T", icon: <IoText size={17} /> },
-  { tool: "eraser", label: "Eraser", shortcut: "E", icon: <FaEraser size={14} /> },
+  { tool: "pen", label: "Pen", shortcut: "P", icon: <IoPencil size={14} /> },
+  { tool: "highlighter", label: "Highlighter", shortcut: "H", icon: <BsHighlighter size={13} /> },
+  { tool: "text", label: "Text note", shortcut: "T", icon: <IoText size={15} /> },
+  { tool: "eraser", label: "Eraser", shortcut: "E", icon: <FaEraser size={12} /> },
 ];
 
-// Thin vertical hairline used to separate control groups, mirroring macOS/iPadOS toolbar chrome.
-const Divider: React.FC = () => <div className="w-px h-6 bg-black/[0.06] dark:bg-white/[0.1] shrink-0" />;
+type DockEntry =
+  | { kind: "divider"; key: string }
+  | {
+      kind: "button";
+      key: string;
+      title: string;
+      kbd?: string;
+      active?: boolean;
+      disabled?: boolean;
+      onClick: () => void;
+      icon: React.ReactNode;
+      tool?: AnnotationTool;
+      badge?: number;
+    };
 
-// Circular, icon-only button — the base unit every control in this toolbar is built from.
-const IconButton: React.FC<{
-  title: string;
-  onClick?: () => void;
-  disabled?: boolean;
-  active?: boolean;
-  children: React.ReactNode;
-}> = ({ title, onClick, disabled, active, children }) => (
-  <button
-    type="button"
-    title={title}
-    onClick={onClick}
-    disabled={disabled}
-    className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors duration-150 ${
-      active
-        ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
-        : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-800 dark:hover:text-neutral-100"
-    } disabled:opacity-30 disabled:hover:bg-transparent disabled:pointer-events-none`}
-  >
-    {children}
-  </button>
-);
-
-const SaveStatus: React.FC<{ isSaving: boolean; saveError: string | null }> = ({ isSaving, saveError }) => {
-  if (saveError) {
-    return (
-      <div className="flex items-center gap-1.5 text-red-500 text-xs font-medium" title={saveError}>
-        <IoAlertCircleOutline size={15} />
-        <span className="hidden sm:inline">Save failed</span>
-      </div>
-    );
-  }
-  if (isSaving) {
-    return (
-      <div className="flex items-center gap-1.5 text-neutral-400 dark:text-neutral-500 text-xs font-medium">
-        <IoCloudUploadOutline size={15} className="animate-pulse" />
-        <span className="hidden sm:inline">Saving…</span>
-      </div>
-    );
-  }
-  return (
-    <div className="flex items-center gap-1.5 text-emerald-500/80 text-xs font-medium">
-      <IoCheckmarkCircle size={15} />
-      <span className="hidden sm:inline">Saved</span>
-    </div>
-  );
-};
-
-// Editable page number: free-typed while focused, committed on Enter/blur, and re-synced from
-// `currentPageIndex` whenever navigation happens some other way (arrow keys, prev/next buttons).
-const PageJumpInput: React.FC<{ currentPageIndex: number; numPages: number; onPageChange: (pageIndex: number) => void }> = ({
-  currentPageIndex,
-  numPages,
-  onPageChange,
-}) => {
-  const [value, setValue] = useState(String(currentPageIndex + 1));
-
-  useEffect(() => {
-    setValue(String(currentPageIndex + 1));
-  }, [currentPageIndex]);
-
-  const commit = (): void => {
-    const parsed = parseInt(value, 10);
-    if (Number.isFinite(parsed) && numPages > 0) {
-      onPageChange(Math.min(Math.max(parsed - 1, 0), numPages - 1));
-    } else {
-      setValue(String(currentPageIndex + 1));
-    }
-  };
-
-  return (
-    <input
-      type="text"
-      inputMode="numeric"
-      title="Jump to page"
-      value={value}
-      onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          commit();
-          e.currentTarget.blur();
-        } else if (e.key === "Escape") {
-          setValue(String(currentPageIndex + 1));
-          e.currentTarget.blur();
-        }
-      }}
-      onBlur={commit}
-      onFocus={(e) => e.currentTarget.select()}
-      className="w-7 text-center text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
-    />
-  );
-};
-
-// Editable zoom level: free-typed while focused, committed on Enter/blur (clamped to
-// [minZoom, maxZoom]), and re-synced from `zoom` whenever it changes some other way (the +/-
-// buttons, trackpad pinch-zoom, etc).
-const ZoomInput: React.FC<{ zoom: number; minZoom: number; maxZoom: number; onZoomChange: (zoom: number) => void }> = ({
-  zoom,
-  minZoom,
-  maxZoom,
-  onZoomChange,
-}) => {
-  const [value, setValue] = useState(String(Math.round(zoom * 100)));
-
-  useEffect(() => {
-    setValue(String(Math.round(zoom * 100)));
-  }, [zoom]);
-
-  const commit = (): void => {
-    const parsed = parseInt(value, 10);
-    if (Number.isFinite(parsed)) {
-      onZoomChange(Math.min(maxZoom, Math.max(minZoom, parsed / 100)));
-    } else {
-      setValue(String(Math.round(zoom * 100)));
-    }
-  };
-
-  return (
-    <input
-      type="text"
-      inputMode="numeric"
-      title={`Zoom level (${Math.round(minZoom * 100)}-${Math.round(maxZoom * 100)}%) — Ctrl+0 to reset to 100%`}
-      value={value}
-      onChange={(e) => setValue(e.target.value.replace(/[^0-9]/g, ""))}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          commit();
-          e.currentTarget.blur();
-        } else if (e.key === "Escape") {
-          setValue(String(Math.round(zoom * 100)));
-          e.currentTarget.blur();
-        }
-      }}
-      onBlur={commit}
-      onFocus={(e) => e.currentTarget.select()}
-      className="w-8 text-center text-xs font-medium text-neutral-600 dark:text-neutral-300 bg-transparent rounded focus:outline-none focus:ring-1 focus:ring-blue-400 tabular-nums"
-    />
-  );
-};
+// Total stagger spread across the dock's buttons as it rises - small enough that the last button
+// lands well inside the container's own reveal, large enough to read as "rising up".
+const STAGGER_MS = 14;
 
 const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
-  title,
+  open,
   sidebarView,
   onSidebarViewChange,
+  commentCount,
   tool,
   onToolChange,
   onDeselectTool,
@@ -224,14 +77,6 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onColorChange,
   strokeWidth,
   onStrokeWidthChange,
-  currentPageIndex,
-  numPages,
-  pageStep,
-  onPageChange,
-  zoom,
-  onZoomChange,
-  minZoom,
-  maxZoom,
   twoPageMode,
   onToggleTwoPageMode,
   onToggleFullscreen,
@@ -239,69 +84,118 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   canRedo,
   onUndo,
   onRedo,
-  isSaving,
-  saveError,
   isExporting,
-  exportProgress,
   onExport,
 }) => {
+  const dockRef = useRef<HTMLDivElement>(null);
+  const toolButtonRefs = useRef<Partial<Record<AnnotationTool, HTMLButtonElement | null>>>({});
+  // Vertical center of the active tool's button, relative to the dock - the options flyout (color
+  // + size) hangs off the left of the dock at that height, so it reads as belonging to that tool.
+  const [optionsTop, setOptionsTop] = useState<number | null>(null);
+
+  // Re-measured on dock scroll too - in a short window the dock scrolls and the flyout follows.
+  const measureOptionsTop = (): void => {
+    const button = tool ? toolButtonRefs.current[tool] : null;
+    const dock = dockRef.current;
+    if (!button || !dock) {
+      setOptionsTop(null);
+      return;
+    }
+    const b = button.getBoundingClientRect();
+    const d = dock.getBoundingClientRect();
+    const center = b.top + b.height / 2 - d.top;
+    // Hidden while its button is scrolled out of the dock - it would otherwise point at nothing.
+    setOptionsTop(center >= 0 && center <= d.height ? center : null);
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(measureOptionsTop, [tool, open]);
+
+  // Top-to-bottom. The view toggle sits at the very bottom - closest to the Edit button it rises
+  // from - with the document-level actions above it and the markup tools in the middle.
+  const entries: DockEntry[] = [
+    { kind: "button", key: "undo", title: "Undo", kbd: "Ctrl+Z", disabled: !canUndo, onClick: onUndo, icon: <IoArrowUndo size={14} /> },
+    { kind: "button", key: "redo", title: "Redo", kbd: "Ctrl+Shift+Z", disabled: !canRedo, onClick: onRedo, icon: <IoArrowRedo size={14} /> },
+    { kind: "divider", key: "d1" },
+    // "Select" is a real, always-present option (not just a side effect of re-clicking an active
+    // tool) so deselecting has an unmistakable, always-highlightable target.
+    { kind: "button", key: "select", title: "Select", kbd: "V", active: tool === null, onClick: onDeselectTool, icon: <BsCursor size={12} /> },
+    ...TOOL_BUTTONS.map(
+      ({ tool: t, label, shortcut, icon }): DockEntry => ({
+        kind: "button",
+        key: t,
+        title: label,
+        kbd: shortcut,
+        active: tool === t,
+        onClick: () => onToolChange(t),
+        icon,
+        tool: t,
+      })
+    ),
+    // A one-shot action rather than a persistent tool, so it never shows as active.
+    { kind: "button", key: "image", title: "Insert image", onClick: onInsertImageClick, icon: <IoImageOutline size={14} /> },
+    { kind: "divider", key: "d2" },
+    {
+      kind: "button",
+      key: "thumbnails",
+      title: "Page thumbnails",
+      active: sidebarView === "thumbnails",
+      onClick: () => onSidebarViewChange("thumbnails"),
+      icon: <IoGridOutline size={13} />,
+    },
+    {
+      kind: "button",
+      key: "outline",
+      title: "Table of contents",
+      active: sidebarView === "outline",
+      onClick: () => onSidebarViewChange("outline"),
+      icon: <IoListOutline size={14} />,
+    },
+    {
+      kind: "button",
+      key: "comments",
+      title: commentCount > 0 ? `Comments (${commentCount})` : "Comments",
+      active: sidebarView === "comments",
+      onClick: () => onSidebarViewChange("comments"),
+      icon: <IoChatbubblesOutline size={14} />,
+      badge: commentCount,
+    },
+    // Flattens annotations into a brand-new standalone PDF next to the source file - unlike the
+    // sidecar JSON the save indicator reports on, this is readable outside this app.
+    {
+      kind: "button",
+      key: "export",
+      title: isExporting ? "Exporting…" : "Export as a PDF with your markup",
+      disabled: isExporting,
+      onClick: onExport,
+      icon: <IoDownloadOutline size={14} className={isExporting ? "animate-pulse" : undefined} />,
+    },
+    { kind: "divider", key: "d3" },
+    { kind: "button", key: "fullscreen", title: "Fullscreen presentation", kbd: "F", onClick: onToggleFullscreen, icon: <IoExpand size={14} /> },
+    {
+      kind: "button",
+      key: "view",
+      title: twoPageMode ? "Single page view" : "Two-page view",
+      kbd: "B",
+      active: twoPageMode,
+      onClick: onToggleTwoPageMode,
+      icon: <MdAutoStories size={15} />,
+    },
+  ];
+
+  const count = entries.length;
+
   return (
-    <div className="shrink-0 px-4 pt-3 pb-2">
-      <div className="flex items-center gap-3 mx-auto max-w-fit px-3 py-2 rounded-2xl bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.04] dark:ring-white/[0.08]">
-        {/* Sidebar panel toggles: page thumbnails and the PDF's table of contents. Each re-clicks
-            itself off (handled by the parent, same toggle pattern as the tool buttons below) so
-            there's always an unambiguous way back to "no panel open". */}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
-          <IconButton title="Page thumbnails" active={sidebarView === "thumbnails"} onClick={() => onSidebarViewChange("thumbnails")}>
-            <IoGridOutline size={15} />
-          </IconButton>
-          <IconButton title="Table of contents" active={sidebarView === "outline"} onClick={() => onSidebarViewChange("outline")}>
-            <IoListOutline size={16} />
-          </IconButton>
-        </div>
-
-        <Divider />
-
-        {title && (
-          <>
-            <div className="flex items-center gap-1.5 pl-1 pr-1 text-neutral-600 dark:text-neutral-300 max-w-[160px]" title={title}>
-              <IoDocumentTextOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-              <span className="text-sm font-medium truncate">{title}</span>
-            </div>
-            <Divider />
-          </>
-        )}
-
-        {/* Tool segmented control. "Select" is a real, always-present option (not just a side
-            effect of re-clicking an active tool) so deselecting has an unmistakable, always-
-            highlightable target — clicking an active pen/highlighter/eraser again also toggles
-            it off, but this is the explicit, discoverable way to get back to "nothing selected". */}
-        <div className="flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.045] dark:bg-white/[0.06]">
-          <IconButton title="Select / no tool (V)" active={tool === null} onClick={onDeselectTool}>
-            <BsCursor size={14} />
-          </IconButton>
-          {TOOL_BUTTONS.map(({ tool: t, label, shortcut, icon }) => (
-            <IconButton key={t} title={`${label} (${shortcut})`} active={tool === t} onClick={() => onToolChange(t)}>
-              {icon}
-            </IconButton>
-          ))}
-        </div>
-
-        {/* Inserting an image isn't a persistent "tool" the way pen/highlighter/text are — it's a
-            one-shot action (pick a file, it appears selected and ready to drag/resize/rotate) —
-            so it lives here as a standalone button rather than in the tool segmented control. */}
-        <IconButton title="Insert image" onClick={onInsertImageClick}>
-          <IoImageOutline size={16} />
-        </IconButton>
-
-        {tool && tool !== "eraser" && (
-          <>
-            <Divider />
-            <ColorSwatchPicker color={color} onChange={onColorChange} />
-          </>
-        )}
-
-        <div className="flex items-center gap-2 pl-1">
+    <div className="relative min-h-0 flex flex-col">
+      {/* Options for the active tool only - nothing to set with Select. Size is stroke width for
+          pen/highlighter, font size for text notes and radius for the eraser. */}
+      {open && tool && optionsTop !== null && (
+        <div
+          key={tool}
+          style={{ top: optionsTop }}
+          className="absolute right-full mr-2 -translate-y-1/2 pointer-events-auto flex flex-col items-center gap-2 px-1 py-2 rounded-full bg-white/85 dark:bg-neutral-900/85 backdrop-blur-xl shadow-[0_4px_16px_rgba(0,0,0,0.10)] ring-1 ring-black/[0.05] dark:ring-white/[0.08] animate-[dockOptionsIn_180ms_cubic-bezier(0.2,0.9,0.3,1.2)]"
+        >
+          {tool !== "eraser" && <ColorSwatchPicker size="sm" placement="left" color={color} onChange={onColorChange} />}
+          {/* Vertical slider, larger values at the top (vertical-lr + rtl). */}
           <input
             type="range"
             min={1}
@@ -309,90 +203,71 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             step={1}
             value={strokeWidth}
             onChange={(e) => onStrokeWidthChange(Number(e.target.value))}
-            title="Stroke width ([ / ])"
-            className="w-16 accent-blue-500"
+            data-tip={tool === "text" ? "Text size" : tool === "eraser" ? "Eraser size" : "Stroke width"}
+            data-tip-kbd="[ / ]"
+            data-tip-side="left"
+            aria-label="Size"
+            style={{ writingMode: "vertical-lr", direction: "rtl" }}
+            className="w-3 h-16 accent-blue-500 cursor-pointer"
           />
+          <span className="text-[10px] leading-none font-medium text-neutral-500 dark:text-neutral-400 tabular-nums">{strokeWidth}</span>
         </div>
+      )}
 
-        <Divider />
-
-        <div className="flex items-center gap-0.5">
-          <IconButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo}>
-            <IoArrowUndo size={16} />
-          </IconButton>
-          <IconButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={onRedo}>
-            <IoArrowRedo size={16} />
-          </IconButton>
-        </div>
-
-        <Divider />
-
-        <IconButton title={twoPageMode ? "Single page view (B)" : "Two-page view (B)"} active={twoPageMode} onClick={onToggleTwoPageMode}>
-          <MdAutoStories size={17} />
-        </IconButton>
-
-        <IconButton title="Enter fullscreen / presentation mode (F)" onClick={onToggleFullscreen}>
-          <IoExpand size={16} />
-        </IconButton>
-
-        <Divider />
-
-        {/* Page navigator pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
-          <IconButton title="Previous page (←)" disabled={currentPageIndex <= 0} onClick={() => onPageChange(currentPageIndex - pageStep)}>
-            <IoIosArrowBack size={15} />
-          </IconButton>
-          {numPages === 0 ? (
-            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300 w-14 text-center">…</span>
-          ) : (
-            <span className="flex items-center gap-1 text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
-              <PageJumpInput currentPageIndex={currentPageIndex} numPages={numPages} onPageChange={onPageChange} />
-              <span className="text-neutral-400 dark:text-neutral-500">
-                {twoPageMode && currentPageIndex + 1 < numPages ? `-${currentPageIndex + 2} ` : " "}
-                / {numPages}
-              </span>
-            </span>
-          )}
-          <IconButton title="Next page (→)" disabled={currentPageIndex >= numPages - 1} onClick={() => onPageChange(currentPageIndex + pageStep)}>
-            <IoIosArrowForward size={15} />
-          </IconButton>
-        </div>
-
-        {/* Zoom pill */}
-        <div className="flex items-center gap-1 rounded-full bg-black/[0.045] dark:bg-white/[0.06] pl-1 pr-2 py-0.5">
-          <IconButton title="Zoom out (Ctrl+-)" disabled={zoom <= minZoom} onClick={() => onZoomChange(Math.max(minZoom, Math.round((zoom - 0.25) * 100) / 100))}>
-            <IoRemove size={16} />
-          </IconButton>
-          <span className="flex items-center text-xs font-medium text-neutral-600 dark:text-neutral-300 tabular-nums">
-            <ZoomInput zoom={zoom} minZoom={minZoom} maxZoom={maxZoom} onZoomChange={onZoomChange} />%
-          </span>
-          <IconButton title="Zoom in (Ctrl+=)" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
-            <IoAdd size={16} />
-          </IconButton>
-        </div>
-
-        <Divider />
-
-        {/* Flattens annotations into a brand-new standalone PDF next to the source file — unlike
-            the sidecar JSON SaveStatus reports on, this is what makes markup readable outside
-            this app (a real PDF, not something that needs to be re-composited on load). */}
-        <IconButton
-          title={
-            isExporting
-              ? exportProgress
-                ? `Exporting… page ${exportProgress.completed}/${exportProgress.total}`
-                : "Exporting…"
-              : "Export annotated PDF"
+      {/* The reveal: the dock's clip rises from its bottom edge (where the Edit button is) while
+          the buttons themselves drift up in a bottom-first stagger. While closed it stays mounted
+          but inert, so closing animates too. */}
+      <div
+        ref={dockRef}
+        aria-hidden={!open}
+        onScroll={measureOptionsTop}
+        style={{
+          clipPath: open ? "inset(0 0 0 0 round 16px)" : "inset(100% 0 0 0 round 16px)",
+          transition: "clip-path 380ms cubic-bezier(0.22, 1, 0.36, 1), opacity 260ms ease, transform 380ms cubic-bezier(0.22, 1, 0.36, 1)",
+          opacity: open ? 1 : 0,
+          transform: open ? "translateY(0)" : "translateY(16px)",
+          scrollbarWidth: "none",
+        }}
+        className={`min-h-0 flex flex-col items-center p-0.5 overflow-y-auto rounded-full bg-white/80 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_16px_rgba(0,0,0,0.10)] ring-1 ring-black/[0.05] dark:ring-white/[0.08] ${
+          open ? "pointer-events-auto" : "pointer-events-none"
+        }`}
+      >
+        {entries.map((entry, i) => {
+          const fromBottom = count - 1 - i;
+          const itemStyle: React.CSSProperties = {
+            transition: "opacity 240ms ease, transform 320ms cubic-bezier(0.22, 1, 0.36, 1)",
+            transitionDelay: open ? `${fromBottom * STAGGER_MS}ms` : "0ms",
+            opacity: open ? 1 : 0,
+            transform: open ? "translateY(0)" : "translateY(10px)",
+          };
+          if (entry.kind === "divider") {
+            return <div key={entry.key} style={itemStyle} className="w-3.5 h-px my-0.5 bg-black/[0.08] dark:bg-white/[0.1] shrink-0" />;
           }
-          disabled={isExporting}
-          onClick={onExport}
-        >
-          <IoDownloadOutline size={16} className={isExporting ? "animate-pulse" : undefined} />
-        </IconButton>
-
-        <div className="pr-1">
-          <SaveStatus isSaving={isSaving} saveError={saveError} />
-        </div>
+          return (
+            <div key={entry.key} style={itemStyle} className="shrink-0 relative">
+            <button
+              ref={entry.tool ? (el) => void (toolButtonRefs.current[entry.tool!] = el) : undefined}
+              type="button"
+              tabIndex={open ? 0 : -1}
+              data-tip={entry.title}
+              data-tip-kbd={entry.kbd}
+              data-tip-side="left"
+              aria-label={entry.title}
+              aria-pressed={entry.active}
+              onClick={entry.onClick}
+              disabled={entry.disabled}
+              className={`flex items-center justify-center w-7 h-7 rounded-full transition-[background-color,color,box-shadow,transform] duration-150 active:scale-90 ${
+                entry.active
+                  ? "bg-blue-500 text-white shadow-[0_2px_8px_rgba(59,130,246,0.45)]"
+                  : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-800 dark:hover:text-neutral-100"
+              } disabled:opacity-30 disabled:hover:bg-transparent disabled:pointer-events-none`}
+            >
+              {entry.icon}
+            </button>
+            {!!entry.badge && !entry.active && <CountBadge count={entry.badge} className="-top-0.5 -right-0.5 scale-[0.85] origin-top-right" />}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

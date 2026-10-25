@@ -38,12 +38,17 @@ pub struct RecordingProgress {
 // Sidecar convention mirrors click_sidecar_path/system_audio's own "<stem>.<suffix>" naming in
 // recording.rs - deleted once the watcher stops, so it never lingers as a stray file next to a
 // finished recording.
+//
+// Kept in the temp capture folder, not beside the recording: ffmpeg rewrites it twice a second, and
+// inside the library each rewrite set off the file watcher and a full library rescan.
 pub fn progress_sidecar_path(output_path: &Path) -> PathBuf {
     let stem = output_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("recording");
-    output_path.with_file_name(format!("{}.progress.log", stem))
+    let dir = std::env::temp_dir().join("briefcast-capture");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}.progress.log", stem))
 }
 
 // Spawns a background task that tails `progress_path` and emits a `recording-progress` event
@@ -59,17 +64,22 @@ pub fn watch(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut last_len: u64 = 0;
+        // Whether another ffmpeg has taken over by the time this one is gone - a start retried
+        // through a different capture path reuses the same progress file, which then isn't ours
+        // to delete.
+        let replaced;
         loop {
             let _ = tauri::async_runtime::spawn_blocking(|| {
                 std::thread::sleep(Duration::from_millis(750));
             })
             .await;
 
-            let still_this_recording = {
+            let current = {
                 let guard = ffmpeg_process.lock().await;
-                guard.as_ref().map(|c| c.id()) == Some(expected_pid)
+                guard.as_ref().map(|c| c.id())
             };
-            if !still_this_recording {
+            if current != Some(expected_pid) {
+                replaced = current.is_some();
                 break;
             }
 
@@ -86,7 +96,9 @@ pub fn watch(
                 let _ = app_handle.emit("recording-progress", progress);
             }
         }
-        let _ = std::fs::remove_file(&progress_path);
+        if !replaced {
+            let _ = std::fs::remove_file(&progress_path);
+        }
     });
 }
 

@@ -1,5 +1,5 @@
 // hooks/usePageRenderCache.ts
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
 import { getPageTextLines, TextLine } from "../handlers/pdfAnnotationHandlers";
 
@@ -45,6 +45,19 @@ export default function usePageRenderCache(): PageRenderCache {
   const renderInFlightRef = useRef<Map<string, Promise<RenderedPage>>>(new Map());
   const textCacheRef = useRef<Map<number, TextLine[]>>(new Map());
   const textInFlightRef = useRef<Map<number, Promise<TextLine[]>>>(new Map());
+
+  // The cached canvases are detached, so they get no restore event of their own - but a GPU reset
+  // that blanked the on-screen canvases (which do fire one) blanked these too. Drop them so the
+  // re-render that useCanvasRestoreTick triggers in PdfPage draws fresh pixels instead of
+  // blitting empty ones. Text lines aren't pixels and stay cached.
+  useEffect(() => {
+    const drop = () => {
+      renderCacheRef.current.clear();
+      renderInFlightRef.current.clear();
+    };
+    document.addEventListener("contextrestored", drop, true);
+    return () => document.removeEventListener("contextrestored", drop, true);
+  }, []);
 
   const rememberRendered = (key: string, value: RenderedPage): void => {
     const cache = renderCacheRef.current;

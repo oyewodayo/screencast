@@ -29,6 +29,7 @@ import katex from "katex";
 import useCanvasWheel from "../../hooks/useCanvasWheel";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import WhiteboardTable from "./WhiteboardTable";
+import { FillPaint, nodeFillPaint, PaintedShape } from "./NodeFillPaint";
 import {
   ArrowheadType,
   CHART_ANNOTATION_SHAPES,
@@ -43,6 +44,7 @@ import {
   WhiteboardNode,
   WhiteboardPage,
   WhiteboardShapeType,
+  resolveNodeFill,
 } from "../../utils/whiteboardTypes";
 import {
   AMP_MINUS_Y_FRAC,
@@ -58,6 +60,7 @@ import {
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
   edgeBoundingBox,
+  fillImageSrc,
   imageDestRect,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
@@ -149,6 +152,34 @@ function ChartLabelText({ label, node }: { label: ChartLabel; node: WhiteboardNo
   );
 }
 
+// The body of a rectangle/equation card/ellipse. A solid fill stays a single CSS-painted div (the
+// cheapest thing the compositor can draw, and what nearly every box on a board is); a gradient,
+// image or pattern fill adds an SVG underlay carrying the paint, with the div on top drawing only
+// the border - so the stroke keeps CSS's crisp inside-the-box placement either way.
+function BoxShapeBody({ node, paint }: { node: WhiteboardNode; paint: FillPaint }) {
+  const ellipse = node.shapeType === "ellipse";
+  const radius = ellipse ? "50%" : node.cornerRadius ?? 0;
+  const border = node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined;
+  if (!paint.defs) {
+    return <div style={{ position: "absolute", inset: 0, backgroundColor: paint.fill === "none" ? "transparent" : paint.fill, border, borderRadius: radius, boxSizing: "border-box" }} />;
+  }
+  const w = node.width;
+  const h = node.height;
+  const r = Math.max(0, Math.min(node.cornerRadius ?? 0, w / 2, h / 2));
+  const shape = (p: { fill: string; fillOpacity?: number; opacity?: number }) =>
+    ellipse ? <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} {...p} /> : <rect x={0} y={0} width={w} height={h} rx={r} ry={r} {...p} />;
+  return (
+    <>
+      <svg width="100%" height="100%" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0 }}>
+        {paint.defs}
+        {shape({ fill: paint.fill, fillOpacity: paint.fillOpacity })}
+        {paint.overlay && shape({ fill: paint.overlay, opacity: paint.overlayOpacity })}
+      </svg>
+      {border && <div style={{ position: "absolute", inset: 0, border, borderRadius: radius, boxSizing: "border-box" }} />}
+    </>
+  );
+}
+
 // The live body of an "image" node. Rendered as a real <img> rather than drawn into a canvas: the
 // browser already handles decoding, progressive paint, GPU-side scaling and (critically) redrawing
 // during a resize drag far better than re-rasterizing a multi-megapixel bitmap on the main thread
@@ -176,7 +207,7 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
     inset: 0,
     overflow: "hidden",
     borderRadius,
-    backgroundColor: node.fillColor ?? "transparent",
+    backgroundColor: resolveNodeFill(node) ?? "transparent",
   };
 
   // The ring is its OWN empty overlay rather than an inset box-shadow on the frame, because an inset
@@ -885,7 +916,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // An in-progress canvas drag wins over a style-panel preview: both are "uncommitted display-only
   // state", but only one gesture can be happening at a time, and the drag is the one the pointer is
   // currently driving.
-  const nodes = liveNodes ?? previewNodes ?? page.nodes;
+  //
+  // The preview holds only the shapes being previewed (the selection), so it's merged over the page
+  // rather than standing in for it - used as the whole node list, every unselected shape vanished
+  // for as long as a style slider was held.
+  const previewedNodes = useMemo(() => {
+    if (!previewNodes) return null;
+    const byId = new Map(previewNodes.map((n) => [n.id, n]));
+    return page.nodes.map((n) => byId.get(n.id) ?? n);
+  }, [previewNodes, page.nodes]);
+  const nodes = liveNodes ?? previewedNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edges = liveEdges ?? page.edges;
 
@@ -2274,6 +2314,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           const showQuickConnectArrows =
             isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = cachedShapeOutline(node);
+          const paint = nodeFillPaint(node, fillImageSrc(node, imageSrcFor));
           return (
             <div
               key={node.id}
@@ -2382,56 +2423,45 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
                   onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
                 />
-              ) : node.shapeType === "ellipse" ? (
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    backgroundColor: node.fillColor ?? "transparent",
-                    border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
-                    borderRadius: "50%",
-                    boxSizing: "border-box",
-                  }}
-                />
-              ) : node.shapeType === "rectangle" || node.shapeType === "equation" ? (
+              ) : node.shapeType === "ellipse" || node.shapeType === "rectangle" || node.shapeType === "equation" ? (
                 // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
                 // formula can sit on a card/badge instead of bare on the canvas - purely optional,
                 // still transparent/borderless by default (same fillColor: null start every other
                 // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
                 // fields are actually used.
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    backgroundColor: node.fillColor ?? "transparent",
-                    border: node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined,
-                    borderRadius: node.cornerRadius ?? 0,
-                    boxSizing: "border-box",
-                  }}
-                />
+                <BoxShapeBody node={node} paint={paint} />
               ) : node.shapeType === "text" ? (
                 isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
               ) : outline.kind === "cylinder" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <path
-                    d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
-                    fill={node.fillColor ?? "none"}
+                  {paint.defs}
+                  <PaintedShape
+                    paint={paint}
                     stroke={node.strokeColor}
                     strokeWidth={node.strokeWidth}
+                    draw={(p) => (
+                      <path
+                        d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
+                        {...p}
+                      />
+                    )}
                   />
-                  <ellipse
-                    cx={node.width / 2}
-                    cy={node.height * CYLINDER_CAP_RATIO}
-                    rx={node.width / 2}
-                    ry={node.height * CYLINDER_CAP_RATIO}
-                    fill={node.fillColor ?? "none"}
+                  <PaintedShape
+                    paint={paint}
                     stroke={node.strokeColor}
                     strokeWidth={node.strokeWidth}
+                    draw={(p) => <ellipse cx={node.width / 2} cy={node.height * CYLINDER_CAP_RATIO} rx={node.width / 2} ry={node.height * CYLINDER_CAP_RATIO} {...p} />}
                   />
                 </svg>
               ) : outline.kind === "polygon" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  {paint.defs}
+                  <PaintedShape
+                    paint={paint}
+                    stroke={node.strokeColor}
+                    strokeWidth={node.strokeWidth}
+                    draw={(p) => <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} strokeLinejoin="round" {...p} />}
+                  />
                   {outline.innerLines?.map((line, i) => (
                     <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
                   ))}
@@ -2441,7 +2471,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 </svg>
               ) : outline.kind === "path" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <path d={outline.d} fill={node.fillColor ?? "none"} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" />
+                  {paint.defs}
+                  <PaintedShape paint={paint} stroke={node.strokeColor} strokeWidth={node.strokeWidth} draw={(p) => <path d={outline.d} strokeLinejoin="round" {...p} />} />
                 </svg>
               ) : outline.kind === "chart" ? (
                 <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
@@ -2451,7 +2482,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   <g transform={outline.inset ? `translate(${outline.inset.dx},${outline.inset.dy})` : undefined}>
                     {outline.parts.map((part, i) =>
                       part.role === "fill" ? (
-                        <path key={i} d={part.d} fill={node.fillColor ?? "none"} stroke="none" />
+                        <path key={i} d={part.d} fill={resolveNodeFill(node) ?? "none"} stroke="none" />
                       ) : part.role === "marker" ? (
                         <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
                       ) : part.role === "slice" ? (
@@ -2466,9 +2497,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                         // export's own annotation branch exactly.
                         <path key={i} d={part.d} fill={part.color} stroke={part.color} strokeWidth={1} strokeLinecap="round" />
                       ) : part.role === "axis" ? (
-                        <path key={i} d={part.d} fill="none" stroke="#9ca3af" strokeWidth={1} />
+                        <path key={i} d={part.d} fill="none" stroke={part.color ?? "#9ca3af"} strokeOpacity={part.opacity} strokeWidth={part.width ?? 1} strokeLinecap="square" />
                       ) : part.role === "grid" ? (
-                        <path key={i} d={part.d} fill="none" stroke="#e5e7eb" strokeWidth={0.75} />
+                        <path key={i} d={part.d} fill="none" stroke={part.color ?? "#e5e7eb"} strokeOpacity={part.opacity} strokeWidth={0.75} />
                       ) : (
                         <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
                       )

@@ -91,6 +91,9 @@ pub struct ClickCapture {
     // is that thread's id, captured once at spawn via the channel below.
     thread_id: u32,
     handle: JoinHandle<Vec<ClickEvent>>,
+    // QPC time (100ns, audio_capture::now_hns) every click's elapsed_secs counts from - lets
+    // recording/assembly.rs place clicks on the final file's own timeline.
+    pub started_hns: i64,
 }
 
 impl ClickCapture {
@@ -99,9 +102,10 @@ impl ClickCapture {
     /// space resolve_capture_target/gdigrab_input_args already resolve for the ffmpeg side) - every
     /// click gets normalized against these before being recorded.
     pub fn start(origin: (i32, i32), size: (i32, i32)) -> Result<Self, String> {
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, i64), String>>();
 
         let handle = std::thread::spawn(move || -> Vec<ClickEvent> {
+            let started_hns = crate::services::audio_capture::now_hns();
             HOOK_CTX.with(|ctx| {
                 *ctx.borrow_mut() = Some(HookContext {
                     start: Instant::now(),
@@ -115,7 +119,7 @@ impl ClickCapture {
             let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
             let hook = match hook {
                 Ok(h) => {
-                    let _ = ready_tx.send(Ok(thread_id));
+                    let _ = ready_tx.send(Ok((thread_id, started_hns)));
                     h
                 }
                 Err(e) => {
@@ -145,7 +149,7 @@ impl ClickCapture {
         });
 
         match ready_rx.recv() {
-            Ok(Ok(thread_id)) => Ok(Self { thread_id, handle }),
+            Ok(Ok((thread_id, started_hns))) => Ok(Self { thread_id, handle, started_hns }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(e)
