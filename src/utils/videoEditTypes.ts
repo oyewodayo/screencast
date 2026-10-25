@@ -9,6 +9,7 @@
 // very last clip's end, splitting divides one clip into two adjacent clips (same sourcePath), and
 // deleting removes a clip from the array outright.
 
+import type { StageScene } from "./stage/stageTypes";
 import type { AudioFx } from "./audioFx";
 import type { GainPoint } from "./audioAutomation";
 import type { MasterBus } from "./masterBus";
@@ -859,6 +860,9 @@ export interface VideoEditState {
   screenStyle?: ScreenStyle | null;
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
+  // Motion-graphics scenes (Stage - src/utils/stage): elements moving through beats, drawn over the
+  // video and its tracks, beneath blur regions, pictures and text. Undefined = none.
+  scenes?: StageScene[];
   updatedAt: string;
 }
 
@@ -883,6 +887,7 @@ export interface EditableFields {
   screenStyle?: ScreenStyle | null;
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
+  scenes?: StageScene[];
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -935,7 +940,10 @@ export interface VideoEditCommand {
     | "edit-automation"
     | "edit-video-tracks"
     | "find-hide"
-    | "edit-screen-style";
+    | "edit-screen-style"
+    | "add-scene"
+    | "edit-scene"
+    | "delete-scene";
 }
 
 export function createEmptyState(sourcePath: string, duration: number): VideoEditState {
@@ -1026,6 +1034,13 @@ export const isBlankClipId = (id: string): boolean => id.startsWith(BLANK_CLIP_P
 
 // Where the last audio track ends - the length of an audio-only project.
 export const audioEndTime = (audioOverlays: { endTime: number }[]): number => audioOverlays.reduce((end, o) => Math.max(end, o.endTime), 0);
+
+// How long a project with no clips of its own runs on its blank canvas: until its last sound or its
+// last scene ends (a video made from scratch is scenes and sound on that canvas).
+export function canvasEndTime(state: Pick<VideoEditState, "audioOverlays" | "scenes">): number {
+  const scenes = (state.scenes ?? []).reduce((end, s) => Math.max(end, s.startTime + s.beats.reduce((sum, b) => sum + (Number.isFinite(b.hold) && b.hold > 0 ? b.hold : 0), 0)), 0);
+  return Math.max(audioEndTime(state.audioOverlays), scenes);
+}
 
 // The length of the project canvas (get_video_canvas_proxy, conversion.rs).
 export const VIDEO_CANVAS_SECONDS = 100 * 3600;

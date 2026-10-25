@@ -57,6 +57,7 @@ import VideoEditorHome from "../components/video/VideoEditorHome";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
 import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
 import AdjustmentLayersLayer from "../components/video/AdjustmentLayersLayer";
+import StageLayer from "../components/video/StageLayer";
 import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
@@ -775,6 +776,7 @@ const Dashboard = () => {
   const [isPlacingImage, setIsPlacingImage] = useState<boolean>(false);
   const [selectedBlurOverlayId, setSelectedBlurOverlayId] = useState<string | null>(null);
   const [selectedAdjustmentId, setSelectedAdjustmentId] = useState<string | null>(null);
+  const [selectedSceneId, setSelectedSceneId] = useState<string | null>(null);
   // Motion tracking (motionTracking.ts): picking what to follow, then following it.
   const [trackSession, setTrackSession] = useState<null | {
     kind: TrackKind;
@@ -1438,11 +1440,31 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       setSelectedImageOverlayId(null);
       setSelectedBlurOverlayId(null);
       setSelectedPipOverlayId(null);
+      setSelectedSceneId(null);
     }
   }, []);
   useEffect(() => {
     if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId) setSelectedAdjustmentId(null);
   }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedPipOverlayId]);
+  // A Stage scene is edited on its own - selecting one lets go of every other selection, and the
+  // other way round.
+  const selectScene = useCallback((id: string | null) => {
+    setSelectedSceneId(id);
+    if (id) {
+      setSelectedOverlayId(null);
+      setSelectedImageOverlayId(null);
+      setSelectedBlurOverlayId(null);
+      setSelectedPipOverlayId(null);
+      setSelectedAdjustmentId(null);
+    }
+  }, []);
+  useEffect(() => {
+    if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId || selectedAdjustmentId) setSelectedSceneId(null);
+  }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedPipOverlayId, selectedAdjustmentId]);
+  // A scene deleted or undone away lets go of its selection.
+  useEffect(() => {
+    if (selectedSceneId && !editStore.scenes.some((s) => s.id === selectedSceneId)) setSelectedSceneId(null);
+  }, [selectedSceneId, editStore.scenes]);
   // Any clip's preview source as the player loads it - the primary file's already-resolved URL,
   // an image's proxy, or another video's asset URL (TransitionPreviewLayer compares this against
   // what the player actually has loaded).
@@ -2911,6 +2933,21 @@ const setScreen = () => {
 		const timer = window.setInterval(send, 500);
 		return () => window.clearInterval(timer);
 	}, []);
+
+	// The playhead to timeline time `t` - on the clips as they play, so a project made only of scenes
+	// (on its blank canvas) seeks too. What the scene panel uses to show a beat at rest.
+	const seekPlaybackTime = (t: number) => {
+		let acc = 0;
+		const clips = editStore.playbackClips;
+		for (let i = 0; i < clips.length; i++) {
+			const d = clipOutputDuration(clips[i]);
+			if (acc + d > t + 1e-3 || i === clips.length - 1) {
+				handleSeekActiveFile(clips[i].sourcePath, outputOffsetToSource(clips[i], Math.min(d, Math.max(0, t - acc))));
+				return;
+			}
+			acc += d;
+		}
+	};
 
 	// Timeline time -> the clip and source time under it, for the remote's Retake (which goes back to
 	// where the take it replaces began).
@@ -5580,6 +5617,11 @@ const setScreen = () => {
                             hiddenTracks={editStore.hiddenVideoTracks}
                             panelRequest={pipPanelRequest}
                           />
+                          {/* Stage scenes over the video and its tracks, beneath blur regions,
+                              pictures and text - where export composites them. */}
+                          {editStore.scenes.length > 0 && (
+                            <StageLayer mode="render" frameRect={frameRect} scenes={editStore.scenes} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} isPlaying={playerIsPlaying} />
+                          )}
                           {!inset && overlayLayer}
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
                         </div>
@@ -5638,6 +5680,22 @@ const setScreen = () => {
                             onCancel={() => setIsMarkingBubble(false)}
                           />
                         )}
+                        <StageLayer
+                          mode="controls"
+                          frameRect={frameRect}
+                          scenes={editStore.scenes}
+                          currentOutputTime={currentOutputTime}
+                          getOutputTime={getExactOutputTime}
+                          selectedSceneId={selectedSceneId}
+                          onSelectScene={selectScene}
+                          onUpdateScene={editStore.updateScene}
+                          onDeleteScene={editStore.deleteScene}
+                          onDuplicateScene={(id) => selectScene(editStore.duplicateScene(id))}
+                          onSeek={(t) => {
+                            if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+                            seekPlaybackTime(t);
+                          }}
+                        />
                         <AdjustmentLayersLayer
                           mode="controls"
                           frameRect={frameRect}
@@ -5975,6 +6033,8 @@ const setScreen = () => {
         onSelectBlurOverlay={setSelectedBlurOverlayId}
         selectedAdjustmentId={selectedAdjustmentId}
         onSelectAdjustment={selectAdjustment}
+        selectedSceneId={selectedSceneId}
+        onSelectScene={selectScene}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={() => setIsPlacingBlur((v) => !v)}
         selectedPipOverlayId={selectedPipOverlayId}

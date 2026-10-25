@@ -26,6 +26,13 @@ describe("imageReveal", () => {
     expect(keys(s, 60).size).toBe(31);
   });
 
+  it("keeps every frame of the reveal distinct at a 60fps export's rate", () => {
+    const s = { style: "wipe" as const, seconds: 1 };
+    const at60 = new Set(Array.from({ length: 60 * 60 }, (_, k) => imageRevealState(s, k / 60, 60, 60).key));
+    // 60 reveal frames + 1 settled frame - not 30 doubled up.
+    expect(at60.size).toBe(61);
+  });
+
   it("repeats its shine on a period - one cycle of frames, whatever the length", () => {
     const s = { style: "glare" as const, seconds: 1, shineEvery: 3 };
     expect(keys(s, 30).size).toBe(keys(s, 300).size);

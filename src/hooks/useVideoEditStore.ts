@@ -14,7 +14,10 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCapt
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, audioEndTime, blankClipsFor, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import type { StageScene } from "../utils/stage/stageTypes";
+import { duplicateScene as duplicateStageScene, makeStageScene } from "../utils/stage/stageEditing";
+import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
 import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
 import type { TimelineClipboardItems } from "../utils/timelineClipboard";
 import { exportBlendMode } from "../utils/blendModes";
@@ -262,6 +265,14 @@ export interface UseVideoEditStoreResult {
   moveAdjustmentLayerTime: (id: string, newStartTime: number) => void;
   deleteAdjustmentLayer: (id: string) => void;
   duplicateAdjustmentLayer: (id: string) => string;
+  // Motion-graphics scenes (Stage). updateScene takes the scene to its next state (stageEditing.ts);
+  // a run of quick edits to one scene (a drag, a slider) is one undo step.
+  scenes: StageScene[];
+  addScene: (startTime: number, frame: { width: number; height: number }) => string;
+  updateScene: (id: string, edit: (scene: StageScene) => StageScene) => void;
+  moveSceneTime: (id: string, startTime: number) => void;
+  deleteScene: (id: string) => void;
+  duplicateScene: (id: string) => string;
   // Chapters (videoChapters.ts), anchored to source moments; replaced as a whole list.
   chapters: VideoChapter[];
   setChapters: (chapters: VideoChapter[]) => void;
@@ -526,11 +537,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   }, []);
   // A project of sound alone plays over its own canvas (the file the player already has open) for as
   // long as the audio runs - available at once, nothing to load.
-  const audioOnly = !!sourcePath && isVideoProjectPath(sourcePath) && !!state && state.clips.length === 0 && state.audioOverlays.length > 0;
-  const audioOnlyEnd = audioOnly && state ? audioEndTime(state.audioOverlays) : 0;
+  // A project with sound or scenes but no clips plays on its blank canvas for as long as they run.
+  const canvasEnd = !!sourcePath && isVideoProjectPath(sourcePath) && !!state && state.clips.length === 0 ? canvasEndTime(state) : 0;
   const playbackClips = useMemo(
-    () => (audioOnly && sourcePath ? blankClipsFor(sourcePath, audioOnlyEnd, VIDEO_CANVAS_SECONDS) : state?.clips ?? []),
-    [audioOnly, sourcePath, audioOnlyEnd, state?.clips]
+    () => (canvasEnd > 0 && sourcePath ? blankClipsFor(sourcePath, canvasEnd, VIDEO_CANVAS_SECONDS) : state?.clips ?? []),
+    [canvasEnd, sourcePath, state?.clips]
   );
 
   const registerSourceDuration = useCallback((path: string, duration: number) => {
@@ -595,6 +606,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 audioOverlays: parsed.audioOverlays ?? [],
                 pipOverlays: parsed.pipOverlays ?? [],
                 adjustmentLayers: parsed.adjustmentLayers ?? [],
+                scenes: parsed.scenes ?? [],
                 chapters: parsed.chapters ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
@@ -785,6 +797,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     screenStyle: current.screenStyle,
     pointerStyle: current.pointerStyle,
     keystrokeStyle: current.keystrokeStyle,
+    scenes: current.scenes ?? [],
     ...patch,
   });
 
@@ -1305,6 +1318,58 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const copy = duplicateOverlay(original);
       const blurOverlays = addOverlay(current.blurOverlays, copy);
       pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "add-blur");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
+  // ---- Stage scenes -----------------------------------------------------------------------------
+
+  const addScene = useCallback(
+    (startTime: number, frame: { width: number; height: number }): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const scene = makeStageScene({ startTime, frameWidth: frame.width, frameHeight: frame.height });
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), scene] }), "add-scene");
+      return scene.id;
+    },
+    [pushCommand]
+  );
+
+  const updateScene = useCallback(
+    (id: string, edit: (scene: StageScene) => StageScene) => {
+      const current = stateRef.current;
+      const scene = current?.scenes?.find((s) => s.id === id);
+      if (!current || !scene) return;
+      const next = edit(scene);
+      if (next === scene) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: (current.scenes ?? []).map((s) => (s.id === id ? next : s)) }), "edit-scene");
+    },
+    [pushCommand]
+  );
+
+  const moveSceneTime = useCallback(
+    (id: string, startTime: number) => updateScene(id, (s) => ({ ...s, startTime: Math.max(0, startTime) })),
+    [updateScene]
+  );
+
+  const deleteScene = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: (current.scenes ?? []).filter((s) => s.id !== id) }), "delete-scene");
+    },
+    [pushCommand]
+  );
+
+  const duplicateScene = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      const original = current?.scenes?.find((s) => s.id === id);
+      if (!current || !original) return "";
+      // Right after the original.
+      const copy = duplicateStageScene(original, original.startTime + original.beats.reduce((sum, b) => sum + b.hold, 0));
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), copy] }), "add-scene");
       return copy.id;
     },
     [pushCommand]
@@ -2049,8 +2114,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const saved = override ?? stateRef.current;
       if (!sourcePath || !saved) return null;
       // Sound with no pictures saves as a video of a blank screen (blankClipsFor).
-      const audioOnly = saved.clips.length === 0 && isVideoProjectPath(sourcePath) && saved.audioOverlays.length > 0;
-      const current = audioOnly ? { ...saved, clips: blankClipsFor(await ensureBlankFrame(sourcePath), audioEndTime(saved.audioOverlays), IMAGE_CLIP_MAX_SECONDS) } : saved;
+      // Sound or scenes with no clips save as a video of the blank canvas they play on.
+      const canvasOnly = saved.clips.length === 0 && isVideoProjectPath(sourcePath) && canvasEndTime(saved) > 0;
+      const current = canvasOnly ? { ...saved, clips: blankClipsFor(await ensureBlankFrame(sourcePath), canvasEndTime(saved), IMAGE_CLIP_MAX_SECONDS) } : saved;
       if (current.clips.length === 0) return null;
       // Overlays, blur regions, picture-in-picture and captions are laid out on the FINAL frame -
       // the platform format's when one is chosen (export fits the video into it first).
@@ -2063,7 +2129,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         endTime: number;
         animation: string;
         keyframes?: ExportKeyframe[];
-        frames?: { unique: string[]; sequence: number[] };
+        frames?: { unique: string[]; sequence: number[]; fps: number };
         blendMode?: string;
         onFrame?: boolean;
       }[] = [];
@@ -2073,6 +2139,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         // the padding around it: drawn at the hole's size, then moved to where it is.
         const content = current.screenStyle ? screenContentRect(videoPixelSize.width, videoPixelSize.height, current.screenStyle) : null;
         const { width: pxW, height: pxH } = content ?? videoPixelSize;
+        // Animated overlays are drawn at the rate export reads them at - the video's own (a 60fps
+        // recording's titles move at 60), so a frame sequence lines up with the video frame for frame.
+        const fps = await invoke<number>("get_export_frame_rate", { sourcePaths: current.clips.map((c) => c.sourcePath) }).catch(() => 30);
         // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
         // top-left in pixels (offset from the overlay's x/y by however the renderer padded it).
         const exportKeyframes = (o: { x: number; y: number; startTime: number; keyframes?: OverlayKeyframe[] }, xPx: number, yPx: number) =>
@@ -2098,7 +2167,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               // A shape/animated element burns in as a frame sequence of its own animation -
               // drawn by the same function as the preview (videoAssets.ts).
               // eslint-disable-next-line no-await-in-loop
-              const seq = await renderAssetFrames(o, pxW, pxH);
+              const seq = await renderAssetFrames(o, pxW, pxH, fps);
               if (seq)
                 overlays.push({
                   dataBase64: "",
@@ -2108,7 +2177,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                   endTime: o.endTime,
                   animation: exportOverlayAnimation(o.animation),
                   keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                  frames: { unique: seq.unique, sequence: seq.sequence },
+                  frames: { unique: seq.unique, sequence: seq.sequence, fps },
                   blendMode,
                 });
               continue;
@@ -2117,7 +2186,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               // A revealing picture (imageReveal.ts) or one whose mask opens (layerMask.ts) burns in
               // as a frame sequence.
               // eslint-disable-next-line no-await-in-loop
-              const seq = await renderImageRevealFrames(o, pxW, pxH);
+              const seq = await renderImageRevealFrames(o, pxW, pxH, fps);
               if (seq)
                 overlays.push({
                   dataBase64: "",
@@ -2127,7 +2196,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                   endTime: o.endTime,
                   animation: exportOverlayAnimation(o.animation),
                   keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                  frames: { unique: seq.unique, sequence: seq.sequence },
+                  frames: { unique: seq.unique, sequence: seq.sequence, fps },
                   blendMode,
                 });
               continue;
@@ -2142,7 +2211,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           if (isTextReveal(o.animation)) {
             // Letter-by-letter titles burn in as a frame sequence (textReveal.ts).
             // eslint-disable-next-line no-await-in-loop
-            const seq = await renderTextRevealFrames(o, pxW, pxH);
+            const seq = await renderTextRevealFrames(o, pxW, pxH, fps);
             if (seq)
               overlays.push({
                 dataBase64: "",
@@ -2152,7 +2221,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 endTime: o.endTime,
                 animation: "none",
                 keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                frames: { unique: seq.unique, sequence: seq.sequence },
+                frames: { unique: seq.unique, sequence: seq.sequence, fps },
                 blendMode,
               });
             continue;
@@ -2306,6 +2375,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         ? (current.adjustmentLayers ?? []).map((l) => adjustmentLayerExport(l, videoPixelSize.width, videoPixelSize.height)).filter((l) => l !== null)
         : [];
 
+      // Stage scenes: each rendered here, frame by frame, by the same renderer as the preview, at the
+      // final frame's size and the export's rate (composited before the screen frame goes round it).
+      const stageLayers: StageLayerSpec[] = [];
+      if (videoPixelSize && (current.scenes?.length ?? 0) > 0) {
+        const fps = await invoke<number>("get_export_frame_rate", { sourcePaths: current.clips.map((c) => c.sourcePath) }).catch(() => 30);
+        for (const scene of current.scenes!) {
+          // eslint-disable-next-line no-await-in-loop
+          stageLayers.push(await renderStageForExport(scene, { width: videoPixelSize.width, height: videoPixelSize.height, fps }));
+        }
+      }
+
       // Screen-recording polish (screenPolish.ts): the frame around the edited picture and the
       // shortcut chips, both on the final frame, and each clip's drawn pointer.
       const recordings = await loadClipRecordings(current.clips);
@@ -2335,6 +2415,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           master: masterForExport(current.master),
           screenStyle,
           keystrokes,
+          stageLayers,
         },
         sourcePath,
         durationSec: totalOutputDuration(current.clips),
@@ -2522,6 +2603,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteBlurOverlay,
     duplicateBlurOverlay,
     adjustmentLayers: state?.adjustmentLayers ?? [],
+    scenes: state?.scenes ?? [],
+    addScene,
+    updateScene,
+    moveSceneTime,
+    deleteScene,
+    duplicateScene,
     addAdjustmentLayer,
     updateAdjustmentLayer,
     resizeAdjustmentLayerTime,

@@ -25,6 +25,7 @@ mod commands {
     pub mod native_playback;
     pub mod snip;
     pub mod screen_color;
+    pub mod stage_render;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
@@ -519,6 +520,11 @@ fn main() {
             commands::conversion::transcribe_doc_audio,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::get_export_frame_rate,
+            commands::stage_render::stage_render_open,
+            commands::stage_render::stage_render_frame,
+            commands::stage_render::stage_render_finish,
+            commands::stage_render::stage_render_discard,
             commands::background_removal::background_removal_status,
             commands::recording::load_bubble_sidecar,
             commands::object_find::find_objects,

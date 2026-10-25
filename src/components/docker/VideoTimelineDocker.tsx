@@ -5,6 +5,9 @@ import { fillWindow } from "../../utils/reframeTrack";
 import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { IoLayersOutline } from "react-icons/io5";
+import { beatStarts as stageBeatStarts, sceneDuration, setBeatHold, setSceneDuration } from "../../utils/stage/stageEditing";
+import type { StageScene } from "../../utils/stage/stageTypes";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
@@ -731,6 +734,9 @@ interface VideoTimelineDockerProps {
   // Adjustment layers (AdjustmentLayersLayer.tsx draws them and their settings).
   selectedAdjustmentId?: string | null;
   onSelectAdjustment?: (id: string | null) => void;
+  // Stage scenes (motion graphics) - selected one edited in StageLayer's panel.
+  selectedSceneId?: string | null;
+  onSelectScene?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
 
@@ -800,6 +806,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectBlurOverlay,
   selectedAdjustmentId = null,
   onSelectAdjustment,
+  selectedSceneId,
+  onSelectScene,
   isPlacingBlur = false,
   onToggleArmPlaceBlur,
   selectedPipOverlayId = null,
@@ -1511,7 +1519,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     editStore.clips.length > 0 || isProject ? editStore.playbackClips : duration > 0 ? [{ id: "__pending__", sourcePath: file.path, start: 0, end: duration }] : [];
   // A project with audio and no pictures: the audio is the timeline. Its blank clips drive playback
   // and Save but never show on the video lane, which keeps offering to add pictures.
-  const isAudioOnly = isProject && editStore.clips.length === 0 && editStore.audioOverlays.length > 0;
+  // A project with no clips but sound or scenes plays (and saves) over its blank canvas.
+  const isAudioOnly = isProject && editStore.clips.length === 0 && (editStore.audioOverlays.length > 0 || editStore.scenes.length > 0);
 
   // Applies the in-progress resize (if any) so every position derived below - block widths, tick
   // marks, the playhead, other handles - stays visually consistent with the live drag instead of
@@ -1915,6 +1924,71 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     onSelectAdjustment?.(id);
     if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
   };
+  // ---- Stage scene lane: move a scene, stretch its last beat, drag a beat's boundary. -------------
+  // A scenes-only project's canvas grows with its scenes, so they move freely there; over clips a
+  // scene stays inside the video, as overlays do.
+  const scenesFree = editStore.clips.length === 0;
+  const [sceneDrag, setSceneDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
+  const [sceneEdgeDrag, setSceneEdgeDrag] = useState<null | { id: string; beat: number | "end"; startClientX: number; startValue: number; liveValue: number }>(null);
+  const renderScenes: StageScene[] = editStore.scenes.map((sc) => {
+    if (sceneDrag && sc.id === sceneDrag.id) return { ...sc, startTime: sceneDrag.liveStartTime };
+    if (sceneEdgeDrag && sc.id === sceneEdgeDrag.id)
+      return sceneEdgeDrag.beat === "end" ? setSceneDuration(sc, sceneEdgeDrag.liveValue) : setBeatHold(sc, sceneEdgeDrag.beat, sceneEdgeDrag.liveValue);
+    return sc;
+  });
+  const beginSceneDrag = (sc: StageScene) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setSceneDrag({ id: sc.id, startClientX: e.clientX, startTime: sc.startTime, duration: sceneDuration(sc), isDragging: false, liveStartTime: sc.startTime });
+  };
+  const handleSceneDragMove = (e: React.PointerEvent) => {
+    if (!sceneDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - sceneDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    const raw = snapToTargets(sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    const liveStartTime = Math.max(0, scenesFree ? raw : Math.min(raw, totalOutputDuration - sceneDrag.duration));
+    setSceneDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endSceneDrag = () => {
+    if (!sceneDrag) return;
+    const { id, isDragging, liveStartTime, duration } = sceneDrag;
+    setSceneDrag(null);
+    if (isDragging) editStore.moveSceneTime(id, liveStartTime);
+    onSelectScene?.(id);
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime + Math.min(duration, 1.5) * 0.9);
+  };
+  // A beat boundary (`beat` = the beat whose end it is) or the scene's end, dragged: that beat holds
+  // longer or shorter; everything after it moves with it.
+  const beginSceneEdgeDrag = (sc: StageScene, beat: number | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectScene?.(sc.id);
+    const startValue = beat === "end" ? sceneDuration(sc) : sc.beats[beat].hold;
+    setSceneEdgeDrag({ id: sc.id, beat, startClientX: e.clientX, startValue, liveValue: startValue });
+  };
+  const handleSceneEdgeDragMove = (e: React.PointerEvent) => {
+    if (!sceneEdgeDrag) return;
+    e.stopPropagation();
+    const liveValue = Math.max(0.1, sceneEdgeDrag.startValue + (e.clientX - sceneEdgeDrag.startClientX) / pxPerSec);
+    setSceneEdgeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
+  };
+  const endSceneEdgeDrag = () => {
+    if (!sceneEdgeDrag) return;
+    const { id, beat, liveValue } = sceneEdgeDrag;
+    setSceneEdgeDrag(null);
+    editStore.updateScene(id, (sc) => (beat === "end" ? setSceneDuration(sc, liveValue) : setBeatHold(sc, beat, liveValue)));
+  };
+  const addScene = async () => {
+    // Laid out for the frame it will be seen in: the video's, or a fresh project's own.
+    let frame = videoPixelSize;
+    if (!frame && isProject) frame = await invoke<{ width: number; height: number }>("read_video_project", { projectPath: file.path }).catch(() => null);
+    const total = totalOutputDuration;
+    const startTime = editStore.clips.length > 0 ? Math.max(0, Math.min(currentOutputTime, total - 1)) : Math.max(0, currentOutputTime);
+    const id = editStore.addScene(startTime, frame ?? { width: 1920, height: 1080 });
+    onSelectScene?.(id);
+    seekToOutputTime(startTime + 1.4);
+  };
+
   const addAdjustmentLayer = () => {
     const total = totalOutputDuration;
     if (total <= 0) return;
@@ -2171,7 +2245,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     return y;
   };
   // The lanes run as far as the longest audio overhang, so all of it stays on screen to work with.
-  const laneEndTime = renderAudioOverlays.reduce((end, o) => Math.max(end, o.endTime), totalOutputDuration);
+  const laneEndTime = Math.max(
+    renderAudioOverlays.reduce((end, o) => Math.max(end, o.endTime), totalOutputDuration),
+    editStore.scenes.reduce((end, sc) => Math.max(end, sc.startTime + sceneDuration(sc)), 0)
+  );
   // Zoomed all the way out, the whole timeline fits on screen - however long it is (a day of audio
   // is a fraction of a pixel a second). Never tighter than MIN_PX_PER_SEC for a short one.
   const minPxPerSec = Math.min(MIN_PX_PER_SEC, (viewWidth * 0.95) / Math.max(1, laneEndTime));
@@ -4327,6 +4404,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
+            title="Add a scene - motion graphics that animate from beat to beat: titles, lists, live numbers, diagrams"
+            onClick={() => void addScene()}
+            className={`flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium transition-colors ${selectedSceneId ? "text-white bg-teal-500/40" : "text-teal-200 bg-teal-500/15 hover:bg-teal-500/25"}`}
+          >
+            <IoLayersOutline size={13} />
+            Scene
+          </button>
+          <button
+            type="button"
             title="Make it a Short - your best moments as vertical clips with captions"
             onClick={() => setShortsOpen(true)}
             disabled={captionSourcePaths.length === 0 || !editStore.editState}
@@ -4708,6 +4794,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       className="flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 text-white hover:bg-teal-500"
                     >
                       <IoAddCircleOutline size={12} /> Add media
+                    </button>
+                    or
+                    <button
+                      type="button"
+                      title="Start from scratch - a scene of titles, lists, numbers or diagrams that animate from beat to beat"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={() => void addScene()}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded bg-white/10 text-teal-100 hover:bg-white/20"
+                    >
+                      <IoLayersOutline size={12} /> Add scene
                     </button>
                   </span>
                 </div>
@@ -5099,6 +5195,88 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
             </div>
+
+            {/* Stage scene lane - teal. Scenes that overlap stack in rows. Each block shows its beats
+                as a strip along its foot, as long as each holds; the boundary between two beats drags
+                (how long the first holds), as does the scene's end. */}
+            {(() => {
+              const ROW = 32;
+              const rowEnds: number[] = [];
+              const rowOf = new Map<string, number>();
+              for (const sc of [...renderScenes].sort((a, b) => a.startTime - b.startTime)) {
+                const end = sc.startTime + sceneDuration(sc);
+                let r = rowEnds.findIndex((e) => e <= sc.startTime + 1e-6);
+                if (r < 0) r = rowEnds.push(end) - 1;
+                else rowEnds[r] = end;
+                rowOf.set(sc.id, r);
+              }
+              return (
+                <div className={`relative border-t border-neutral-800 ${renderScenes.length === 0 ? "hidden" : ""}`} style={{ height: Math.max(1, rowEnds.length) * ROW }}>
+                  {renderScenes.map((sc) => {
+                    const left = sc.startTime * pxPerSec;
+                    const duration = sceneDuration(sc);
+                    const width = Math.max(1, duration * pxPerSec);
+                    const top = (rowOf.get(sc.id) ?? 0) * ROW + 3;
+                    const isSelected = selectedSceneId === sc.id;
+                    const starts = stageBeatStarts(sc);
+                    const local = currentOutputTime - sc.startTime;
+                    const title = sc.name ?? (sc.elements.find((el) => el.kind === "text")?.props.text ?? "Scene");
+                    return (
+                      <React.Fragment key={sc.id}>
+                        <div
+                          onPointerDown={beginSceneDrag(sc)}
+                          onPointerMove={handleSceneDragMove}
+                          onPointerUp={endSceneDrag}
+                          onPointerCancel={endSceneDrag}
+                          title={`${title} - ${sc.beats.length} beat${sc.beats.length === 1 ? "" : "s"}, ${duration.toFixed(1)}s. Drag to move it.`}
+                          className={`absolute rounded-md overflow-hidden border flex flex-col cursor-grab active:cursor-grabbing transition-colors ${
+                            isSelected ? "border-white bg-teal-700/80 shadow-[0_0_0_1px_rgba(255,255,255,0.35)]" : "border-teal-500/70 bg-teal-950/70 hover:bg-teal-900/70"
+                          }`}
+                          style={{ left, width, top, height: ROW - 6 }}
+                        >
+                          <span className="flex-1 min-h-0 flex items-center gap-1 px-1.5 text-[11px] text-white">
+                            <IoLayersOutline size={11} className="shrink-0 text-teal-200" />
+                            <span className="truncate">{title}</span>
+                          </span>
+                          {/* The beats, each as long as it holds; the one under the playhead lit. */}
+                          <span className="flex gap-px h-[4px] mx-px mb-px">
+                            {sc.beats.map((b, i) => {
+                              const on = local >= starts[i] && local < starts[i] + b.hold;
+                              return <span key={b.id} className={`rounded-[1px] ${on ? "bg-white" : isSelected ? "bg-teal-200/70" : "bg-teal-400/50"}`} style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }} />;
+                            })}
+                          </span>
+                        </div>
+                        {starts.slice(1).map((at, i) => (
+                          <div
+                            key={sc.beats[i + 1].id}
+                            onPointerDown={beginSceneEdgeDrag(sc, i)}
+                            onPointerMove={handleSceneEdgeDragMove}
+                            onPointerUp={endSceneEdgeDrag}
+                            onPointerCancel={endSceneEdgeDrag}
+                            title={`Beat ${i + 2} begins here - drag to change how long beat ${i + 1} holds`}
+                            className="group absolute w-2 -ml-1 cursor-ew-resize z-10 flex justify-center"
+                            style={{ left: left + at * pxPerSec, top, height: ROW - 6 }}
+                          >
+                            <span className="w-px h-full bg-white/0 group-hover:bg-white/60" />
+                          </div>
+                        ))}
+                        <div
+                          onPointerDown={beginSceneEdgeDrag(sc, "end")}
+                          onPointerMove={handleSceneEdgeDragMove}
+                          onPointerUp={endSceneEdgeDrag}
+                          onPointerCancel={endSceneEdgeDrag}
+                          title="Drag to change how long the last beat holds"
+                          className="group absolute w-2.5 -ml-2 cursor-ew-resize z-10 flex items-center justify-center"
+                          style={{ left: left + width, top, height: ROW - 6 }}
+                        >
+                          <span className={`w-[3px] h-3 rounded-full ${isSelected ? "bg-white" : "bg-teal-300/70"} group-hover:bg-white`} />
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              );
+            })()}
 
             {/* Adjustment-layer lane - violet; the chip names what the layer does. */}
             <div className={`h-8 relative border-t border-neutral-800 ${renderAdjustmentLayers.length === 0 ? "hidden" : ""}`}>

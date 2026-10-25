@@ -3867,7 +3867,7 @@ pub struct OverlayImage {
     #[serde(default)]
     pub keyframes: Option<Vec<OverlayKeyframe>>,
     // An animated overlay (a shape/element - videoAssets.ts) as a PNG frame sequence instead of
-    // one still: frame k shows at start_time + k/OVERLAY_INPUT_FPS. Frames repeat a lot (a looping
+    // one still: frame k shows at start_time + k/its fps. Frames repeat a lot (a looping
     // pulse, a held shape), so only the distinct images travel - `sequence[k]` indexes `unique`.
     // `data_base64` is unused when this is set.
     #[serde(default)]
@@ -3882,11 +3882,70 @@ pub struct OverlayImage {
     pub on_frame: bool,
 }
 
+// A Stage scene rendered for this export (stage_render.rs): its stored frames as an image sequence
+// (straight-alpha PNGs, u000000.png...), the scene frame each one starts at, where the scene sits on
+// the output timeline, and the rate it was rendered at. Composited above the video and its tracks
+// and beneath pictures and text.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageLayerSpec {
+    pub pattern: String,
+    pub frames: Vec<u32>,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub fps: f64,
+}
+
+// The scene frame stored image N starts at, as an expression in N: a balanced tree of comparisons
+// (as keyframe_expr builds), so a few thousand stored frames stay a shallow expression.
+fn frame_index_expr(frames: &[u32]) -> String {
+    fn tree(frames: &[u32], lo: usize, hi: usize) -> String {
+        if hi - lo == 1 {
+            return frames[lo].to_string();
+        }
+        let mid = (lo + hi) / 2;
+        format!("if(lt(N,{mid}),{},{})", tree(frames, lo, mid), tree(frames, mid, hi))
+    }
+    if frames.is_empty() { "0".to_string() } else { tree(frames, 0, frames.len()) }
+}
+
+// The filters putting a Stage layer (input `input`, rendered at the output frame's size) over
+// [current], writing [out]. The image sequence is read with a timebase of one frame, so each stored
+// image is re-timed to the scene frame it starts at plus the scene's start, in frames - rounded UP to
+// a whole frame (setpts would otherwise truncate a start that isn't frame-aligned, as 29.97 fps
+// starts rarely are, and show it a frame early), less a hair so a whole number stays itself. The
+// last stored image holds (eof_action=repeat) until the scene's end, where `enable` lets go of it.
+fn stage_layer_chain(layer: &StageLayerSpec, input: usize, current: &str, tag: &str, out: &str) -> String {
+    format!(
+        "[{input}:v]format=rgba,setpts='ceil({idx}+{start:.9}-0.000001)'[{tag}];\
+         [{current}][{tag}]overlay=x=0:y=0:eof_action=repeat:enable='between(t,{s:.4},{e:.4})'[{out}];",
+        idx = frame_index_expr(&layer.frames),
+        start = layer.start_time * layer.fps,
+        s = layer.start_time,
+        e = layer.end_time,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn stage_layer_chain_for_test(layer: &StageLayerSpec, input: usize, current: &str, tag: &str, out: &str) -> String {
+    stage_layer_chain(layer, input, current, tag, out)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayFrames {
     pub unique: Vec<String>,
     pub sequence: Vec<u32>,
+    // The rate the frames were drawn at (get_export_frame_rate) - None is DEFAULT_OVERLAY_FPS, what
+    // every sequence was drawn at before the rate followed the video.
+    #[serde(default)]
+    pub fps: Option<f64>,
+}
+
+impl OverlayFrames {
+    fn rate(&self) -> f64 {
+        self.fps.filter(|f| f.is_finite() && *f >= 1.0).map_or(DEFAULT_OVERLAY_FPS, |f| f.min(MAX_OVERLAY_FPS))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3902,9 +3961,39 @@ pub struct OverlayKeyframe {
     pub easing: String,
 }
 
-// Overlay PNG inputs run at this rate so a keyframed scale (which, in this ffmpeg, can only follow
-// time through the frame number `n`) maps frames to seconds exactly.
-const OVERLAY_INPUT_FPS: f64 = 30.0;
+// Overlay inputs (PNG stills, frame sequences, masks) run at the video's own rate - a 60fps
+// recording's titles, stickers and keyframed scale/opacity move at 60, not every other frame. The
+// rate also maps frames to seconds for a keyframed scale (which, in this ffmpeg, can only follow
+// time through the frame number `n`). Capped at MAX_OVERLAY_FPS: a 120fps source would double every
+// animated overlay's frames for motion few screens show.
+const DEFAULT_OVERLAY_FPS: f64 = 30.0;
+const MAX_OVERLAY_FPS: f64 = 60.0;
+
+pub(crate) fn overlay_rate(video_fps: f64) -> f64 {
+    if video_fps.is_finite() && video_fps >= 1.0 {
+        video_fps.min(MAX_OVERLAY_FPS)
+    } else {
+        DEFAULT_OVERLAY_FPS
+    }
+}
+
+// The rate an export of these sources runs at: the first video's (an image has no rate of its own -
+// ffprobe reports image2's arbitrary 25), else IMAGE_SEGMENT_FPS for an all-image timeline. The
+// transitions path pins every segment to it; overlays animate at overlay_rate of it.
+fn export_video_fps<'a>(ffprobe_path: &PathBuf, source_paths: impl IntoIterator<Item = &'a str>) -> f64 {
+    match source_paths.into_iter().find(|p| !is_still_image_path(p)) {
+        Some(path) => probe_frame_rate(ffprobe_path, path),
+        None => IMAGE_SEGMENT_FPS,
+    }
+}
+
+// The rate the editor draws animated overlays at for an export of these sources - the same rate
+// export_trimmed_video reads them at, so a frame sequence lines up with the video frame for frame.
+#[tauri::command]
+pub async fn get_export_frame_rate(app_handle: AppHandle, source_paths: Vec<String>) -> Result<f64, String> {
+    let ffprobe_path = get_ffprobe_path(&app_handle)?;
+    blocking(move || overlay_rate(export_video_fps(&ffprobe_path, source_paths.iter().map(String::as_str)))).await
+}
 
 fn easing_expr(easing: &str, p: &str) -> String {
     match easing {
@@ -3948,16 +4037,16 @@ fn keyframe_value(kfs: &[OverlayKeyframe], t: f64, value: impl Fn(&OverlayKeyfra
 
 // A keyframed overlay's opacity as per-frame alpha commands for `target` (a named
 // colorchannelmixer): its value at every frame where it changes - from the overlay's start through
-// its last keyframe - and nothing after, where it holds.
-fn opacity_commands(kfs: &[OverlayKeyframe], target: &str, start: f64, end: f64) -> String {
+// its last keyframe - and nothing after, where it holds. `fps`: the overlay's frame rate.
+fn opacity_commands(kfs: &[OverlayKeyframe], target: &str, start: f64, end: f64, fps: f64) -> String {
     let opacity = |t: f64| keyframe_value(kfs, t, |k| k.opacity.clamp(0.0, 1.0));
     let last_change = kfs.iter().map(|k| k.time).fold(start, f64::max).min(end);
-    let frames = ((last_change - start) * OVERLAY_INPUT_FPS).ceil().max(0.0) as usize;
+    let frames = ((last_change - start) * fps).ceil().max(0.0) as usize;
     // Only where the 8-bit alpha actually changes - a hold costs no commands.
     let mut cmds: Vec<String> = Vec::new();
     let mut last = String::new();
     for n in 0..=frames {
-        let t = start + n as f64 / OVERLAY_INPUT_FPS;
+        let t = start + n as f64 / fps;
         let v = format!("{:.4}", (opacity(t) * 255.0).round() / 255.0);
         if v != last {
             cmds.push(format!("{t:.4} {target} aa {v}"));
@@ -4350,9 +4439,9 @@ pub struct MaskKeyframeSpec {
 }
 
 // The moving mask as a grey stream the layer's size ([out]): the mask's picture scaled and placed
-// per frame on black (inverted when asked). Its input is the picture looped at OVERLAY_INPUT_FPS
-// from the layer's start, so the frame number gives the time for the per-frame size.
-fn moving_mask_chain(pip: &PipOverlay, motion: &MaskMotionSpec, input: usize, tag: &str, out: &str) -> String {
+// per frame on black (inverted when asked). Its input is the picture looped at `fps` (the overlay
+// rate) from the layer's start, so the frame number gives the time for the per-frame size.
+fn moving_mask_chain(pip: &PipOverlay, motion: &MaskMotionSpec, input: usize, tag: &str, out: &str, fps: f64) -> String {
     // The keyframes as OverlayKeyframes (x, y, and the size riding in scale/opacity), for keyframe_expr.
     let kfs: Vec<OverlayKeyframe> = motion
         .keyframes
@@ -4360,7 +4449,7 @@ fn moving_mask_chain(pip: &PipOverlay, motion: &MaskMotionSpec, input: usize, ta
         .map(|k| OverlayKeyframe { time: k.time, x: k.x, y: k.y, scale: k.w.max(2.0), opacity: k.h.max(2.0), easing: k.easing.clone() })
         .collect();
     let (w, h, st) = (pip.width, pip.height, pip.start_time);
-    let frame_time = format!("({st:.4}+n/{OVERLAY_INPUT_FPS})");
+    let frame_time = format!("({st:.4}+n/{fps})");
     let (mw, mh) = (keyframe_expr(&kfs, &frame_time, |k| k.scale), keyframe_expr(&kfs, &frame_time, |k| k.opacity));
     let (kx, ky) = (keyframe_expr(&kfs, "t", |k| k.x), keyframe_expr(&kfs, "t", |k| k.y));
     // Smaller than 2 px the picture can't be scaled down any further - a closed reveal would show as
@@ -4375,7 +4464,7 @@ fn moving_mask_chain(pip: &PipOverlay, motion: &MaskMotionSpec, input: usize, ta
     let negate = if motion.invert { ",negate" } else { "" };
     let d = (pip.end_time - pip.start_time).max(0.01) + 0.1;
     format!(
-        "color=c=black:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={d:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}mc];\
+        "color=c=black:s={w}x{h}:r={fps}:d={d:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}mc];\
          [{input}:v]format=yuv420p,setpts=PTS-STARTPTS+{st:.4}/TB,scale=w='max(2,trunc({mw}/2)*2)':h='max(2,trunc({mh}/2)*2)':eval=frame[{tag}mp];\
          [{tag}mc][{tag}mp]overlay=x='{kx}':y='{ky}':eof_action=repeat:enable='{shown}',format=gray{negate}[{out}];"
     )
@@ -4403,18 +4492,18 @@ pub struct CutoutBackgroundSpec {
 }
 
 // The filters putting `bg` behind the cut-out [cut] (both the layer's size), writing [out] - empty
-// when the background can't be drawn (it then stays see-through).
-fn cutout_background_chain(pip: &PipOverlay, bg: &CutoutBackgroundSpec, cut: &str, tag: &str, out: &str) -> String {
+// when the background can't be drawn (it then stays see-through). `fps`: the overlay rate.
+fn cutout_background_chain(pip: &PipOverlay, bg: &CutoutBackgroundSpec, cut: &str, tag: &str, out: &str, fps: f64) -> String {
     let (w, h, st) = (pip.width, pip.height, pip.start_time);
     let dur = (pip.end_time - pip.start_time).max(0.01) + 0.1;
     let base = match bg.kind.as_str() {
         "color" => {
             let hex = bg.color.as_deref().map(|c| c.trim().trim_start_matches('#')).and_then(|c| u32::from_str_radix(c, 16).ok()).unwrap_or(0) & 0xff_ffff;
-            format!("color=c=0x{hex:06x}:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bg];")
+            format!("color=c=0x{hex:06x}:s={w}x{h}:r={fps}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bg];")
         }
         "image" => match pip.background_input {
             Some(input) => format!(
-                "color=c=black:s={w}x{h}:r={OVERLAY_INPUT_FPS}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bb];\
+                "color=c=black:s={w}x{h}:r={fps}:d={dur:.3},setpts=PTS+{st:.4}/TB,format=yuv420p[{tag}bb];\
                  [{input}:v]scale={w}:{h},setpts=PTS-STARTPTS+{st:.4}/TB[{tag}bi];[{tag}bb][{tag}bi]overlay=eof_action=repeat:format=auto,format=yuv420p[{tag}bg];"
             ),
             None => return String::new(),
@@ -4573,6 +4662,8 @@ fn pip_overlay_chain(
     out_label: &str,
     // The final frame's size - needed to blend (blend_composite); None composites normally.
     frame: Option<(i64, i64)>,
+    // The overlay rate its masks and backgrounds run at.
+    fps: f64,
 ) -> String {
     let duration = (pip.end_time - pip.start_time).max(0.01);
     let trim_end = pip.trim_start + duration;
@@ -4612,7 +4703,7 @@ fn pip_overlay_chain(
         let video_label = match (pip.cutout_path.as_ref(), pip.cutout_background.as_ref()) {
             (Some(_), Some(bg)) => {
                 let out = format!("pip{stage_index}bgo");
-                let bg_chain = cutout_background_chain(pip, bg, &video_label, &format!("pip{stage_index}"), &out);
+                let bg_chain = cutout_background_chain(pip, bg, &video_label, &format!("pip{stage_index}"), &out, fps);
                 if bg_chain.is_empty() {
                     video_label
                 } else {
@@ -4630,7 +4721,7 @@ fn pip_overlay_chain(
         });
         let moving = match (pip.mask_motion.as_ref(), pip.mask_motion_input) {
             (Some(motion), Some(input)) => {
-                chain.push_str(&moving_mask_chain(pip, motion, input, &t, &format!("{t}mv")));
+                chain.push_str(&moving_mask_chain(pip, motion, input, &t, &format!("{t}mv"), fps));
                 Some(format!("{t}mv"))
             }
             _ => None,
@@ -4970,7 +5061,7 @@ fn css_op_from_spec(spec: &CssOpSpec) -> Option<CssColorOp> {
 // window and box (trim + crop) so nothing outside either is ever processed, then laid back over
 // the untouched picture - weighted by its mask, opacity and fades.
 #[allow(clippy::too_many_arguments)]
-fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize, i64, i64)>, (fw, fh): (i64, i64), current: &str, tag: &str, out: &str) -> String {
+fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize, i64, i64)>, (fw, fh): (i64, i64), current: &str, tag: &str, out: &str, fps: f64) -> String {
     // The frontend renders the mask on even edges inside the frame (4:2:0 chroma can only be
     // cropped on even pixels); kept that way here whatever arrives, the mask scaled to match.
     let moving = mask_input.is_some() && layer.mask_keyframes.as_ref().is_some_and(|k| !k.is_empty());
@@ -5023,7 +5114,7 @@ fn adjustment_layer_chain(layer: &AdjustmentLayerSpec, mask_input: Option<(usize
             let (kx, ky) = (keyframe_expr(kfs, "t", |k| k.x), keyframe_expr(kfs, "t", |k| k.y));
             let negate = if layer.mask_invert { ",negate" } else { "" };
             graph.push_str(&format!(
-                "color=c=black:s={fw}x{fh}:r={OVERLAY_INPUT_FPS}:d={d:.3},setpts=PTS+{start:.4}/TB,format=yuv420p[{tag}mc];\
+                "color=c=black:s={fw}x{fh}:r={fps}:d={d:.3},setpts=PTS+{start:.4}/TB,format=yuv420p[{tag}mc];\
                  [{input}:v]format=yuv420p,setpts=PTS-STARTPTS+{start:.4}/TB[{tag}mp];\
                  [{tag}mc][{tag}mp]overlay=x='{kx}':y='{ky}':eof_action=repeat,format=gray{negate}[{tag}mk];[{cur}][{tag}mk]alphamerge[{tag}a3];",
                 d = end - start + 0.1
@@ -7142,6 +7233,8 @@ pub async fn export_trimmed_video(
     // Keyboard-shortcut chips (keystrokes.ts) as a sprite track on the output timeline, over every
     // overlay and under the captions. None = none.
     keystrokes: Option<SpriteTrack>,
+    // Stage scenes rendered for this export (StageLayerSpec); None = none.
+    stage_layers: Option<Vec<StageLayerSpec>>,
     // Set by the background export queue (exportQueue.ts): the run gets its own cancel state
     // (cancel_export_job), progress events keyed "export-job:<id>", a live preview frame
     // (export-job-preview events) and below-normal CPU priority so editing stays smooth meanwhile.
@@ -7177,6 +7270,14 @@ pub async fn export_trimmed_video(
         }
     }
     let (quality_preset, quality_crf) = resolve_export_quality(quality.as_deref());
+    // The video's rate (export_video_fps): transitions pin every segment to it, and overlays animate
+    // at overlay_rate of it - the rate the editor drew their frame sequences at (get_export_frame_rate).
+    let video_fps = {
+        let ffprobe_path = get_ffprobe_path(&app_handle)?;
+        let paths: Vec<String> = segments.iter().map(|s| s.source_path.clone()).collect();
+        blocking(move || export_video_fps(&ffprobe_path, paths.iter().map(String::as_str))).await?
+    };
+    let overlay_fps = overlay_rate(video_fps);
 
     // The primary video's OWN audio level (distinct from any audio overlay's own volume/muted,
     // which are separate mixed-in tracks) - 0.0 when muted, otherwise whatever the editor's track
@@ -7241,15 +7342,15 @@ pub async fn export_trimmed_video(
     let total_duration: f64 = segments.iter().map(segment_output_duration).sum();
     let mut temp_overlay_paths: Vec<PathBuf> = Vec::new();
     for (i, ov) in overlays.iter().enumerate() {
-        // An animated overlay reads its own frame sequence at the overlay rate - it starts at
-        // timestamp 0 and is shifted to start_time in the filter graph (see the overlay loop).
+        // An animated overlay reads its own frame sequence at the rate it was drawn at - it starts
+        // at timestamp 0 and is shifted to start_time in the filter graph (see the overlay loop).
         if let Some(frames) = &ov.frames {
             match write_temp_overlay_sequence(frames, i, &mut temp_overlay_paths) {
                 Ok(pattern) => inputs.push(InputSpec {
                     path: pattern,
                     pre_args: vec![
                         "-framerate".into(),
-                        format!("{}", OVERLAY_INPUT_FPS),
+                        format!("{}", frames.rate()),
                         "-start_number".into(),
                         "0".into(),
                     ],
@@ -7279,7 +7380,7 @@ pub async fn export_trimmed_video(
         temp_overlay_paths.push(path.clone());
         // -loop 1 turns the single PNG into a stream that lasts only as long as the overlay is on
         // screen; the graph shifts it to start at start_time (like a frame sequence). Looping it
-        // for the whole output instead decoded the PNG at 30fps for the entire video, per
+        // for the whole output instead decoded the PNG at the overlay rate for the entire video, per
         // overlay - most of that only to be hidden by the overlay's enable window.
         inputs.push(InputSpec {
             path: path.to_string_lossy().to_string(),
@@ -7287,7 +7388,7 @@ pub async fn export_trimmed_video(
                 "-loop".into(),
                 "1".into(),
                 "-framerate".into(),
-                format!("{}", OVERLAY_INPUT_FPS),
+                format!("{}", overlay_fps),
                 "-t".into(),
                 format!("{:.3}", (ov.end_time - ov.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
             ],
@@ -7323,7 +7424,7 @@ pub async fn export_trimmed_video(
                         "-loop".into(),
                         "1".into(),
                         "-framerate".into(),
-                        format!("{}", OVERLAY_INPUT_FPS),
+                        format!("{}", overlay_fps),
                         "-t".into(),
                         format!("{:.3}", (bv.end_time - bv.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
                     ],
@@ -7384,6 +7485,16 @@ pub async fn export_trimmed_video(
         }
     }
 
+    // Stage scenes: each its stored frames as an image sequence, one frame per timebase tick.
+    let stage_layers = stage_layers.unwrap_or_default();
+    let stage_inputs: Vec<usize> = stage_layers
+        .iter()
+        .map(|layer| {
+            inputs.push(InputSpec { path: layer.pattern.clone(), pre_args: vec!["-framerate".into(), format!("{}", layer.fps), "-start_number".into(), "0".into()] });
+            inputs.len() - 1
+        })
+        .collect();
+
     // Adjustment layers' region masks, after everything else (no index arithmetic above changes):
     // (input index, mask width, mask height) per layer that has one.
     let mut adjustment_masks: Vec<Option<(usize, i64, i64)>> = Vec::with_capacity(adjustment_layers.len());
@@ -7414,7 +7525,7 @@ pub async fn export_trimmed_video(
                 "-loop".into(),
                 "1".into(),
                 "-framerate".into(),
-                format!("{}", OVERLAY_INPUT_FPS),
+                format!("{}", overlay_fps),
                 "-t".into(),
                 format!("{:.3}", (layer.end_time - layer.start_time).clamp(0.01, total_duration.max(0.01)) + 0.1),
             ],
@@ -7455,7 +7566,7 @@ pub async fn export_trimmed_video(
         pip.mask_motion_input = Some(inputs.len());
         inputs.push(InputSpec {
             path: path.to_string_lossy().to_string(),
-            pre_args: vec!["-loop".into(), "1".into(), "-framerate".into(), format!("{}", OVERLAY_INPUT_FPS), "-t".into(), format!("{:.3}", (pip.end_time - pip.start_time).max(0.01) + 0.1)],
+            pre_args: vec!["-loop".into(), "1".into(), "-framerate".into(), format!("{}", overlay_fps), "-t".into(), format!("{:.3}", (pip.end_time - pip.start_time).max(0.01) + 0.1)],
         });
     }
     // Cut-out backgrounds that are pictures - single frames too, like the masks.
@@ -7497,7 +7608,8 @@ pub async fn export_trimmed_video(
         None => None,
     };
 
-    let has_video_overlays = !overlays.is_empty();
+    // Stage scenes are drawn over the picture like any overlay - none of the copy-the-source fast paths.
+    let has_video_overlays = !overlays.is_empty() || !stage_layers.is_empty();
     let has_blur_overlays = !blur_overlays.is_empty();
     let has_audio_overlays = !audio_overlays.is_empty();
     let has_pip_overlays = !pip_overlays.is_empty();
@@ -7878,17 +7990,8 @@ pub async fn export_trimmed_video(
             // rate, current rate of 1/0 is invalid", even though the first one alone works fine) -
             // so every segment gets an explicit `fps=` up front, using the first segment's own
             // source file's frame rate as the shared target (screen recordings from this app are
-            // effectively always one consistent rate throughout a session either way).
-            // The first VIDEO segment's rate - an image has no rate of its own to offer (ffprobe
-            // reports image2's arbitrary 25), so an all-image timeline uses IMAGE_SEGMENT_FPS.
-            let target_fps = match segments.iter().find(|s| !is_still_image_path(&s.source_path)) {
-                Some(seg) => {
-                    let ffprobe_path = ffprobe_path.clone();
-                    let source_path = seg.source_path.clone();
-                    blocking(move || probe_frame_rate(&ffprobe_path, &source_path)).await?
-                }
-                None => IMAGE_SEGMENT_FPS,
-            };
+            // effectively always one consistent rate throughout a session either way) - video_fps.
+            let target_fps = video_fps;
 
             // `settb=AVTB` too: xfade also demands both inputs share one timebase, but a plain
             // 2-way `concat` fold step (a boundary with no transition) outputs AVTB (1/1000000)
@@ -7991,7 +8094,7 @@ pub async fn export_trimmed_video(
                     continue;
                 }
                 let out = format!("adj{i}out");
-                filter.push_str(&adjustment_layer_chain(layer, adjustment_masks[i], frame, current_label, &format!("adj{i}"), &out));
+                filter.push_str(&adjustment_layer_chain(layer, adjustment_masks[i], frame, current_label, &format!("adj{i}"), &out, overlay_fps));
                 *current_label = out;
             }
         };
@@ -8002,7 +8105,14 @@ pub async fn export_trimmed_video(
         // stackOrder), so each composites over the ones before it.
         for (i, pip) in pip_overlays.iter().enumerate() {
             let out_label = format!("pip{}out", i);
-            filter.push_str(&pip_overlay_chain(pip, pip.video_input, i, &current_label, &out_label, adjust_frame));
+            filter.push_str(&pip_overlay_chain(pip, pip.video_input, i, &current_label, &out_label, adjust_frame, overlay_fps));
+            current_label = out_label;
+        }
+        // Stage scenes over the video and its tracks, beneath blur regions, pictures and text - the
+        // preview mounts StageLayer right there too (Dashboard.tsx).
+        for (i, layer) in stage_layers.iter().enumerate() {
+            let out_label = format!("stg{i}out");
+            filter.push_str(&stage_layer_chain(layer, stage_inputs[i], &current_label, &format!("stg{i}"), &out_label));
             current_label = out_label;
         }
         for (i, bv) in blur_overlays.iter().enumerate() {
@@ -8028,6 +8138,9 @@ pub async fn export_trimmed_video(
                     continue;
                 }
                 let mut source_label = format!("{}:v", overlay_input_base + i);
+                // The rate this overlay's input runs at - its frame sequence's own, else the rate a
+                // still is looped at (see the inputs above).
+                let input_fps = ov.frames.as_ref().map_or(overlay_fps, OverlayFrames::rate);
                 // Every overlay input (a frame sequence, or a still looped for its own window) starts
                 // at timestamp 0 - shifted to start at the overlay's own start_time, so everything
                 // below (fade st=, the opacity commands, the enable window) reads absolute output times.
@@ -8070,7 +8183,7 @@ pub async fn export_trimmed_video(
                     }
                 };
                 // Scale per frame - `n` counts this input's frames, which start at start_time.
-                let frame_time = format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS);
+                let frame_time = format!("({:.4}+n/{})", ov.start_time, input_fps);
                 // A flip squashes the width on top (overlay_flip_sx_expr).
                 let squash_at = |tv: &str| flips.then(|| overlay_flip_sx_expr(ov.start_time, ov.end_time, tv));
                 if let Some(s) = scale_at(&frame_time) {
@@ -8089,7 +8202,7 @@ pub async fn export_trimmed_video(
                         let faded = format!("ovkfa{}", i);
                         filter.push_str(&format!(
                             "[{composited_label}]format=rgba,{},colorchannelmixer@ka{i}=aa=1[{faded}];",
-                            opacity_commands(kfs, &format!("colorchannelmixer@ka{i}"), ov.start_time, ov.end_time)
+                            opacity_commands(kfs, &format!("colorchannelmixer@ka{i}"), ov.start_time, ov.end_time, input_fps)
                         ));
                         composited_label = faded;
                     }
@@ -8112,7 +8225,7 @@ pub async fn export_trimmed_video(
                 // when it stays put, the whole frame when anything moves it.
                 if let (Some(mode), Some(frame), Some((w, h))) = (ov.blend_mode.as_deref().and_then(blend_mode_ffmpeg), adjust_frame, overlay_layer_size(ov)) {
                     let moving = kfs.is_some() || animation.starts_with("slide") || animation == "drop" || scale_at("t").is_some();
-                    let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: OVERLAY_INPUT_FPS };
+                    let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: input_fps };
                     filter.push_str(&blend_composite(&current_label, &layer, frame, mode, ov.start_time, ov.end_time, &format!("ovb{i}"), &next_label));
                     *current_label = next_label;
                     continue;
@@ -8404,6 +8517,12 @@ pub async fn export_trimmed_video(
 
     for temp_path in &temp_overlay_paths {
         let _ = std::fs::remove_file(temp_path);
+    }
+    // A Stage scene's frames live in a folder of their own.
+    for layer in &stage_layers {
+        if let Some(dir) = Path::new(&layer.pattern).parent().filter(|d| d.file_name().is_some_and(|n| n.to_string_lossy().starts_with("briefcast_stage_"))) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     finish_export(&app_handle, result?, loudness_lufs, loudness_ceiling, &chapters).await
@@ -9664,7 +9783,7 @@ mod tests {
 
     #[test]
     fn an_overlay_frame_sequence_counts_as_present_when_its_first_frame_is() {
-        let frames = OverlayFrames { unique: vec![BASE64.encode([137u8, 80, 78, 71])], sequence: vec![0, 0, 0] };
+        let frames = OverlayFrames { unique: vec![BASE64.encode([137u8, 80, 78, 71])], sequence: vec![0, 0, 0], fps: None };
         let mut created = Vec::new();
         let pattern = write_temp_overlay_sequence(&frames, 9_999, &mut created).expect("frames written");
         let input = InputSpec { path: pattern.clone(), pre_args: vec!["-framerate".into(), "30".into(), "-start_number".into(), "0".into()] };
@@ -9936,13 +10055,36 @@ mod tests {
     }
 
     #[test]
+    fn overlays_animate_at_the_videos_rate_up_to_sixty() {
+        assert_eq!(overlay_rate(60.0), 60.0);
+        assert_eq!(overlay_rate(30000.0 / 1001.0), 30000.0 / 1001.0);
+        assert_eq!(overlay_rate(25.0), 25.0);
+        assert_eq!(overlay_rate(120.0), MAX_OVERLAY_FPS);
+        assert_eq!(overlay_rate(0.0), DEFAULT_OVERLAY_FPS);
+        assert_eq!(overlay_rate(f64::NAN), DEFAULT_OVERLAY_FPS);
+        // A sequence keeps the rate it was drawn at; one from before the rate was sent is 30fps.
+        let frames = |fps: Option<f64>| OverlayFrames { unique: vec![], sequence: vec![], fps };
+        assert_eq!(frames(Some(60.0)).rate(), 60.0);
+        assert_eq!(frames(None).rate(), DEFAULT_OVERLAY_FPS);
+        assert_eq!(frames(Some(240.0)).rate(), MAX_OVERLAY_FPS);
+        assert_eq!(frames(Some(-1.0)).rate(), DEFAULT_OVERLAY_FPS);
+        let parsed: OverlayFrames = serde_json::from_str(r#"{"unique":[],"sequence":[]}"#).unwrap();
+        assert_eq!(parsed.rate(), DEFAULT_OVERLAY_FPS);
+        // An all-image timeline has no video rate to follow.
+        assert_eq!(export_video_fps(&PathBuf::from("ffprobe-not-needed"), ["a.png", "b.HEIC"]), IMAGE_SEGMENT_FPS);
+    }
+
+    #[test]
     fn keyframed_opacity_is_per_frame_commands_only_where_it_changes() {
         let kf = |time: f64, opacity: f64| OverlayKeyframe { time, x: 0.0, y: 0.0, scale: 1.0, opacity, easing: "linear".into() };
-        let cmds = opacity_commands(&[kf(10.0, 0.0), kf(11.0, 1.0)], "colorchannelmixer@ka0", 10.0, 60.0);
+        let cmds = opacity_commands(&[kf(10.0, 0.0), kf(11.0, 1.0)], "colorchannelmixer@ka0", 10.0, 60.0, 30.0);
         assert!(cmds.starts_with("sendcmd=c='10.0000 colorchannelmixer@ka0 aa 0.0000;"), "{cmds}");
         assert!(cmds.ends_with("11.0000 colorchannelmixer@ka0 aa 1.0000'"), "{cmds}");
         // 31 frames across the fade, nothing for the 49s it then holds.
         assert_eq!(cmds.matches("aa ").count(), 31, "{cmds}");
+        // A 60fps overlay fades in every one of its frames.
+        let cmds60 = opacity_commands(&[kf(10.0, 0.0), kf(11.0, 1.0)], "colorchannelmixer@ka0", 10.0, 60.0, 60.0);
+        assert_eq!(cmds60.matches("aa ").count(), 61, "{cmds60}");
         assert!((keyframe_value(&[kf(0.0, 0.0), kf(2.0, 1.0)], 0.5, |k| k.opacity) - 0.25).abs() < 1e-9);
     }
 
@@ -10283,6 +10425,7 @@ mod tests {
             animation: "none".to_string(),
             keyframes: None,
             frames: None,
+            on_frame: false,
         };
         assert_eq!(
             overlay_position_expr(&ov, "none"),
@@ -10306,6 +10449,7 @@ mod tests {
             animation: "slide-left".to_string(),
             keyframes: None,
             frames: None,
+            on_frame: false,
         };
         let (x, y) = overlay_position_expr(&ov, "slide-left");
         assert_eq!(y, "200"); // y untouched
@@ -11001,31 +11145,31 @@ mod tests {
         };
         let dim = vec![CssOpSpec { op: "brightness".into(), value: 0.5 }];
         let a = adj(dim.clone(), &|_| {});
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a0", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a0", "out", 30.0));
         let px = frame(&[base.clone()], graph.trim_end_matches(';'), 1.0);
         near(at(&px, 160, 120), [100.0, 50.0, 25.0], 3.0, "brightness");
         let px = frame(&[base.clone()], graph.trim_end_matches(';'), 0.2);
         near(at(&px, 160, 120), base_rgb, 3.0, "brightness before its window");
         // Half opacity mixes halfway; a fade-in is halfway up half-way through it.
         let a = adj(dim.clone(), &|a| a.opacity = 0.5);
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a1", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a1", "out", 30.0));
         near(at(&frame(&[base.clone()], graph.trim_end_matches(';'), 1.0), 160, 120), [150.0, 75.0, 37.5], 3.0, "opacity");
         let a = adj(dim.clone(), &|a| a.fade_in = 0.5);
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a2", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a2", "out", 30.0));
         near(at(&frame(&[base.clone()], graph.trim_end_matches(';'), 0.75), 160, 120), [150.0, 75.0, 37.5], 6.0, "fade in");
         // A mask confines it: the left half only.
         let mask_png = tmp.join("mask.png");
         run(&s(&["-f", "lavfi", "-i", "color=c=white:s=160x240,format=gray", "-frames:v", "1", &mask_png.to_string_lossy()]));
         let mask = s(&["-loop", "1", "-framerate", "30", "-t", "1.1", "-i", &mask_png.to_string_lossy()]);
         let a = adj(dim.clone(), &|_| {});
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, Some((1, 160, 240)), (320, 240), "base", "a3", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, Some((1, 160, 240)), (320, 240), "base", "a3", "out", 30.0));
         let px = frame(&[base.clone(), mask.clone()], graph.trim_end_matches(';'), 1.0);
         near(at(&px, 40, 120), [100.0, 50.0, 25.0], 3.0, "masked in");
         near(at(&px, 280, 120), base_rgb, 3.0, "masked out");
         // Blur: a black|white edge comes out as the Gaussian's integral - 1 sigma in, ~84%.
         let edge = s(&["-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=3,drawbox=x=160:y=0:w=160:h=240:color=white:t=fill"]);
         let a = adj(vec![], &|a| a.blur_sigma = Some(10.0));
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a4", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a4", "out", 30.0));
         let px = frame(&[edge.clone()], graph.trim_end_matches(';'), 1.0);
         let phi = |z: f64| 0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2));
         for x in [150usize, 155, 160, 165, 170, 180] {
@@ -11034,7 +11178,7 @@ mod tests {
         }
         // A vignette layer and a colour look together still render.
         let a = adj(vec![CssOpSpec { op: "saturate".into(), value: 1.6 }, CssOpSpec { op: "hue-rotate".into(), value: 10.0 }], &|a| a.vignette = Some(0.8));
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a5", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&a, None, (320, 240), "base", "a5", "out", 30.0));
         frame(&[base.clone()], graph.trim_end_matches(';'), 1.0);
 
         // A keyframed blur region lands where its keyframes put it.
@@ -11094,7 +11238,7 @@ mod tests {
             mask_motion_input: None,
         };
         let long_base = s(&["-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=30:d=6"]);
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         let px = frame(&[long_base.clone(), pip_src.clone()], graph.trim_end_matches(';'), 4.0);
         let reference = |t: f64| run(&s(&["-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=10", "-ss", &format!("{t:.3}"), "-frames:v", "1", "-vf", "scale=160:120,format=yuv420p,format=rgb24", "-f", "rawvideo", "pipe:1"]));
         let mse = |r: &[u8]| {
@@ -11113,7 +11257,7 @@ mod tests {
         assert!(right < 60.0 && right * 4.0 < wrong, "pip timing: mse {right} at the right moment vs {wrong}");
         // ...and blends: screen over the base.
         let pip = PipOverlay { blend_mode: Some("screen".into()), ..pip };
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         frame(&[long_base.clone(), pip_src.clone()], graph.trim_end_matches(';'), 4.0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -11205,7 +11349,7 @@ mod tests {
             mask_motion: None,
             mask_motion_input: None,
         };
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         let frame = |t: f64| -> Vec<u8> {
             let mut args: Vec<String> = [base.clone(), screen.clone(), mask.clone()].concat();
             args.extend(s(&["-filter_complex", graph.trim_end_matches(';'), "-map", "[out]", "-ss"]));
@@ -11289,7 +11433,7 @@ mod tests {
             mask_motion: None,
             mask_motion_input: None,
         };
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         let px = run(&[
             "-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=25:d=2",
             "-c:v", "libvpx-vp9", "-i", &cutout.to_string_lossy(),
@@ -11301,7 +11445,7 @@ mod tests {
         near(at(130, 60), [128.0, 128.0, 128.0], "the opaque half shows the cut-out");
         // With a colour behind the person, the see-through half shows that colour instead.
         let pip = PipOverlay { cutout_background: Some(CutoutBackgroundSpec { kind: "color".into(), color: Some("#2050e0".into()), image_base64: None, blur_sigma: None, blur_margin: None, source_crop: None }), ..pip };
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         let px = run(&[
             "-f", "lavfi", "-i", "color=c=0xC86432:s=320x240:r=25:d=2",
             "-c:v", "libvpx-vp9", "-i", &cutout.to_string_lossy(),
@@ -11350,7 +11494,7 @@ mod tests {
             opacity: 1.0, fade_in: 0.0, fade_out: 0.0, mask_data_base64: None, mask_x: 0, mask_y: 0,
             mask_keyframes: Some(vec![kf(0.5, 20.0, 100.0), kf(1.5, 220.0, 100.0)]), mask_invert: true, fill: None,
         };
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&spot, Some((1, 40, 40)), (320, 240), "base", "spot", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&spot, Some((1, 40, 40)), (320, 240), "base", "spot", "out", 30.0));
         let sq = square.to_string_lossy().to_string();
         let px = frame_at(&["-f", "lavfi", "-i", base, "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq], graph.trim_end_matches(';'), "1.0");
         near(at(&px, 140, 120), orange, "inside the spotlight at mid-move");
@@ -11359,7 +11503,7 @@ mod tests {
 
         // Fill: the whole frame one colour.
         let fill = AdjustmentLayerSpec { color_ops: vec![], mask_keyframes: None, mask_invert: false, fill: Some("#2050e0".into()), ..spot };
-        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&fill, None, (320, 240), "base", "fill", "out"));
+        let graph = format!("[0:v]format=yuv420p[base];{}", adjustment_layer_chain(&fill, None, (320, 240), "base", "fill", "out", 30.0));
         let px = frame_at(&["-f", "lavfi", "-i", base], graph.trim_end_matches(';'), "1.0");
         near(at(&px, 160, 120), [32.0, 80.0, 224.0], "filled");
 
@@ -11376,7 +11520,7 @@ mod tests {
             ], invert: false }),
             mask_motion_input: Some(2),
         };
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&pip, 1, 0, "base", "out", Some((320, 240)), 30.0));
         let px = frame_at(&["-f", "lavfi", "-i", base, "-f", "lavfi", "-i", "color=c=0x808080:s=160x120:r=30:d=3", "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq], graph.trim_end_matches(';'), "1.0");
         near(at(&px, 80, 60), [128.0, 128.0, 128.0], "the layer shows inside the mask at mid-move");
         near(at(&px, 20, 60), orange, "and not where the mask started");
@@ -11395,13 +11539,13 @@ mod tests {
             video_input: 1, audio_input: None, background_input: None,
         };
         let inputs = ["-f", "lavfi", "-i", base, "-f", "lavfi", "-i", "color=c=0x808080:s=160x120:r=30:d=3", "-loop", "1", "-framerate", "30", "-t", "3.1", "-i", &sq];
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(false), 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(false), 1, 0, "base", "out", Some((320, 240)), 30.0));
         let first = frame_at(&inputs, graph.trim_end_matches(';'), "0");
         for (x, y) in [(79, 59), (80, 60), (81, 61), (80, 59)] {
             near(at(&first, x, y), orange, "nothing of the layer on the closed iris's first frame");
         }
         near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "1.2"), 80, 60), [128.0, 128.0, 128.0], "open after the iris");
-        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(true), 1, 0, "base", "out", Some((320, 240))));
+        let graph = format!("[0:v]format=yuv420p[base];{}", pip_overlay_chain(&iris(true), 1, 0, "base", "out", Some((320, 240)), 30.0));
         near(at(&frame_at(&inputs, graph.trim_end_matches(';'), "0"), 80, 60), [128.0, 128.0, 128.0], "inverted: the whole layer on the first frame");
         let _ = std::fs::remove_dir_all(&tmp);
     }

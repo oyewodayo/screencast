@@ -2042,20 +2042,20 @@ export function drawAssetFrame(ctx: CanvasRenderingContext2D, asset: OverlayAsse
 // Which distinct picture frame k (of `total`) is - equal keys mean identical frames, so export
 // only renders and ships each key once. Entering/leaving frames are always unique; after that a
 // still element is one frame, a looping one repeats every LOOP_PERIOD_SEC, and a timed one
-// (progress, countdown) is different every frame.
-export function assetFrameKey(asset: OverlayAsset, k: number, total: number, duration: number): string {
+// (progress, countdown) is different every frame. `fps`: the rate frames are drawn at.
+export function assetFrameKey(asset: OverlayAsset, k: number, total: number, duration: number, fps = ASSET_FPS): string {
   const entry = assetEntry(asset.kind);
-  const e = Math.ceil(entranceSeconds(asset, duration) * ASSET_FPS);
+  const e = Math.ceil(entranceSeconds(asset, duration) * fps);
   const x = asset.exit ? e : 0;
-  const settled = Math.max(e, Math.ceil((entry.settleSec ?? 0) * ASSET_FPS));
+  const settled = Math.max(e, Math.ceil((entry.settleSec ?? 0) * fps));
   if (k < settled || k >= total - x) return `f${k}`;
   // A glitch's tear reads pixels from the canvas, so it can't be keyed - but it only runs while entering.
-  if (entry.idleKey && asset.loop === "none") return `i${entry.idleKey(asset, k / ASSET_FPS, duration)}`;
+  if (entry.idleKey && asset.loop === "none") return `i${entry.idleKey(asset, k / fps, duration)}`;
   const motion = entry.motion;
   const loops = asset.loop !== "none" || motion === "periodic";
   if (motion === "timed") return `f${k}`;
   if (!loops) return "still";
-  return `p${k % Math.round(LOOP_PERIOD_SEC * ASSET_FPS)}`;
+  return `p${k % Math.round(LOOP_PERIOD_SEC * fps)}`;
 }
 
 export interface RenderedAssetFrames {
@@ -2072,7 +2072,9 @@ export interface RenderedAssetFrames {
 export async function renderAssetFrames(
   overlay: { asset?: OverlayAsset; x: number; y: number; width: number; height: number; opacity: number; rotation?: number; flipHorizontal?: boolean; flipVertical?: boolean; shadow?: boolean; startTime: number; endTime: number },
   framePixelWidth: number,
-  framePixelHeight: number
+  framePixelHeight: number,
+  // The export's overlay rate (get_export_frame_rate).
+  fps = ASSET_FPS
 ): Promise<RenderedAssetFrames | null> {
   const asset = overlay.asset;
   if (!asset) return null;
@@ -2099,19 +2101,19 @@ export async function renderAssetFrames(
 
   // A sticker's face and picture have to be in before the first frame is drawn.
   if (isStickerKind(asset.kind)) await loadStickerResources(asset);
-  const total = Math.max(1, Math.ceil(duration * ASSET_FPS));
+  const total = Math.max(1, Math.ceil(duration * fps));
   const keyIndex = new Map<string, number>();
   const unique: string[] = [];
   const sequence: number[] = [];
   for (let k = 0; k < total; k++) {
-    const key = assetFrameKey(asset, k, total, duration);
+    const key = assetFrameKey(asset, k, total, duration, fps);
     let idx = keyIndex.get(key);
     if (idx === undefined) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, cw, ch);
       ctx.translate(cw / 2, ch / 2);
       ctx.globalAlpha = overlay.opacity;
-      drawAssetFrame(ctx, asset, w, h, k / ASSET_FPS, duration, {
+      drawAssetFrame(ctx, asset, w, h, k / fps, duration, {
         rotationDeg: overlay.rotation,
         flipHorizontal: overlay.flipHorizontal,
         flipVertical: overlay.flipVertical,

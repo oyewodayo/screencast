@@ -21,16 +21,17 @@ import { IMAGE_REVEAL_FPS, ImageRevealSettings, ImageRevealState, imageRevealSta
 
 // A text overlay with a title reveal (textReveal.ts) as the PNG frame sequence export burns in
 // (OverlayFrames, conversion.rs) - each distinct moment once, the fully-typed title once.
+// `fps`: the export's overlay rate (get_export_frame_rate).
 export async function renderTextRevealFrames(
   overlay: TextOverlay,
   framePixelWidth: number,
-  framePixelHeight: number
+  framePixelHeight: number,
+  fps = 30
 ): Promise<{ unique: string[]; sequence: number[]; xPx: number; yPx: number } | null> {
   if (!isTextReveal(overlay.animation)) return null;
   const kind = overlay.animation;
   const duration = overlay.endTime - overlay.startTime;
   if (duration <= 0) return null;
-  const fps = 30;
   const total = Math.max(1, Math.ceil(duration * fps));
   const unique: string[] = [];
   const sequence: number[] = [];
@@ -520,7 +521,8 @@ export const imageOverlayAnimates = (o: ImageOverlay): boolean => !!o.reveal || 
 export async function renderImageRevealFrames(
   overlay: ImageOverlay,
   framePixelWidth: number,
-  framePixelHeight: number
+  framePixelHeight: number,
+  fps = IMAGE_REVEAL_FPS
 ): Promise<{ unique: string[]; sequence: number[]; xPx: number; yPx: number } | null> {
   const settings = overlay.reveal;
   const duration = overlay.endTime - overlay.startTime;
@@ -532,14 +534,14 @@ export async function renderImageRevealFrames(
   const boxW = Math.max(1, Math.round(overlay.width * framePixelWidth));
   const boxH = Math.max(1, Math.round(overlay.height * framePixelHeight));
   const pic = mask ? revealMaskCanvas(mask, boxW, boxH, false) : null;
-  const total = Math.max(1, Math.ceil(duration * IMAGE_REVEAL_FPS));
+  const total = Math.max(1, Math.ceil(duration * fps));
   const unique: string[] = [];
   const sequence: number[] = [];
   const keyIndex = new Map<string, number>();
   let origin: { xPx: number; yPx: number } | null = null;
   for (let k = 0; k < total; k++) {
-    const t = k / IMAGE_REVEAL_FPS;
-    const state = settings ? imageRevealState(settings, t, duration) : undefined;
+    const t = k / fps;
+    const state = settings ? imageRevealState(settings, t, duration, fps) : undefined;
     const key = `${state?.key ?? "still"}|${mask ? revealCoverageKey(mask, t, duration, boxW, boxH) : ""}`;
     let idx = keyIndex.get(key);
     if (idx === undefined) {

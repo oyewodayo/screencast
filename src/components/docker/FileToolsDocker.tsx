@@ -114,6 +114,8 @@ interface FileToolsDockerProps {
   onSelectBlurOverlay?: (id: string | null) => void;
   selectedAdjustmentId?: string | null;
   onSelectAdjustment?: (id: string | null) => void;
+  selectedSceneId?: string | null;
+  onSelectScene?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
   // Video-only: PiP-overlay selection/placement state, same threading as the overlay props above.
@@ -171,6 +173,8 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   onSelectBlurOverlay,
   selectedAdjustmentId,
   onSelectAdjustment,
+  selectedSceneId,
+  onSelectScene,
   isPlacingBlur,
   onToggleArmPlaceBlur,
   selectedPipOverlayId,
@@ -225,6 +229,8 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         onSelectBlurOverlay={onSelectBlurOverlay}
         selectedAdjustmentId={selectedAdjustmentId}
         onSelectAdjustment={onSelectAdjustment}
+        selectedSceneId={selectedSceneId}
+        onSelectScene={onSelectScene}
         isPlacingBlur={isPlacingBlur}
         onToggleArmPlaceBlur={onToggleArmPlaceBlur}
         selectedPipOverlayId={selectedPipOverlayId}

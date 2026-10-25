@@ -97,6 +97,11 @@ const ICON_DEFS = [
   { value: "dollar", label: "Money", group: "Things", keywords: "price cost pay revenue", paths: ["M12 2v20", "M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"] },
   { value: "coffee", label: "Coffee", group: "Things", keywords: "break cafe drink", paths: ["M17 8h1a4 4 0 1 1 0 8h-1", "M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z", "M6 2v2", "M10 2v2", "M14 2v2"] },
   { value: "wifi", label: "Online", group: "Things", keywords: "wifi internet live connected", paths: ["M5 12.5a10 10 0 0 1 14 0", "M8.5 16a5 5 0 0 1 7 0", "M12 19.5h.01", "M2 9a15 15 0 0 1 20 0"] },
+  { value: "awake", label: "Awake eye", group: "Things", keywords: "eye lashes watch awake insomnia see", paths: ["M2.5 14s3.4-5.5 9.5-5.5s9.5 5.5 9.5 5.5s-3.4 5.5-9.5 5.5S2.5 14 2.5 14Z", circle(12, 14, 2.6), "M12 4.2v2", "M7.4 5.2l.9 1.8", "M16.6 5.2l-.9 1.8", "M3.6 7.6l1.5 1.3", "M20.4 7.6l-1.5 1.3"] },
+  { value: "battery", label: "Battery", group: "Things", keywords: "power charge energy low", paths: ["M4 7h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z", "M22 10.5v3", "M6 10.5v3"] },
+  { value: "laptop", label: "Laptop", group: "Things", keywords: "computer mac notebook device", paths: ["M5 5h14a1 1 0 0 1 1 1v10H4V6a1 1 0 0 1 1-1Z", "M2 19h20"] },
+  { value: "terminal", label: "Terminal", group: "Things", keywords: "command shell console code cli", paths: ["M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z", "M7 9l3 3l-3 3", "M12.5 15H17"] },
+  { value: "pause", label: "Pause", group: "Things", keywords: "stop hold wait", paths: ["M9 6v12", "M15 6v12"] },
   { value: "percent", label: "Percent", group: "Things", keywords: "discount sale off rate", paths: ["M19 5L5 19", circle(6.5, 6.5, 2.5), circle(17.5, 17.5, 2.5)] },
   // signs
   { value: "ok-circle", label: "Approved", group: "Signs", keywords: "check done success", paths: [circle(12, 12, 10), "M8 12.5l2.7 2.7L16.5 9.5"] },

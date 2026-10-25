@@ -22,6 +22,15 @@ describe("assetFrameKey", () => {
     expect(long).toBeLessThanOrEqual(LOOP_PERIOD_SEC * ASSET_FPS + 2 * Math.ceil(entranceSeconds(asset, 12) * ASSET_FPS));
   });
 
+  it("keeps every entering frame distinct at a 60fps export's rate", () => {
+    const asset = { ...makeAsset("rectangle"), loop: "none" as const };
+    const total = 10 * 60;
+    const keys = Array.from({ length: total }, (_, k) => assetFrameKey(asset, k, total, 10, 60));
+    const entering = Math.ceil(entranceSeconds(asset, 10) * 60);
+    expect(new Set(keys).size).toBe(entering * 2 + 1);
+    expect(entering).toBe(2 * Math.ceil(entranceSeconds(asset, 10) * ASSET_FPS));
+  });
+
   it("renders every frame of a timed element", () => {
     const keys = keysFor(makeAsset("countdown"), 3);
     expect(new Set(keys).size).toBe(keys.length);
