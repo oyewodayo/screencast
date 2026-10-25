@@ -6,10 +6,10 @@
 // video when there's no sidebar to dock into. Purely presentational: VideoOverlayLayer owns all
 // state and passes values + callbacks in.
 //
-// Every control here keeps focus where it is (mousedown default prevented, sliders included) -
-// the text panel only exists while TextNoteEditor is open, and that editor commits and closes the
-// moment its textarea loses focus. The blur panel's X/Y/W/H fields are the one exception (real
-// inputs), safe there since a blur region has no editing session to end.
+// Buttons and sliders here keep focus where it is (mousedown default prevented) - the text panel
+// only exists while the text editor is open. Real inputs (a slider's typed value, the blend
+// <select>) are fine: the text panel is marked TEXT_EDIT_PANEL_ATTR, so VideoTextEditor lets focus
+// come in here without ending the edit.
 import { REVEAL_STYLES, revealStartingMask, type LayerMask, type RevealStyle } from "../../utils/layerMask";
 import { KEYFRAME_EASINGS, KEYFRAME_SNAP_SEC, KeyframeEasing, OverlayKeyframe, keyframeAt, keyframeStateAt, removeKeyframeAt, upsertKeyframe } from "../../utils/keyframes";
 import React, { useEffect, useRef, useState } from "react";
@@ -18,9 +18,12 @@ import TitleLookTile from "./TitleLookTile";
 import { TITLE_FONTS, TITLE_FONT_CATEGORIES, TitleFontCategory, loadTitleFonts, titleFont, titleFontStyle } from "../../utils/titleFonts";
 import { TITLE_STYLES, TitleStyle, wearsTitleStyle } from "../../utils/titleStyles";
 import { overlayAnimationStyle } from "../../utils/overlayAnimation";
+import { DEFAULT_TEXT_LINE_HEIGHT } from "../../utils/videoOverlayRender";
 import {
   IoArrowDown,
   IoArrowUp,
+  IoChevronDown,
+  IoChevronUp,
   IoCopyOutline,
   IoCropOutline,
   IoLocateOutline,
@@ -30,7 +33,10 @@ import {
   IoSwapVerticalOutline,
   IoTrashOutline,
 } from "react-icons/io5";
-import { MdFormatAlignCenter, MdFormatAlignJustify, MdFormatAlignLeft, MdFormatAlignRight } from "react-icons/md";
+import { TEXT_EDIT_PANEL_ATTR } from "./VideoTextEditor";
+import { MdColorize, MdFormatAlignCenter, MdFormatAlignJustify, MdFormatAlignLeft, MdFormatAlignRight } from "react-icons/md";
+import { alphaOf, parseHexInput, sameRgb, toHex, withAlpha } from "../../utils/cssColor";
+import { pickScreenColor } from "./ScreenColorPicker";
 import Slider from "../docker/Slider";
 import NumberStepper from "../docker/NumberStepper";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
@@ -41,6 +47,10 @@ import { TextAlign } from "../../utils/pdfAnnotationTypes";
 import { ImageRevealDirection, ImageRevealSettings, ImageRevealStyle } from "../../utils/imageReveal";
 import { CANVAS_TEXT_REVEALS, TEXT_REVEAL_SPEED_MAX, TEXT_REVEAL_SPEED_MIN, TextReveal, TextRevealSettings, isTextReveal, textRevealSeconds } from "../../utils/textReveal";
 import { ASSET_ENTRANCES, ASSET_LOOPS, AssetEntrance, AssetLoop, OverlayAsset, assetEntry, assetSupportsOutline, assetUsesColor2, countdownPlan } from "../../utils/videoAssets";
+import { StickerFill, isStickerKind, stickerArt, stickerAspect, stickerHasSurface, stickerIconRole, stickerTagLabel } from "../../utils/stickerAssets";
+import { EmojiPicker, IconPicker } from "./StickerPickers";
+import AssetCanvas from "./AssetCanvas";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 const keepFocus = (e: React.MouseEvent) => e.preventDefault();
 
@@ -87,9 +97,143 @@ function Segmented<T extends string>({
   );
 }
 
-// Label, slider and a live value readout on one row. The wrapper swallows mousedown's default so
-// the slider never takes focus (see this file's header).
-const SliderRow: React.FC<{
+// Press-and-hold repeat for a stepping button: one step on press, then (after a short pause) steps
+// that speed up the longer it's held. `step` returns false once there's nowhere further to go.
+const STEP_HOLD_DELAY_MS = 350;
+const STEP_HOLD_INTERVAL_MS = 70;
+const STEP_HOLD_FAST_MS = 30;
+function useHoldRepeat() {
+  const holdRef = useRef<number | null>(null);
+  const stop = () => {
+    if (holdRef.current !== null) window.clearTimeout(holdRef.current);
+    holdRef.current = null;
+  };
+  useEffect(() => stop, []);
+  const start = (e: React.PointerEvent, step: (shift: boolean) => boolean) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    stop();
+    const shift = e.shiftKey;
+    if (!step(shift)) return;
+    let ticks = 0;
+    const tick = () => {
+      ticks++;
+      if (!step(shift)) return stop();
+      holdRef.current = window.setTimeout(tick, ticks > 12 ? STEP_HOLD_FAST_MS : STEP_HOLD_INTERVAL_MS);
+    };
+    holdRef.current = window.setTimeout(tick, STEP_HOLD_DELAY_MS);
+  };
+  // Spread onto the button: press starts it, any way of letting go ends it.
+  return (step: (shift: boolean) => boolean) => ({
+    onMouseDown: keepFocus,
+    onPointerDown: (e: React.PointerEvent) => start(e, step),
+    onPointerUp: stop,
+    onPointerLeave: stop,
+    onPointerCancel: stop,
+  });
+}
+
+// The value a SliderRow shows, with a small up/down caret beside it: tap a caret to step once,
+// hold it to keep stepping (faster the longer it's held); or click the number to type one - Enter
+// (or click away) sets it, Escape leaves it, arrow keys step it (Shift for ten steps). It reads and
+// writes in the units shown - `scale` maps them to the slider's own value (100 for a 0-1 value shown
+// as a percent). The carets never take focus, so the text being edited stays open.
+export const ValueField: React.FC<{ value: number; min: number; max: number; step: number; scale: number; format: (v: number) => string; onChange: (v: number) => void; wide?: boolean }> = ({
+  value,
+  min,
+  max,
+  step,
+  scale,
+  format,
+  onChange,
+  wide,
+}) => {
+  const [draft, setDraft] = useState<string | null>(null);
+  const discardRef = useRef(false);
+  // The value as last stepped - a held caret steps from here, not from a prop a render behind.
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const hold = useHoldRepeat();
+  const clamp = (v: number) => Math.max(min, Math.min(max, v));
+  const decimals = Math.max(0, Math.min(3, -Math.floor(Math.log10(step * scale) + 1e-9)));
+  const shown = (v: number) => String(Number((v * scale).toFixed(decimals)));
+  const commit = (raw: string) => {
+    const parsed = parseFloat(raw.replace(",", ".").replace(/[^0-9.+-]/g, ""));
+    // Untouched (or Escape) changes nothing - no undo step for just clicking in and out.
+    if (!discardRef.current && raw !== shown(value) && Number.isFinite(parsed)) onChange(clamp(parsed / scale));
+    discardRef.current = false;
+    setDraft(null);
+  };
+  const nudge = (dir: 1 | -1, steps = 1): boolean => {
+    const next = clamp(Number((valueRef.current + dir * step * steps).toFixed(6)));
+    if (next === valueRef.current) return false;
+    valueRef.current = next;
+    onChange(next);
+    setDraft((d) => (d === null ? null : shown(next)));
+    return true;
+  };
+  const caret = (dir: 1 | -1) => (
+    <button
+      type="button"
+      tabIndex={-1}
+      title={dir > 0 ? "Increase (hold to keep going, Shift for ×10)" : "Decrease (hold to keep going, Shift for ×10)"}
+      disabled={dir > 0 ? value >= max : value <= min}
+      {...hold((shift) => nudge(dir, shift ? 10 : 1))}
+      className={`flex-1 w-4 flex items-center justify-center text-white/45 hover:text-white hover:bg-white/10 active:bg-blue-500/30 active:text-white disabled:opacity-25 disabled:hover:bg-transparent transition-colors ${
+        dir > 0 ? "rounded-tr-md" : "rounded-br-md border-t border-white/10"
+      }`}
+    >
+      {dir > 0 ? <IoChevronUp size={8} /> : <IoChevronDown size={8} />}
+    </button>
+  );
+  return (
+    <div className="shrink-0 flex items-stretch h-6 rounded-md bg-white/[0.05] ring-1 ring-white/10 focus-within:ring-blue-400/70 focus-within:bg-black/40 transition-colors">
+      <input
+        type="text"
+        inputMode="decimal"
+        value={draft ?? format(value)}
+        title="Type a value"
+        onFocus={(e) => {
+          setDraft(shown(value));
+          const el = e.currentTarget;
+          requestAnimationFrame(() => el.select());
+        }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => draft !== null && commit(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation(); // keep the timeline's shortcuts out of typing
+          if (e.key === "Enter") e.currentTarget.blur();
+          else if (e.key === "Escape") {
+            discardRef.current = true;
+            e.currentTarget.blur();
+          } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            e.preventDefault();
+            nudge(e.key === "ArrowUp" ? 1 : -1, e.shiftKey ? 10 : 1);
+          }
+        }}
+        className={`${wide ? "w-14" : "w-11"} min-w-0 pl-1.5 pr-1 bg-transparent text-right tabular-nums text-[11px] text-white/85 outline-none cursor-text`}
+      />
+      <div className="flex flex-col border-l border-white/10">
+        {caret(1)}
+        {caret(-1)}
+      </div>
+    </div>
+  );
+};
+
+// The display scale a SliderRow's `format` applies (1, or 100 for a fraction shown as a percent),
+// read off the format itself so every row gets a typeable value without restating it.
+const displayScale = (format: (v: number) => string, min: number, max: number): number => {
+  const probe = Math.abs(max) >= Math.abs(min) ? max : min;
+  const shown = parseFloat(format(probe).replace(/[^0-9.+-]/g, ""));
+  if (!probe || !Number.isFinite(shown) || !shown) return 1;
+  return 10 ** Math.round(Math.log10(Math.abs(shown / probe)));
+};
+
+// Label, slider and its value (typeable) on one row. The slider's wrapper swallows mousedown's
+// default so dragging never takes focus. With `reset`, a value moved off its default shows a small
+// reset arrow on the label (on hover), and double-clicking the label or the slider puts it back.
+export const SliderRow: React.FC<{
   label: string;
   value: number;
   min: number;
@@ -98,15 +242,41 @@ const SliderRow: React.FC<{
   marks?: readonly number[];
   format: (v: number) => string;
   onChange: (v: number) => void;
-}> = ({ label, value, min, max, step, marks, format, onChange }) => (
-  <div className="flex items-center gap-2.5 text-[11px]">
-    <span className="w-[58px] shrink-0 text-white/60">{label}</span>
-    <div className="flex-1 min-w-0" onMouseDown={keepFocus}>
-      <Slider value={value} min={min} max={max} step={step} marks={marks} onChange={onChange} />
+  reset?: number;
+}> = ({ label, value, min, max, step, marks, format, onChange, reset }) => {
+  const modified = reset !== undefined && Math.abs(value - reset) > step / 2;
+  const doReset = () => {
+    if (modified) onChange(reset!);
+  };
+  return (
+    <div className="group/row flex items-center gap-2.5 text-[11px]">
+      <span
+        className={`relative w-[58px] shrink-0 select-none ${modified ? "text-white/80" : "text-white/60"}`}
+        title={reset !== undefined ? `Double-click to reset to ${format(reset)}` : undefined}
+        onMouseDown={keepFocus}
+        onDoubleClick={doReset}
+      >
+        {label}
+        {modified && (
+          <button
+            type="button"
+            tabIndex={-1}
+            title={`Reset to ${format(reset!)}`}
+            onMouseDown={keepFocus}
+            onClick={doReset}
+            className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-4 h-4 flex items-center justify-center rounded text-transparent group-hover/row:text-white/55 hover:!text-white hover:bg-white/10 transition-colors"
+          >
+            <IoRefreshOutline size={10} />
+          </button>
+        )}
+      </span>
+      <div className="flex-1 min-w-0" onMouseDown={keepFocus} onDoubleClick={doReset}>
+        <Slider value={value} min={min} max={max} step={step} marks={marks} onChange={onChange} />
+      </div>
+      <ValueField value={value} min={min} max={max} step={step} scale={displayScale(format, min, max)} format={format} onChange={onChange} />
     </div>
-    <span className="w-10 shrink-0 text-right tabular-nums text-white/85">{format(value)}</span>
-  </div>
-);
+  );
+};
 
 const Switch: React.FC<{ on: boolean; onChange: (next: boolean) => void; label: string }> = ({ on, onChange, label }) => (
   <button
@@ -209,7 +379,7 @@ const sampleOverlay = (animation: OverlayAnimation): TextOverlay => ({
   updatedAt: 0,
 });
 
-const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void; text?: boolean }> = ({ value, onChange, text }) => {
+export const AnimationSection: React.FC<{ value: OverlayAnimation | undefined; onChange: (next: OverlayAnimation) => void; text?: boolean }> = ({ value, onChange, text }) => {
   const gridRef = useRef<HTMLDivElement>(null);
   const boxes = useRef(new Map<OverlayAnimation, HTMLSpanElement>());
   const startRef = useRef(performance.now());
@@ -319,14 +489,69 @@ const PositionPad: React.FC<{ x: number; y: number; width: number; height: numbe
   );
 };
 
-const PositionSection: React.FC<{ x: number; y: number; width: number; height: number; onPlace: (x: number, y: number) => void }> = (props) => (
-  <Section title="Position">
-    <div className="flex items-center gap-3">
-      <PositionPad {...props} />
-      <span className="text-[10.5px] leading-snug text-white/40">Click a dot to snap the box there, or drag it on the video.</span>
+// Position fields and nudges count pixels on a 1080-tall frame - the same basis as outline widths -
+// so a 1px nudge is the same step at any preview size and lands on whole pixels in a 1080p export.
+const POSITION_PX_BASIS = 1080;
+
+// Arrow buttons that move the box a pixel at a time (Shift: ten) - hold one to keep it moving.
+const NudgePad: React.FC<{ onNudge: (dx: number, dy: number, big: boolean) => boolean }> = ({ onNudge }) => {
+  const hold = useHoldRepeat();
+  const arrow = (dx: number, dy: number, icon: React.ReactNode, name: string) => (
+    <button
+      type="button"
+      tabIndex={-1}
+      title={`Nudge ${name} 1px - hold to keep going, Shift for 10px (Alt+arrow keys while typing)`}
+      {...hold((shift) => onNudge(dx, dy, shift))}
+      className="flex items-center justify-center rounded-md bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10 active:bg-blue-500/30 active:text-white transition-colors"
+    >
+      {icon}
+    </button>
+  );
+  return (
+    <div className="grid grid-cols-3 grid-rows-3 gap-0.5 w-[78px] h-[78px] shrink-0">
+      <span />
+      {arrow(0, -1, <IoChevronUp size={12} />, "up")}
+      <span />
+      {arrow(-1, 0, <IoChevronUp size={12} className="-rotate-90" />, "left")}
+      <span className="flex items-center justify-center text-[9px] tabular-nums text-white/30 select-none">1px</span>
+      {arrow(1, 0, <IoChevronUp size={12} className="rotate-90" />, "right")}
+      <span />
+      {arrow(0, 1, <IoChevronDown size={12} />, "down")}
+      <span />
     </div>
-  </Section>
-);
+  );
+};
+
+const PositionSection: React.FC<{ x: number; y: number; width: number; height: number; onPlace: (x: number, y: number) => void; aspect?: number }> = ({ aspect, ...props }) => {
+  const W = POSITION_PX_BASIS * (aspect && aspect > 0 ? aspect : 16 / 9);
+  const H = POSITION_PX_BASIS;
+  // Where the last nudge put it - a held arrow keeps going from there, not from props a render behind.
+  const posRef = useRef({ x: props.x, y: props.y });
+  posRef.current = { x: props.x, y: props.y };
+  const nudge = (dx: number, dy: number, big: boolean): boolean => {
+    const step = big ? 10 : 1;
+    const next = { x: posRef.current.x + (dx * step) / W, y: posRef.current.y + (dy * step) / H };
+    posRef.current = next;
+    props.onPlace(next.x, next.y);
+    return true;
+  };
+  const px = (v: number) => `${Math.round(v)}`;
+  return (
+    <Section title="Position">
+      <div className="flex items-center gap-3">
+        <PositionPad {...props} />
+        <NudgePad onNudge={nudge} />
+      </div>
+      <div className="flex items-center gap-2 text-[11px]">
+        <span className="text-white/50">X</span>
+        <ValueField wide value={props.x * W} min={-W} max={2 * W} step={1} scale={1} format={px} onChange={(v) => props.onPlace(v / W, props.y)} />
+        <span className="ml-1 text-white/50">Y</span>
+        <ValueField wide value={props.y * H} min={-H} max={2 * H} step={1} scale={1} format={px} onChange={(v) => props.onPlace(props.x, v / H)} />
+        <span className="text-[10px] text-white/35">px</span>
+      </div>
+    </Section>
+  );
+};
 
 const formatTime = (sec: number): string => {
   const t = Math.max(0, sec);
@@ -400,6 +625,8 @@ const ActionBar: React.FC<{ onDuplicate?: () => void; onFront?: () => void; onBa
 );
 
 interface CommonProps {
+  // The frame's width over its height - position fields and nudges count frame pixels with it.
+  frameAspect?: number;
   x: number;
   y: number;
   width: number;
@@ -495,13 +722,14 @@ const TrackingBlock: React.FC<{ track?: OverlayTrackInfo; onTrack?: () => void; 
 const KeyframeAwarePosition: React.FC<CommonProps> = (props) => {
   const { keyframes, onKeyframes } = props;
   if (!keyframes || keyframes.length === 0 || !onKeyframes) {
-    return <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} />;
+    return <PositionSection x={props.x} y={props.y} width={props.width} height={props.height} onPlace={props.onPlace} aspect={props.frameAspect} />;
   }
   const local = Math.max(0, Math.min(props.endTime - props.startTime, props.playhead - props.startTime));
   const state = keyframeStateAt(keyframes, local)!;
   const here = keyframeAt(keyframes, local);
   return (
     <PositionSection
+      aspect={props.frameAspect}
       x={state.x}
       y={state.y}
       width={props.width}
@@ -531,7 +759,7 @@ const MotionSection: React.FC<CommonProps> = (props) => {
     return (
       <Section title="Motion">
         {tracking}
-        <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && onKeyframes(keyframes.map((k) => ({ ...k, opacity: v / 100 })))} />
+        <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} reset={100} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && onKeyframes(keyframes.map((k) => ({ ...k, opacity: v / 100 })))} />
       </Section>
     );
   }
@@ -555,8 +783,8 @@ const MotionSection: React.FC<CommonProps> = (props) => {
         </div>
       ) : (
         <div className="flex flex-col gap-1.5">
-          <SliderRow label="Scale" value={Math.round(state.scale * 100)} min={10} max={400} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ scale: v / 100 })} />
-          <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ opacity: v / 100 })} />
+          <SliderRow label="Scale" reset={100} value={Math.round(state.scale * 100)} min={10} max={400} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ scale: v / 100 })} />
+          <SliderRow label="Opacity" value={Math.round(state.opacity * 100)} reset={100} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => inRange && setHere({ opacity: v / 100 })} />
           <div className="flex flex-col gap-0.5">
             {sorted.map((k) => (
               <div key={k.time} className={`flex items-center gap-1.5 text-[11px] px-1 rounded ${Math.abs(k.time - local) <= KEYFRAME_SNAP_SEC ? "bg-amber-500/15" : ""}`}>
@@ -611,16 +839,18 @@ export interface TextDockedPanelProps extends CommonProps {
   look: Partial<TextOverlay>;
   // A ready-made look (titleStyles.ts), and single look fields (face, tracking, gradient, glow, shadow).
   onApplyLook: (style: TitleStyle) => void;
-  onLook: (patch: Pick<Partial<TextOverlay>, "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "rotation">) => void;
+  onLook: (patch: Pick<Partial<TextOverlay>, "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "rotation" | "lineHeight" | "textCase" | "boxFill" | "boxBorder">) => void;
   backgroundColor?: string;
   strokeColor?: string;
   strokeWidth?: number;
   cornerStyle?: TextOverlayCornerStyle;
   animation?: OverlayAnimation;
   fontSizePx: number;
+  // Box padding: top/bottom, and left/right.
   paddingPx: number;
+  paddingXPx: number;
   onFontSizePx: (px: number) => void;
-  onPaddingPx: (px: number) => void;
+  onPaddingPx: (edge: "x" | "y", px: number) => void;
   onCornerStyle: (corner: TextOverlayCornerStyle) => void;
   onStroke: (patch: { strokeColor?: string; strokeWidth?: number }) => void;
   onAnimation: (next: OverlayAnimation) => void;
@@ -641,8 +871,8 @@ export interface TextDockedPanelProps extends CommonProps {
   onAlign?: (align: TextAlign) => void;
 }
 
-const TEXT_COLORS = ["#ffffff", "#111827", "#ef4444", "#f97316", "#facc15", "#22c55e", "#3b82f6", "#a855f7", "#ec4899"];
-const HIGHLIGHTS: { value: string | undefined; title: string }[] = [
+export const TEXT_COLORS = ["#ffffff", "#111827", "#ef4444", "#f97316", "#facc15", "#22c55e", "#3b82f6", "#a855f7", "#ec4899"];
+export const HIGHLIGHTS: { value: string | undefined; title: string }[] = [
   { value: undefined, title: "No highlight" },
   { value: "rgba(0,0,0,0.65)", title: "Dark" },
   { value: "rgba(255,255,255,0.9)", title: "Light" },
@@ -696,6 +926,7 @@ const RevealSection: React.FC<{
       )}
       <SliderRow
         label="Speed"
+        reset={1}
         value={settings.speed ?? 1}
         min={TEXT_REVEAL_SPEED_MIN}
         max={TEXT_REVEAL_SPEED_MAX}
@@ -706,6 +937,7 @@ const RevealSection: React.FC<{
       />
       <SliderRow
         label="Delay"
+        reset={0}
         value={settings.delay ?? 0}
         min={0}
         max={Math.max(0.5, Math.min(10, duration * 0.8))}
@@ -745,7 +977,7 @@ const RevealSection: React.FC<{
       )}
       <LabeledRow label="Underline">
         <Switch on={!!settings.underline} label="Accent line that draws in under the title" onChange={(on) => onChange({ underline: on ? UNDERLINE_COLORS[0] : undefined })} />
-        {settings.underline && <Swatches colors={UNDERLINE_COLORS} value={settings.underline} onPick={(c) => c && onChange({ underline: c })} />}
+        {settings.underline && <Swatches custom colors={UNDERLINE_COLORS} value={settings.underline} onPick={(c) => c && onChange({ underline: c })} />}
       </LabeledRow>
       <LabeledRow label="Exit">
         <div className="flex-1">
@@ -765,39 +997,114 @@ const RevealSection: React.FC<{
   );
 };
 
-// A row of colour dots - inline (no popup), so it never opens off-screen or steals focus.
-const Swatches: React.FC<{ colors: (string | undefined)[]; value: string | undefined; onPick: (c: string | undefined) => void; titles?: string[] }> = ({
-  colors,
-  value,
-  onPick,
-  titles,
-}) => (
-  <div className="flex flex-wrap items-center gap-1.5">
-    {colors.map((c, i) => {
-      const selected = (c ?? null) === (value ?? null) || (!!c && !!value && c.toLowerCase() === value.toLowerCase());
-      return (
-        <button
-          key={c ?? "none"}
-          type="button"
-          title={titles?.[i] ?? c ?? "None"}
-          onMouseDown={keepFocus}
-          onClick={() => onPick(c)}
-          className={`relative w-[22px] h-[22px] rounded-full transition-transform hover:scale-110 ${
-            selected ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-900" : "ring-1 ring-white/25"
-          }`}
-          style={{ background: c ?? "transparent" }}
-        >
-          {!c && <span className="absolute inset-[5px] border-t-2 border-red-400 rotate-45 origin-center top-1/2 -translate-y-1/2" />}
-        </button>
-      );
-    })}
-  </div>
-);
+
+// A hex code field: type or paste one (#, 3 or 6 digits), Enter or click away to use it.
+const HexField: React.FC<{ value: string | undefined; onPick: (hex: string) => void }> = ({ value, onPick }) => {
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = value ? toHex(value).slice(1).toUpperCase() : "";
+  const commit = (raw: string) => {
+    const hex = parseHexInput(raw);
+    if (hex && hex.slice(1).toUpperCase() !== shown) onPick(hex);
+    setDraft(null);
+  };
+  return (
+    <label className="flex items-center h-[22px] rounded-md bg-white/[0.05] ring-1 ring-white/10 focus-within:ring-blue-400/70 focus-within:bg-black/40 pl-1.5 text-[10.5px] tabular-nums transition-colors">
+      <span className="text-white/35">#</span>
+      <input
+        type="text"
+        spellCheck={false}
+        maxLength={9}
+        value={draft ?? shown}
+        title="Hex colour code"
+        onFocus={(e) => {
+          setDraft(shown);
+          const el = e.currentTarget;
+          requestAnimationFrame(() => el.select());
+        }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => draft !== null && commit(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") e.currentTarget.blur();
+          else if (e.key === "Escape") {
+            setDraft(shown);
+            const el = e.currentTarget;
+            requestAnimationFrame(() => el.blur());
+          }
+        }}
+        className="w-[52px] bg-transparent px-1 uppercase text-white/85 outline-none"
+      />
+    </label>
+  );
+};
+
+// A row of colour dots - inline (no popup), so it never opens off-screen or steals focus. With
+// `custom`, the row ends in any-colour controls: a rainbow dot that opens the colour picker (and
+// wears the colour while it isn't one of the presets), the eyedropper, and a hex field. `matchRgb`
+// counts a preset as picked whatever its opacity (a highlight's opacity is set separately).
+export const Swatches: React.FC<{
+  colors: (string | undefined)[];
+  value: string | undefined;
+  onPick: (c: string | undefined) => void;
+  titles?: string[];
+  custom?: boolean;
+  matchRgb?: boolean;
+}> = ({ colors, value, onPick, titles, custom, matchRgb }) => {
+  const pickerRef = useRef<HTMLInputElement>(null);
+  const same = (c: string | undefined) =>
+    (c ?? null) === (value ?? null) || (!!c && !!value && (c.toLowerCase() === value.toLowerCase() || (!!matchRgb && sameRgb(c, value))));
+  const isCustom = !!value && !colors.some(same);
+  const dot = (selected: boolean) => `relative w-[22px] h-[22px] rounded-full transition-transform hover:scale-110 ${selected ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-900" : "ring-1 ring-white/25"}`;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {colors.map((c, i) => (
+          <button key={c ?? "none"} type="button" title={titles?.[i] ?? c ?? "None"} onMouseDown={keepFocus} onClick={() => onPick(c)} className={dot(same(c))} style={{ background: c ?? "transparent" }}>
+            {!c && <span className="absolute inset-[5px] border-t-2 border-red-400 rotate-45 origin-center top-1/2 -translate-y-1/2" />}
+          </button>
+        ))}
+        {custom && (
+          <button
+            type="button"
+            title="Any colour…"
+            onMouseDown={keepFocus}
+            onClick={() => {
+              const el = pickerRef.current;
+              if (!el) return;
+              if (typeof el.showPicker === "function") el.showPicker();
+              else el.click();
+            }}
+            className={dot(isCustom)}
+            style={{ background: "conic-gradient(#ef4444, #facc15, #22c55e, #22d3ee, #3b82f6, #a855f7, #ec4899, #ef4444)" }}
+          >
+            <span className="absolute inset-[5px] rounded-full ring-1 ring-black/20" style={{ background: isCustom ? value : "#ffffff" }} />
+          </button>
+        )}
+        {/* The picker the rainbow dot opens - live as it's dragged around. */}
+        {custom && <input ref={pickerRef} type="color" tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />}
+      </div>
+      {custom && (
+        <div className="flex items-center gap-1.5">
+          <button
+              type="button"
+              title="Pick a colour from the screen - the video included"
+              onMouseDown={keepFocus}
+              onClick={() => void pickScreenColor().then((c) => c && onPick(c))}
+              className="w-[22px] h-[22px] flex items-center justify-center rounded-md bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              <MdColorize size={13} />
+            </button>
+          <HexField value={value} onPick={onPick} />
+        </div>
+      )}
+    </div>
+  );
+};
 
 // ---------- title looks, fonts and effects ----------
 
 // Every ready-made look as a tile drawn by the real text renderer - what you see is what you get.
-const TitleLookGallery: React.FC<{ look: Partial<TextOverlay>; onApply: (style: TitleStyle) => void }> = ({ look, onApply }) => (
+export const TitleLookGallery: React.FC<{ look: Partial<TextOverlay>; onApply: (style: TitleStyle) => void }> = ({ look, onApply }) => (
   <Section title="Style">
     <div className="grid grid-cols-3 gap-1.5">
       {TITLE_STYLES.map((style) => {
@@ -823,7 +1130,7 @@ const TitleLookGallery: React.FC<{ look: Partial<TextOverlay>; onApply: (style: 
 );
 
 // Every face, each name set in itself, a category at a time.
-const FontSection: React.FC<{ value: string | undefined; onChange: (id: string | undefined) => void }> = ({ value, onChange }) => {
+export const FontSection: React.FC<{ value: string | undefined; onChange: (id: string | undefined) => void }> = ({ value, onChange }) => {
   const [category, setCategory] = useState<TitleFontCategory | "All">(() => titleFont(value)?.category ?? "All");
   const [, setLoaded] = useState(0);
   useEffect(() => {
@@ -893,40 +1200,108 @@ const SHADOWS: { value: TextOverlay["shadow"]; label: string; title: string }[] 
   { value: { color: "rgba(0,0,0,0.75)", x: 0, y: 0, blur: 0.3 }, label: "Halo", title: "A dark halo all round - legible on anything" },
 ];
 
+// A colour as one compact control: a dot that opens the picker (live), the eyedropper, a hex field.
+const ColorField: React.FC<{ value: string; onPick: (c: string) => void }> = ({ value, onPick }) => {
+  const pickerRef = useRef<HTMLInputElement>(null);
+  return (
+    <div className="flex items-center gap-1.5">
+      <button
+        type="button"
+        title="Pick a colour"
+        onMouseDown={keepFocus}
+        onClick={() => {
+          const el = pickerRef.current;
+          if (!el) return;
+          if (typeof el.showPicker === "function") el.showPicker();
+          else el.click();
+        }}
+        className="w-[22px] h-[22px] shrink-0 rounded-full ring-1 ring-white/25 transition-transform hover:scale-110"
+        style={{ background: value }}
+      />
+      <input ref={pickerRef} type="color" tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />
+      <button
+          type="button"
+          title="Pick a colour from the screen - the video included"
+          onMouseDown={keepFocus}
+          onClick={() => void pickScreenColor().then((c) => c && onPick(c))}
+          className="w-[22px] h-[22px] flex items-center justify-center rounded-md bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10 transition-colors"
+        >
+          <MdColorize size={13} />
+        </button>
+      <HexField value={value} onPick={onPick} />
+    </div>
+  );
+};
+
+// A two-colour gradient - for the letters and for the box behind them: ready-made pairs, then its
+// own two ends and direction, all live.
+type Gradient = { from: string; to: string; angle?: number };
+const GradientEditor: React.FC<{ value: Gradient; onChange: (g: Gradient) => void }> = ({ value, onChange }) => (
+  <div className="flex flex-col gap-1.5">
+    <div className="flex flex-wrap gap-1.5">
+      {GRADIENTS.map((g) => {
+        const selected = value.from === g.from && value.to === g.to;
+        return (
+          <button
+            key={g.title}
+            type="button"
+            title={g.title}
+            onMouseDown={keepFocus}
+            onClick={() => onChange({ ...value, from: g.from, to: g.to })}
+            className={`w-[22px] h-[22px] rounded-full transition-transform hover:scale-110 ${selected ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-900" : "ring-1 ring-white/25"}`}
+            style={{ background: `linear-gradient(${180 - (value.angle ?? 0)}deg, ${g.from}, ${g.to})` }}
+          />
+        );
+      })}
+      <button
+        type="button"
+        title="Swap the two ends"
+        onMouseDown={keepFocus}
+        onClick={() => onChange({ ...value, from: value.to, to: value.from })}
+        className="w-[22px] h-[22px] flex items-center justify-center rounded-full bg-white/[0.06] text-white/60 hover:text-white hover:bg-white/10 transition-colors"
+      >
+        <IoSwapVerticalOutline size={12} />
+      </button>
+    </div>
+    <LabeledRow label="From">
+      <ColorField value={value.from} onPick={(from) => onChange({ ...value, from })} />
+    </LabeledRow>
+    <LabeledRow label="To">
+      <ColorField value={value.to} onPick={(to) => onChange({ ...value, to })} />
+    </LabeledRow>
+    <SliderRow
+      label="Direction"
+      value={value.angle ?? 0}
+      min={0}
+      max={360}
+      step={1}
+      marks={[90, 180, 270]}
+      reset={0}
+      format={(v) => `${Math.round(v)}°`}
+      onChange={(angle) => onChange({ ...value, angle: angle % 360 === 0 ? undefined : angle })}
+    />
+  </div>
+);
+
+const BOX_BORDER_COLORS = ["#ffffff", "#000000", "#facc15", "#ef4444", "#3b82f6", "#a855f7"];
+
 // Tracking, gradient fill, glow and shadow.
 const TextEffectsSection: React.FC<{ look: Partial<TextOverlay>; onLook: TextDockedPanelProps["onLook"] }> = ({ look, onLook }) => {
   const shadowIndex = Math.max(0, SHADOWS.findIndex((s) => JSON.stringify(s.value ?? null) === JSON.stringify(look.shadow ?? null)));
   return (
     <Section title="Effects">
-      <SliderRow label="Spacing" value={look.letterSpacing ?? 0} min={-0.05} max={0.5} step={0.01} marks={[0]} format={(v) => `${Math.round(v * 100)}%`} onChange={(v) => onLook({ letterSpacing: Math.abs(v) < 0.005 ? undefined : v })} />
+      <SliderRow label="Spacing" reset={0} value={look.letterSpacing ?? 0} min={-0.05} max={0.5} step={0.01} marks={[0]} format={(v) => `${Math.round(v * 100)}%`} onChange={(v) => onLook({ letterSpacing: Math.abs(v) < 0.005 ? undefined : v })} />
       <LabeledRow label="Gradient">
         <Switch on={!!look.fill} label={look.fill ? "Solid colour instead" : "Gradient fill"} onChange={(on) => onLook({ fill: on ? { from: GRADIENTS[0].from, to: GRADIENTS[0].to } : undefined })} />
       </LabeledRow>
-      {look.fill && (
-        <div className="flex flex-wrap gap-1.5">
-          {GRADIENTS.map((g) => {
-            const selected = look.fill?.from === g.from && look.fill?.to === g.to;
-            return (
-              <button
-                key={g.title}
-                type="button"
-                title={g.title}
-                onMouseDown={keepFocus}
-                onClick={() => onLook({ fill: { from: g.from, to: g.to } })}
-                className={`w-[22px] h-[22px] rounded-full transition-transform hover:scale-110 ${selected ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-900" : "ring-1 ring-white/25"}`}
-                style={{ background: `linear-gradient(180deg, ${g.from}, ${g.to})` }}
-              />
-            );
-          })}
-        </div>
-      )}
+      {look.fill && <GradientEditor value={look.fill} onChange={(fill) => onLook({ fill })} />}
       <LabeledRow label="Glow">
         <Switch on={!!look.glow} label={look.glow ? "Remove glow" : "Add glow"} onChange={(on) => onLook({ glow: on ? { color: GLOW_COLORS[0], size: 0.35 } : undefined })} />
       </LabeledRow>
       {look.glow && (
         <>
-          <Swatches colors={GLOW_COLORS} value={look.glow.color} onPick={(c) => c && onLook({ glow: { color: c, size: look.glow?.size ?? 0.35 } })} />
-          <SliderRow label="Glow size" value={look.glow.size} min={0.05} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} onChange={(size) => onLook({ glow: { color: look.glow?.color ?? GLOW_COLORS[0], size } })} />
+          <Swatches custom colors={GLOW_COLORS} value={look.glow.color} onPick={(c) => c && onLook({ glow: { color: c, size: look.glow?.size ?? 0.35 } })} />
+          <SliderRow label="Glow size" reset={0.35} value={look.glow.size} min={0.05} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} onChange={(size) => onLook({ glow: { color: look.glow?.color ?? GLOW_COLORS[0], size } })} />
         </>
       )}
       <LabeledRow label="Shadow">
@@ -942,16 +1317,27 @@ const TextEffectsSection: React.FC<{ look: Partial<TextOverlay>; onLook: TextDoc
 export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
   const outlineOn = !!props.strokeWidth;
   return (
-    <>
+    <div {...{ [TEXT_EDIT_PANEL_ATTR]: "" }} className="contents">
       <TitleLookGallery look={props.look} onApply={props.onApplyLook} />
       <FontSection value={props.look.fontFamily} onChange={(fontFamily) => props.onLook({ fontFamily })} />
 
       <Section title="Text">
-        <SliderRow label="Size" value={props.fontSizePx} min={8} max={200} step={1} format={(v) => `${Math.round(v)}px`} onChange={props.onFontSizePx} />
+        <SliderRow label="Size" value={props.fontSizePx} min={8} max={400} step={1} format={(v) => `${Math.round(v)}px`} onChange={props.onFontSizePx} />
+        <SliderRow
+          label="Line gap"
+          value={props.look.lineHeight ?? DEFAULT_TEXT_LINE_HEIGHT}
+          min={0.7}
+          max={2.5}
+          step={0.05}
+          marks={[DEFAULT_TEXT_LINE_HEIGHT]}
+          reset={DEFAULT_TEXT_LINE_HEIGHT}
+          format={(v) => `${v.toFixed(2)}×`}
+          onChange={(v) => props.onLook({ lineHeight: Math.abs(v - DEFAULT_TEXT_LINE_HEIGHT) < 0.001 ? undefined : v })}
+        />
         {props.onTextColor && (
           <div className="flex flex-col gap-1.5">
             <span className="text-[11px] text-white/60">Colour</span>
-            <Swatches colors={TEXT_COLORS} value={props.textColor} onPick={(c) => c && props.onTextColor?.(c)} />
+            <Swatches custom colors={TEXT_COLORS} value={props.textColor} onPick={(c) => c && props.onTextColor?.(c)} />
           </div>
         )}
         {props.onBold && props.onItalic && props.onAlign && (
@@ -962,6 +1348,18 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
               </button>
               <button type="button" title="Italic (Ctrl+I)" onMouseDown={keepFocus} onClick={props.onItalic} className="w-8 h-7 rounded-md text-[13px] italic font-serif text-white/70 hover:text-white hover:bg-white/10">
                 I
+              </button>
+              <button
+                type="button"
+                title={props.look.textCase === "upper" ? "Back to the text as typed" : "ALL CAPITALS - without retyping"}
+                aria-pressed={props.look.textCase === "upper"}
+                onMouseDown={keepFocus}
+                onClick={() => props.onLook({ textCase: props.look.textCase === "upper" ? undefined : "upper" })}
+                className={`w-8 h-7 rounded-md text-[11px] font-semibold tracking-wide transition-colors ${
+                  props.look.textCase === "upper" ? "bg-blue-500/25 text-blue-200" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                AA
               </button>
             </div>
             <div className="flex-1">
@@ -982,7 +1380,27 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
         {props.onHighlight && (
           <div className="flex flex-col gap-1.5">
             <span className="text-[11px] text-white/60">Highlight</span>
-            <Swatches colors={HIGHLIGHTS.map((h) => h.value)} titles={HIGHLIGHTS.map((h) => h.title)} value={props.backgroundColor} onPick={props.onHighlight} />
+            <Swatches
+              custom
+              matchRgb
+              colors={HIGHLIGHTS.map((h) => h.value)}
+              titles={HIGHLIGHTS.map((h) => h.title)}
+              value={props.backgroundColor}
+              // A preset brings its own opacity; any other colour keeps the box's current one.
+              onPick={(c) => props.onHighlight?.(!c || HIGHLIGHTS.some((h) => h.value === c) ? c : withAlpha(c, props.backgroundColor ? alphaOf(props.backgroundColor) : 1))}
+            />
+            {props.backgroundColor && (
+              <SliderRow
+                label="Opacity"
+                value={Math.round(alphaOf(props.backgroundColor) * 100)}
+                min={5}
+                max={100}
+                step={1}
+                reset={100}
+                format={(v) => `${Math.round(v)}%`}
+                onChange={(v) => props.onHighlight?.(withAlpha(props.backgroundColor!, v / 100))}
+              />
+            )}
           </div>
         )}
         <LabeledRow label="Outline">
@@ -992,10 +1410,11 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
             onChange={(on) => props.onStroke(on ? { strokeWidth: 2, strokeColor: props.strokeColor ?? "#000000" } : { strokeWidth: undefined })}
           />
         </LabeledRow>
-        {outlineOn && <Swatches colors={OUTLINE_COLORS} value={props.strokeColor ?? "#000000"} onPick={(c) => c && props.onStroke({ strokeColor: c, strokeWidth: props.strokeWidth })} />}
+        {outlineOn && <Swatches custom colors={OUTLINE_COLORS} value={props.strokeColor ?? "#000000"} onPick={(c) => c && props.onStroke({ strokeColor: c, strokeWidth: props.strokeWidth })} />}
         {outlineOn && (
           <SliderRow
             label="Thickness"
+            reset={2}
             value={props.strokeWidth ?? 2}
             min={1}
             max={12}
@@ -1010,6 +1429,7 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
       <Section title="Rotate">
         <SliderRow
           label="Angle"
+          reset={0}
           value={props.look.rotation ?? 0}
           min={-180}
           max={180}
@@ -1042,7 +1462,8 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
       </Section>
 
       <Section title="Box">
-        <SliderRow label="Padding" value={props.paddingPx} min={0} max={60} step={1} format={(v) => `${Math.round(v)}px`} onChange={props.onPaddingPx} />
+        <SliderRow label="Left/right" value={props.paddingXPx} min={0} max={120} step={1} format={(v) => `${Math.round(v)}px`} onChange={(px) => props.onPaddingPx("x", px)} />
+        <SliderRow label="Top/bottom" value={props.paddingPx} min={0} max={80} step={1} format={(v) => `${Math.round(v)}px`} onChange={(px) => props.onPaddingPx("y", px)} />
         <LabeledRow label="Corners">
           <div className="flex-1">
             <Segmented
@@ -1056,6 +1477,38 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
             />
           </div>
         </LabeledRow>
+      <LabeledRow label="Gradient">
+        <Switch
+          on={!!props.look.boxFill}
+          label={props.look.boxFill ? "Solid box colour instead" : "Gradient box"}
+          onChange={(on) => props.onLook({ boxFill: on ? { from: GRADIENTS[4].from, to: GRADIENTS[4].to } : undefined })}
+        />
+        {props.look.boxFill && <span className="text-white/40">in place of the highlight colour</span>}
+      </LabeledRow>
+      {props.look.boxFill && <GradientEditor value={props.look.boxFill} onChange={(boxFill) => props.onLook({ boxFill })} />}
+      <LabeledRow label="Border">
+        <Switch
+          on={!!props.look.boxBorder}
+          label={props.look.boxBorder ? "Remove the box border" : "Add a border round the box"}
+          onChange={(on) => props.onLook({ boxBorder: on ? { color: BOX_BORDER_COLORS[0], width: 3 } : undefined })}
+        />
+      </LabeledRow>
+      {props.look.boxBorder && (
+        <>
+          <Swatches custom colors={BOX_BORDER_COLORS} value={props.look.boxBorder.color} onPick={(c) => c && props.onLook({ boxBorder: { ...props.look.boxBorder!, color: c } })} />
+          <SliderRow
+            label="Width"
+            value={props.look.boxBorder.width}
+            min={0.5}
+            max={80}
+            step={0.5}
+            marks={[3, 20]}
+            reset={3}
+            format={(v) => `${v}px`}
+            onChange={(width) => props.onLook({ boxBorder: { ...props.look.boxBorder!, width } })}
+          />
+        </>
+      )}
       </Section>
 
       {props.onBlendMode && <BlendSection value={props.blendMode} onChange={props.onBlendMode} />}
@@ -1073,7 +1526,7 @@ export const TextDockedPanel: React.FC<TextDockedPanelProps> = (props) => {
       <KeyframeAwarePosition {...props} />
       <TimingSection start={props.startTime} end={props.endTime} playhead={props.playhead} onSet={props.onSetTime} />
       <ActionBar onDuplicate={props.onDuplicate} onFront={props.onFront} onBack={props.onBack} onDelete={props.onDelete} />
-    </>
+    </div>
   );
 };
 
@@ -1180,6 +1633,179 @@ const CounterSection: React.FC<{
   );
 };
 
+// This very sticker, shown in each style - picked by seeing it, not by name.
+const STYLE_CHOICES: { fill: StickerFill; label: string }[] = [
+  { fill: "solid", label: "Solid" },
+  { fill: "outline", label: "Outline" },
+  { fill: "none", label: "No background" },
+];
+const StyleChoice: React.FC<{ asset: OverlayAsset; fill: StickerFill; label: string; active: boolean; onPick: () => void }> = ({ asset, fill, label, active, onPick }) => {
+  const shown = React.useMemo(() => ({ ...asset, fill, entrance: "none" as const, loop: "none" as const }), [asset, fill]);
+  const aspect = stickerAspect(shown) ?? assetEntry(asset.kind).aspect;
+  const fit = Math.min(62 / aspect, 30);
+  return (
+    <button
+      type="button"
+      title={label}
+      onMouseDown={keepFocus}
+      onClick={onPick}
+      className={`flex flex-col items-center gap-1 rounded-lg p-1.5 transition-colors ${active ? "bg-white/15 ring-1 ring-blue-400/70" : "bg-white/[0.04] hover:bg-white/[0.09]"}`}
+    >
+      <span className="relative flex items-center justify-center rounded-md bg-[linear-gradient(160deg,#6b7385,#2a303c)] overflow-hidden" style={{ width: 72, height: 40 }}>
+        <span className="relative block" style={{ width: fit * aspect, height: fit }}>
+          <AssetCanvas asset={shown} widthPx={fit * aspect} heightPx={fit} duration={10} getTime={() => 5} />
+        </span>
+      </span>
+      <span className={`text-[10px] ${active ? "text-white" : "text-white/55"}`}>{label}</span>
+    </button>
+  );
+};
+
+const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
+// A sticker's words, style, colours and icon or picture (stickerAssets.ts).
+const StickerSections: React.FC<{ asset: OverlayAsset; onAsset: (patch: Partial<OverlayAsset>) => void }> = ({ asset, onAsset }) => {
+  const entry = assetEntry(asset.kind);
+  const tagLabel = stickerTagLabel(asset.kind);
+  // A kicker reads above its headline, a tag or pill after the rest.
+  const tagFirst = asset.kind === "card" || asset.kind === "title";
+  const fill = asset.fill ?? "solid";
+  const usesAccent = !["chip", "card", "stat", "icon", "emoji"].includes(asset.kind);
+  const art = stickerArt(asset.kind);
+  // A profile's badge and photo are two things; elsewhere a picture takes the icon's place.
+  const separateArt = asset.kind === "profile";
+  const pickPicture = async () => {
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: "Picture", extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"] }] });
+    if (typeof picked === "string") onAsset({ image: picked });
+  };
+  const tagRow = tagLabel && (
+    <LabeledRow label={tagLabel}>
+      <DraftTextField value={asset.tag ?? ""} onCommit={(tag) => onAsset({ tag })} />
+    </LabeledRow>
+  );
+  return (
+    <>
+      <Section title="Words">
+        {asset.kind === "emoji" && <EmojiPicker value={asset.text} onPick={(text) => onAsset({ text })} />}
+        {asset.kind === "rating" && (
+          <LabeledRow label="Rating">
+            <NumberStepper value={asset.countTo ?? 5} min={0} max={5} step={0.1} decimals={1} suffix=" / 5" onChange={(v) => onAsset({ countTo: Math.round(v * 10) / 10 })} />
+          </LabeledRow>
+        )}
+        {asset.kind === "meter" && (
+          <LabeledRow label="Value">
+            <NumberStepper value={asset.countTo ?? 0} min={0} max={100} step={1} decimals={0} suffix="%" onChange={(v) => onAsset({ countTo: Math.round(v) })} />
+          </LabeledRow>
+        )}
+        {asset.kind === "stat" && (
+          <LabeledRow label="Count">
+            <NumberStepper value={asset.countFrom ?? 0} min={0} max={999999999} step={1} decimals={0} suffix="" onChange={(v) => onAsset({ countFrom: Math.round(v) })} />
+            <span className="text-white/40">to</span>
+            <NumberStepper value={asset.countTo ?? 0} min={0} max={999999999} step={1} decimals={0} suffix="" onChange={(v) => onAsset({ countTo: Math.round(v) })} />
+          </LabeledRow>
+        )}
+        {tagFirst && tagRow}
+        {entry.text && asset.kind !== "emoji" && (
+          <LabeledRow label={entry.text[0]}>
+            <DraftTextField value={asset.text ?? ""} onCommit={(text) => onAsset({ text })} />
+          </LabeledRow>
+        )}
+        {entry.text?.[1] && (
+          <LabeledRow label={entry.text[1]}>
+            <DraftTextField value={asset.subtext ?? ""} onCommit={(subtext) => onAsset({ subtext })} />
+          </LabeledRow>
+        )}
+        {!tagFirst && tagRow}
+        {asset.kind === "message" && (
+          <LabeledRow label="Side">
+            <div className="flex-1">
+              <Segmented
+                value={asset.side ?? "left"}
+                onChange={(side) => onAsset({ side })}
+                options={[
+                  { value: "left", title: "Their message - tail and photo on the left", label: "Them" },
+                  { value: "right", title: "Your message - tail and photo on the right", label: "You" },
+                ]}
+              />
+            </div>
+          </LabeledRow>
+        )}
+      </Section>
+      {stickerHasSurface(asset.kind) && (
+        <Section title="Style">
+          <div className="grid grid-cols-3 gap-1">
+            {STYLE_CHOICES.map((c) => (
+              <StyleChoice key={c.fill} asset={asset} fill={c.fill} label={c.label} active={fill === c.fill} onPick={() => onAsset({ fill: c.fill })} />
+            ))}
+          </div>
+          {fill === "solid" && (
+            <LabeledRow label="Border">
+              <Switch on={!!asset.border} label="A border in the edge colour" onChange={(border) => onAsset({ border })} />
+            </LabeledRow>
+          )}
+        </Section>
+      )}
+      <Section title="Colour">
+        <LabeledRow label={stickerHasSurface(asset.kind) ? "Fill" : "Words"}>
+          <div onMouseDown={keepFocus} title="Main colour">
+            <ColorSwatchPicker color={asset.color} onChange={(c) => onAsset({ color: c })} size="sm" />
+          </div>
+        </LabeledRow>
+        {usesAccent && (
+          <LabeledRow label="Accent">
+            <div onMouseDown={keepFocus} title="Chips, discs and the big figure">
+              <ColorSwatchPicker color={asset.accent ?? "#1463f3"} onChange={(c) => onAsset({ accent: c })} size="sm" />
+            </div>
+          </LabeledRow>
+        )}
+        <LabeledRow label="3D edge">
+          <Switch on={asset.lip !== false} label="A solid edge under it - the sticker look" onChange={(lip) => onAsset({ lip })} />
+          {(asset.lip !== false || asset.border) && (
+            <div onMouseDown={keepFocus} title="Edge, border and dark words">
+              <ColorSwatchPicker color={asset.color2 ?? "#0b2f8f"} onChange={(c) => onAsset({ color2: c })} size="sm" />
+            </div>
+          )}
+        </LabeledRow>
+      </Section>
+      {art && (
+        <Section title={art === "picture" ? "Photo" : separateArt ? "Badge and photo" : art === "icon" ? "Icon" : "Icon or picture"}>
+          {art !== "picture" && (
+            <IconPicker
+              value={!separateArt && asset.image ? undefined : asset.icon ?? "none"}
+              allowNone={asset.kind !== "icon"}
+              onPick={(icon) => onAsset(separateArt ? { icon } : { icon, image: undefined })}
+            />
+          )}
+          {separateArt && <span className="text-[10px] text-white/40">{stickerIconRole(asset.kind)} beside the name - the photo is the avatar.</span>}
+          {art !== "icon" &&
+            (asset.image ? (
+              <div className="flex items-center gap-2">
+                <span className="flex-1 min-w-0 truncate text-[11px] text-white/70" title={asset.image}>
+                  {fileName(asset.image)}
+                </span>
+                <button type="button" onMouseDown={keepFocus} onClick={() => void pickPicture()} className="h-7 px-2 rounded-md bg-white/[0.06] text-[11px] text-white/70 hover:text-white hover:bg-white/10">
+                  Replace
+                </button>
+                <button type="button" onMouseDown={keepFocus} onClick={() => onAsset({ image: undefined })} className="h-7 px-2 rounded-md bg-white/[0.06] text-[11px] text-white/70 hover:text-white hover:bg-white/10">
+                  Remove
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onMouseDown={keepFocus}
+                onClick={() => void pickPicture()}
+                className="h-7 rounded-md bg-white/[0.06] text-[11px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+              >
+                {art === "picture" || separateArt ? "Add a photo…" : "Use your own picture…"}
+              </button>
+            ))}
+        </Section>
+      )}
+    </>
+  );
+};
+
 // Colours, style and the element's own built-in effects (videoAssets.ts) - separate from the
 // box-level Animation/Motion sections below, which still apply on top.
 export const AssetSettingsSections: React.FC<{
@@ -1190,10 +1816,11 @@ export const AssetSettingsSections: React.FC<{
   onSetTime?: (edge: "start" | "end", time: number) => void;
 }> = ({ asset, onAsset, startTime, endTime, onSetTime }) => (
   <>
+    {isStickerKind(asset.kind) && <StickerSections asset={asset} onAsset={onAsset} />}
     {(asset.kind === "countdown" || asset.kind === "timer") && (
       <CounterSection asset={asset} onAsset={onAsset} startTime={startTime} endTime={endTime} onSetTime={onSetTime} />
     )}
-    {assetEntry(asset.kind).text && (
+    {!isStickerKind(asset.kind) && assetEntry(asset.kind).text && (
       <Section title="Text">
         <LabeledRow label={assetEntry(asset.kind).text![0]}>
           <DraftTextField value={asset.text ?? ""} onCommit={(text) => onAsset({ text })} />
@@ -1205,6 +1832,7 @@ export const AssetSettingsSections: React.FC<{
         )}
       </Section>
     )}
+    {!isStickerKind(asset.kind) && (
     <Section title="Element">
       <LabeledRow label="Colour">
         <div onMouseDown={keepFocus} title="Main colour">
@@ -1239,6 +1867,7 @@ export const AssetSettingsSections: React.FC<{
         <Switch on={!!asset.glow} label="Neon glow" onChange={(glow) => onAsset({ glow })} />
       </LabeledRow>
     </Section>
+    )}
     <Section title="Entrance">
       <ChipGrid<AssetEntrance> options={ASSET_ENTRANCES} value={asset.entrance} onChange={(entrance) => onAsset({ entrance })} />
       <LabeledRow label="Exit">
@@ -1431,7 +2060,7 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
       <AssetSettingsSections asset={props.asset} onAsset={props.onAsset} startTime={props.startTime} endTime={props.endTime} onSetTime={props.onSetTime} />
     )}
     <Section title="Appearance">
-      <SliderRow label="Opacity" value={Math.round(props.opacity * 100)} min={10} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => props.onOpacity(v / 100)} />
+      <SliderRow label="Opacity" value={Math.round(props.opacity * 100)} reset={100} min={10} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => props.onOpacity(v / 100)} />
       {!props.asset && (
         <LabeledRow label="Corners">
           <div className="flex-1">
@@ -1464,7 +2093,7 @@ export const ImageDockedPanel: React.FC<ImageDockedPanelProps> = (props) => (
 
     <Section title="Transform">
       <SliderRow label="Size" value={Math.round(props.width * 100)} min={5} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => props.onScale(v / 100)} />
-      <SliderRow label="Rotation" value={props.rotation > 180 ? props.rotation - 360 : props.rotation} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={props.onRotation} />
+      <SliderRow label="Rotation" reset={0} value={props.rotation > 180 ? props.rotation - 360 : props.rotation} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={props.onRotation} />
       <div className="flex items-center gap-1">
         <IconButton title="Flip horizontally" onClick={props.onFlipHorizontal} active={props.flipHorizontal}>
           <IoSwapHorizontalOutline size={15} />
@@ -1547,7 +2176,7 @@ export const BlurDockedPanel: React.FC<BlurDockedPanelProps> = (props) => (
     </Section>
 
     <Section title="Transform">
-      <SliderRow label="Rotation" value={props.rotation} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={props.onRotation} />
+      <SliderRow label="Rotation" reset={0} value={props.rotation} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={props.onRotation} />
       <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
         {(
           [
@@ -1644,12 +2273,12 @@ export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ la
       </Section>
 
       <Section title="Adjust">
-        <SliderRow label="Brightness" value={layer.brightness ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(brightness) => onChange({ brightness })} />
-        <SliderRow label="Contrast" value={layer.contrast ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(contrast) => onChange({ contrast })} />
-        <SliderRow label="Saturation" value={layer.saturation ?? 1} min={0} max={2} step={0.01} marks={[1]} format={pct} onChange={(saturation) => onChange({ saturation })} />
-        <SliderRow label="Hue" value={layer.hue ?? 0} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={(hue) => onChange({ hue })} />
-        <SliderRow label="Blur" value={(layer.blur ?? 0) / MAX_ADJUSTMENT_BLUR} min={0} max={1} step={0.01} format={pct} onChange={(v) => onChange({ blur: v * MAX_ADJUSTMENT_BLUR })} />
-        <SliderRow label="Vignette" value={layer.vignette ?? 0} min={0} max={1} step={0.01} format={pct} onChange={(vignette) => onChange({ vignette })} />
+        <SliderRow label="Brightness" reset={1} value={layer.brightness ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(brightness) => onChange({ brightness })} />
+        <SliderRow label="Contrast" reset={1} value={layer.contrast ?? 1} min={0.4} max={1.6} step={0.01} marks={[1]} format={pct} onChange={(contrast) => onChange({ contrast })} />
+        <SliderRow label="Saturation" reset={1} value={layer.saturation ?? 1} min={0} max={2} step={0.01} marks={[1]} format={pct} onChange={(saturation) => onChange({ saturation })} />
+        <SliderRow label="Hue" reset={0} value={layer.hue ?? 0} min={-180} max={180} step={1} marks={[0]} format={(v) => `${Math.round(v)}°`} onChange={(hue) => onChange({ hue })} />
+        <SliderRow label="Blur" reset={0} value={(layer.blur ?? 0) / MAX_ADJUSTMENT_BLUR} min={0} max={1} step={0.01} format={pct} onChange={(v) => onChange({ blur: v * MAX_ADJUSTMENT_BLUR })} />
+        <SliderRow label="Vignette" reset={0} value={layer.vignette ?? 0} min={0} max={1} step={0.01} format={pct} onChange={(vignette) => onChange({ vignette })} />
       </Section>
 
       <Section title="Where">
@@ -1694,9 +2323,9 @@ export const AdjustmentDockedPanel: React.FC<AdjustmentDockedPanelProps> = ({ la
       </Section>
 
       <Section title="Strength">
-        <SliderRow label="Mix" value={layer.opacity ?? 1} min={0} max={1} step={0.01} format={pct} onChange={(opacity) => onChange({ opacity })} />
-        <SliderRow label="Fade in" value={layer.fadeIn ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeIn) => onChange({ fadeIn })} />
-        <SliderRow label="Fade out" value={layer.fadeOut ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeOut) => onChange({ fadeOut })} />
+        <SliderRow label="Mix" reset={1} value={layer.opacity ?? 1} min={0} max={1} step={0.01} format={pct} onChange={(opacity) => onChange({ opacity })} />
+        <SliderRow label="Fade in" reset={0} value={layer.fadeIn ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeIn) => onChange({ fadeIn })} />
+        <SliderRow label="Fade out" reset={0} value={layer.fadeOut ?? 0} min={0} max={Math.min(5, span / 2)} step={0.05} format={(v) => `${v.toFixed(1)}s`} onChange={(fadeOut) => onChange({ fadeOut })} />
       </Section>
 
       <TimingSection start={layer.startTime} end={layer.endTime} playhead={playhead} onSet={onSetTime} />

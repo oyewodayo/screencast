@@ -3876,6 +3876,10 @@ pub struct OverlayImage {
     // blend_composite. None/"normal" (or anything not in blend_mode_ffmpeg) is a plain overlay.
     #[serde(default)]
     pub blend_mode: Option<String>,
+    // Composited over the screen frame (wallpaper and padding) rather than onto the picture inside
+    // it, so it can sit on the padding - x/y are then on the whole frame. Only with a screen style.
+    #[serde(default)]
+    pub on_frame: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5561,7 +5565,7 @@ fn lowercase_extension(path: &str) -> String {
 // Still images a timeline clip can be built from (the editor's image clips - see Clip's own doc
 // comment, videoEditTypes.ts). Mirrors IMAGE_CLIP_EXTENSIONS there. EXIF orientation needs no
 // handling of its own: ffmpeg auto-rotates image inputs by it, in -vf and -filter_complex alike.
-fn is_still_image_path(path: &str) -> bool {
+pub(crate) fn is_still_image_path(path: &str) -> bool {
     matches!(
         lowercase_extension(path).as_str(),
         "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif" | "heic" | "heif"
@@ -8015,121 +8019,131 @@ pub async fn export_trimmed_video(
         // overlay_position_expr) - before being composited via `overlay` gated to that overlay's own
         // [start,end) window on the output timeline either way.
         let overlay_input_base = segments.len();
-        for (i, ov) in overlays.iter().enumerate() {
-            let mut source_label = format!("{}:v", overlay_input_base + i);
-            // Every overlay input (a frame sequence, or a still looped for its own window) starts
-            // at timestamp 0 - shifted to start at the overlay's own start_time, so everything
-            // below (fade st=, the opacity commands, the enable window) reads absolute output times.
-            {
-                let shifted = format!("ovseq{}", i);
-                filter.push_str(&format!(
-                    "[{}]format=rgba,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
-                    source_label, ov.start_time, shifted
-                ));
-                source_label = shifted;
-            }
-            let animation = sanitize_overlay_animation(&ov.animation);
-            let composited_label = if animation == "fade" || animation == "zoom" {
-                // The preview's ramp: 0.4s, or half the overlay's length if that's shorter.
-                let ramp = overlay_animation_ramp(ov.start_time, ov.end_time);
-                let faded_label = format!("ovfade{}", i);
-                let fade_out_start = (ov.end_time - ramp).max(ov.start_time);
-                filter.push_str(&format!(
-                    "[{}]fade=in:st={:.3}:d={ramp:.4}:alpha=1,fade=out:st={:.3}:d={ramp:.4}:alpha=1[{}];",
-                    source_label, ov.start_time, fade_out_start, faded_label
-                ));
-                faded_label
-            } else {
-                source_label
-            };
-            let (mut x_expr, mut y_expr) = overlay_position_expr(ov, animation);
-            let mut composited_label = composited_label;
-            let kfs = ov.keyframes.as_ref().filter(|k| !k.is_empty());
-            let flips = animation == "flip";
-            let kf_scales = kfs.is_some_and(|kfs| kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3));
-            // The overlay's scale over time in `tv`: its keyframed scale times pop's overshoot -
-            // the preview multiplies the two the same way (the box's scale() transform inside the
-            // keyframe layer's). None when it never scales.
-            let scale_at = |tv: &str| -> Option<String> {
-                let kf = kfs.filter(|_| kf_scales).map(|kfs| keyframe_expr(kfs, tv, |k| k.scale.max(0.01)));
-                let pop = overlay_anim_scale_expr(animation, ov.start_time, ov.end_time, tv);
-                match (kf, pop) {
-                    (Some(a), Some(b)) => Some(format!("({a})*({b})")),
-                    (a, b) => a.or(b),
+        // Pictures and text over the picture (`on_frame` false), or - after the screen frame goes
+        // around it - over the frame itself (`on_frame` true). One stacking order either way.
+        let frame_overlays = screen_style.is_some();
+        let composite_overlays = |filter: &mut String, current_label: &mut String, on_frame: bool| {
+            for (i, ov) in overlays.iter().enumerate() {
+                if (ov.on_frame && frame_overlays) != on_frame {
+                    continue;
                 }
-            };
-            // Scale per frame - `n` counts this input's frames, which start at start_time.
-            let frame_time = format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS);
-            // A flip squashes the width on top (overlay_flip_sx_expr).
-            let squash_at = |tv: &str| flips.then(|| overlay_flip_sx_expr(ov.start_time, ov.end_time, tv));
-            if let Some(s) = scale_at(&frame_time) {
-                let sx = squash_at(&frame_time).map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
-                let scaled = format!("ovkfs{}", i);
-                filter.push_str(&format!(
-                    "[{composited_label}]scale=w='max(2,trunc(iw*({sx})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
-                ));
-                composited_label = scaled;
-            }
-            if let Some(kfs) = kfs {
-                // Keyframed opacity: one alpha factor per frame (opacity_commands), applied by
-                // colorchannelmixer - a multiply per pixel, where the per-pixel expression it
-                // replaces (geq) cost ~1µs a pixel.
-                if kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3) {
-                    let faded = format!("ovkfa{}", i);
+                let mut source_label = format!("{}:v", overlay_input_base + i);
+                // Every overlay input (a frame sequence, or a still looped for its own window) starts
+                // at timestamp 0 - shifted to start at the overlay's own start_time, so everything
+                // below (fade st=, the opacity commands, the enable window) reads absolute output times.
+                {
+                    let shifted = format!("ovseq{}", i);
                     filter.push_str(&format!(
-                        "[{composited_label}]format=rgba,{},colorchannelmixer@ka{i}=aa=1[{faded}];",
-                        opacity_commands(kfs, &format!("colorchannelmixer@ka{i}"), ov.start_time, ov.end_time)
+                        "[{}]format=rgba,setpts=PTS-STARTPTS+{:.4}/TB[{}];",
+                        source_label, ov.start_time, shifted
                     ));
-                    composited_label = faded;
+                    source_label = shifted;
                 }
-                // A slide still plays on top of keyframed motion, as in the preview: its offset
-                // from the resting spot is added to the keyframed position.
-                let (slide_x, slide_y) = overlay_slide_offset_expr(ov, animation);
-                x_expr = format!("({})+({slide_x})", keyframe_expr(kfs, "t", |k| k.x));
-                y_expr = format!("({})+({slide_y})", keyframe_expr(kfs, "t", |k| k.y));
+                let animation = sanitize_overlay_animation(&ov.animation);
+                let composited_label = if animation == "fade" || animation == "zoom" {
+                    // The preview's ramp: 0.4s, or half the overlay's length if that's shorter.
+                    let ramp = overlay_animation_ramp(ov.start_time, ov.end_time);
+                    let faded_label = format!("ovfade{}", i);
+                    let fade_out_start = (ov.end_time - ramp).max(ov.start_time);
+                    filter.push_str(&format!(
+                        "[{}]fade=in:st={:.3}:d={ramp:.4}:alpha=1,fade=out:st={:.3}:d={ramp:.4}:alpha=1[{}];",
+                        source_label, ov.start_time, fade_out_start, faded_label
+                    ));
+                    faded_label
+                } else {
+                    source_label
+                };
+                let (mut x_expr, mut y_expr) = overlay_position_expr(ov, animation);
+                let mut composited_label = composited_label;
+                let kfs = ov.keyframes.as_ref().filter(|k| !k.is_empty());
+                let flips = animation == "flip";
+                let kf_scales = kfs.is_some_and(|kfs| kfs.iter().any(|k| (k.scale - 1.0).abs() > 1e-3));
+                // The overlay's scale over time in `tv`: its keyframed scale times pop's overshoot -
+                // the preview multiplies the two the same way (the box's scale() transform inside the
+                // keyframe layer's). None when it never scales.
+                let scale_at = |tv: &str| -> Option<String> {
+                    let kf = kfs.filter(|_| kf_scales).map(|kfs| keyframe_expr(kfs, tv, |k| k.scale.max(0.01)));
+                    let pop = overlay_anim_scale_expr(animation, ov.start_time, ov.end_time, tv);
+                    match (kf, pop) {
+                        (Some(a), Some(b)) => Some(format!("({a})*({b})")),
+                        (a, b) => a.or(b),
+                    }
+                };
+                // Scale per frame - `n` counts this input's frames, which start at start_time.
+                let frame_time = format!("({:.4}+n/{})", ov.start_time, OVERLAY_INPUT_FPS);
+                // A flip squashes the width on top (overlay_flip_sx_expr).
+                let squash_at = |tv: &str| flips.then(|| overlay_flip_sx_expr(ov.start_time, ov.end_time, tv));
+                if let Some(s) = scale_at(&frame_time) {
+                    let sx = squash_at(&frame_time).map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
+                    let scaled = format!("ovkfs{}", i);
+                    filter.push_str(&format!(
+                        "[{composited_label}]scale=w='max(2,trunc(iw*({sx})/2)*2)':h='max(2,trunc(ih*({s})/2)*2)':eval=frame[{scaled}];"
+                    ));
+                    composited_label = scaled;
+                }
+                if let Some(kfs) = kfs {
+                    // Keyframed opacity: one alpha factor per frame (opacity_commands), applied by
+                    // colorchannelmixer - a multiply per pixel, where the per-pixel expression it
+                    // replaces (geq) cost ~1µs a pixel.
+                    if kfs.iter().any(|k| (k.opacity - 1.0).abs() > 1e-3) {
+                        let faded = format!("ovkfa{}", i);
+                        filter.push_str(&format!(
+                            "[{composited_label}]format=rgba,{},colorchannelmixer@ka{i}=aa=1[{faded}];",
+                            opacity_commands(kfs, &format!("colorchannelmixer@ka{i}"), ov.start_time, ov.end_time)
+                        ));
+                        composited_label = faded;
+                    }
+                    // A slide still plays on top of keyframed motion, as in the preview: its offset
+                    // from the resting spot is added to the keyframed position.
+                    let (slide_x, slide_y) = overlay_slide_offset_expr(ov, animation);
+                    x_expr = format!("({})+({slide_x})", keyframe_expr(kfs, "t", |k| k.x));
+                    y_expr = format!("({})+({slide_y})", keyframe_expr(kfs, "t", |k| k.y));
+                }
+                if let Some(s) = scale_at("t") {
+                    // Scaled about the box's centre, as the preview does.
+                    let sx = squash_at("t").map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
+                    x_expr = format!("({x_expr})+overlay_w*(1/({sx})-1)/2");
+                    y_expr = format!("({y_expr})+overlay_h*(1/({s})-1)/2");
+                }
+                // Never "outv" itself - later stages (PiP, adjustment layers, captions) read from here;
+                // the final rename below names whatever ran last.
+                let next_label = format!("ov{}", i);
+                // A blend mode composites through blend_composite instead: over the overlay's own box
+                // when it stays put, the whole frame when anything moves it.
+                if let (Some(mode), Some(frame), Some((w, h))) = (ov.blend_mode.as_deref().and_then(blend_mode_ffmpeg), adjust_frame, overlay_layer_size(ov)) {
+                    let moving = kfs.is_some() || animation.starts_with("slide") || animation == "drop" || scale_at("t").is_some();
+                    let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: OVERLAY_INPUT_FPS };
+                    filter.push_str(&blend_composite(&current_label, &layer, frame, mode, ov.start_time, ov.end_time, &format!("ovb{i}"), &next_label));
+                    *current_label = next_label;
+                    continue;
+                }
+                filter.push_str(&format!(
+                    "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
+                    current_label,
+                    composited_label,
+                    x_expr,
+                    y_expr,
+                    ov.start_time,
+                    ov.end_time,
+                    next_label
+                ));
+                *current_label = next_label;
             }
-            if let Some(s) = scale_at("t") {
-                // Scaled about the box's centre, as the preview does.
-                let sx = squash_at("t").map(|q| format!("({s})*({q})")).unwrap_or_else(|| s.clone());
-                x_expr = format!("({x_expr})+overlay_w*(1/({sx})-1)/2");
-                y_expr = format!("({y_expr})+overlay_h*(1/({s})-1)/2");
-            }
-            // Never "outv" itself - later stages (PiP, adjustment layers, captions) read from here;
-            // the final rename below names whatever ran last.
-            let next_label = format!("ov{}", i);
-            // A blend mode composites through blend_composite instead: over the overlay's own box
-            // when it stays put, the whole frame when anything moves it.
-            if let (Some(mode), Some(frame), Some((w, h))) = (ov.blend_mode.as_deref().and_then(blend_mode_ffmpeg), adjust_frame, overlay_layer_size(ov)) {
-                let moving = kfs.is_some() || animation.starts_with("slide") || animation == "drop" || scale_at("t").is_some();
-                let layer = BlendLayer { label: &composited_label, x: x_expr.clone(), y: y_expr.clone(), width: w, height: h, moving, fps: OVERLAY_INPUT_FPS };
-                filter.push_str(&blend_composite(&current_label, &layer, frame, mode, ov.start_time, ov.end_time, &format!("ovb{i}"), &next_label));
-                current_label = next_label;
-                continue;
-            }
-            filter.push_str(&format!(
-                "[{}][{}]overlay=x='{}':y='{}':enable='between(t,{:.3},{:.3})'[{}];",
-                current_label,
-                composited_label,
-                x_expr,
-                y_expr,
-                ov.start_time,
-                ov.end_time,
-                next_label
-            ));
-            current_label = next_label;
-        }
+        };
+        composite_overlays(&mut filter, &mut current_label, false);
 
         // Adjustment layers placed "over" act on everything composited so far (captions excepted).
         adjust_pass(&mut filter, &mut current_label, true);
 
         // The screen frame (wallpaper, padding, corners, shadow) goes around the whole edited
-        // picture - clips, layers, blurs, pictures and text shrink into it together, so nothing
-        // placed on the video ever moves off what it was placed on. Only the shortcut chips and
-        // captions sit on the frame itself, as in the preview.
+        // picture - clips, layers and blurs shrink into it together. Pictures and text, the
+        // shortcut chips and captions then sit on the frame itself, as in the preview, so a title
+        // can be placed on the padding.
         if let (Some(ss), Some(input), Some(frame)) = (&screen_style, screen_style_input, adjust_frame) {
             filter.push_str(&screen_style_chain(&current_label, input, ss, frame, "styled"));
             current_label = "styled".to_string();
         }
+        composite_overlays(&mut filter, &mut current_label, true);
 
         // Shortcut chips over everything but the captions, as the preview stacks them.
         if let (Some(track), Some(input)) = (&keystrokes, keystroke_input) {

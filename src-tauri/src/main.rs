@@ -20,9 +20,11 @@ mod commands {
     pub mod file_info;
     pub mod motion_tracking;
     pub mod object_find;
+    pub mod face_find;
     pub mod music_library;
     pub mod native_playback;
     pub mod snip;
+    pub mod screen_color;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
@@ -521,6 +523,12 @@ fn main() {
             commands::recording::load_bubble_sidecar,
             commands::object_find::find_objects,
             commands::object_find::cancel_find_objects,
+            commands::face_find::face_matching_status,
+            commands::face_find::download_face_matching,
+            commands::face_find::cancel_face_matching_download,
+            commands::face_find::outline_kind_at,
+            commands::face_find::prepare_face_matching,
+            commands::face_find::find_person,
             commands::camera_effects::camera_effect_start,
             commands::camera_effects::camera_effect_status,
             commands::camera_effects::camera_effect_preview,
@@ -563,6 +571,7 @@ fn main() {
             commands::native_playback::get_next_audio_chunk,
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
+            commands::screen_color::sample_screen_at_cursor,
             commands::snip::snip_begin,
             commands::snip::snip_info,
             commands::snip::snip_frame,

@@ -13,7 +13,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { BlurOverlay, Clip, ImageOverlay } from "./videoEditTypes";
-import { isImageClipPath } from "./videoEditTypes";
 import type { OverlayKeyframe } from "./keyframes";
 import { outputOffsetToSource } from "./clipTiming";
 import { clipSpans, fitRect, forward, simplifyTimed, toOutX, toOutY, toSrcX, toSrcY, type Box } from "./motionTracking";
@@ -39,8 +38,14 @@ const FIND_STEP = 1 / 12;
 // Largest error (output pixels) the baked keyframes may stray from the found path.
 const SIMPLIFY_TOLERANCE_PX = 0.35;
 
-// A clip whose source time maps straight onto the output (constant speed, not reversed).
-const playsStraight = (c: Clip) => !c.speedRamp && !c.reversedFrom && !isImageClipPath(c.sourcePath);
+// A clip whose source time maps straight onto the output (constant speed, not reversed). A photo
+// counts: the finder reads it as its picture held for the clip's length (find_objects loops it).
+const playsStraight = (c: Clip) => !c.speedRamp && !c.reversedFrom;
+
+// What the finder reads for a clip's source: ffmpeg can't decode HEIC/HEIF, so an iPhone photo is
+// read from the PNG it's already decoded to for preview (get_heic_preview, cached).
+const readablePath = (path: string): Promise<string> =>
+  /\.(heic|heif)$/i.test(path) ? invoke<string>("get_heic_preview", { inputPath: path }) : Promise.resolve(path);
 
 export interface FindRequest {
   clips: Clip[];
@@ -52,18 +57,25 @@ export interface FindRequest {
   sensitivity: number;
   jobId: string;
   onProgress?: (progress: number, found: number) => void;
+  // Look for the person whose face is outlined (find_person, face_find.rs) rather than the pattern.
+  person?: boolean;
 }
 
-export async function findEverywhere(req: FindRequest): Promise<Appearance[]> {
+// The outline, mapped into the source picture of the clip it was drawn on - what both finders, and
+// the "is it a face?" check, take as their anchor.
+async function anchorOf(req: Pick<FindRequest, "clips" | "frame" | "target" | "anchorTime">) {
   const spans = clipSpans(req.clips);
   const anchorIndex = spans.findIndex((s, i) => req.anchorTime < s.outEnd || i === spans.length - 1);
   const at = spans[anchorIndex];
-  if (!at || isImageClipPath(at.clip.sourcePath)) throw new Error("Outline it on a moment of the video (not a still picture)");
-  // Each source's picture size - its fit into the frame decides the mapping.
+  if (!at) throw new Error("Add something to the timeline first");
+  // Each source's picture size - its fit into the frame decides the mapping - and the file read.
   const sizes = new Map<string, Box>();
+  const readable = new Map<string, string>();
   const fitOf = async (path: string) => {
     if (!sizes.has(path)) {
-      const [w, h] = await invoke<[number, number]>("video_frame_size", { sourcePath: path });
+      const file = await readablePath(path);
+      readable.set(path, file);
+      const [w, h] = await invoke<[number, number]>("video_frame_size", { sourcePath: file });
       sizes.set(path, fitRect({ width: w, height: h }, req.frame));
     }
     return sizes.get(path)!;
@@ -72,18 +84,31 @@ export async function findEverywhere(req: FindRequest): Promise<Appearance[]> {
   const g0 = forward(at.clip, await fitOf(at.clip.sourcePath), anchorSource);
   const xs = [toSrcX(g0, req.target.x), toSrcX(g0, req.target.x + req.target.width)];
   const ys = [toSrcY(g0, req.target.y), toSrcY(g0, req.target.y + req.target.height)];
-  const anchor = { sourcePath: at.clip.sourcePath, time: anchorSource, x: Math.min(...xs), y: Math.min(...ys), width: Math.abs(xs[1] - xs[0]), height: Math.abs(ys[1] - ys[0]) };
+  const anchor = { sourcePath: readable.get(at.clip.sourcePath)!, time: anchorSource, x: Math.min(...xs), y: Math.min(...ys), width: Math.abs(xs[1] - xs[0]), height: Math.abs(ys[1] - ys[0]) };
   if (!(anchor.width > 0.004 && anchor.height > 0.004)) throw new Error("Outline something a little bigger");
+  return { spans, anchor, sizes, readable, fitOf };
+}
 
+// What the outline is around (outline_kind, face_find.rs): a face; a person (an outline well beyond
+// their face - that much of them is covered); several faces; several people; or a thing (no face -
+// the pattern is looked for). "unknown" until face matching is downloaded.
+export type OutlineKind = "face" | "person" | "faces" | "people" | "thing" | "unknown";
+export async function outlineKind(req: Pick<FindRequest, "clips" | "frame" | "target" | "anchorTime">): Promise<OutlineKind> {
+  const { anchor } = await anchorOf(req);
+  return invoke<OutlineKind>("outline_kind_at", { anchor });
+}
+
+export async function findEverywhere(req: FindRequest): Promise<Appearance[]> {
+  const { spans, anchor, sizes, readable, fitOf } = await anchorOf(req);
   const searched = spans.filter((s) => playsStraight(s.clip));
   for (const s of searched) await fitOf(s.clip.sourcePath);
-  const ranges = searched.map((s) => ({ sourcePath: s.clip.sourcePath, start: s.clip.start, end: s.clip.end }));
+  const ranges = searched.map((s) => ({ sourcePath: readable.get(s.clip.sourcePath)!, start: s.clip.start, end: s.clip.end }));
   const unlisten = await listen<{ jobId: string; progress: number; found: number }>("find-objects-progress", (e) => {
     if (e.payload.jobId === req.jobId) req.onProgress?.(e.payload.progress, e.payload.found);
   });
   let tracks: FoundTrack[];
   try {
-    tracks = await invoke<FoundTrack[]>("find_objects", { request: { jobId: req.jobId, anchor, ranges, sensitivity: req.sensitivity } });
+    tracks = await invoke<FoundTrack[]>(req.person ? "find_person" : "find_objects", { request: { jobId: req.jobId, anchor, ranges, sensitivity: req.sensitivity } });
   } finally {
     unlisten();
   }
@@ -107,6 +132,23 @@ export async function findEverywhere(req: FindRequest): Promise<Appearance[]> {
 }
 
 export const cancelFind = (jobId: string) => invoke("cancel_find_objects", { jobId }).catch(() => {});
+
+// Face matching (face_find.rs) downloads once: the engine background removal also uses, and two
+// small models.
+export interface FaceMatchingStatus {
+  state: "ready" | "needs-download" | "unsupported";
+  downloadMb: number;
+}
+export const faceMatchingStatus = (): Promise<FaceMatchingStatus> => invoke<FaceMatchingStatus>("face_matching_status");
+export async function downloadFaceMatching(onProgress: (fraction: number) => void): Promise<void> {
+  const unlisten = await listen<{ downloaded: number; total: number }>("face-matching-download", (e) => onProgress(e.payload.total > 0 ? e.payload.downloaded / e.payload.total : 0));
+  try {
+    await invoke("download_face_matching");
+  } finally {
+    unlisten();
+  }
+}
+export const cancelFaceMatchingDownload = () => invoke("cancel_face_matching_download").catch(() => {});
 
 // ---- Appearances -> overlays -----------------------------------------------------------------
 

@@ -43,6 +43,8 @@ interface AudioOverlayPopoverProps {
   anchor: { left: number; top: number };
   onUpdate: (patch: AudioOverlayContentPatch) => void;
   onDuplicate: () => void;
+  // Repeats this part back to back up to the video's end (fading out over the last `fadeOutSec`).
+  onRepeatToFill: (fadeOutSec?: number) => void;
   onDelete: () => void;
   // Where the video (and so the export) ends on the output timeline - audio past it isn't exported.
   videoEnd: number;
@@ -76,7 +78,7 @@ interface AudioOverlayPopoverProps {
   onClose: () => void;
 }
 
-const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onDelete, videoEnd, onSplitAtPlayhead, onPreviewStart, timelinePlaying, hasImageClips, onCutImagesOnBeat, onOpenMixer, onDrawVolume, volumeLineOpen, cleanupStatus, cleanupError, noiseFocus, onHearOriginal, bleedJob, onFindBleed, onCancelBleed, onRestoreBleed, onClose }) => {
+const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anchor, onUpdate, onDuplicate, onRepeatToFill, onDelete, videoEnd, onSplitAtPlayhead, onPreviewStart, timelinePlaying, hasImageClips, onCutImagesOnBeat, onOpenMixer, onDrawVolume, volumeLineOpen, cleanupStatus, cleanupError, noiseFocus, onHearOriginal, bleedJob, onFindBleed, onCancelBleed, onRestoreBleed, onClose }) => {
   const [noiseExtrasOpen, setNoiseExtrasOpen] = useState(!!noiseFocus);
   useEffect(() => {
     if (noiseFocus) setNoiseExtrasOpen(true);
@@ -148,8 +150,14 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
     onUpdate({ trimStart: f, endTime: overlay.startTime + (t - f) });
   };
   const pastVideoEnd = Math.max(0, overlay.endTime - Math.max(overlay.startTime, videoEnd));
-  // Ends it exactly where the video does (never longer than what's left of the song).
+  // Ends it exactly where the video does. A song with enough left plays on to there; anything
+  // shorter - a sound effect, a loop - plays its part again and again until the video ends.
+  const repeatsToFit = partFrom + (videoEnd - overlay.startTime) > overlay.sourceDuration + 0.05;
   const fitToVideo = (fadeOut: boolean) => {
+    if (repeatsToFit) {
+      onRepeatToFill(fadeOut ? FIT_FADE_OUT_SEC : undefined);
+      return;
+    }
     const t = Math.max(partFrom + MIN_PART_SEC, Math.min(partFrom + (videoEnd - overlay.startTime), overlay.sourceDuration));
     onUpdate({ endTime: overlay.startTime + (t - partFrom), ...(fadeOut ? { fadeOutSec: FIT_FADE_OUT_SEC } : {}) });
   };
@@ -337,10 +345,20 @@ const AudioOverlayPopover: React.FC<AudioOverlayPopoverProps> = ({ overlay, anch
           <p className="text-[10px] leading-snug text-amber-300/90">{formatSec(pastVideoEnd)} runs past the end of the video and won't be exported.</p>
         )}
         <div className="flex flex-wrap items-center gap-1 text-[11px]">
-          <button type="button" onClick={() => fitToVideo(false)} title="End this audio exactly where the video ends" className={partButtonClass}>
+          <button
+            type="button"
+            onClick={() => fitToVideo(false)}
+            title={repeatsToFit ? "Shorter than the video - repeat it back to back until the video ends" : "End this audio exactly where the video ends"}
+            className={partButtonClass}
+          >
             Fit to video
           </button>
-          <button type="button" onClick={() => fitToVideo(true)} title={`Fit to the video and fade out over its last ${FIT_FADE_OUT_SEC}s`} className={partButtonClass}>
+          <button
+            type="button"
+            onClick={() => fitToVideo(true)}
+            title={repeatsToFit ? `Repeat it until the video ends, fading out over the last ${FIT_FADE_OUT_SEC}s` : `Fit to the video and fade out over its last ${FIT_FADE_OUT_SEC}s`}
+            className={partButtonClass}
+          >
             Fit & fade out
           </button>
           <button type="button" onClick={() => setPart(partFrom, overlay.sourceDuration)} title="Play on to the end of the song" className={partButtonClass}>

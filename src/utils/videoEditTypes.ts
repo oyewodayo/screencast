@@ -397,6 +397,13 @@ export interface TextOverlay {
   // (VideoOverlayLayer) and export burn-in (videoOverlayRender.ts) - kept as a fraction rather than
   // raw px so it scales consistently with the frame the same way fontSize/x/y already do.
   padding?: number;
+  // Left/right padding, same basis as `padding` - undefined means the same as `padding`, so
+  // `padding` alone is the top/bottom and the sides together.
+  paddingX?: number;
+  // Line spacing, as a multiple of the font size - undefined is the standard 1.3.
+  lineHeight?: number;
+  // "upper" shows the text in capitals without retyping it (the typed text is kept as it is).
+  textCase?: "upper";
   // Typography (titleFonts.ts) and finish. Any of these set and the overlay is drawn by the one
   // canvas renderer (drawTextOverlay, videoOverlayRender.ts) in the preview as well as in export,
   // so they always match. Undefined = the system face, solid `color`, no glow/shadow.
@@ -405,12 +412,19 @@ export interface TextOverlay {
   letterSpacing?: number;
   // A gradient fill in place of `color` (top to bottom by default; angle in degrees, 0 = down).
   fill?: { from: string; to: string; angle?: number };
+  // The box behind the text: a gradient in place of backgroundColor (same angle convention as
+  // `fill`), and a border just inside its edge (width in px at 1080 tall, like strokeWidth).
+  boxFill?: { from: string; to: string; angle?: number };
+  boxBorder?: { color: string; width: number };
   // A soft light around the letters; size is a fraction of the font size.
   glow?: { color: string; size: number };
   // A drop shadow; offsets and blur are fractions of the font size.
   shadow?: { color: string; x: number; y: number; blur: number };
   // Degrees clockwise about the box's centre (-90 = reading bottom to top, a vertical title).
   rotation?: number;
+  // Where it stacks among text AND pictures (overlayStack, videoEditHandlers.ts) - higher is on
+  // top. Undefined is 1, above pictures' default 0.
+  layer?: number;
   // Normalized 0..1 fractions of the letterboxed VIDEO FRAME (not the player container) - stays
   // pixel-stable relative to the actual picture regardless of window size/fullscreen, since
   // object-fit:contain preserves the frame's own aspect ratio. y-down (top edge), unlike
@@ -448,6 +462,9 @@ export interface ImageOverlay {
   asset?: OverlayAsset;
   // How the picture inside the box reveals itself - wipe, glare streak, focus pull (imageReveal.ts).
   reveal?: ImageRevealSettings;
+  // Where it stacks among pictures AND text (overlayStack, videoEditHandlers.ts) - higher is on
+  // top. Undefined is 0, beneath text's default 1.
+  layer?: number;
   x: number;
   y: number;
   width: number;

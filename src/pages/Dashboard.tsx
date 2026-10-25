@@ -1,6 +1,6 @@
 // Dashboard.tsx
 import FindHideTool, { type FindStatus } from "../components/video/FindHideTool";
-import { cancelFind, coversFor, findEverywhere, type HideEffect, type HideShape } from "../utils/objectFind";
+import { cancelFaceMatchingDownload, cancelFind, coversFor, downloadFaceMatching, faceMatchingStatus, findEverywhere, outlineKind, type FaceMatchingStatus, type HideEffect, type HideShape, type OutlineKind } from "../utils/objectFind";
 // What motion tracking can make follow a subject.
 type TrackKind = "text" | "image" | "blur" | "adjustment";
 import { cameraEffectSpec } from "../utils/cameraEffect";
@@ -10,7 +10,7 @@ import { removeBackground } from "../utils/backgroundRemoval";
 import { BLUR_DEFAULT, cutoutBackgroundFromPref } from "../utils/cutoutBackground";
 import { VIDEO_CHANNEL, silencedBySolo, useMixerSession } from "../utils/mixerState";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { ToolPanelHostContext } from "../components/docker/ToolPanelHost";
+import { ToolPanelHostContext, ToolPanelOpenContext } from "../components/docker/ToolPanelHost";
 import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
 import { buildCaptionLines } from "../utils/captions";
 import * as Y from "yjs";
@@ -28,7 +28,9 @@ import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-sh
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
 import SidebarFileIcon from "../components/SidebarFileIcon";
-import VideoPlayer, { VideoPlayerHandle } from "../components/VideoPlayer";
+import VideoPlayer, { EditTimeline, VideoPlayerHandle } from "../components/VideoPlayer";
+import { seekTimeline, timelineTime } from "../utils/timelineTransport";
+import { chapterAtOutputTime, outputChapters } from "../utils/videoChapters";
 import useVideoEditStore from "../hooks/useVideoEditStore";
 import useImageEditStore from "../hooks/useImageEditStore";
 import VideoOverlayLayer from "../components/video/VideoOverlayLayer";
@@ -117,6 +119,8 @@ import {
   type PhoneCaptureHandle,
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
+import { copyImageUrlToClipboard } from "../utils/imageClipboard";
+import InlineRenameInput from "../components/InlineRenameInput";
 import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
 import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
@@ -190,6 +194,7 @@ import {
   IoFolderOpenOutline,
   IoImageOutline,
   IoPhonePortraitOutline,
+  IoCopyOutline,
 } from "react-icons/io5";
 import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -531,7 +536,10 @@ const Dashboard = () => {
   // Spins the sidebar's manual refresh icon while a refresh is in flight — see handleRefreshFiles.
   const [isRefreshingFiles, setIsRefreshingFiles] = useState<boolean>(false);
   const [renamingFile, setRenamingFile] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState<string>("");
+  // Which surface owns the inline rename field. The sidebar row and the folder gallery tile both
+  // show the same file, so keying the field off renamingFile alone mounted two autoFocus inputs:
+  // the second stole focus, the first blurred and committed the untouched name straight away.
+  const [renameInGallery, setRenameInGallery] = useState<boolean>(false);
   // Folder relative-path (see FileMap's keys) whose inline "new folder" input is active, or null
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
@@ -785,16 +793,40 @@ const Dashboard = () => {
   const [isFinding, setIsFinding] = useState(false);
   const [findStatus, setFindStatus] = useState<FindStatus>({ phase: "idle" });
   const findJobRef = useRef<string | null>(null);
-  const runFindAndHide = async (target: { x: number; y: number; width: number; height: number }, effect: HideEffect, shape: HideShape, sensitivity: number) => {
+  // Face matching's state, read when Find & hide opens (and again once it's been downloaded).
+  const [faceMatching, setFaceMatching] = useState<FaceMatchingStatus | null>(null);
+  useEffect(() => {
+    if (!isFinding) return;
+    faceMatchingStatus()
+      .then((status) => {
+        setFaceMatching(status);
+        // Ready: load the models now, while the user draws.
+        if (status.state === "ready") void invoke("prepare_face_matching").catch(() => {});
+      })
+      .catch(() => setFaceMatching(null));
+  }, [isFinding]);
+  const probeOutline = async (target: { x: number; y: number; width: number; height: number }, anchorTime: number): Promise<OutlineKind> => {
+    if (!selectedFile || faceMatching?.state !== "ready") return "unknown";
+    try {
+      return await outlineKind({ clips: editStore.clips, frame: await resolveTimelineFrame(selectedFile.sourcePath), target, anchorTime });
+    } catch {
+      return "unknown";
+    }
+  };
+  const runFindAndHide = async (target: { x: number; y: number; width: number; height: number }, effect: HideEffect, shape: HideShape, sensitivity: number, anchorTime: number, person: boolean) => {
     if (!selectedFile) return;
     if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
     const jobId = crypto.randomUUID();
     findJobRef.current = jobId;
-    setFindStatus({ phase: "searching", progress: 0, found: 0 });
     try {
+      if (person && faceMatching?.state !== "ready") {
+        setFindStatus({ phase: "downloading", progress: 0 });
+        await downloadFaceMatching((progress) => findJobRef.current === jobId && setFindStatus({ phase: "downloading", progress }));
+        if (findJobRef.current !== jobId) return;
+        setFaceMatching(await faceMatchingStatus());
+      }
+      setFindStatus({ phase: "searching", progress: 0, found: 0 });
       const frame = await resolveTimelineFrame(selectedFile.sourcePath);
-      const exact = getExactOutputTime();
-      const anchorTime = exact !== null && Math.abs(exact - currentOutputTime) < 0.5 ? exact : currentOutputTime;
       const appearances = await findEverywhere({
         clips: editStore.clips,
         frame,
@@ -802,6 +834,7 @@ const Dashboard = () => {
         anchorTime,
         sensitivity,
         jobId,
+        person,
         onProgress: (progress, found) => findJobRef.current === jobId && setFindStatus({ phase: "searching", progress, found }),
       });
       if (findJobRef.current !== jobId) return;
@@ -812,7 +845,9 @@ const Dashboard = () => {
     } catch (err) {
       if (findJobRef.current !== jobId) return;
       const message = String(err instanceof Error ? err.message : err);
-      setFindStatus(message.includes("cancelled") ? { phase: "idle" } : { phase: "error", message });
+      if (message.includes("cancelled") || message.includes("CANCELLED")) setFindStatus({ phase: "idle" });
+      else if (message.includes("NO_FACE_IN_OUTLINE")) setFindStatus({ phase: "error", message: "There's no face inside the outline - draw around the face, or choose This thing." });
+      else setFindStatus({ phase: "error", message });
     } finally {
       if (findJobRef.current === jobId) findJobRef.current = null;
     }
@@ -920,6 +955,10 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       setShowFileList(true);
       setVideoSidebarTab("tools");
     }
+  }, []);
+  const openToolsPanel = useCallback(() => {
+    setShowFileList(true);
+    setVideoSidebarTab("tools");
   }, []);
   // Opening a tool from the timeline while the Media tab is showing brings its panel into view.
   useEffect(() => {
@@ -1076,6 +1115,35 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     const clip = clips[index];
     return start + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, playback.time)));
   }, [getPlayerPlaybackState]);
+  // The player's bar and time readout follow the edit while the timeline editor is open.
+  const editingTimeline = dockerMode === "file-tools" && editStore.playbackClips.length > 0;
+  // Its chapters on the edit's time; a changed one is re-anchored to the moment now under it, and
+  // chapters on footage that's been cut out (not on the timeline) are kept as they are.
+  const editChapters = editStore.chapters;
+  const editClips = editStore.clips;
+  const setEditChapters = editStore.setChapters;
+  const playerEditTimeline = useMemo<EditTimeline | null>(() => {
+    if (!editingTimeline) return null;
+    const shown = outputChapters(editClips, editChapters);
+    return {
+      duration: totalOutputDuration,
+      getTime: () => timelineTime() ?? getExactOutputTime(),
+      seek: seekTimeline,
+      chapters: shown,
+      onChaptersChange: (next) => {
+        const before = new Map(shown.map((c) => [c.id, c]));
+        const cutOut = editChapters.filter((c) => !before.has(c.id));
+        const kept = next.flatMap((c) => {
+          const was = before.get(c.id);
+          const original = editChapters.find((o) => o.id === c.id);
+          if (was && original && Math.abs(was.time - c.time) < 1e-3) return [{ ...original, label: c.label }];
+          const anchored = chapterAtOutputTime(editClips, c.time, c.label);
+          return anchored ? [{ ...anchored, id: c.id }] : [];
+        });
+        setEditChapters([...cutOut, ...kept]);
+      },
+    };
+  }, [editingTimeline, totalOutputDuration, getExactOutputTime, editClips, editChapters, setEditChapters]);
 
   // ---- Motion tracking: pick what to follow on the paused frame, follow it, bake it into the
   // overlay's keyframes (motionTracking.ts) as one undo step.
@@ -1500,7 +1568,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     };
     if (sourcePath === selectedFile?.sourcePath) {
       // Back to the primary file - its asset URL is already resolved (selectedFile.path).
-      void (videoPlayerRef.current?.loadSource(selectedFile.path, target, selectedFile.sourcePath) ?? Promise.resolve()).finally(settled);
+      void (videoPlayerRef.current?.loadSource(selectedFile.path, target, selectedFile.sourcePath, resume || undefined) ?? Promise.resolve()).finally(settled);
       return;
     }
     resolveTimelineClipUrl(sourcePath)
@@ -1509,7 +1577,7 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
         // resets previewSourcePathRef (effect above), and a late load here would otherwise swap
         // the newly opened video back out for this one.
         if (previewSourcePathRef.current !== sourcePath) return;
-        return videoPlayerRef.current?.loadSource(url, target, isImageClipPath(sourcePath) ? undefined : sourcePath);
+        return videoPlayerRef.current?.loadSource(url, target, isImageClipPath(sourcePath) ? undefined : sourcePath, resume || undefined);
       })
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
       .finally(settled);
@@ -3011,8 +3079,13 @@ const setScreen = () => {
 			editStateJson: JSON.stringify(state),
 		});
 		setIsNewVideoProjectOpen(false);
-		void handleDirectoryFiles();
-		await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+		// The library re-listing waits until the editor is up - run alongside, its re-render of the
+		// whole library competed with opening the project and made Create feel slow.
+		try {
+			await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+		} finally {
+			void handleDirectoryFiles();
+		}
 	};
 	// Back to where the user was after a reload (sleep/wake, a recovered WebView, Ctrl+R) rather
 	// than the home screen - see sessionRestore.ts. Restored once on mount; saving only starts
@@ -3182,7 +3255,13 @@ const setScreen = () => {
 	// Briefcast's own documents, whiteboards and mind maps in one most-recent-first list, with
 	// pinned files (in pin order - see utils/homeScreenFiles.ts) always on top. See
 	// utils/homeLibraryItems.ts for the ranking.
-	const allLibraryFiles = Object.values(files).flat();
+	// Memoized (with the per-tool lists below) so the Video Editor home and Create dialog get the
+	// same arrays back on every unrelated Dashboard render - a new array re-ran their thumbnail
+	// effects and re-rendered every tile.
+	const allLibraryFiles = useMemo(() => Object.values(files).flat(), [files]);
+	const libraryVideoFiles = useMemo(() => allLibraryFiles.filter((file) => getFileCategory(file.name) === "video"), [allLibraryFiles]);
+	const libraryImageClipFiles = useMemo(() => allLibraryFiles.filter((file) => isImageClipPath(file.path)), [allLibraryFiles]);
+	const libraryClipVideoFiles = useMemo(() => libraryVideoFiles.filter((file) => !isVideoProjectPath(file.path)), [libraryVideoFiles]);
 	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
 	const homeItems = buildHomeItems({
 		files: allLibraryFiles,
@@ -3948,9 +4027,8 @@ const setScreen = () => {
 		setOpenMenu(null);
 	};
 
-	const startRename = (file: FileEntry) => {
-		const dotIndex = file.name.lastIndexOf('.');
-		setRenameValue(dotIndex > 0 ? file.name.slice(0, dotIndex) : file.name);
+	const startRename = (file: FileEntry, inGallery = false) => {
+		setRenameInGallery(inGallery);
 		setRenamingFile(file.path);
 		setOpenMenu(null);
 	};
@@ -4057,6 +4135,10 @@ const setScreen = () => {
 
 	const renameFile = async (file: { name: string; path: string }, newName: string): Promise<void> => {
 		if (!newName || newName === file.name) return;
+		// The rename field shows the name without its extension, and rename_file adds it back - so
+		// an untouched stem is the same name, not a clash with itself.
+		const dotIndex = file.name.lastIndexOf('.');
+		if (dotIndex > 0 && newName === file.name.slice(0, dotIndex)) return;
 		const undoPrepare = selectedFile?.sourcePath === file.path ? await editStore.prepareFileMove() : null;
 		try {
 			const newPath = await invoke<string>('rename_file', { oldPath: file.path, newName });
@@ -4082,10 +4164,34 @@ const setScreen = () => {
 		}
 	};
 
-	const commitRename = async (file: FileEntry) => {
-		const newName = renameValue.trim();
+	// The draft lives in InlineRenameInput, which also guarantees a single commit per rename.
+	const commitRename = async (file: FileEntry, newName: string) => {
 		setRenamingFile(null);
 		await renameFile(file, newName);
+	};
+
+	const cancelRename = () => setRenamingFile(null);
+
+	const handleCopyFilePath = async (file: FileEntry) => {
+		setOpenMenu(null);
+		try {
+			await navigator.clipboard.writeText(file.path);
+			setMessage("Path copied");
+		} catch (error) {
+			console.error("Failed to copy path to clipboard:", error);
+			setError(`Failed to copy path: ${error}`);
+		}
+	};
+
+	const handleCopyFileImage = async (file: FileEntry) => {
+		setOpenMenu(null);
+		try {
+			await copyImageUrlToClipboard(await resolveImageDisplayUrl(file));
+			setMessage("Image copied");
+		} catch (error) {
+			console.error("Failed to copy image to clipboard:", error);
+			setError(`Failed to copy image: ${error}`);
+		}
 	};
 
 	// Computed once per render so both the fixed sidebar header and the scrollable list below
@@ -4167,6 +4273,7 @@ const setScreen = () => {
 
   return (
     <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
+    <ToolPanelOpenContext.Provider value={isEditingVideo ? openToolsPanel : null}>
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
       {/* flex-1 min-h-0 here (and h-full min-h-0 on the row below) is load-bearing, not
           cosmetic: without a real height bound propagated all the way down, the main content
@@ -4763,18 +4870,12 @@ const setScreen = () => {
                                 fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
                               />
                               {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
-                              {renamingFile === file.path ? (
-                                <input
+                              {renamingFile === file.path && !renameInGallery ? (
+                                <InlineRenameInput
+                                  fileName={file.name}
+                                  onCommit={(value) => void commitRename(file, value)}
+                                  onCancel={cancelRename}
                                   className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-                                  autoFocus
-                                  value={renameValue}
-                                  onClick={(e) => e.stopPropagation()}
-                                  onChange={(e) => setRenameValue(e.target.value)}
-                                  onBlur={() => commitRename(file)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') commitRename(file);
-                                    if (e.key === 'Escape') setRenamingFile(null);
-                                  }}
                                 />
                               ) : (
                                 <div
@@ -4976,6 +5077,28 @@ const setScreen = () => {
                                         <IoCreateOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                                         <span className="flex-1 text-left">Rename</span>
                                       </button>
+                                      <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void handleCopyFilePath(file);
+                                        }}
+                                      >
+                                        <IoCopyOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                        <span className="flex-1 text-left">Copy path</span>
+                                      </button>
+                                      {getFileCategory(file.name) === "image" && (
+                                        <button
+                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleCopyFileImage(file);
+                                          }}
+                                        >
+                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                                          <span className="flex-1 text-left">Copy image</span>
+                                        </button>
+                                      )}
                                        {isConvertibleCategory(getFileCategory(file.name)) && (
                                          <button
                                             className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
@@ -5202,8 +5325,8 @@ const setScreen = () => {
           <div className="relative flex-1 min-w-0 min-h-0 flex items-center justify-center">
           {isNewVideoProjectOpen && (
             <NewVideoProjectDialog
-              libraryImages={allLibraryFiles.filter((file) => isImageClipPath(file.path))}
-              libraryVideos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path))}
+              libraryImages={libraryImageClipFiles}
+              libraryVideos={libraryClipVideoFiles}
               resolveThumbnailUrl={resolveImageThumbnailUrl}
               resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
               onCreate={handleCreateVideoProject}
@@ -5212,7 +5335,7 @@ const setScreen = () => {
           )}
           {videoEditorScreen?.mode === "home" ? (
             <VideoEditorHome
-              videos={allLibraryFiles.filter((file) => getFileCategory(file.name) === "video")}
+              videos={libraryVideoFiles}
               recentPaths={recentPaths}
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
@@ -5321,6 +5444,7 @@ const setScreen = () => {
                     : undefined
                 }
                 isEditingVideo={dockerMode === "file-tools"}
+                editTimeline={playerEditTimeline}
                 onAutoplayNextChange={() =>
                   isAudioSelected ? setAudioAutoplayNext((prev) => !prev) : setVideoAutoplayNext((prev) => !prev)
                 }
@@ -5335,6 +5459,56 @@ const setScreen = () => {
                           ? { left: fullFrame.left + inset.x * fullFrame.width, top: fullFrame.top + inset.y * fullFrame.height, width: inset.width * fullFrame.width, height: inset.height * fullFrame.height }
                           : fullFrame;
                         const contentBox = { left: (inset?.x ?? 0) * fullFrame.width, top: (inset?.y ?? 0) * fullFrame.height, width: frameRect.width, height: frameRect.height };
+                        // Pictures and text: on the picture, or - with a Screen Style - over the frame
+                        // around it, laid out on the picture still but free to sit on the padding
+                        // (export composites them after the frame too, prepareExport's onFrame).
+                        const overlayLayer = (
+                          <VideoOverlayLayer
+                          frameRect={frameRect}
+                          overlays={editStore.textOverlays}
+                          imageOverlays={editStore.imageOverlays}
+                          currentOutputTime={currentOutputTime}
+                          selectedOverlayId={selectedOverlayId}
+                          onSelectOverlay={setSelectedOverlayId}
+                          selectedImageOverlayId={selectedImageOverlayId}
+                          onSelectImageOverlay={setSelectedImageOverlayId}
+                          isPlacingText={isPlacingText}
+                          onPlacementConsumed={() => setIsPlacingText(false)}
+                          onAddTextOverlay={editStore.addTextOverlay}
+                          onUpdateTextOverlayContent={(id, patch) => editStore.updateTextOverlayContent(id, keyframeAwarePatch(editStore.textOverlays.find((o) => o.id === id), patch))}
+                          getOutputTime={getExactOutputTime}
+                          onDeleteTextOverlay={editStore.deleteTextOverlay}
+                          onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
+                          onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
+                          onSendTextOverlayToBack={editStore.sendTextOverlayToBack}
+                          isPlacingImage={isPlacingImage}
+                          onPlacementImageConsumed={() => setIsPlacingImage(false)}
+                          onAddImageOverlay={editStore.addImageOverlay}
+                          onUpdateImageOverlayContent={(id, patch) => editStore.updateImageOverlayContent(id, keyframeAwarePatch(editStore.imageOverlays.find((o) => o.id === id), patch))}
+                          onDeleteImageOverlay={editStore.deleteImageOverlay}
+                          onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
+                          onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
+                          onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
+                          blurOverlays={editStore.blurOverlays}
+                          selectedBlurOverlayId={selectedBlurOverlayId}
+                          onSelectBlurOverlay={setSelectedBlurOverlayId}
+                          isPlacingBlur={isPlacingBlur}
+                          onPlacementBlurConsumed={() => setIsPlacingBlur(false)}
+                          onAddBlurOverlay={editStore.addBlurOverlay}
+                          onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
+                          onDeleteBlurOverlay={editStore.deleteBlurOverlay}
+                          onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
+                          onSetOverlayTime={(kind, id, edge, time) => {
+                            const clamped = Math.max(0, Math.min(totalOutputDuration, time));
+                            if (kind === "text") editStore.resizeTextOverlayTime(id, edge, clamped);
+                            else if (kind === "image") editStore.resizeImageOverlayTime(id, edge, clamped);
+                            else editStore.resizeBlurOverlayTime(id, edge, clamped);
+                          }}
+                          onTrackMotion={startMotionTrack}
+                          totalOutputDuration={totalOutputDuration}
+                          placeBounds={inset ? { x0: -inset.x / inset.width, y0: -inset.y / inset.height, x1: (1 - inset.x) / inset.width, y1: (1 - inset.y) / inset.height } : undefined}
+                        />
+                        );
                         return (
                         <>
                           <div className="absolute pointer-events-none" style={contentBox}>
@@ -5406,54 +5580,16 @@ const setScreen = () => {
                             hiddenTracks={editStore.hiddenVideoTracks}
                             panelRequest={pipPanelRequest}
                           />
-                          <VideoOverlayLayer
-                          frameRect={frameRect}
-                          overlays={editStore.textOverlays}
-                          imageOverlays={editStore.imageOverlays}
-                          currentOutputTime={currentOutputTime}
-                          selectedOverlayId={selectedOverlayId}
-                          onSelectOverlay={setSelectedOverlayId}
-                          selectedImageOverlayId={selectedImageOverlayId}
-                          onSelectImageOverlay={setSelectedImageOverlayId}
-                          isPlacingText={isPlacingText}
-                          onPlacementConsumed={() => setIsPlacingText(false)}
-                          onAddTextOverlay={editStore.addTextOverlay}
-                          onUpdateTextOverlayContent={(id, patch) => editStore.updateTextOverlayContent(id, keyframeAwarePatch(editStore.textOverlays.find((o) => o.id === id), patch))}
-                          getOutputTime={getExactOutputTime}
-                          onDeleteTextOverlay={editStore.deleteTextOverlay}
-                          onDuplicateTextOverlay={(id) => setSelectedOverlayId(editStore.duplicateTextOverlay(id))}
-                          onBringTextOverlayToFront={editStore.bringTextOverlayToFront}
-                          onSendTextOverlayToBack={editStore.sendTextOverlayToBack}
-                          isPlacingImage={isPlacingImage}
-                          onPlacementImageConsumed={() => setIsPlacingImage(false)}
-                          onAddImageOverlay={editStore.addImageOverlay}
-                          onUpdateImageOverlayContent={(id, patch) => editStore.updateImageOverlayContent(id, keyframeAwarePatch(editStore.imageOverlays.find((o) => o.id === id), patch))}
-                          onDeleteImageOverlay={editStore.deleteImageOverlay}
-                          onDuplicateImageOverlay={(id) => setSelectedImageOverlayId(editStore.duplicateImageOverlay(id))}
-                          onBringImageOverlayToFront={editStore.bringImageOverlayToFront}
-                          onSendImageOverlayToBack={editStore.sendImageOverlayToBack}
-                          blurOverlays={editStore.blurOverlays}
-                          selectedBlurOverlayId={selectedBlurOverlayId}
-                          onSelectBlurOverlay={setSelectedBlurOverlayId}
-                          isPlacingBlur={isPlacingBlur}
-                          onPlacementBlurConsumed={() => setIsPlacingBlur(false)}
-                          onAddBlurOverlay={editStore.addBlurOverlay}
-                          onUpdateBlurOverlayContent={editStore.updateBlurOverlayContent}
-                          onDeleteBlurOverlay={editStore.deleteBlurOverlay}
-                          onDuplicateBlurOverlay={(id) => setSelectedBlurOverlayId(editStore.duplicateBlurOverlay(id))}
-                          onSetOverlayTime={(kind, id, edge, time) => {
-                            const clamped = Math.max(0, Math.min(totalOutputDuration, time));
-                            if (kind === "text") editStore.resizeTextOverlayTime(id, edge, clamped);
-                            else if (kind === "image") editStore.resizeImageOverlayTime(id, edge, clamped);
-                            else editStore.resizeBlurOverlayTime(id, edge, clamped);
-                          }}
-                          onTrackMotion={startMotionTrack}
-                          totalOutputDuration={totalOutputDuration}
-                        />
+                          {!inset && overlayLayer}
                         <AdjustmentLayersLayer mode="over" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
                         </div>
                         {/* The frame around the edited picture, then what sits on the frame itself. */}
                         {editStore.screenStyle && projectFrame && <ScreenBackdropLayer style={editStore.screenStyle} frame={projectFrame} />}
+                        {inset && (
+                          <div className="absolute pointer-events-none" style={contentBox}>
+                            {overlayLayer}
+                          </div>
+                        )}
                         <KeystrokeLayer frameRect={fullFrame} chips={keyChips} style={keystrokeStyle} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />
                         {/* Above PiP and every other overlay - same stacking as the export, where the
                             captions are the last video stage (export_trimmed_video). */}
@@ -5473,8 +5609,16 @@ const setScreen = () => {
                           <FindHideTool
                             frameRect={frameRect}
                             status={findStatus}
-                            onFind={(target, effect, shape, sensitivity) => void runFindAndHide(target, effect, shape, sensitivity)}
+                            onFind={(target, effect, shape, sensitivity, anchorTime, person) => void runFindAndHide(target, effect, shape, sensitivity, anchorTime, person)}
+                            onProbe={probeOutline}
+                            faceMatching={faceMatching}
+                            getTime={getExactOutputTime}
+                            currentTime={currentOutputTime}
+                            onDrawStart={() => {
+                              if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+                            }}
                             onCancelSearch={() => {
+                              if (findStatus.phase === "downloading") void cancelFaceMatchingDownload();
                               if (findJobRef.current) void cancelFind(findJobRef.current);
                               findJobRef.current = null;
                               setFindStatus({ phase: "idle" });
@@ -5564,12 +5708,10 @@ const setScreen = () => {
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
-              renamingFile={renamingFile}
-              renameValue={renameValue}
-              onRenameValueChange={setRenameValue}
-              onStartRename={startRename}
+              renamingFile={renameInGallery ? renamingFile : null}
+              onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
-              onCancelRename={() => setRenamingFile(null)}
+              onCancelRename={cancelRename}
               selectedFilePaths={selectedFilePaths}
               onToggleFileSelected={toggleFileSelected}
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
@@ -5588,12 +5730,10 @@ const setScreen = () => {
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
-              renamingFile={renamingFile}
-              renameValue={renameValue}
-              onRenameValueChange={setRenameValue}
-              onStartRename={startRename}
+              renamingFile={renameInGallery ? renamingFile : null}
+              onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
-              onCancelRename={() => setRenamingFile(null)}
+              onCancelRename={cancelRename}
               selectedFilePaths={selectedFilePaths}
               onToggleFileSelected={toggleFileSelected}
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
@@ -5610,12 +5750,10 @@ const setScreen = () => {
               onOpenPdf={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
-              renamingFile={renamingFile}
-              renameValue={renameValue}
-              onRenameValueChange={setRenameValue}
-              onStartRename={startRename}
+              renamingFile={renameInGallery ? renamingFile : null}
+              onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
-              onCancelRename={() => setRenamingFile(null)}
+              onCancelRename={cancelRename}
               selectedFilePaths={selectedFilePaths}
               onToggleFileSelected={toggleFileSelected}
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
@@ -5631,12 +5769,10 @@ const setScreen = () => {
               onOpenDocument={(file) => loadFileForPlayback(file.path, file.name)}
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
-              renamingFile={renamingFile}
-              renameValue={renameValue}
-              onRenameValueChange={setRenameValue}
-              onStartRename={startRename}
+              renamingFile={renameInGallery ? renamingFile : null}
+              onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
-              onCancelRename={() => setRenamingFile(null)}
+              onCancelRename={cancelRename}
               selectedFilePaths={selectedFilePaths}
               onToggleFileSelected={toggleFileSelected}
               onSelectOnly={(path) => setSelectedFilePaths(new Set([path]))}
@@ -5820,6 +5956,9 @@ const setScreen = () => {
         onOutputTimeChange={setCurrentOutputTime}
         getExactOutputTime={getExactOutputTime}
         getPlayerTime={getTimelinePlayerTime}
+        onPausePlayer={() => {
+          if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+        }}
         onActiveClipChange={setActiveClipEffects}
         onReframePreviewChange={setReframePreview}
         noiseReductionStatus={noiseReductionStatus}
@@ -5978,6 +6117,7 @@ const setScreen = () => {
         <TelemetryNotice />
       </div>
     </div>
+    </ToolPanelOpenContext.Provider>
     </ToolPanelHostContext.Provider>
   );
 };

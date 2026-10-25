@@ -114,14 +114,7 @@ pub async fn download_background_removal(app_handle: AppHandle, window: Window) 
         let emit = |downloaded: u64| {
             let _ = window.emit("background-removal-download", EngineDownloadProgress { downloaded, total });
         };
-        if !DLLS.iter().all(|d| dll_ok(&dir, d)) {
-            let wheel = dir.join(WHEEL_ASSET.file_name);
-            if !is_valid_install(&wheel, &WHEEL_ASSET) {
-                download_asset(&WHEEL_ASSET, &wheel, &DOWNLOAD_CANCELLED, DOWNLOAD_CANCELLED_ERR, &emit)?;
-            }
-            extract_dlls(&wheel, &dir)?;
-            let _ = std::fs::remove_file(&wheel);
-        }
+        ensure_engine_dlls(&dir, &DOWNLOAD_CANCELLED, DOWNLOAD_CANCELLED_ERR, &emit)?;
         emit(WHEEL_ASSET.size);
         let model = dir.join(MODEL_ASSET.file_name);
         if !is_valid_install(&model, &MODEL_ASSET) {
@@ -132,6 +125,30 @@ pub async fn download_background_removal(app_handle: AppHandle, window: Window) 
     })
     .await
     .map_err(|e| format!("Download task failed: {}", e))?
+}
+
+// The engine's DLLs, downloaded and unpacked unless they're already in place and verified - shared
+// with face matching (face_find.rs), which runs its models on the same engine.
+pub(crate) const ENGINE_DOWNLOAD_SIZE: u64 = WHEEL_ASSET.size;
+pub(crate) fn engine_dlls_ready(dir: &Path) -> bool {
+    DLLS.iter().all(|d| dll_ok(dir, d))
+}
+// In place at their pinned sizes - what a later run checks, once ensure_engine_dlls has verified them
+// by hash on the way in (hashing the ~40 MB again on every use costs seconds in a debug build).
+pub(crate) fn engine_dlls_present(dir: &Path) -> bool {
+    DLLS.iter().all(|(name, size, _)| std::fs::metadata(dir.join(name)).map(|m| m.len() == *size).unwrap_or(false))
+}
+pub(crate) fn ensure_engine_dlls(dir: &Path, cancel: &AtomicBool, cancelled_err: &str, emit: &dyn Fn(u64)) -> Result<(), String> {
+    if engine_dlls_ready(dir) {
+        return Ok(());
+    }
+    let wheel = dir.join(WHEEL_ASSET.file_name);
+    if !is_valid_install(&wheel, &WHEEL_ASSET) {
+        download_asset(&WHEEL_ASSET, &wheel, cancel, cancelled_err, emit)?;
+    }
+    extract_dlls(&wheel, dir)?;
+    let _ = std::fs::remove_file(&wheel);
+    Ok(())
 }
 
 #[tauri::command(async)]

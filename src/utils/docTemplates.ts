@@ -57,6 +57,10 @@ export function templateLayout(template: DocTemplate): DocLayout {
 // card shows exactly what the new document will contain (shading attributes, normalized marks)
 // rather than the template's hand-written source.
 const previewCache = new Map<string, DocPreviewData>();
+// The preview only if it's already been built - for rendering a card without paying for the parse.
+export function cachedTemplatePreview(template: DocTemplate): DocPreviewData | null {
+  return previewCache.get(template.id) ?? null;
+}
 export function templatePreview(template: DocTemplate): DocPreviewData {
   const cached = previewCache.get(template.id);
   if (cached) return cached;

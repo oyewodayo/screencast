@@ -60,7 +60,9 @@ import ElementsGallery from "../video/ElementsGallery";
 import SplitScreenPanel from "../video/SplitScreenPanel";
 import HighlightIntroPanel from "../video/HighlightIntroPanel";
 import ShortsStudio from "../shorts/ShortsStudio";
-import { assetEntry, makeAsset } from "../../utils/videoAssets";
+import { OverlayAsset, assetEntry } from "../../utils/videoAssets";
+import { isStickerKind, loadStickerResources } from "../../utils/stickerAssets";
+import { placeStickerSet, stickerBox } from "../../utils/stickerSets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import MusicLibraryPanel from "./MusicLibraryPanel";
 import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
@@ -71,6 +73,7 @@ import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
 import AudioChipContextMenu, { AudioSaveFormat } from "./AudioChipContextMenu";
 import AutomationLine from "./AutomationLine";
 import { claimPlayback, readPreviewHead, registerPlayback } from "../../utils/previewHead";
+import { registerTimelineTransport } from "../../utils/timelineTransport";
 import { describeProgress, etaTracker, listenJobProgress, useJobProgress } from "../../utils/jobProgress";
 import { startBleedRemoval } from "../../utils/bleed/bleedJob";
 import type { BleedStrength } from "../../utils/bleed/bleedJob";
@@ -686,6 +689,9 @@ interface VideoTimelineDockerProps {
   getExactOutputTime?: () => number | null;
   // The player's source time right now, frame-accurate - null while it can't be trusted (mid-switch).
   getPlayerTime?: () => number | null;
+  // Pauses the player if it is playing - a no-op otherwise, so the end-of-sequence stop can never
+  // start playback instead (a toggle did, whenever the <video> was momentarily paused mid-switch).
+  onPausePlayer?: () => void;
   // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
   // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
   // without needing to know about clips at all - same "report state this component already tracks
@@ -777,6 +783,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   getExactOutputTime,
   getPlayerTime,
+  onPausePlayer,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus = "idle",
@@ -2328,6 +2335,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     lastAppliedTimeRef.current = sourceTime;
     onSeek(renderClips[index].sourcePath, sourceTime);
   };
+  // The player's scrub bar reads and seeks the edit through here (timelineTransport.ts) - always
+  // against the latest clips, and the active clip as of this very frame.
+  const transportRef = useRef<{ seekToOutputTime: (t: number) => void; outputTimeNow: () => number | null }>({ seekToOutputTime: () => {}, outputTimeNow: () => null });
+  transportRef.current = {
+    seekToOutputTime: (t: number) => renderClips.length > 0 && seekToOutputTime(t),
+    outputTimeNow: () => {
+      const index = activeClipIndexRef.current;
+      const clip = renderClips[index];
+      const t = getPlayerTime?.();
+      if (!clip || t == null) return null;
+      return outputStarts[index] + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, t)));
+    },
+  };
+  useEffect(
+    () =>
+      registerTimelineTransport({
+        getTime: () => transportRef.current.outputTimeNow(),
+        seek: (t) => transportRef.current.seekToOutputTime(t),
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   const handleScrubPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return; // right-click opens menus, it doesn't move the playhead
@@ -3211,12 +3240,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // Playback running out of one clip carries on into the next - even if the <video> paused
       // itself on reaching the end of its file. A scrub past the end while paused stays paused.
       advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
-    } else if (isPlaying && !stopRequestedRef.current && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
+    } else if (isPlaying && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
       // Finished the last clip in playback order - stop there rather than playing on into the
       // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
-      // cut for a reason). Play again restarts from clip 0 (handleTransportPlayClick).
-      stopRequestedRef.current = true;
-      onTogglePlay();
+      // cut for a reason). Play again restarts from clip 0 (the isPlaying effect below).
+      stopAtEnd();
     }
   }, [currentTime, editStore.clips]);
   function advanceToClip(index: number, resume: boolean) {
@@ -3238,16 +3266,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
     if (t < clip.end - FRAME_BOUNDARY_SEC) return;
     if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
-    else if (!stopRequestedRef.current) {
-      // The end of the last clip - stop there (see the effect above). Once: isPlaying only turns
-      // false a render later, and a second toggle would start it again.
-      stopRequestedRef.current = true;
-      onTogglePlay();
-    }
+    else stopAtEnd(); // the end of the last clip - stop there (see the effect above)
   };
+  // A definite pause, safe to repeat every frame until it lands. Without onPausePlayer it falls back
+  // to a toggle - once, since isPlaying only turns false a render later and a second toggle would
+  // start it again.
+  function stopAtEnd() {
+    if (onPausePlayer) return onPausePlayer();
+    if (stopRequestedRef.current) return;
+    stopRequestedRef.current = true;
+    onTogglePlay();
+  }
   useEffect(() => {
     if (isPlaying) stopRequestedRef.current = false;
-    if (!isPlaying || !getPlayerTime) return;
+    if (!isPlaying) return;
+    // Play pressed while sitting at the end of the last clip - from the player's own button, k, or
+    // anywhere else that isn't handleTransportPlayClick - starts over from clip 0 instead of being
+    // stopped again on the very next frame.
+    const lastIndex = baseClips.length - 1;
+    const last = baseClips[lastIndex];
+    const t = getPlayerTime?.() ?? currentTime;
+    if (last && activeClipIndexRef.current >= lastIndex && t >= last.end - SEEK_TOLERANCE_SEC) advanceToClip(0, true);
+    if (!getPlayerTime) return;
     let raf = 0;
     const tick = () => {
       boundaryCheckRef.current();
@@ -5671,9 +5711,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         <ElementsGallery
           anchor={elementsAnchor}
           onClose={() => setElementsAnchor(null)}
-          onPick={(kind) => {
+          onPick={(asset: OverlayAsset) => {
+            const kind = asset.kind;
             const entry = assetEntry(kind);
             const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
+            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
+            const endTime = Math.min(total, startTime + length);
+            setElementsAnchor(null);
+            if (isStickerKind(kind)) {
+              // Sized to its words in its own face - wait for the face before measuring.
+              void loadStickerResources(asset).then(() => {
+                const box = stickerBox(asset, entry.frameHeight ?? 0.2, frameAspect);
+                const id = editStore.addImageOverlay("", Math.max(0.02, 0.5 - box.width / 2), Math.max(0.02, 0.5 - box.height / 2), box.width, box.height, startTime, endTime, asset);
+                onSelectImageOverlay?.(id);
+              });
+              return;
+            }
             // Wide elements (underlines, bars) by width; everything else about a third of the frame tall.
             let height = entry.aspect >= 3 ? 0.5 / entry.aspect * frameAspect : 0.32;
             let width = (height * entry.aspect) / frameAspect;
@@ -5685,13 +5740,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               width = 1;
               height = 1;
             }
-            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
-            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
-            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
-            const endTime = Math.min(total, startTime + length);
-            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, makeAsset(kind));
+            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, asset);
             onSelectImageOverlay?.(id);
+          }}
+          onPickSet={(set) => {
+            const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : set.length;
+            const start = Math.max(0, Math.min(currentOutputTime, total - Math.min(set.length, total)));
             setElementsAnchor(null);
+            void Promise.all(set.pieces.map((p) => loadStickerResources(p.asset))).then(() => {
+              editStore.addImageOverlays(placeStickerSet(set, frameAspect, start, total));
+            });
           }}
         />
       )}
@@ -5787,6 +5846,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(overlay.id));
                 setAudioPopoverAnchor(null);
               }}
+              onRepeatToFill={(fadeOutSec) => editStore.repeatAudioOverlayToFill(overlay.id, totalOutputDuration, fadeOutSec)}
               videoEnd={totalOutputDuration}
               timelinePlaying={isPlaying}
               onPreviewStart={() => {

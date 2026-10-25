@@ -88,11 +88,31 @@ function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w:
   ctx.closePath();
 }
 
-function cornerRadiusPx(style: TextOverlayCornerStyle | undefined, heightPx: number): number {
-  if (style === "pill") return heightPx / 2;
-  if (style === "rounded") return 8;
+// A text box's corner radius, in the same px as its box and font. "Rounded" is a share of the font
+// size, so the curve keeps its shape from the small preview to a 4K export (and on any screen
+// density); the canvas clamps it to half the box, as CSS does.
+const ROUNDED_CORNER_EM = 0.3;
+export function textCornerRadiusPx(style: TextOverlayCornerStyle | undefined, boxHeightPx: number, fontSizePx: number): number {
+  if (style === "pill") return boxHeightPx / 2;
+  if (style === "rounded") return Math.min(boxHeightPx / 2, fontSizePx * ROUNDED_CORNER_EM);
   return 0;
 }
+
+// A gradient's ends across a w x h box at `angle` (0 = top to bottom, 90 = left to right) - the
+// same gradient line CSS's linear-gradient draws, so canvas and DOM boxes match.
+function gradientLine(w: number, h: number, angle: number): [number, number, number, number] {
+  const a = (angle * Math.PI) / 180;
+  const half = (Math.abs(Math.sin(a)) * w + Math.abs(Math.cos(a)) * h) / 2;
+  return [w / 2 - Math.sin(a) * half, h / 2 - Math.cos(a) * half, w / 2 + Math.sin(a) * half, h / 2 + Math.cos(a) * half];
+}
+
+// The box's fill as CSS (the DOM preview and the editor) - a gradient when it has one.
+export const textBoxBackgroundCss = (o: Pick<TextOverlay, "boxFill" | "backgroundColor">): string =>
+  o.boxFill ? `linear-gradient(${180 - (o.boxFill.angle ?? 0)}deg, ${o.boxFill.from}, ${o.boxFill.to})` : o.backgroundColor ?? "transparent";
+
+// The box's border as CSS: an inset ring, so it never changes the box's size or the text's wrap.
+export const textBoxBorderCss = (o: Pick<TextOverlay, "boxBorder">, frameHeightPx: number): string | undefined =>
+  o.boxBorder && o.boxBorder.width > 0 ? `inset 0 0 0 ${textStrokePx(o.boxBorder.width, frameHeightPx)}px ${o.boxBorder.color}` : undefined;
 
 // A text stroke's width in pixels on a frame `frameHeightPx` tall - TextOverlay.strokeWidth is
 // pixels at 1080 tall, so an outline keeps its weight from the small preview to a 4K export.
@@ -160,23 +180,48 @@ function levelCanvasFor(into: HTMLCanvasElement | undefined): HTMLCanvasElement 
   return c;
 }
 
+// Line spacing as a multiple of the font size (TextOverlay.lineHeight).
+export const DEFAULT_TEXT_LINE_HEIGHT = 1.3;
+export const textLineHeight = (o: Pick<TextOverlay, "lineHeight">): number => o.lineHeight ?? DEFAULT_TEXT_LINE_HEIGHT;
+
+// The text as shown (TextOverlay.textCase). Letter for letter - a capital that would be two letters
+// (ß) keeps its own - so colour/bold runs and reveal states, which index letters, still line up.
+export function caseText(text: string, textCase: TextOverlay["textCase"]): string {
+  if (textCase !== "upper") return text;
+  let out = "";
+  for (const ch of text) {
+    const up = ch.toUpperCase();
+    out += up.length === ch.length ? up : ch;
+  }
+  return out;
+}
+
+// A text overlay's box padding in px - `y` top/bottom, `x` left/right. Undefined padding is the
+// pre-existing fixed 2px look; see TextOverlay.padding / paddingX.
+export function textPaddingPx(overlay: Pick<TextOverlay, "padding" | "paddingX">, framePixelHeight: number): { x: number; y: number } {
+  const y = overlay.padding !== undefined ? overlay.padding * framePixelHeight : 2;
+  return { x: overlay.paddingX !== undefined ? overlay.paddingX * framePixelHeight : y, y };
+}
+
 function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixelHeight: number, reveal?: TextRevealState, into?: HTMLCanvasElement): DrawnTextOverlay | null {
   const text = overlay.text.trim();
   if (!text) return null;
 
   const fontSizePx = overlay.fontSize * framePixelHeight;
-  const maxWidthPx = overlay.width * framePixelWidth;
+  // overlay.width is the whole box, padding included (the DOM preview's border-box): the letters
+  // wrap inside it, less the side padding.
+  const { x: padX, y: padding } = textPaddingPx(overlay, framePixelHeight);
+  const boxWidthPx = overlay.width * framePixelWidth;
+  // Padding wider than the box leaves a sliver, not nothing - text then wraps a letter a line, as CSS does.
+  const maxWidthPx = Math.max(1, boxWidthPx - padX * 2);
   const fontFor = (run: { bold?: boolean; italic?: boolean } = {}) => titleFontCss(overlay.fontFamily, fontSizePx, run);
   const baseFont = fontFor();
   const spacingPx = (overlay.letterSpacing ?? 0) * fontSizePx;
-  const { lines, lineHeight, height: textHeightPx } = measureTextBlock(overlay.text, fontSizePx, maxWidthPx, { font: baseFont, letterSpacing: spacingPx });
-  if (maxWidthPx <= 0 || textHeightPx <= 0) return null;
+  const shownText = caseText(overlay.text, overlay.textCase);
+  const { lines, lineHeight, height: textHeightPx } = measureTextBlock(shownText, fontSizePx, maxWidthPx, { font: baseFont, letterSpacing: spacingPx, lineHeight: textLineHeight(overlay) });
+  if (boxWidthPx <= 0 || textHeightPx <= 0) return null;
 
-  // Mirrors VideoOverlayLayer's own read-only render: undefined means the pre-existing fixed 2px
-  // look, otherwise a frameRect.height fraction (same basis as fontSize) - see TextOverlay.padding's
-  // own doc comment.
-  const padding = overlay.padding !== undefined ? overlay.padding * framePixelHeight : 2;
-  const canvasWidth = Math.max(1, Math.ceil(maxWidthPx + padding * 2));
+  const canvasWidth = Math.max(1, Math.ceil(boxWidthPx));
   const boxHeight = Math.max(1, Math.ceil(textHeightPx + padding * 2));
   // Room below the box for a reveal's accent underline (it hangs just under the box - RevealText).
   const underlineColor = reveal && overlay.reveal?.underline;
@@ -205,12 +250,30 @@ function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixel
   out.setTransform(1, 0, 0, 1, 0, 0);
   out.globalAlpha = 1;
   out.clearRect(0, 0, cw, ch);
-  if (overlay.backgroundColor) {
+  const boxRadius = textCornerRadiusPx(overlay.cornerStyle, boxHeight, fontSizePx);
+  if (overlay.boxFill || overlay.backgroundColor) {
     out.globalAlpha = reveal ? reveal.fade : 1;
-    out.fillStyle = overlay.backgroundColor;
     out.translate(bleed, bleed);
-    roundedRectPath(out, 0, 0, canvasWidth, boxHeight, cornerRadiusPx(overlay.cornerStyle, boxHeight));
+    if (overlay.boxFill) {
+      const g = out.createLinearGradient(...gradientLine(canvasWidth, boxHeight, overlay.boxFill.angle ?? 0));
+      g.addColorStop(0, overlay.boxFill.from);
+      g.addColorStop(1, overlay.boxFill.to);
+      out.fillStyle = g;
+    } else out.fillStyle = overlay.backgroundColor!;
+    roundedRectPath(out, 0, 0, canvasWidth, boxHeight, boxRadius);
     out.fill();
+    out.setTransform(1, 0, 0, 1, 0, 0);
+    out.globalAlpha = 1;
+  }
+  // The border, just inside the box's edge (CSS's inset ring) - its outer edge follows the corners.
+  const borderPx = overlay.boxBorder ? textStrokePx(overlay.boxBorder.width, framePixelHeight) : 0;
+  if (overlay.boxBorder && borderPx > 0) {
+    out.globalAlpha = reveal ? reveal.fade : 1;
+    out.translate(bleed, bleed);
+    out.strokeStyle = overlay.boxBorder.color;
+    out.lineWidth = borderPx;
+    roundedRectPath(out, borderPx / 2, borderPx / 2, canvasWidth - borderPx, boxHeight - borderPx, Math.max(0, boxRadius - borderPx / 2));
+    out.stroke();
     out.setTransform(1, 0, 0, 1, 0, 0);
     out.globalAlpha = 1;
   }
@@ -230,6 +293,15 @@ function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixel
   ctx.letterSpacing = `${spacingPx}px`;
   ctx.textBaseline = "top";
   if (reveal) ctx.globalAlpha = reveal.fade;
+  // Where the letters sit in each line, exactly as CSS places them (the DOM preview, and the box
+  // the text is measured into): the font's ascent-to-descent band centred in the line height, the
+  // leftover leading split evenly above and below. Drawing from the line's top edge instead left
+  // all of the leading underneath, so text sat visibly high in its box.
+  // (Measured against the "top" baseline the letters are drawn from.)
+  const faceMetrics = ctx.measureText("Hg");
+  const faceAscent = faceMetrics.fontBoundingBoxAscent ?? 0;
+  const faceDescent = faceMetrics.fontBoundingBoxDescent ?? fontSizePx;
+  const glyphTop = (lineHeight - (faceAscent + faceDescent)) / 2 + faceAscent;
 
   const colorRuns = overlay.colorRuns ?? [];
   const boldRuns = overlay.boldRuns ?? [];
@@ -321,14 +393,14 @@ function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixel
   };
 
   lines.forEach((line, i) => {
-    const y = padding + i * lineHeight;
+    const y = padding + i * lineHeight + glyphTop;
 
     if (!hasFormatting) {
       ctx.font = baseFont;
       // Tracking adds space after the last letter too - leave it out when centring.
       const lineWidth = Math.max(0, ctx.measureText(line.text).width - (line.text ? spacingPx : 0));
       const xOffset = align === "center" ? (maxWidthPx - lineWidth) / 2 : align === "right" ? maxWidthPx - lineWidth : 0;
-      drawSegment(line.text, padding + xOffset, y, baseFont, overlay.color, line.startOffset);
+      drawSegment(line.text, padX + xOffset, y, baseFont, overlay.color, line.startOffset);
       return;
     }
 
@@ -370,7 +442,7 @@ function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixel
     if (line.text) naturalWidth -= spacingPx;
 
     const xOffset = align === "center" ? (maxWidthPx - naturalWidth) / 2 : align === "right" ? maxWidthPx - naturalWidth : 0;
-    let x = padding + xOffset;
+    let x = padX + xOffset;
     for (const seg of segments) {
       x += drawSegment(seg.text, x, y, seg.font, seg.color, seg.start);
     }
@@ -379,7 +451,7 @@ function drawLevelText(overlay: TextOverlay, framePixelWidth: number, framePixel
   if (underlineColor && reveal.underline > 0) {
     ctx.globalAlpha = reveal.fade;
     ctx.fillStyle = underlineColor;
-    roundedRectPath(ctx, padding, boxHeight + fontSizePx * 0.08, maxWidthPx * reveal.underline, fontSizePx * 0.09, fontSizePx * 0.05);
+    roundedRectPath(ctx, padX, boxHeight + fontSizePx * 0.08, maxWidthPx * reveal.underline, fontSizePx * 0.09, fontSizePx * 0.05);
     ctx.fill();
   }
   ctx.letterSpacing = "0px";

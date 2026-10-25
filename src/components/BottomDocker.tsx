@@ -98,6 +98,8 @@ interface Props {
   getExactOutputTime?: () => number | null;
   // The player's source time, frame-accurate - null mid-switch (Dashboard's getTimelinePlayerTime).
   getPlayerTime?: () => number | null;
+  // Pauses the player if it is playing - a no-op otherwise, unlike a toggle.
+  onPausePlayer?: () => void;
   // Video-only: reports the active clip's own color/Ken Burns fields upward, same threading as
   // onOutputTimeChange above.
   onActiveClipChange?: (effects: ActiveClipEffects | null) => void;
@@ -258,6 +260,7 @@ const BottomDocker = ({
   onOutputTimeChange,
   getExactOutputTime,
   getPlayerTime,
+  onPausePlayer,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus,
@@ -713,6 +716,7 @@ const BottomDocker = ({
             onOutputTimeChange={onOutputTimeChange}
             getExactOutputTime={getExactOutputTime}
             getPlayerTime={getPlayerTime}
+            onPausePlayer={onPausePlayer}
             onActiveClipChange={onActiveClipChange}
             onReframePreviewChange={onReframePreviewChange}
             noiseReductionStatus={noiseReductionStatus}

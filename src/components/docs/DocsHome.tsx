@@ -14,7 +14,7 @@ import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../u
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
 import { openDocumentFile } from "../../utils/docFileImport";
 import { extractPlainText } from "../../utils/docYjsText";
-import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
+import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, cachedTemplatePreview, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
 import { loadDocPreview, type DocPreviewData } from "../../utils/docPreview";
 import DocTemplateVariantPicker from "./DocTemplateVariantPicker";
 import DocFolderSidebar from "./DocFolderSidebar";
@@ -79,6 +79,41 @@ const DocCardThumbnail: React.FC<{ doc: DocSummary }> = ({ doc }) => {
   );
 };
 
+// Building a template's preview (a schema parse, then typesetting it) is the slowest part of
+// opening Docs, so cards show their skeleton first and fill in after the screen has painted - one
+// card per task, so no single long task holds up a click.
+const previewQueue: (() => void)[] = [];
+let previewQueueRunning = false;
+function runPreviewQueue() {
+  const next = previewQueue.shift();
+  if (!next) {
+    previewQueueRunning = false;
+    return;
+  }
+  next();
+  setTimeout(runPreviewQueue, 0);
+}
+function queueTemplatePreview(task: () => void): () => void {
+  previewQueue.push(task);
+  if (!previewQueueRunning) {
+    previewQueueRunning = true;
+    // After the next paint: rAF runs before it, the timeout after.
+    requestAnimationFrame(() => setTimeout(runPreviewQueue, 0));
+  }
+  return () => {
+    const i = previewQueue.indexOf(task);
+    if (i >= 0) previewQueue.splice(i, 1);
+  };
+}
+
+const TemplatePreview: React.FC<{ template: DocTemplate }> = ({ template }) => {
+  const [preview, setPreview] = useState<DocPreviewData | null>(() => cachedTemplatePreview(template));
+  useEffect(() => {
+    if (preview) return;
+    return queueTemplatePreview(() => setPreview(templatePreview(template)));
+  }, [template, preview]);
+  return <DocPagePreview preview={preview} />;
+};
 
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
@@ -676,7 +711,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
                 isBusy={creatingTemplateId === template.id}
                 onClick={() => void handleCreateFromTemplate(template)}
               >
-                <DocPagePreview preview={templatePreview(template)} />
+                <TemplatePreview template={template} />
               </DocTemplateCard>
             );
             const gridClass = "grid gap-4 grid-cols-[repeat(auto-fill,minmax(128px,1fr))]";
