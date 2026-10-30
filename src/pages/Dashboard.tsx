@@ -5500,7 +5500,7 @@ const setScreen = () => {
                         // around it, laid out on the picture still but free to sit on the padding
                         // (export composites them after the frame too, prepareExport's onFrame).
                         const overlayLayer = (
-                          <VideoOverlayLayer
+                        <VideoOverlayLayer
                           frameRect={frameRect}
                           overlays={editStore.textOverlays}
                           imageOverlays={editStore.imageOverlays}

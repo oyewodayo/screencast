@@ -14,6 +14,7 @@ import { CommentsChip, EditButton, PageNavigator, SaveIndicator, ZoomControl } f
 import PageFlipOverlay, { FlipRect, PageFlip } from "./pdf/PageFlipOverlay";
 import PdfPage from "./pdf/PdfPage";
 import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
+import PdfMagnifierLens from "./pdf/PdfMagnifierLens";
 import { loadSettings } from "../utils/appSettings";
 import Toast from "./custom/Toast";
 
@@ -101,6 +102,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
   // Starts deselected since the dock starts closed; opening the dock restores the last tool used
   // (initially the default tool from Settings).
   const [tool, setTool] = useState<AnnotationTool | null>(null);
+  const [magnifierActive, setMagnifierActive] = useState<boolean>(false);
+  const [isMagnifierPinned, setIsMagnifierPinned] = useState<boolean>(false);
   const [settingsDefaultTool] = useState<AnnotationTool | null>(() => {
     const defaultTool = loadSettings().pdfDefaultTool;
     return defaultTool === "none" ? null : defaultTool;
@@ -210,9 +213,24 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
     setCurrentPageIndex(target);
   };
 
+  const handleToggleMagnifier = useCallback(() => {
+    setMagnifierActive((prev) => {
+      const next = !prev;
+      if (next) {
+        setTool(null);
+      } else {
+        setIsMagnifierPinned(false);
+      }
+      return next;
+    });
+  }, []);
+
   const handleToolChange = (nextTool: AnnotationTool): void => {
     setSelectedObjectId(null); // switching to a drawing tool exits image-selection mode
     setToolsOpen(true); // a tool shortcut (P, H, ...) reveals the dock it belongs to
+    if (!isMagnifierPinned) {
+      setMagnifierActive(false);
+    }
     const next = tool === nextTool ? null : nextTool;
     lastToolRef.current = next;
     setTool(next);
@@ -221,6 +239,9 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
   const handleDeselectTool = (): void => {
     setTool(null);
     lastToolRef.current = null;
+    if (!isMagnifierPinned) {
+      setMagnifierActive(false);
+    }
   };
 
   // Closing the dock puts the viewer back into plain reading mode (an invisible-but-armed pen
@@ -655,6 +676,14 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
 
       if (e.key === "Escape") {
         e.preventDefault();
+        if (magnifierActive) {
+          if (isMagnifierPinned) {
+            setIsMagnifierPinned(false);
+          } else {
+            setMagnifierActive(false);
+          }
+          return;
+        }
         if (isFullscreen) onToggleFullscreen();
         else {
           handleDeselectTool();
@@ -710,6 +739,10 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
           e.preventDefault();
           handleDeselectTool();
           break;
+        case "m":
+          e.preventDefault();
+          handleToggleMagnifier();
+          break;
         case "p":
           e.preventDefault();
           handleToolChange("pen");
@@ -747,7 +780,23 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [clampedPageIndex, numPages, pageStep, twoPageMode, tool, toolsOpen, store.canUndo, store.canRedo, store.undo, store.redo, isFullscreen, onToggleFullscreen]);
+  }, [
+    clampedPageIndex,
+    numPages,
+    pageStep,
+    twoPageMode,
+    tool,
+    toolsOpen,
+    store.canUndo,
+    store.canRedo,
+    store.undo,
+    store.redo,
+    isFullscreen,
+    onToggleFullscreen,
+    magnifierActive,
+    isMagnifierPinned,
+    handleToggleMagnifier,
+  ]);
 
   if (pdfError) {
     return (
@@ -852,6 +901,24 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
 
       {flip && pdfDoc && <PageFlipOverlay key={flip.id} flip={flip} pdfDoc={pdfDoc} cache={pageCache} zoom={zoom} onDone={() => setFlip(null)} />}
 
+      {magnifierActive && (
+        <PdfMagnifierLens
+          active={magnifierActive}
+          onClose={() => {
+            setMagnifierActive(false);
+            setIsMagnifierPinned(false);
+          }}
+          viewerRef={rootRef}
+          scrollContainerRef={scrollContainerRef}
+          pdfDoc={pdfDoc}
+          currentPageIndex={clampedPageIndex}
+          twoPageMode={twoPageMode}
+          numPages={numPages}
+          zoom={zoom}
+          onPinChange={setIsMagnifierPinned}
+        />
+      )}
+
       {!isFullscreen && (
         <>
           <div className="absolute top-4 left-4 z-30">
@@ -859,7 +926,16 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
           </div>
           {/* Centered on the same vertical axis as the Edit button / tools dock below it. */}
           <div className="absolute top-4 right-[26px] z-30">
-            <ZoomControl zoom={zoom} minZoom={MIN_ZOOM} maxZoom={MAX_ZOOM} fitMode={fitMode} onZoomChange={applyManualZoom} onFit={() => setFitMode(true)} />
+            <ZoomControl
+              zoom={zoom}
+              minZoom={MIN_ZOOM}
+              maxZoom={MAX_ZOOM}
+              fitMode={fitMode}
+              onZoomChange={applyManualZoom}
+              onFit={() => setFitMode(true)}
+              magnifierActive={magnifierActive}
+              onToggleMagnifier={handleToggleMagnifier}
+            />
           </div>
 
           {/* Bottom-right stack: the tools dock rises out of the Edit button; the page navigator
@@ -889,6 +965,8 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
                 onRedo={store.redo}
                 isExporting={isExporting}
                 onExport={handleExport}
+                magnifierActive={magnifierActive}
+                onToggleMagnifier={handleToggleMagnifier}
               />
               {/* With the dock closed (the default when reopening a document), this is what tells
                   you the PDF already carries comments - the dock's own Comments entry takes over

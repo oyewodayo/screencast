@@ -56,16 +56,19 @@ import {
   clampAmpLeadTerminalY,
   computeCurveBowFromPath,
   CYLINDER_CAP_RATIO,
+  dashArrayFor,
   DEFAULT_AMP_INPUT_LEAD_LENGTH,
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
   edgeBoundingBox,
   fillImageSrc,
+  hexToRgba,
   imageDestRect,
   MAX_AMP_LEAD_LENGTH,
   MIN_AMP_LEAD_LENGTH,
   nearestSegmentInsertIndex,
   nodeCenter,
+  nodeDropShadowCSS,
   nudgeEdgeBy,
   outlineOptionsFor,
   resolveAmplifierGeometry,
@@ -159,7 +162,11 @@ function ChartLabelText({ label, node }: { label: ChartLabel; node: WhiteboardNo
 function BoxShapeBody({ node, paint }: { node: WhiteboardNode; paint: FillPaint }) {
   const ellipse = node.shapeType === "ellipse";
   const radius = ellipse ? "50%" : node.cornerRadius ?? 0;
-  const border = node.strokeWidth > 0 ? `${node.strokeWidth}px solid ${node.strokeColor}` : undefined;
+  const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+    ? hexToRgba(node.strokeColor, node.strokeOpacity)
+    : node.strokeColor;
+  const borderStyle = node.strokeStyle ?? "solid";
+  const border = node.strokeWidth > 0 ? `${node.strokeWidth}px ${borderStyle} ${strokeColor}` : undefined;
   if (!paint.defs) {
     return <div style={{ position: "absolute", inset: 0, backgroundColor: paint.fill === "none" ? "transparent" : paint.fill, border, borderRadius: radius, boxSizing: "border-box" }} />;
   }
@@ -2138,11 +2145,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // content already does, and exactly like whiteboardHandlers.ts's Canvas2D export (which has no
   // notion of zoom at all) always draws it. A temporary drag preview (connector/freehand) is the
   // one exception that stays zoom-constant on purpose - see previewEdgeStyle's own reasoning.
-  const dashArrayFor = useCallback((strokeStyle: WhiteboardEdge["strokeStyle"], strokeWidth: number): string | undefined => {
-    if (strokeStyle === "solid") return undefined;
-    if (strokeStyle === "dotted") return `${strokeWidth * 0.4},${strokeWidth * 1.6 + 3}`;
-    return "8,6";
-  }, []);
 
   return (
     <div
@@ -2315,6 +2317,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = cachedShapeOutline(node);
           const paint = nodeFillPaint(node, fillImageSrc(node, imageSrcFor));
+          const nodeStrokeDash = dashArrayFor(node.strokeStyle, node.strokeWidth);
+          const nodeStrokeOpacity = node.strokeOpacity ?? 1;
+          const shadowFilter = nodeDropShadowCSS(node);
+          const nodeOpacity = node.opacity ?? 1;
           return (
             <div
               key={node.id}
@@ -2377,414 +2383,436 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
               }}
             >
-              {node.shapeType === "freehand" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <path
-                    d={smoothedPathD((node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height })))}
-                    fill="none"
-                    stroke={node.strokeColor}
-                    strokeWidth={node.strokeWidth}
-                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
-                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    vectorEffect="non-scaling-stroke"
-                  />
-                </svg>
-              ) : node.shapeType === "vector" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  <line
-                    x1={0}
-                    y1={node.height / 2}
-                    x2={node.width}
-                    y2={node.height / 2}
-                    stroke={node.strokeColor}
-                    strokeWidth={node.strokeWidth}
-                    markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
-                    markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
-                    strokeLinecap="round"
-                    vectorEffect="non-scaling-stroke"
-                  />
-                </svg>
-              ) : node.shapeType === "latticeGauge" ? (
-                <LatticeGaugeWidget
-                  node={node}
-                  canvasZoom={zoom}
-                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
-                  onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
-                />
-              ) : node.shapeType === "image" ? (
-                <WhiteboardImageBody node={node} src={imageSrcFor?.(node) ?? null} cropping={croppingNodeId === node.id} />
-              ) : node.shapeType === "table" ? (
-                <WhiteboardTable
-                  node={node}
-                  selected={selected}
-                  canvasZoom={zoom}
-                  onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
-                  onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
-                />
-              ) : node.shapeType === "ellipse" || node.shapeType === "rectangle" || node.shapeType === "equation" ? (
-                // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
-                // formula can sit on a card/badge instead of bare on the canvas - purely optional,
-                // still transparent/borderless by default (same fillColor: null start every other
-                // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
-                // fields are actually used.
-                <BoxShapeBody node={node} paint={paint} />
-              ) : node.shapeType === "text" ? (
-                isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
-              ) : outline.kind === "cylinder" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  {paint.defs}
-                  <PaintedShape
-                    paint={paint}
-                    stroke={node.strokeColor}
-                    strokeWidth={node.strokeWidth}
-                    draw={(p) => (
-                      <path
-                        d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
-                        {...p}
-                      />
-                    )}
-                  />
-                  <PaintedShape
-                    paint={paint}
-                    stroke={node.strokeColor}
-                    strokeWidth={node.strokeWidth}
-                    draw={(p) => <ellipse cx={node.width / 2} cy={node.height * CYLINDER_CAP_RATIO} rx={node.width / 2} ry={node.height * CYLINDER_CAP_RATIO} {...p} />}
-                  />
-                </svg>
-              ) : outline.kind === "polygon" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  {paint.defs}
-                  <PaintedShape
-                    paint={paint}
-                    stroke={node.strokeColor}
-                    strokeWidth={node.strokeWidth}
-                    draw={(p) => <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} strokeLinejoin="round" {...p} />}
-                  />
-                  {outline.innerLines?.map((line, i) => (
-                    <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
-                  ))}
-                  {outline.innerCircle && (
-                    <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} />
-                  )}
-                </svg>
-              ) : outline.kind === "path" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  {paint.defs}
-                  <PaintedShape paint={paint} stroke={node.strokeColor} strokeWidth={node.strokeWidth} draw={(p) => <path d={outline.d} strokeLinejoin="round" {...p} />} />
-                </svg>
-              ) : outline.kind === "chart" ? (
-                <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                  {/* parts/labels are built in the plot box's own coordinates and shifted into place
-                      by `inset`; the title captions in overlayLabels are already node-local and sit
-                      OUTSIDE this group - see whiteboardHandlers.ts's ShapeOutline "chart" variant. */}
-                  <g transform={outline.inset ? `translate(${outline.inset.dx},${outline.inset.dy})` : undefined}>
-                    {outline.parts.map((part, i) =>
-                      part.role === "fill" ? (
-                        <path key={i} d={part.d} fill={resolveNodeFill(node) ?? "none"} stroke="none" />
-                      ) : part.role === "marker" ? (
-                        <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
-                      ) : part.role === "slice" ? (
-                        <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
-                      ) : part.role === "series" ? (
-                        <path key={i} d={part.d} fill="none" stroke={part.color} strokeWidth={Math.max(0.5, part.width)} strokeLinecap="round" strokeLinejoin="round" />
-                      ) : part.role === "seriesFill" ? (
-                        <path key={i} d={part.d} fill={part.color} fillOpacity={SERIES_FILL_OPACITY} stroke="none" />
-                      ) : part.role === "annotation" ? (
-                        // Filled for the marker glyphs AND stroked so a leader line (a zero-area
-                        // path that would fill to nothing) still draws - matching the Canvas2D
-                        // export's own annotation branch exactly.
-                        <path key={i} d={part.d} fill={part.color} stroke={part.color} strokeWidth={1} strokeLinecap="round" />
-                      ) : part.role === "axis" ? (
-                        <path key={i} d={part.d} fill="none" stroke={part.color ?? "#9ca3af"} strokeOpacity={part.opacity} strokeWidth={part.width ?? 1} strokeLinecap="square" />
-                      ) : part.role === "grid" ? (
-                        <path key={i} d={part.d} fill="none" stroke={part.color ?? "#e5e7eb"} strokeOpacity={part.opacity} strokeWidth={0.75} />
-                      ) : (
-                        <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeLinecap="round" strokeLinejoin="round" />
-                      )
-                    )}
-                    {outline.labels?.map((label, i) => (
-                      <ChartLabelText key={i} label={label} node={node} />
-                    ))}
-                  </g>
-                  {outline.overlayLabels?.map((label, i) => (
-                    <ChartLabelText key={`t${i}`} label={label} node={node} />
-                  ))}
-                </svg>
-              ) : null}
-
-              {/* Manual point-plotting handles for a selected, unlocked "graph" node (see
-                  WhiteboardNode.graphPoints' own doc comment) - a transparent rect over just the
-                  plot area (not the full node box, so the margin around it stays reachable for the
-                  node's own ordinary double-click-to-edit-text below) double-clicks to add a point,
-                  and each existing point gets its own small draggable/double-click-to-remove dot. */}
-              {node.shapeType === "graph" &&
-                selected &&
-                !node.locked &&
-                (() => {
-                  // annotationCoordinateMapper rather than graphCoordinateMapper directly: for a
-                  // "graph" it resolves the identical axis window (resolveGraphAxisRange), but it
-                  // ALSO accounts for the margins any axis/chart titles reserve - without which
-                  // every handle here would sit offset from the curve by exactly those margins the
-                  // moment a title was set.
-                  const { padX, padY, plotW, plotH, mapX, mapY, offsetX, offsetY } = annotationCoordinateMapper(
-                    node.shapeType,
-                    node.width,
-                    node.height,
-                    outlineOptionsFor(node)
-                  );
-                  const points = node.graphPoints ?? [];
-                  return (
-                    <svg
-                      width="100%"
-                      height="100%"
-                      viewBox={`0 0 ${node.width} ${node.height}`}
-                      preserveAspectRatio="none"
-                      // Sibling of the body svg above (both mount as separate children of this
-                      // node's own already-`position: absolute` div), not the only child - without
-                      // its own `position: absolute` this one would lay out in normal document FLOW
-                      // instead of overlaying the body, pushed below it and offset by whatever else
-                      // is in between (exactly what happened here before this was added: every
-                      // point handle rendered well outside the node's own visible box).
-                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
-                    >
-                      <g transform={`translate(${offsetX},${offsetY})`}>
-                        <rect
-                          x={padX}
-                          y={padY}
-                          width={plotW}
-                          height={plotH}
-                          fill="transparent"
-                          style={{ pointerEvents: "all", cursor: "copy" }}
-                          onDoubleClick={(e) => addGraphPoint(node, e)}
+              <div
+                className="absolute inset-0 pointer-events-none"
+                style={{
+                  filter: shadowFilter,
+                  opacity: nodeOpacity,
+                }}
+              >
+                {node.shapeType === "freehand" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    <path
+                      d={smoothedPathD((node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height })))}
+                      fill="none"
+                      stroke={node.strokeColor}
+                      strokeWidth={node.strokeWidth}
+                      strokeDasharray={nodeStrokeDash}
+                      strokeOpacity={nodeStrokeOpacity}
+                      markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                      markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </svg>
+                ) : node.shapeType === "vector" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    <line
+                      x1={0}
+                      y1={node.height / 2}
+                      x2={node.width}
+                      y2={node.height / 2}
+                      stroke={node.strokeColor}
+                      strokeWidth={node.strokeWidth}
+                      strokeDasharray={nodeStrokeDash}
+                      strokeOpacity={nodeStrokeOpacity}
+                      markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                      markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                      strokeLinecap="round"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </svg>
+                ) : node.shapeType === "latticeGauge" ? (
+                  <div style={{ pointerEvents: "auto", width: "100%", height: "100%" }}>
+                    <LatticeGaugeWidget
+                      node={node}
+                      canvasZoom={zoom}
+                      onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                      onSelect={() => onSelectionChange(new Set([node.id]), new Set())}
+                    />
+                  </div>
+                ) : node.shapeType === "image" ? (
+                  <WhiteboardImageBody node={node} src={imageSrcFor?.(node) ?? null} cropping={croppingNodeId === node.id} />
+                ) : node.shapeType === "table" ? (
+                  <div style={{ pointerEvents: selected ? "auto" : "none", width: "100%", height: "100%" }}>
+                    <WhiteboardTable
+                      node={node}
+                      selected={selected}
+                      canvasZoom={zoom}
+                      onCommit={(patch) => onEditNode(node, { ...node, ...patch })}
+                      onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
+                    />
+                  </div>
+                ) : node.shapeType === "ellipse" || node.shapeType === "rectangle" || node.shapeType === "equation" ? (
+                  // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
+                  // formula can sit on a card/badge instead of bare on the canvas - purely optional,
+                  // still transparent/borderless by default (same fillColor: null start every other
+                  // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
+                  // fields are actually used.
+                  <BoxShapeBody node={node} paint={paint} />
+                ) : node.shapeType === "text" ? (
+                  isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
+                ) : outline.kind === "cylinder" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    {paint.defs}
+                    <PaintedShape
+                      paint={paint}
+                      stroke={node.strokeColor}
+                      strokeWidth={node.strokeWidth}
+                      strokeDasharray={nodeStrokeDash}
+                      strokeOpacity={nodeStrokeOpacity}
+                      draw={(p) => (
+                        <path
+                          d={`M0,${node.height * CYLINDER_CAP_RATIO} L0,${node.height * (1 - CYLINDER_CAP_RATIO)} A${node.width / 2},${node.height * CYLINDER_CAP_RATIO} 0 0,0 ${node.width},${node.height * (1 - CYLINDER_CAP_RATIO)} L${node.width},${node.height * CYLINDER_CAP_RATIO} Z`}
+                          {...p}
                         />
-                        {points.map((p, i) => (
+                      )}
+                    />
+                    <PaintedShape
+                      paint={paint}
+                      stroke={node.strokeColor}
+                      strokeWidth={node.strokeWidth}
+                      strokeDasharray={nodeStrokeDash}
+                      strokeOpacity={nodeStrokeOpacity}
+                      draw={(p) => <ellipse cx={node.width / 2} cy={node.height * CYLINDER_CAP_RATIO} rx={node.width / 2} ry={node.height * CYLINDER_CAP_RATIO} {...p} />}
+                    />
+                  </svg>
+                ) : outline.kind === "polygon" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    {paint.defs}
+                    <PaintedShape
+                      paint={paint}
+                      stroke={node.strokeColor}
+                      strokeWidth={node.strokeWidth}
+                      strokeDasharray={nodeStrokeDash}
+                      strokeOpacity={nodeStrokeOpacity}
+                      draw={(p) => <polygon points={outline.points.map(([px, py]) => `${px},${py}`).join(" ")} strokeLinejoin="round" {...p} />}
+                    />
+                    {outline.innerLines?.map((line, i) => (
+                      <polyline key={i} points={line.map(([px, py]) => `${px},${py}`).join(" ")} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeDasharray={nodeStrokeDash} strokeOpacity={nodeStrokeOpacity} strokeLinejoin="round" strokeLinecap="round" />
+                    ))}
+                    {outline.innerCircle && (
+                      <circle cx={outline.innerCircle.cx} cy={outline.innerCircle.cy} r={outline.innerCircle.r} fill="none" stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeDasharray={nodeStrokeDash} strokeOpacity={nodeStrokeOpacity} />
+                    )}
+                  </svg>
+                ) : outline.kind === "path" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    {paint.defs}
+                    <PaintedShape paint={paint} stroke={node.strokeColor} strokeWidth={node.strokeWidth} strokeDasharray={nodeStrokeDash} strokeOpacity={nodeStrokeOpacity} draw={(p) => <path d={outline.d} strokeLinejoin="round" {...p} />} />
+                  </svg>
+                ) : outline.kind === "chart" ? (
+                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                    {/* parts/labels are built in the plot box's own coordinates and shifted into place
+                        by `inset`; the title captions in overlayLabels are already node-local and sit
+                        OUTSIDE this group - see whiteboardHandlers.ts's ShapeOutline "chart" variant. */}
+                    <g transform={outline.inset ? `translate(${outline.inset.dx},${outline.inset.dy})` : undefined}>
+                      {outline.parts.map((part, i) =>
+                        part.role === "fill" ? (
+                          <path key={i} d={part.d} fill={resolveNodeFill(node) ?? "none"} stroke="none" />
+                        ) : part.role === "marker" ? (
+                          <path key={i} d={part.d} fill={node.strokeColor} stroke="none" />
+                        ) : part.role === "slice" ? (
+                          <path key={i} d={part.d} fill={part.color} stroke="#ffffff" strokeWidth={1} />
+                        ) : part.role === "series" ? (
+                          <path key={i} d={part.d} fill="none" stroke={part.color} strokeWidth={Math.max(0.5, part.width)} strokeLinecap="round" strokeLinejoin="round" />
+                        ) : part.role === "seriesFill" ? (
+                          <path key={i} d={part.d} fill={part.color} fillOpacity={SERIES_FILL_OPACITY} stroke="none" />
+                        ) : part.role === "annotation" ? (
+                          // Filled for the marker glyphs AND stroked so a leader line (a zero-area
+                          // path that would fill to nothing) still draws - matching the Canvas2D
+                          // export's own annotation branch exactly.
+                          <path key={i} d={part.d} fill={part.color} stroke={part.color} strokeWidth={1} strokeLinecap="round" />
+                        ) : part.role === "axis" ? (
+                          <path key={i} d={part.d} fill="none" stroke={part.color ?? "#9ca3af"} strokeOpacity={part.opacity} strokeWidth={part.width ?? 1} strokeLinecap="square" />
+                        ) : part.role === "grid" ? (
+                          <path key={i} d={part.d} fill="none" stroke={part.color ?? "#e5e7eb"} strokeOpacity={part.opacity} strokeWidth={0.75} />
+                        ) : (
+                          <path key={i} d={part.d} fill="none" stroke={node.strokeColor} strokeWidth={Math.max(1, node.strokeWidth)} strokeDasharray={nodeStrokeDash} strokeOpacity={nodeStrokeOpacity} strokeLinecap="round" strokeLinejoin="round" />
+                        )
+                      )}
+                      {outline.labels?.map((label, i) => (
+                        <ChartLabelText key={i} label={label} node={node} />
+                      ))}
+                    </g>
+                    {outline.overlayLabels?.map((label, i) => (
+                      <ChartLabelText key={`t${i}`} label={label} node={node} />
+                    ))}
+                  </svg>
+                ) : null}
+
+                {/* Manual point-plotting handles for a selected, unlocked "graph" node (see
+                    WhiteboardNode.graphPoints' own doc comment) - a transparent rect over just the
+                    plot area (not the full node box, so the margin around it stays reachable for the
+                    node's own ordinary double-click-to-edit-text below) double-clicks to add a point,
+                    and each existing point gets its own small draggable/double-click-to-remove dot. */}
+                {node.shapeType === "graph" &&
+                  selected &&
+                  !node.locked &&
+                  (() => {
+                    // annotationCoordinateMapper rather than graphCoordinateMapper directly: for a
+                    // "graph" it resolves the identical axis window (resolveGraphAxisRange), but it
+                    // ALSO accounts for the margins any axis/chart titles reserve - without which
+                    // every handle here would sit offset from the curve by exactly those margins the
+                    // moment a title was set.
+                    const { padX, padY, plotW, plotH, mapX, mapY, offsetX, offsetY } = annotationCoordinateMapper(
+                      node.shapeType,
+                      node.width,
+                      node.height,
+                      outlineOptionsFor(node)
+                    );
+                    const points = node.graphPoints ?? [];
+                    return (
+                      <svg
+                        width="100%"
+                        height="100%"
+                        viewBox={`0 0 ${node.width} ${node.height}`}
+                        preserveAspectRatio="none"
+                        // Sibling of the body svg above (both mount as separate children of this
+                        // node's own already-`position: absolute` div), not the only child - without
+                        // its own `position: absolute` this one would lay out in normal document FLOW
+                        // instead of overlaying the body, pushed below it and offset by whatever else
+                        // is in between (exactly what happened here before this was added: every
+                        // point handle rendered well outside the node's own visible box).
+                        style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                      >
+                        <g transform={`translate(${offsetX},${offsetY})`}>
+                          <rect
+                            x={padX}
+                            y={padY}
+                            width={plotW}
+                            height={plotH}
+                            fill="transparent"
+                            style={{ pointerEvents: "all", cursor: "copy" }}
+                            onDoubleClick={(e) => addGraphPoint(node, e)}
+                          />
+                          {points.map((p, i) => (
+                            <circle
+                              key={i}
+                              cx={mapX(p.x)}
+                              cy={mapY(p.y)}
+                              r={5.5 / zoom}
+                              fill="#2563eb"
+                              stroke="#ffffff"
+                              strokeWidth={1.5 / zoom}
+                              style={{ pointerEvents: "all", cursor: "grab" }}
+                              onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
+                              onDoubleClick={(e) => removeGraphPoint(node, i, e)}
+                            />
+                          ))}
+                        </g>
+                      </svg>
+                    );
+                  })()}
+
+                {/* Crop overlay for an image node in crop mode (double-click to enter, Escape or a
+                    click elsewhere to leave). The body behind this is showing the FULL source; this
+                    dims everything outside the kept rectangle and puts a drag handle on each of its
+                    four edges. */}
+                {node.shapeType === "image" &&
+                  croppingNodeId === node.id &&
+                  !node.locked &&
+                  (() => {
+                    const c = resolveImageCrop(node);
+                    const left = c.x * node.width;
+                    const top = c.y * node.height;
+                    const w = c.w * node.width;
+                    const h = c.h * node.height;
+                    const grip = 9 / zoom;
+                    // Corners are listed AFTER the sides so they paint (and hit-test) on top where the
+                    // two overlap - dragging a corner is the more specific intent.
+                    const handles: { handle: CropHandle; x: number; y: number; width: number; height: number; cursor: string }[] = [
+                      { handle: "left", x: left - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
+                      { handle: "right", x: left + w - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
+                      { handle: "top", x: left, y: top - grip / 2, width: w, height: grip, cursor: "ns-resize" },
+                      { handle: "bottom", x: left, y: top + h - grip / 2, width: w, height: grip, cursor: "ns-resize" },
+                      { handle: "nw", x: left - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
+                      { handle: "ne", x: left + w - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
+                      { handle: "sw", x: left - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
+                      { handle: "se", x: left + w - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
+                    ];
+                    const corners: [number, number][] = [
+                      [left, top],
+                      [left + w, top],
+                      [left, top + h],
+                      [left + w, top + h],
+                    ];
+                    return (
+                      <svg
+                        width="100%"
+                        height="100%"
+                        viewBox={`0 0 ${node.width} ${node.height}`}
+                        preserveAspectRatio="none"
+                        style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                      >
+                        {/* The dimmed region is the whole box minus the kept rect - drawn as one path
+                            with an inner subpath wound the opposite way so the even-odd rule punches
+                            the keeper out, rather than as four separate edge rectangles. */}
+                        <path
+                          d={`M0,0 H${node.width} V${node.height} H0 Z M${left},${top} V${top + h} H${left + w} V${top} Z`}
+                          fill="rgba(17,24,39,0.55)"
+                          fillRule="evenodd"
+                          style={{ pointerEvents: "none" }}
+                        />
+                        {/* Dragging anywhere inside the kept region pans the crop without resizing
+                            it. Listed before the edge/corner grips so those win where they overlap. */}
+                        <rect
+                          x={left}
+                          y={top}
+                          width={w}
+                          height={h}
+                          fill="transparent"
+                          style={{ pointerEvents: "all", cursor: "move" }}
+                          onPointerDown={(e) => beginImageCropDrag(node, "inside", e)}
+                        />
+                        <rect x={left} y={top} width={w} height={h} fill="none" stroke="#ffffff" strokeWidth={1.5 / zoom} style={{ pointerEvents: "none" }} />
+                        {/* Rule-of-thirds guides, the standard crop-tool framing aid. */}
+                        {[1, 2].map((i) => (
+                          <React.Fragment key={`g${i}`}>
+                            <line x1={left + (w * i) / 3} y1={top} x2={left + (w * i) / 3} y2={top + h} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
+                            <line x1={left} y1={top + (h * i) / 3} x2={left + w} y2={top + (h * i) / 3} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
+                          </React.Fragment>
+                        ))}
+                        {handles.map((handle) => (
+                          <rect
+                            key={handle.handle}
+                            x={handle.x}
+                            y={handle.y}
+                            width={Math.max(handle.width, grip)}
+                            height={Math.max(handle.height, grip)}
+                            fill="transparent"
+                            style={{ pointerEvents: "all", cursor: handle.cursor }}
+                            onPointerDown={(e) => beginImageCropDrag(node, handle.handle, e)}
+                          />
+                        ))}
+                        {/* Visible corner marks - the grips themselves are transparent hit areas, so
+                            without these there is nothing showing the corners can be grabbed. */}
+                        {corners.map(([cx, cy], i) => (
+                          <rect
+                            key={`c${i}`}
+                            x={cx - grip / 2}
+                            y={cy - grip / 2}
+                            width={grip}
+                            height={grip}
+                            fill="#ffffff"
+                            stroke="#111827"
+                            strokeWidth={1 / zoom}
+                            style={{ pointerEvents: "none" }}
+                          />
+                        ))}
+                      </svg>
+                    );
+                  })()}
+
+                {/* Draggable handles for a selected, unlocked chart's data-space annotations (see
+                    WhiteboardNode.chartAnnotations) - drag to move the callout to a different data
+                    coordinate, double-click to delete it. Rendered as a hollow ring around wherever
+                    the annotation's own marker already draws, so the handle reads as "grab this
+                    callout" without hiding the marker it belongs to. */}
+                {CHART_ANNOTATION_SHAPES.has(node.shapeType) &&
+                  selected &&
+                  !node.locked &&
+                  (node.chartAnnotations?.length ?? 0) > 0 &&
+                  (() => {
+                    const mapper = annotationCoordinateMapper(node.shapeType, node.width, node.height, outlineOptionsFor(node));
+                    return (
+                      <svg
+                        width="100%"
+                        height="100%"
+                        viewBox={`0 0 ${node.width} ${node.height}`}
+                        preserveAspectRatio="none"
+                        style={{ position: "absolute", inset: 0, overflow: "visible" }}
+                      >
+                        {/* Shifted by the title margins for the same reason the outline's own parts
+                            are - see annotationCoordinateMapper's offsetX/offsetY doc comment. */}
+                        <g transform={`translate(${mapper.offsetX},${mapper.offsetY})`}>
+                          {(node.chartAnnotations ?? []).map((a, i) => (
+                            <circle
+                              key={i}
+                              cx={mapper.mapX(a.x)}
+                              cy={mapper.mapY(a.y)}
+                              r={7 / zoom}
+                              fill="transparent"
+                              stroke="#2563eb"
+                              strokeWidth={1.5 / zoom}
+                              style={{ pointerEvents: "all", cursor: "grab" }}
+                              onPointerDown={(e) => beginAnnotationDrag(node, i, e)}
+                              onDoubleClick={(e) => removeAnnotation(node, i, e)}
+                            />
+                          ))}
+                        </g>
+                      </svg>
+                    );
+                  })()}
+
+                {/* Draggable data handles for a selected, unlocked bar/line/scatter chart (see
+                    beginChartDataDrag's own doc comment) - one small circle per WhiteboardNode.
+                    chartData entry, at the exact spot chartColumnLayout already draws it. */}
+                {(node.shapeType === "barChart" || node.shapeType === "lineChart" || node.shapeType === "scatterPlot") &&
+                  selected &&
+                  !node.locked &&
+                  (() => {
+                    const data = node.chartData ?? DEFAULT_CHART_DATA;
+                    const { columnX, valueToY } = chartColumnLayout(node.width, node.height, data);
+                    return (
+                      // Same "needs its own position: absolute" reasoning as the graph-points overlay
+                      // just above - this is also a sibling, not the sole child, of this node's div.
+                      <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+                        {data.map((v, i) => (
                           <circle
                             key={i}
-                            cx={mapX(p.x)}
-                            cy={mapY(p.y)}
-                            r={5.5 / zoom}
+                            cx={columnX(i)}
+                            cy={valueToY(v)}
+                            r={6 / zoom}
                             fill="#2563eb"
                             stroke="#ffffff"
                             strokeWidth={1.5 / zoom}
-                            style={{ pointerEvents: "all", cursor: "grab" }}
-                            onPointerDown={(e) => beginGraphPointDrag(node, i, e)}
-                            onDoubleClick={(e) => removeGraphPoint(node, i, e)}
-                          />
+                            style={{ pointerEvents: "all", cursor: "ns-resize" }}
+                            onPointerDown={(e) => beginChartDataDrag(node, i, e)}
+                          >
+                            <title>{`${v}`}</title>
+                          </circle>
                         ))}
-                      </g>
-                    </svg>
-                  );
-                })()}
+                      </svg>
+                    );
+                  })()}
 
-              {/* Crop overlay for an image node in crop mode (double-click to enter, Escape or a
-                  click elsewhere to leave). The body behind this is showing the FULL source; this
-                  dims everything outside the kept rectangle and puts a drag handle on each of its
-                  four edges. */}
-              {node.shapeType === "image" &&
-                croppingNodeId === node.id &&
-                !node.locked &&
-                (() => {
-                  const c = resolveImageCrop(node);
-                  const left = c.x * node.width;
-                  const top = c.y * node.height;
-                  const w = c.w * node.width;
-                  const h = c.h * node.height;
-                  const grip = 9 / zoom;
-                  // Corners are listed AFTER the sides so they paint (and hit-test) on top where the
-                  // two overlap - dragging a corner is the more specific intent.
-                  const handles: { handle: CropHandle; x: number; y: number; width: number; height: number; cursor: string }[] = [
-                    { handle: "left", x: left - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
-                    { handle: "right", x: left + w - grip / 2, y: top, width: grip, height: h, cursor: "ew-resize" },
-                    { handle: "top", x: left, y: top - grip / 2, width: w, height: grip, cursor: "ns-resize" },
-                    { handle: "bottom", x: left, y: top + h - grip / 2, width: w, height: grip, cursor: "ns-resize" },
-                    { handle: "nw", x: left - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
-                    { handle: "ne", x: left + w - grip, y: top - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
-                    { handle: "sw", x: left - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nesw-resize" },
-                    { handle: "se", x: left + w - grip, y: top + h - grip, width: grip * 2, height: grip * 2, cursor: "nwse-resize" },
-                  ];
-                  const corners: [number, number][] = [
-                    [left, top],
-                    [left + w, top],
-                    [left, top + h],
-                    [left + w, top + h],
-                  ];
-                  return (
-                    <svg
-                      width="100%"
-                      height="100%"
-                      viewBox={`0 0 ${node.width} ${node.height}`}
-                      preserveAspectRatio="none"
-                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
-                    >
-                      {/* The dimmed region is the whole box minus the kept rect - drawn as one path
-                          with an inner subpath wound the opposite way so the even-odd rule punches
-                          the keeper out, rather than as four separate edge rectangles. */}
-                      <path
-                        d={`M0,0 H${node.width} V${node.height} H0 Z M${left},${top} V${top + h} H${left + w} V${top} Z`}
-                        fill="rgba(17,24,39,0.55)"
-                        fillRule="evenodd"
-                        style={{ pointerEvents: "none" }}
-                      />
-                      {/* Dragging anywhere inside the kept region pans the crop without resizing
-                          it. Listed before the edge/corner grips so those win where they overlap. */}
-                      <rect
-                        x={left}
-                        y={top}
-                        width={w}
-                        height={h}
-                        fill="transparent"
-                        style={{ pointerEvents: "all", cursor: "move" }}
-                        onPointerDown={(e) => beginImageCropDrag(node, "inside", e)}
-                      />
-                      <rect x={left} y={top} width={w} height={h} fill="none" stroke="#ffffff" strokeWidth={1.5 / zoom} style={{ pointerEvents: "none" }} />
-                      {/* Rule-of-thirds guides, the standard crop-tool framing aid. */}
-                      {[1, 2].map((i) => (
-                        <React.Fragment key={`g${i}`}>
-                          <line x1={left + (w * i) / 3} y1={top} x2={left + (w * i) / 3} y2={top + h} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
-                          <line x1={left} y1={top + (h * i) / 3} x2={left + w} y2={top + (h * i) / 3} stroke="rgba(255,255,255,0.4)" strokeWidth={1 / zoom} style={{ pointerEvents: "none" }} />
-                        </React.Fragment>
-                      ))}
-                      {handles.map((handle) => (
-                        <rect
-                          key={handle.handle}
-                          x={handle.x}
-                          y={handle.y}
-                          width={Math.max(handle.width, grip)}
-                          height={Math.max(handle.height, grip)}
-                          fill="transparent"
-                          style={{ pointerEvents: "all", cursor: handle.cursor }}
-                          onPointerDown={(e) => beginImageCropDrag(node, handle.handle, e)}
-                        />
-                      ))}
-                      {/* Visible corner marks - the grips themselves are transparent hit areas, so
-                          without these there is nothing showing the corners can be grabbed. */}
-                      {corners.map(([cx, cy], i) => (
-                        <rect
-                          key={`c${i}`}
-                          x={cx - grip / 2}
-                          y={cy - grip / 2}
-                          width={grip}
-                          height={grip}
-                          fill="#ffffff"
-                          stroke="#111827"
-                          strokeWidth={1 / zoom}
-                          style={{ pointerEvents: "none" }}
-                        />
-                      ))}
-                    </svg>
-                  );
-                })()}
-
-              {/* Draggable handles for a selected, unlocked chart's data-space annotations (see
-                  WhiteboardNode.chartAnnotations) - drag to move the callout to a different data
-                  coordinate, double-click to delete it. Rendered as a hollow ring around wherever
-                  the annotation's own marker already draws, so the handle reads as "grab this
-                  callout" without hiding the marker it belongs to. */}
-              {CHART_ANNOTATION_SHAPES.has(node.shapeType) &&
-                selected &&
-                !node.locked &&
-                (node.chartAnnotations?.length ?? 0) > 0 &&
-                (() => {
-                  const mapper = annotationCoordinateMapper(node.shapeType, node.width, node.height, outlineOptionsFor(node));
-                  return (
-                    <svg
-                      width="100%"
-                      height="100%"
-                      viewBox={`0 0 ${node.width} ${node.height}`}
-                      preserveAspectRatio="none"
-                      style={{ position: "absolute", inset: 0, overflow: "visible" }}
-                    >
-                      {/* Shifted by the title margins for the same reason the outline's own parts
-                          are - see annotationCoordinateMapper's offsetX/offsetY doc comment. */}
-                      <g transform={`translate(${mapper.offsetX},${mapper.offsetY})`}>
-                        {(node.chartAnnotations ?? []).map((a, i) => (
-                          <circle
-                            key={i}
-                            cx={mapper.mapX(a.x)}
-                            cy={mapper.mapY(a.y)}
-                            r={7 / zoom}
-                            fill="transparent"
-                            stroke="#2563eb"
-                            strokeWidth={1.5 / zoom}
-                            style={{ pointerEvents: "all", cursor: "grab" }}
-                            onPointerDown={(e) => beginAnnotationDrag(node, i, e)}
-                            onDoubleClick={(e) => removeAnnotation(node, i, e)}
-                          />
-                        ))}
-                      </g>
-                    </svg>
-                  );
-                })()}
-
-              {/* Draggable data handles for a selected, unlocked bar/line/scatter chart (see
-                  beginChartDataDrag's own doc comment) - one small circle per WhiteboardNode.
-                  chartData entry, at the exact spot chartColumnLayout already draws it. */}
-              {(node.shapeType === "barChart" || node.shapeType === "lineChart" || node.shapeType === "scatterPlot") &&
-                selected &&
-                !node.locked &&
-                (() => {
-                  const data = node.chartData ?? DEFAULT_CHART_DATA;
-                  const { columnX, valueToY } = chartColumnLayout(node.width, node.height, data);
-                  return (
-                    // Same "needs its own position: absolute" reasoning as the graph-points overlay
-                    // just above - this is also a sibling, not the sole child, of this node's div.
-                    <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0, overflow: "visible" }}>
-                      {data.map((v, i) => (
-                        <circle
-                          key={i}
-                          cx={columnX(i)}
-                          cy={valueToY(v)}
-                          r={6 / zoom}
-                          fill="#2563eb"
-                          stroke="#ffffff"
-                          strokeWidth={1.5 / zoom}
-                          style={{ pointerEvents: "all", cursor: "ns-resize" }}
-                          onPointerDown={(e) => beginChartDataDrag(node, i, e)}
-                        >
-                          <title>{`${v}`}</title>
-                        </circle>
-                      ))}
-                    </svg>
-                  );
-                })()}
-
-              {!isEditing && node.text && node.shapeType === "equation" && (
-                <div
-                  className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
-                  style={{
-                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
-                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
-                  }}
-                >
-                  <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
-                </div>
-              )}
-              {!isEditing && node.text && node.shapeType !== "equation" && (
-                <div
-                  className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
-                  style={{
-                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
-                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
-                    textAlign: node.textAlign,
-                    color: node.fontColor,
-                    fontFamily: node.fontFamily,
-                    fontSize: node.fontSize,
-                    fontWeight: node.fontWeight,
-                    fontStyle: node.fontStyle,
-                    textDecoration: node.textDecoration,
-                    pointerEvents: "none",
-                  }}
-                >
-                  <span>{node.text}</span>
-                </div>
-              )}
-              {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
-                <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">
-                  {node.shapeType === "equation" ? "Double-click to type LaTeX" : "Double-click to type"}
-                </div>
-              )}
+                {!isEditing && node.text && node.shapeType === "equation" && (
+                  <div
+                    className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
+                    style={{
+                      alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                      justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                    }}
+                  >
+                    <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
+                  </div>
+                )}
+                {!isEditing && node.text && node.shapeType !== "equation" && (
+                  <div
+                    className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
+                    style={{
+                      alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                      justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                      textAlign: node.textAlign,
+                      color: node.fontColor,
+                      fontFamily: node.fontFamily,
+                      fontSize: node.fontSize,
+                      fontWeight: node.fontWeight,
+                      fontStyle: node.fontStyle,
+                      textDecoration: node.textDecoration,
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <span>{node.text}</span>
+                  </div>
+                )}
+                {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
+                  <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">
+                    {node.shapeType === "equation" ? "Double-click to type LaTeX" : "Double-click to type"}
+                  </div>
+                )}
+              </div>
 
               {isEditing && (
                 <div

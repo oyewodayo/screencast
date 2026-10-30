@@ -16,7 +16,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
-import { duplicateScene as duplicateStageScene, makeStageScene } from "../utils/stage/stageEditing";
+import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
 import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
 import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
 import type { TimelineClipboardItems } from "../utils/timelineClipboard";
@@ -626,6 +626,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           } catch (err) {
             console.error("Failed to parse video edit state:", err);
           }
+        } else if (isVideoProjectPath(sourcePath)) {
+          // A project whose timeline file is missing (deleted, not synced yet) starts as an empty
+          // canvas rather than one nothing can be added to - setDuration never seeds a project.
+          setState((prev) => prev ?? { ...createEmptyState(sourcePath, 0), clips: [] });
         }
         setLoading(false);
       },
@@ -1329,7 +1333,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (startTime: number, frame: { width: number; height: number }): string => {
       const current = stateRef.current;
       if (!current) return "";
-      const scene = makeStageScene({ startTime, frameWidth: frame.width, frameHeight: frame.height });
+      const scene = makeStageScene({ startTime, frameWidth: frame.width, frameHeight: frame.height, like: sceneBefore(current.scenes, startTime) });
       pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), scene] }), "add-scene");
       return scene.id;
     },

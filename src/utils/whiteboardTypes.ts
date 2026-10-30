@@ -673,6 +673,19 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   fillPatternSpacing?: number;
   strokeColor: string;
   strokeWidth: number;
+  // Border line style: "solid" (default), "dashed" (8,6), or "dotted" (round dots).
+  strokeStyle?: "solid" | "dashed" | "dotted";
+  // Stroke/border opacity (0-1). Absent - resolves to 1 (solid).
+  strokeOpacity?: number;
+  // Overall node opacity (0-1). Absent - resolves to 1 (solid).
+  opacity?: number;
+  // Shadow properties - renders a drop-shadow following the shape's exact silhouette.
+  shadowEnabled?: boolean;
+  shadowColor?: string;
+  shadowOpacity?: number;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
   // Rounds the shape's corners. Every shape whose outline is a straight-edged polygon (triangle,
   // diamond, hexagon, star, trapezoid, callout, ...) honors it, not just rectangles - see
   // whiteboardHandlers.ts's supportsCornerRadius/roundedPolygonD - and an "image" node uses it for

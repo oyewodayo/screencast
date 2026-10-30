@@ -534,3 +534,24 @@
 .ProseMirror .tableWrapper[data-rules="leaders"] :is(sub, sup) {
   line-height: 0;
 }
+
+
+/* ---------- Custom bullet markers & list markers (Word/Google Docs imports) ---------- */
+.ProseMirror :is(ul, ol) > li::marker {
+  color: currentColor;
+}
+.ProseMirror ul[data-bullet="-"] > li::marker {
+  content: "-  ";
+}
+.ProseMirror ul[data-bullet="–"] > li::marker {
+  content: "–  ";
+}
+.ProseMirror ul[data-bullet="◦"] {
+  list-style-type: circle;
+}
+.ProseMirror ul[data-bullet="▪"] {
+  list-style-type: square;
+}
+.ProseMirror ul[data-bullet="none"] {
+  list-style-type: none;
+}

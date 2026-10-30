@@ -9,6 +9,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { compileStage, stageIsMoving } from "./stageEngine";
 import { loadStageImages } from "./stageImages";
+import { loadStageMath } from "./stageMath";
+import { loadStageGraphs } from "./stageGraph";
 import { canvasStageMeasure, loadStageFonts } from "./stageMeasure";
 import { StageRenderer } from "./stageRenderer";
 import type { StageScene } from "./stageTypes";
@@ -76,7 +78,7 @@ export async function renderStageForExport(
 ): Promise<StageLayerSpec> {
   const setupBegan = performance.now();
   // Text is measured in its own faces and weights - a fallback would put every letter somewhere else.
-  await Promise.all([loadStageFonts(scene), loadStageImages(scene)]);
+  await Promise.all([loadStageFonts(scene), loadStageImages(scene), loadStageMath(scene), loadStageGraphs(scene)]);
   const loadedMs = performance.now() - setupBegan;
   const compiled = compileStage(scene, canvasStageMeasure);
   const canvas = document.createElement("canvas");

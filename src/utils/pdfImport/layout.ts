@@ -132,7 +132,7 @@ export function analysePage(pageNo: number, width: number, height: number, glyph
   const marginal: PageAnalysis["marginal"] = [];
   segs = segs.filter((s) => {
     const text = segmentText(s).trim();
-    const inTop = s.bottom < height * 0.075 && s.top <= textTop + 2;
+    const inTop = s.bottom < height * 0.075 && s.top <= textTop + 2 && s.size <= bodySize * 1.1;
     const inBottom = s.top > height * 0.93;
     const pageNumberLike = /^[-–—\s]*(\d{1,4}|[ivxlc]{1,6}|page \d+( of \d+)?)[-–—\s]*$/i.test(text);
     if ((inTop || inBottom) && (pageNumberLike || text.length < 90)) {

@@ -19,6 +19,8 @@ export interface StageChannel {
   id: string;
   name?: string;
   keys: StageChannelKey[];
+  // How the editor shows and reads it, and the format live text uses by default.
+  format?: StageValueFormat;
 }
 
 // int: 42 · pct: 42% · fixed1/fixed2: 42.0 / 42.00 · time: minutes after midnight as 11:42 PM
@@ -102,7 +104,8 @@ export function hasTemplate(text: string | undefined, channels: Map<string, Stag
 export function fillTemplate(text: string, channels: Map<string, StageChannel>, t: number): string {
   return text.replace(TEMPLATE, (whole, id: string, fmt: string | undefined) => {
     const c = channels.get(id);
-    return c ? formatValue(channelValue(c, t), fmt as StageValueFormat | undefined) : whole;
+    // No format named: the value's own (how the editor shows it).
+    return c ? formatValue(channelValue(c, t), (fmt as StageValueFormat | undefined) ?? c.format) : whole;
   });
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolvedBeats } from "./stageEngine";
-import { addBeat, addElement, beatIndexAt, beatRestTime, deleteBeat, deleteElement, duplicateScene, elementInBeat, makeShapeElement, makeStageScene, sceneDuration, setBeatHold, setElementProps, setSceneDuration, stageWidthFor } from "./stageEditing";
+import { addBeat, addElement, beatIndexAt, beatRestTime, deleteBeat, deleteElement, duplicateScene, elementInBeat, makeGraphElement, makeShapeElement, makeStageScene, reinkScene, duplicateElement, renameElement, sceneDuration, setBeatHold, setElementProps, setSceneDuration, stageWidthFor } from "./stageEditing";
 import { StageScene } from "./stageTypes";
 
 // Three beats, the title's text and colour changed along the way.
@@ -115,5 +115,58 @@ describe("beats", () => {
     expect(copiedTitle.id).not.toBe(title);
     expect(copiedTitle.parent).toBe(copy.elements[0].id);
     expect(elementInBeat(copy, 1, copiedTitle.id)!.text).toBe("Two");
+  });
+});
+
+describe("changing the background between light and dark", () => {
+  it("moves the automatic inks across and leaves chosen colours alone", () => {
+    let s = makeStageScene({ startTime: 0, frameWidth: 1920, frameHeight: 1080 });
+    const title = s.elements.find((e) => e.kind === "text")!.id;
+    const graph = makeGraphElement({ x: 0, y: 0, color: "#111111", curve: "#2563eb" });
+    s = addElement(s, 0, graph);
+    s = addBeat(s, 0).scene;
+    s = setElementProps(s, 1, title, { color: "#ef4444" });
+    const dark = reinkScene(s, true);
+    expect(elementInBeat(dark, 0, title)!.color).toBe("#f5f5f4");
+    expect(elementInBeat(dark, 1, title)!.color).toBe("#ef4444");
+    expect(elementInBeat(dark, 0, graph.id)!.color).toBe("#f5f5f4");
+    expect(elementInBeat(dark, 0, graph.id)!.graph!.series[0].color).toBe("#58c4dd");
+    expect(elementInBeat(reinkScene(dark, false), 0, title)!.color).toBe("#111111");
+  });
+});
+
+describe("inks written any way", () => {
+  it("swaps an automatic ink however its colour is spelled", () => {
+    let s = makeStageScene({ startTime: 0, frameWidth: 1920, frameHeight: 1080 });
+    const title = s.elements.find((e) => e.kind === "text")!.id;
+    s = setElementProps(s, 0, title, { color: "rgba(17, 17, 17, 1)" });
+    expect(elementInBeat(reinkScene(s, true), 0, title)!.color).toBe("#f5f5f4");
+  });
+});
+
+describe("a new scene after another", () => {
+  it("takes the scene before's background and motion, its title inked to match", () => {
+    const dark = { ...makeStageScene({ startTime: 0, frameWidth: 1920, frameHeight: 1080 }), background: { kind: "color" as const, color: "#0b0d12" }, spring: "bouncy" as const };
+    const next = makeStageScene({ startTime: 3, frameWidth: 1920, frameHeight: 1080, like: dark });
+    expect(next.background).toEqual(dark.background);
+    expect(next.spring).toBe("bouncy");
+    expect(next.elements.find((e) => e.kind === "text")!.props.color).toBe("#f5f5f4");
+  });
+});
+
+describe("duplicating and naming", () => {
+  it("copies an element with its beat changes, offset, and numbers its name", () => {
+    let s = makeStageScene({ startTime: 0, frameWidth: 1920, frameHeight: 1080 });
+    s = addElement(s, 0, { ...makeShapeElement({ x: 100, y: 200 }), id: "n1", name: "Neuron 1" });
+    s = addBeat(s, 0).scene;
+    s = setElementProps(s, 1, "n1", { color: "#ff0000", x: 300 });
+    const { scene, id } = duplicateElement(s, "n1", 30);
+    const copy = scene.elements.find((e) => e.id === id)!;
+    expect(copy.name).toBe("Neuron 2");
+    expect([copy.props.x, copy.props.y]).toEqual([130, 230]);
+    expect(elementInBeat(scene, 1, id)!.color).toBe("#ff0000");
+    expect(elementInBeat(scene, 1, id)!.x).toBe(330);
+    expect(scene.elements.findIndex((e) => e.id === id)).toBe(scene.elements.findIndex((e) => e.id === "n1") + 1);
+    expect(renameElement(scene, id, "Output").elements.find((e) => e.id === id)!.name).toBe("Output");
   });
 });

@@ -1,6 +1,6 @@
 // components/pdf/AnnotationToolbar.tsx
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { IoPencil, IoArrowUndo, IoArrowRedo, IoText, IoExpand, IoGridOutline, IoListOutline, IoImageOutline, IoDownloadOutline, IoChatbubblesOutline } from "react-icons/io5";
+import { IoPencil, IoArrowUndo, IoArrowRedo, IoText, IoExpand, IoGridOutline, IoListOutline, IoImageOutline, IoDownloadOutline, IoChatbubblesOutline, IoSearchOutline } from "react-icons/io5";
 import { BsHighlighter, BsCursor } from "react-icons/bs";
 import { FaEraser } from "react-icons/fa";
 import { MdAutoStories } from "react-icons/md";
@@ -34,6 +34,8 @@ interface AnnotationToolbarProps {
   onRedo: () => void;
   isExporting: boolean;
   onExport: () => void;
+  magnifierActive?: boolean;
+  onToggleMagnifier?: () => void;
 }
 
 // Every tooltip in this dock goes through TooltipLayer (data-tip / data-tip-kbd) rather than a
@@ -86,6 +88,8 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onRedo,
   isExporting,
   onExport,
+  magnifierActive,
+  onToggleMagnifier,
 }) => {
   const dockRef = useRef<HTMLDivElement>(null);
   const toolButtonRefs = useRef<Partial<Record<AnnotationTool, HTMLButtonElement | null>>>({});
@@ -118,7 +122,20 @@ const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
     { kind: "divider", key: "d1" },
     // "Select" is a real, always-present option (not just a side effect of re-clicking an active
     // tool) so deselecting has an unmistakable, always-highlightable target.
-    { kind: "button", key: "select", title: "Select", kbd: "V", active: tool === null, onClick: onDeselectTool, icon: <BsCursor size={12} /> },
+    { kind: "button", key: "select", title: "Select", kbd: "V", active: tool === null && !magnifierActive, onClick: onDeselectTool, icon: <BsCursor size={12} /> },
+    ...(onToggleMagnifier
+      ? [
+          {
+            kind: "button" as const,
+            key: "magnifier",
+            title: magnifierActive ? "Close magnifying lens" : "Magnifying lens",
+            kbd: "M",
+            active: magnifierActive,
+            onClick: onToggleMagnifier,
+            icon: <IoSearchOutline size={14} />,
+          },
+        ]
+      : []),
     ...TOOL_BUTTONS.map(
       ({ tool: t, label, shortcut, icon }): DockEntry => ({
         kind: "button",

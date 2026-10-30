@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { createDefaultWhiteboardNode, nodeHasFill, resolveFillType, resolveGradientStops, WhiteboardNode } from "../utils/whiteboardTypes";
-import { fillImageRect, fillPatternTile, linearGradientPoints, roundedPolygonD, shapeOutlineFor, supportsCornerRadius } from "./whiteboardHandlers";
+import {
+  dashArrayFor,
+  fillImageRect,
+  fillPatternTile,
+  hexToRgba,
+  linearGradientPoints,
+  nodeDropShadowCSS,
+  roundedPolygonD,
+  shapeOutlineFor,
+  supportsCornerRadius,
+} from "./whiteboardHandlers";
 
 function node(shapeType: WhiteboardNode["shapeType"], overrides: Partial<WhiteboardNode> = {}): WhiteboardNode {
   return { ...createDefaultWhiteboardNode("n1", shapeType, 0, 0), ...overrides };
@@ -89,5 +99,35 @@ describe("fill paint", () => {
   it("builds a non-empty tile for every pattern", () => {
     for (const p of ["grid", "dots", "lines", "diagonal"] as const) expect(fillPatternTile(p, 16).d.length).toBeGreaterThan(0);
     expect(fillPatternTile("none", 16).d).toBe("");
+  });
+});
+
+describe("shadow and stroke helpers", () => {
+  it("formats hexToRgba accurately with clamped opacity", () => {
+    expect(hexToRgba("#000000", 0.5)).toBe("rgba(0,0,0,0.5)");
+    expect(hexToRgba("#ff0000", 1)).toBe("rgba(255,0,0,1)");
+    expect(hexToRgba("#3b82f6", 0)).toBe("rgba(59,130,246,0)");
+  });
+
+  it("produces drop-shadow CSS only when shadowEnabled is true with non-zero opacity", () => {
+    expect(nodeDropShadowCSS({ shadowEnabled: false } as WhiteboardNode)).toBeUndefined();
+    expect(nodeDropShadowCSS({ shadowEnabled: true, shadowOpacity: 0 } as WhiteboardNode)).toBeUndefined();
+    expect(
+      nodeDropShadowCSS({
+        shadowEnabled: true,
+        shadowColor: "#000000",
+        shadowOpacity: 0.25,
+        shadowBlur: 12,
+        shadowOffsetX: 0,
+        shadowOffsetY: 4,
+      } as WhiteboardNode)
+    ).toBe("drop-shadow(0px 4px 12px rgba(0,0,0,0.25))");
+  });
+
+  it("computes stroke dasharray based on style and strokeWidth", () => {
+    expect(dashArrayFor("solid", 2)).toBeUndefined();
+    expect(dashArrayFor(undefined, 2)).toBeUndefined();
+    expect(dashArrayFor("dashed", 2)).toBe("8,6");
+    expect(dashArrayFor("dotted", 2)).toBe("1,6.2");
   });
 });

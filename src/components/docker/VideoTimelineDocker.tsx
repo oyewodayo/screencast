@@ -1945,7 +1945,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (!sceneDrag) return;
     e.stopPropagation();
     const moved = Math.abs(e.clientX - sceneDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const raw = snapToTargets(sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
+    // Its start or its end snaps - to the other scenes' edges too, so scenes butt end to end exactly.
+    const edges = editStore.scenes.filter((x) => x.id !== sceneDrag.id).flatMap((x) => [x.startTime, x.startTime + sceneDuration(x)]);
+    const targets = [...overlaySnapTargets, ...edges];
+    const free = sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec;
+    const startTo = snapToTargets(free, targets, pxPerSec);
+    const endTo = snapToTargets(free + sceneDrag.duration, targets, pxPerSec);
+    const startPull = startTo !== free ? Math.abs(startTo - free) : Infinity;
+    const endPull = endTo !== free + sceneDrag.duration ? Math.abs(endTo - (free + sceneDrag.duration)) : Infinity;
+    const raw = startPull === Infinity && endPull === Infinity ? free : startPull <= endPull ? startTo : endTo - sceneDrag.duration;
     const liveStartTime = Math.max(0, scenesFree ? raw : Math.min(raw, totalOutputDuration - sceneDrag.duration));
     setSceneDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
   };
@@ -4704,7 +4712,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               otherwise the clips' own width plus space for the "+" after the last clip. */}
           <div
             ref={trackContentRef}
-            style={isProject && baseClips.length === 0 && !isAudioOnly ? { width: "100%", minWidth: 320 } : { width: Math.max(totalWidth, laneEndTime * pxPerSec) + ADD_BUTTON_ROOM_PX }}
+            // A blank-canvas project's track is never narrower than the panel: a short scene alone
+            // mustn't squeeze the drop prompt into a column.
+            style={isProject && baseClips.length === 0 && !isAudioOnly ? { width: "100%", minWidth: 320 } : { width: Math.max(totalWidth, laneEndTime * pxPerSec) + ADD_BUTTON_ROOM_PX, minWidth: isProject && editStore.clips.length === 0 ? viewWidth : undefined }}
             className="relative"
           >
             {/* Ruler - represents the *assembled* (playback-order) timeline, not raw source time */}
@@ -4785,7 +4795,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     isAudioOnly ? "justify-start" : "justify-center"
                   }`}
                 >
-                  <span className={`flex items-center gap-2 ${isAudioOnly ? "sticky left-3 pl-3" : ""}`}>
+                  <span className={`flex items-center gap-2 whitespace-nowrap ${isAudioOnly ? "sticky left-3 pl-3" : ""}`}>
                     {isAudioOnly ? "Plays over a blank screen - drop images or videos here, or" : "Drop images or videos here, or"}
                     <button
                       type="button"

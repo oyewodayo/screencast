@@ -766,7 +766,11 @@ const PdfPage: React.FC<PdfPageProps> = ({
   const editorPosition = editingText && viewport ? pdfPointToDevicePoint(viewport, { x: editingText.x, y: editingText.y, pressure: 1 }) : null;
 
   return (
-    <div ref={pageWrapperRef} className="relative inline-block bg-white shadow-[0_12px_40px_rgba(0,0,0,0.14)] ring-1 ring-black/[0.06]">
+    <div
+      ref={pageWrapperRef}
+      data-pdf-page-index={pageIndex}
+      className="relative inline-block bg-white shadow-[0_12px_40px_rgba(0,0,0,0.14)] ring-1 ring-black/[0.06]"
+    >
       <canvas ref={pageCanvasRef} className="block" style={{ position: "relative" }} />
       {/* Selectable text, positioned pixel-for-pixel over the glyphs the page canvas above just
           painted. Only actually interactive in "Select / no tool" mode — see scratchCanvas below,

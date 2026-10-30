@@ -36,6 +36,8 @@ import {
   TbLayoutAlignMiddle,
   TbLayoutAlignTop,
   TbRotateClockwise,
+  TbShadow,
+  TbShadowOff,
   TbStackBack,
   TbStackFront,
   TbUnderline,
@@ -137,6 +139,11 @@ import {
   arrangeNodesInGrid,
   compileGraphExpression,
   DEFAULT_GRID_GAP,
+  DEFAULT_SHADOW_BLUR,
+  DEFAULT_SHADOW_COLOR,
+  DEFAULT_SHADOW_OFFSET_X,
+  DEFAULT_SHADOW_OFFSET_Y,
+  DEFAULT_SHADOW_OPACITY,
   distributeNodes,
   fillPatternTile,
   nudgeEdgeBy,
@@ -212,6 +219,33 @@ const ROUTING_OPTIONS: { value: WhiteboardEdge["routing"]; label: string }[] = [
   { value: "straight", label: "Straight" },
   { value: "orthogonal", label: "Orthogonal" },
   { value: "curved", label: "Curved" },
+];
+
+const SHADOW_PRESETS: {
+  name: string;
+  config?: Partial<WhiteboardNode>;
+  makeConfig?: (n: WhiteboardNode) => Partial<WhiteboardNode>;
+}[] = [
+  { name: "Soft", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.18, shadowBlur: 12, shadowOffsetX: 0, shadowOffsetY: 4 } },
+  { name: "Medium", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.28, shadowBlur: 20, shadowOffsetX: 0, shadowOffsetY: 8 } },
+  { name: "Floating", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.35, shadowBlur: 32, shadowOffsetX: 0, shadowOffsetY: 16 } },
+  {
+    name: "Glow",
+    makeConfig: (n: WhiteboardNode) => ({
+      shadowEnabled: true,
+      shadowColor:
+        n.strokeColor && n.strokeColor !== "#000000" && n.strokeColor !== "#111111"
+          ? n.strokeColor
+          : n.fillColor && n.fillColor !== "#ffffff"
+          ? n.fillColor
+          : "#3b82f6",
+      shadowOpacity: 0.55,
+      shadowBlur: 18,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    }),
+  },
+  { name: "Retro", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.85, shadowBlur: 0, shadowOffsetX: 5, shadowOffsetY: 5 } },
 ];
 
 interface WhiteboardStylePanelProps {
@@ -2403,6 +2437,17 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         <>
           <Section title="Arrange" dense>
             <TransformBlock nodes={selectedNodes} onCommit={updateNodes} />
+            <SliderField
+              label="Opacity"
+              resetKey={`lyo-${ids}`}
+              value={Math.round((selectedNodes[0].opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateNodes({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
+            />
             <div className="flex items-center justify-between gap-2">
               <NudgeBar onNudge={nudgeSelected} />
               <Segmented>
@@ -2485,6 +2530,172 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               />
             );
           })()}
+          {!selectedNodes.every((n) => n.shapeType === "freehand") && (
+            <Field label="Style">
+              <Segmented>
+                {LINE_STYLE_OPTIONS.map((opt) => (
+                  <SegmentButton
+                    key={opt.value}
+                    active={(selectedNodes[0].strokeStyle ?? "solid") === opt.value}
+                    onClick={() => updateNodes({ strokeStyle: opt.value })}
+                    title={opt.label}
+                  >
+                    <svg width={18} height={8} viewBox="0 0 18 8">
+                      <line
+                        x1={1}
+                        y1={4}
+                        x2={17}
+                        y2={4}
+                        stroke="currentColor"
+                        strokeWidth={1.75}
+                        strokeLinecap="round"
+                        strokeDasharray={opt.value === "dashed" ? "4 3" : opt.value === "dotted" ? "0.1 3.5" : undefined}
+                      />
+                    </svg>
+                  </SegmentButton>
+                ))}
+              </Segmented>
+            </Field>
+          )}
+          <SliderField
+            label="Opacity"
+            resetKey={`so-${ids}`}
+            value={Math.round((selectedNodes[0].strokeOpacity ?? 1) * 100)}
+            min={0}
+            max={100}
+            step={1}
+            onCommit={(n) => updateNodes({ strokeOpacity: n >= 100 ? undefined : n / 100 })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { strokeOpacity: n / 100 })}
+            title="Stroke opacity (100% solid, 0% invisible border)"
+          />
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+        <Section
+          title="Shadow"
+          dense
+          action={
+            <button
+              type="button"
+              onClick={() => {
+                const isEnabled = selectedNodes[0].shadowEnabled ?? false;
+                const next = !isEnabled;
+                updateNodes({
+                  shadowEnabled: next,
+                  ...(next && selectedNodes[0].shadowBlur === undefined
+                    ? {
+                        shadowColor: DEFAULT_SHADOW_COLOR,
+                        shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                        shadowBlur: DEFAULT_SHADOW_BLUR,
+                        shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                        shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                      }
+                    : {}),
+                });
+              }}
+              className={`p-1 rounded transition ${
+                selectedNodes[0].shadowEnabled
+                  ? "text-blue-600 dark:text-blue-400 hover:bg-blue-500/10"
+                  : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+              }`}
+              title={selectedNodes[0].shadowEnabled ? "Disable shadow" : "Enable shadow"}
+            >
+              {selectedNodes[0].shadowEnabled ? <TbShadow size={15} /> : <TbShadowOff size={15} />}
+            </button>
+          }
+        >
+          {selectedNodes[0].shadowEnabled ? (
+            <>
+              <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] py-0.5">
+                {SHADOW_PRESETS.map((preset) => (
+                  <button
+                    key={preset.name}
+                    type="button"
+                    onClick={() => {
+                      const patch = "makeConfig" in preset && preset.makeConfig ? preset.makeConfig(selectedNodes[0]) : preset.config ?? {};
+                      updateNodes(patch);
+                    }}
+                    className="px-2 py-0.5 shrink-0 rounded text-[11px] font-medium bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-600 dark:text-neutral-300 transition active:scale-95"
+                    title={`Apply ${preset.name} shadow preset`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+              </div>
+
+              <ColorField
+                label="Color"
+                value={selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR}
+                onChange={(shadowColor) => updateNodes({ shadowColor })}
+              />
+
+              <SliderField
+                label="Opacity"
+                resetKey={`sho-${ids}`}
+                value={Math.round((selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowOpacity: n / 100 })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { shadowOpacity: n / 100 })}
+                title="Shadow opacity (0% to 100%)"
+              />
+
+              <SliderField
+                label="Blur"
+                resetKey={`shb-${ids}`}
+                value={selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR}
+                min={0}
+                max={64}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowBlur: n })}
+                onPreview={previewField("shadowBlur")}
+                title="Shadow blur radius in pixels"
+              />
+
+              <Field label="Offset">
+                <div className="grid grid-cols-2 gap-1.5 w-full">
+                  <PrefixedNumber
+                    prefix="X"
+                    title="Horizontal shadow offset - drag to scrub"
+                    resetKey={`shx-${ids}`}
+                    value={selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
+                    min={-100}
+                    max={100}
+                    onCommit={(x) => updateNodes({ shadowOffsetX: x })}
+                  />
+                  <PrefixedNumber
+                    prefix="Y"
+                    title="Vertical shadow offset - drag to scrub"
+                    resetKey={`shy-${ids}`}
+                    value={selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
+                    min={-100}
+                    max={100}
+                    onCommit={(y) => updateNodes({ shadowOffsetY: y })}
+                  />
+                </div>
+              </Field>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                updateNodes({
+                  shadowEnabled: true,
+                  shadowColor: selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR,
+                  shadowOpacity: selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY,
+                  shadowBlur: selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR,
+                  shadowOffsetX: selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X,
+                  shadowOffsetY: selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y,
+                });
+              }}
+              className="w-full h-7 rounded-md border border-dashed border-black/15 dark:border-white/15 text-[12px] font-medium text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white hover:border-black/30 dark:hover:border-white/30 transition flex items-center justify-center gap-1.5"
+            >
+              <TbShadow size={14} />
+              <span>Add Shadow</span>
+            </button>
+          )}
         </Section>
       )}
 

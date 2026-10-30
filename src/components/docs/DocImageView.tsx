@@ -245,7 +245,7 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, updateAttribute
         alt={node.attrs.alt ?? ""}
         title={node.attrs.title ?? undefined}
         style={{ width: displayWidth, height: displayHeight }}
-        className={`rounded-md max-w-full block cursor-pointer ${selected ? "outline outline-2 outline-blue-500 outline-offset-2" : ""}`}
+        className={`my-0 rounded-md max-w-full block cursor-pointer ${selected ? "outline outline-2 outline-blue-500 outline-offset-2" : ""}`}
       />
 
       {selected && (

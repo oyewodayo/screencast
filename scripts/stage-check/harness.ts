@@ -4,8 +4,12 @@ import { compileStage, CompiledStage } from "../../src/utils/stage/stageEngine";
 import { StageRenderer } from "../../src/utils/stage/stageRenderer";
 import { canvasStageMeasure, loadStageFonts } from "../../src/utils/stage/stageMeasure";
 import { loadStageImages } from "../../src/utils/stage/stageImages";
+import { loadStageMath } from "../../src/utils/stage/stageMath";
+import { GraphState, loadStageGraphs } from "../../src/utils/stage/stageGraph";
 import { StageBeat, StageElement, StageScene, defaultStageProps } from "../../src/utils/stage/stageTypes";
 import * as gate from "./insomnia";
+import { SHOWCASE } from "./showcase";
+import { SHAPE_PRESETS } from "../../src/utils/stage/stageShapes";
 
 const OFF_WHITE = "#e8e8e6";
 const INK = "#111111";
@@ -201,6 +205,128 @@ const pictures = scene(
   ]
 );
 
+// 6. Equations: typeset TeX, coloured terms, and a rewrite from one form to the next (3Blue1Brown).
+const BLUE = "#58c4dd";
+const equations = scene(
+  "equations",
+  [
+    { id: "eq", kind: "math", textLook: { fontSize: 72 }, props: defaultStageProps({ x: 160, y: 380, width: 1600, height: 320, color: "#ffffff", text: "w_1 a_1 + w_2 a_2 + \\cdots + w_n a_n" }) },
+    { id: "cost", kind: "math", textLook: { fontSize: 60 }, props: defaultStageProps({ x: 160, y: 760, width: 1600, height: 200, color: "#ffffff", visible: false, text: "C(w_1, w_2, \\ldots, w_{13{,}002})" }) },
+  ],
+  [
+    { id: "m0", hold: 1.2, changes: {} },
+    { id: "m1", hold: 1.6, changes: { eq: { text: "\\sigma(\\textcolor{" + BLUE + "}{w_1} a_1 + \\textcolor{" + BLUE + "}{w_2} a_2 + \\cdots + \\textcolor{" + BLUE + "}{w_n} a_n + b)" } } },
+    { id: "m2", hold: 1.6, changes: { eq: { text: "a_1^{(1)} = \\sigma\\left(\\textcolor{" + BLUE + "}{w_1} a_1 + \\cdots + \\textcolor{" + BLUE + "}{w_n} a_n + b\\right)" }, cost: { visible: true } } },
+    { id: "m3", hold: 1.6, changes: { cost: { text: "\\frac{1}{n}\\sum_{i=1}^{n} \\left(a_i - y_i\\right)^2" } } },
+  ],
+  { background: { kind: "color", color: "#000000" } }
+);
+
+// 7. Graphs: the cost curve C(w), a ball rolling downhill, a function morphing with a zoom, an area,
+// and a point riding the curve on a value (3Blue1Brown, gradient descent).
+const COST = "0.08w^4 - 0.9w^2 + 0.35w + 3";
+const costView = { xMin: -4.2, xMax: 4.2, yMin: 0, yMax: 6.5 };
+const g0: GraphState = { view: costView, series: [{ id: "c", kind: "function", expr: COST.replace(/w/g, "x"), color: "#fc6255", width: 4 }], markers: [], axes: true, grid: false, ticks: true, xLabel: "w", yLabel: "C(w)" };
+const g1: GraphState = { ...g0, markers: [{ id: "ball", kind: "descent", on: "c", color: "#ffff00", x0: 3.6, rate: 0.12, steps: 14, seconds: 3.2, tangent: true }] };
+const g2: GraphState = {
+  ...g0,
+  view: { xMin: -1, xMax: 4, yMin: -1, yMax: 9 },
+  series: [{ id: "c", kind: "function", expr: "0.5x^2 - x + 1", color: "#58c4dd", width: 4 }],
+  markers: [{ id: "area", kind: "area", on: "c", color: "#58c4dd", from: 0.5, to: 3, readout: true }],
+  grid: true,
+};
+const g3: GraphState = { ...g2, markers: [...g2.markers, { id: "p", kind: "point", on: "c", color: "#ffff00", x: { value: "w" }, tangent: true, drops: true, readout: true }] };
+const graphs = scene(
+  "graphs",
+  [{ id: "g", kind: "graph", props: defaultStageProps({ x: 260, y: 140, width: 1400, height: 820, color: "#ffffff", graph: g0 }), enter: { dx: 0, dy: 0, scale: 1, blur: 0, draw: 0, opacity: 1 }, spring: "slow" }],
+  [
+    { id: "k0", hold: 2.2, changes: {} },
+    { id: "k1", hold: 3.8, changes: { g: { graph: g1 } } },
+    { id: "k2", hold: 2.4, changes: { g: { graph: g2 } } },
+    { id: "k3", hold: 3, changes: { g: { graph: g3 } } },
+  ],
+  { background: { kind: "color", color: "#000000" }, channels: [{ id: "w", keys: [{ t: 8.6, value: 0.2 }, { t: 11.2, value: 3.6 }] }] }
+);
+
+// 8. Shapes: every preset in the gallery, some outlined, graded or shadowed; in the second beat each
+// morphs into another form, rings sweep, corners round.
+const SHAPE_COLORS = ["#58c4dd", "#fc6255", "#83c167", "#ffff00", "#ff862f", "#9a72ac", "#e07a5f"];
+const shapeEls: StageElement[] = SHAPE_PRESETS.map((pr, i) => {
+  const col = i % 7;
+  const row = Math.floor(i / 7);
+  const box = 190;
+  const k = Math.min(box / pr.w, box / pr.h);
+  const w = pr.w * k;
+  const h = pr.h * k;
+  return {
+    id: "sh" + i,
+    kind: "shape",
+    shape: {
+      radius: (pr.round ?? 0) * Math.min(w, h),
+      ...(i % 5 === 1 ? { stroke: { color: "#ffffff", width: 6, align: "center" as const } } : {}),
+      ...(i % 6 === 2 ? { gradient: { to: "#1e3a8a", angle: 135 } } : {}),
+      ...(i % 6 === 4 ? { gradient: { to: "#000000", type: "radial" as const } } : {}),
+      ...(pr.id === "arc" ? { caps: "round" as const } : {}),
+    },
+    props: defaultStageProps({ x: 130 + col * 245 + (box - w) / 2, y: 90 + row * 245 + (box - h) / 2, width: w, height: h, color: SHAPE_COLORS[i % 7], form: pr.form, sides: pr.sides, inner: pr.inner, sweep: pr.sweep }),
+  };
+});
+const MORPH_TO: Record<string, Partial<StageElement["props"]>> = {
+  sh0: { form: "ellipse" },
+  sh3: { form: "star", sides: 5, inner: 0.45 },
+  sh5: { form: "polygon", sides: 8 },
+  sh11: { form: "heart" },
+  sh13: { form: "star", sides: 7, inner: 0.6 },
+  sh15: { form: "chevron", inner: 0.4 },
+  sh18: { sweep: 120 },
+  sh19: { sweep: 40 },
+  sh20: { sweep: 90 },
+  sh1: { radius: 80 },
+};
+const shapes = scene("shapes", shapeEls, [
+  { id: "s0", hold: 1.5, changes: {} },
+  { id: "s1", hold: 2, changes: MORPH_TO },
+], { background: { kind: "color", color: "#101114" }, stagger: 0.02 });
+
+// 9. Motion: wipes four ways and from the centre, a spin and a flip arriving, dashed, dotted and
+// marching outlines, loops, a bent path, and text revealed by letter and by word.
+const W = (id: string, x: number, y: number, color: string, extra: Partial<StageElement> = {}, props: Partial<StageElement["props"]> = {}): StageElement => ({
+  id,
+  kind: "shape",
+  shape: { radius: 18 },
+  props: defaultStageProps({ x, y, width: 220, height: 140, color, ...props }),
+  ...extra,
+});
+const wipeIn = (wipe: "right" | "left" | "up" | "down" | "centre") => ({ enter: { dx: 0, dy: 0, scale: 1, blur: 0, draw: 0, opacity: 1, wipe } });
+const motion = scene(
+  "motion",
+  [
+    W("w1", 80, 60, "#58c4dd", wipeIn("right")),
+    W("w2", 340, 60, "#fc6255", wipeIn("left")),
+    W("w3", 600, 60, "#83c167", wipeIn("up")),
+    W("w4", 860, 60, "#ffff00", wipeIn("down")),
+    W("w5", 1120, 60, "#ff862f", wipeIn("centre")),
+    W("spin", 1380, 60, "#9a72ac", { enter: { dx: 0, dy: 0, scale: 0.4, blur: 0, rotate: -180 } }),
+    W("flip", 1640, 60, "#58c4dd", { enter: { dx: 0, dy: 0, scale: 1, blur: 0, rotateY: -90 } }),
+    W("dash", 80, 300, "rgba(0,0,0,0)", { shape: { radius: 24, stroke: { color: "#ffffff", width: 5, dash: { style: "dash", length: 22, gap: 14 } } } }),
+    W("dot", 340, 300, "rgba(0,0,0,0)", { shape: { stroke: { color: "#ffff00", width: 10, align: "center", dash: { style: "dot", length: 10, gap: 12 } } } }, { form: "ellipse" }),
+    W("march", 600, 300, "#1e293b", { shape: { stroke: { color: "#58c4dd", width: 6, dash: { style: "dash", length: 30, gap: 18, flow: 60 } } } }, { form: "star", sides: 6, inner: 0.55, height: 220, width: 220 }),
+    W("ringdash", 880, 300, "#83c167", { shape: { stroke: { color: "#ffffff", width: 4, align: "outside", dash: { style: "dot", length: 4, gap: 10 } } } }, { form: "ring", inner: 0.7, width: 200, height: 200 }),
+    W("pulse", 1180, 320, "#fc6255", { loops: [{ kind: "pulse", amount: 18 }] }, { form: "heart", width: 160, height: 150 }),
+    W("float", 1420, 320, "#58c4dd", { loops: [{ kind: "float", amount: 30 }, { kind: "sway", amount: 10 }] }, { width: 160, height: 120 }),
+    W("spinloop", 1660, 300, "#ffff00", { loops: [{ kind: "spin", period: 2 }] }, { form: "star", sides: 5, inner: 0.45, width: 180, height: 180 }),
+    W("arc", 80, 640, "#ff862f", {}, { form: "ellipse", width: 120, height: 120 }),
+    text("t1", "Letters arrive one by one", 64, { textReveal: { by: "letter", style: "rise", stagger: 0.04 } }, { x: 360, y: 600, color: "#ffffff" }),
+    text("t2", "Then word after word, popping in", 56, { textReveal: { by: "word", style: "pop", stagger: 0.12 } }, { x: 360, y: 720, color: "#ffff00" }),
+    text("t3", "or typed out like this_", 48, { textReveal: { by: "letter", style: "type", stagger: 0.05 } }, { x: 360, y: 840, color: "#83c167" }),
+  ],
+  [
+    { id: "m0", hold: 1.6, changes: {} },
+    { id: "m1", hold: 2.6, changes: { arc: { x: 1700, y: 900 } }, paths: { arc: { bend: 0.35, orient: false } } },
+  ],
+  { background: { kind: "color", color: "#101114" }, stagger: 0.04 }
+);
+
 declare global {
   interface Window {
     runStage: (opts: { width: number; height: number; frames: Record<string, number[]>; only?: string[] }) => Promise<unknown>;
@@ -215,7 +341,7 @@ window.runStage = async ({ width, height, frames, only }) => {
   const gl = renderer.renderer.getContext();
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
   const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
+  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, equations, graphs, shapes, motion, ...Object.fromEntries(SHOWCASE.map((x) => [x.scene.id, x.scene])), gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
   const out: Record<string, unknown> = { gpu };
   for (const [run, name] of (only ?? Object.keys(scenes)).entries()) {
     const s = scenes[name];
@@ -224,6 +350,8 @@ window.runStage = async ({ width, height, frames, only }) => {
     const t0 = performance.now();
     await loadStageFonts(s);
     await loadStageImages(s);
+    await loadStageMath(s);
+    await loadStageGraphs(s);
     const compiled: CompiledStage = compileStage(s, canvasStageMeasure);
     const compileMs = performance.now() - t0;
     // The editor prepares a scene when it loads - before anything plays.
@@ -265,7 +393,7 @@ window.runStage = async ({ width, height, frames, only }) => {
 
 // Debug: what the engine samples for a scene at `t` (ids, opacity, text) - for when a frame looks wrong.
 (window as unknown as { sampleAt: (name: string, t: number) => Promise<unknown> }).sampleAt = async (name, t) => {
-  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
+  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, equations, graphs, shapes, motion, ...Object.fromEntries(SHOWCASE.map((x) => [x.scene.id, x.scene])), gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
   await loadStageFonts(scenes[name]);
   const { sampleStage } = await import("../../src/utils/stage/stageEngine");
   const c = compileStage(scenes[name], canvasStageMeasure);
@@ -274,7 +402,7 @@ window.runStage = async ({ width, height, frames, only }) => {
 
 // Debug: the renderer's own state for each element after drawing `t`.
 (window as unknown as { gfxAt: (name: string, t: number) => Promise<unknown> }).gfxAt = async (name, t) => {
-  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
+  const scenes: Record<string, StageScene> = { headline, list, race, diagram, pictures, equations, graphs, shapes, motion, ...Object.fromEntries(SHOWCASE.map((x) => [x.scene.id, x.scene])), gHeadline: gate.headline, gList: gate.list, gRace: gate.race, gWifi: gate.wifi, gCards: gate.cardsScene((n) => `${location.origin}/cards/${n}.png`) };
   await loadStageFonts(scenes[name]);
   const canvas = document.createElement("canvas");
   const r = new StageRenderer(canvas, 1920, 1080);

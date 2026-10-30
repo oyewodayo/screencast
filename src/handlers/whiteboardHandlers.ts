@@ -55,6 +55,47 @@ import { latticeRenderOnDemand } from "../components/whiteboard/LatticeGaugeWidg
 
 // ---- Node geometry ----------------------------------------------------------------------------
 
+export const DEFAULT_SHADOW_COLOR = "#000000";
+export const DEFAULT_SHADOW_BLUR = 12;
+export const DEFAULT_SHADOW_OFFSET_X = 0;
+export const DEFAULT_SHADOW_OFFSET_Y = 4;
+export const DEFAULT_SHADOW_OPACITY = 0.25;
+
+export function hexToRgba(color: string, alpha: number): string {
+  const c = color.trim();
+  if (c.startsWith("rgba")) {
+    return c.replace(/[\d.]+\)$/g, `${alpha})`);
+  }
+  if (c.startsWith("rgb")) {
+    return c.replace("rgb", "rgba").replace(")", `, ${alpha})`);
+  }
+  const clean = c.replace("#", "");
+  const num = parseInt(clean.length === 3 ? clean.split("").map((ch) => ch + ch).join("") : clean, 16);
+  if (isNaN(num)) return `rgba(0,0,0,${alpha})`;
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+export function nodeDropShadowCSS(node: WhiteboardNode): string | undefined {
+  if (!node.shadowEnabled) return undefined;
+  const opacity = Math.max(0, Math.min(1, node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+  if (opacity <= 0) return undefined;
+  const color = node.shadowColor ?? DEFAULT_SHADOW_COLOR;
+  const blur = Math.max(0, node.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+  const ox = node.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+  const oy = node.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  const rgba = hexToRgba(color, opacity);
+  return `drop-shadow(${ox}px ${oy}px ${blur}px ${rgba})`;
+}
+
+export function dashArrayFor(strokeStyle?: "solid" | "dashed" | "dotted", strokeWidth: number = 2): string | undefined {
+  if (!strokeStyle || strokeStyle === "solid") return undefined;
+  if (strokeStyle === "dotted") return `${Math.max(1, strokeWidth * 0.4)},${Math.max(3, strokeWidth * 1.6 + 3)}`;
+  return "8,6";
+}
+
 export function nodeCenter(node: WhiteboardNode): { x: number; y: number } {
   return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
 }
@@ -3644,8 +3685,19 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode, ima
     paintNodeFill(ctx, node, path, imageSrcFor);
     if (node.strokeWidth > 0) {
       ctx.lineWidth = node.strokeWidth;
-      ctx.strokeStyle = node.strokeColor;
+      const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+        ? hexToRgba(node.strokeColor, node.strokeOpacity)
+        : node.strokeColor;
+      ctx.strokeStyle = strokeColor;
+      if (node.strokeStyle === "dashed") {
+        ctx.setLineDash([8, 6]);
+      } else if (node.strokeStyle === "dotted") {
+        ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+      } else {
+        ctx.setLineDash([]);
+      }
       ctx.stroke(path);
+      ctx.setLineDash([]);
     }
   };
 
@@ -4044,13 +4096,35 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     if (node.flipHorizontal || node.flipVertical) ctx.scale(node.flipHorizontal ? -1 : 1, node.flipVertical ? -1 : 1);
     ctx.translate(-node.width / 2, -node.height / 2);
   }
+  if (node.opacity !== undefined && node.opacity < 1) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, node.opacity));
+  }
+  if (node.shadowEnabled) {
+    const shadowColor = node.shadowColor ?? DEFAULT_SHADOW_COLOR;
+    const shadowOpacity = Math.max(0, Math.min(1, node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+    ctx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+    ctx.shadowBlur = Math.max(0, node.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+    ctx.shadowOffsetX = node.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+    ctx.shadowOffsetY = node.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  }
   if (node.shapeType === "freehand") {
     const path = freehandPath2D(node);
     ctx.lineWidth = node.strokeWidth;
-    ctx.strokeStyle = node.strokeColor;
+    const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+      ? hexToRgba(node.strokeColor, node.strokeOpacity)
+      : node.strokeColor;
+    ctx.strokeStyle = strokeColor;
+    if (node.strokeStyle === "dashed") {
+      ctx.setLineDash([8, 6]);
+    } else if (node.strokeStyle === "dotted") {
+      ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+    } else {
+      ctx.setLineDash([]);
+    }
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
     ctx.stroke(path);
+    ctx.setLineDash([]);
     // A "Freehand Arrow" (see whiteboardTypes.ts's WhiteboardNode.endArrowType doc comment) caps
     // one or both ends with a marker, angled off the stroke's own final two points (a close-enough
     // stand-in for the smoothed curve's true end tangent - freehandPath2D's own last segment is a

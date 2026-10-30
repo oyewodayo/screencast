@@ -92,7 +92,14 @@ function decorationAttrs(node: PMNode): Record<string, string> | null {
   if (a.span === "all") out["data-span"] = "all";
   if (typeof a.spaceBefore === "number") style.push(`margin-top: ${a.spaceBefore}pt !important`);
   if (typeof a.spaceAfter === "number") style.push(`margin-bottom: ${a.spaceAfter}pt !important`);
+  if (typeof a.borderBottom === "string" && a.borderBottom) {
+    style.push(`border-bottom: ${a.borderBottom}`);
+    style.push(`padding-bottom: 2pt`);
+  }
   if (a.noIndent === true) out["data-no-indent"] = "";
+  if (node.type.name === "bulletList" && typeof a.bulletMarker === "string" && a.bulletMarker) {
+    out["data-bullet"] = a.bulletMarker;
+  }
   if (node.type.name === "table") {
     if (a.rules === "booktabs" || a.rules === "doubled" || a.rules === "leaders" || a.rules === "none") out["data-rules"] = a.rules;
     if (a.fit === true) out["data-fit"] = "";
@@ -138,6 +145,30 @@ const DocBlockFormat = Extension.create({
             default: false,
             parseHTML: (el: HTMLElement) => el.hasAttribute("data-no-indent"),
             renderHTML: (attrs: Record<string, unknown>) => (attrs.noIndent ? { "data-no-indent": "" } : {}),
+          },
+        },
+      },
+      {
+        types: ["paragraph", "heading"],
+        attributes: {
+          borderBottom: {
+            default: null,
+            parseHTML: (el: HTMLElement) => el.getAttribute("data-border-bottom") || null,
+            renderHTML: (attrs: Record<string, unknown>) =>
+              typeof attrs.borderBottom === "string" && attrs.borderBottom
+                ? { "data-border-bottom": attrs.borderBottom, style: `border-bottom: ${attrs.borderBottom}; padding-bottom: 2pt` }
+                : {},
+          },
+        },
+      },
+      {
+        types: ["bulletList"],
+        attributes: {
+          bulletMarker: {
+            default: null,
+            parseHTML: (el: HTMLElement) => el.getAttribute("data-bullet") || null,
+            renderHTML: (attrs: Record<string, unknown>) =>
+              typeof attrs.bulletMarker === "string" && attrs.bulletMarker ? { "data-bullet": attrs.bulletMarker } : {},
           },
         },
       },

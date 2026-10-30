@@ -37,17 +37,29 @@ const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
-// youtube.upload: upload videos. youtube.force-ssl: add captions to them (captions.insert needs it).
-// drive.file: only files Briefcast itself creates on Drive - nothing else there is visible to it.
-const SCOPES: &str = "openid email profile https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/drive.file";
+// Google refuses a single request that mixes YouTube and Drive scopes ("cannot be requested
+// together"), so each service is its own sign-in with its own refresh token, asked for when it is
+// first used.
+//   youtube: youtube.upload uploads videos; youtube.force-ssl adds captions (captions.insert needs it).
+//   drive:   drive.file - only files Briefcast itself creates on Drive; nothing else there is visible.
+const YOUTUBE: &str = "youtube";
+const DRIVE: &str = "drive";
+
+fn scopes_for(service: &str) -> Result<&'static str, String> {
+    match service {
+        YOUTUBE => Ok("openid email profile https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl"),
+        DRIVE => Ok("openid email profile https://www.googleapis.com/auth/drive.file"),
+        other => Err(format!("Unknown Google service: {other}")),
+    }
+}
 // Resumable chunks must be multiples of 256 KiB.
 const CHUNK: usize = 32 * 256 * 1024;
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 pub struct GoogleShareState {
-    // (access token, valid until) - refreshed from the stored refresh token when it runs out.
-    access: Mutex<Option<(String, Instant)>>,
+    // Per service: (access token, valid until) - refreshed from the stored refresh token when it runs out.
+    access: Mutex<HashMap<String, (String, Instant)>>,
     uploads: Mutex<HashMap<String, Arc<AtomicBool>>>,
     sign_in_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
@@ -81,7 +93,9 @@ pub struct GoogleAccount {
 
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
-    refresh_token: String,
+    // service ("youtube" | "drive") -> refresh token for that service's scopes.
+    #[serde(default)]
+    refresh_tokens: HashMap<String, String>,
     account: GoogleAccount,
 }
 
@@ -175,15 +189,16 @@ async fn post_token(body: String) -> Result<TokenResponse, String> {
 }
 
 // A usable access token: the cached one, or a fresh one from the stored refresh token.
-async fn access_token(app: &AppHandle, state: &GoogleShareState) -> Result<String, String> {
-    if let Some((token, until)) = state.access.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+async fn access_token(app: &AppHandle, state: &GoogleShareState, service: &str) -> Result<String, String> {
+    if let Some((token, until)) = state.access.lock().unwrap_or_else(|e| e.into_inner()).get(service).cloned() {
         if Instant::now() + Duration::from_secs(60) < until {
             return Ok(token);
         }
     }
     let (id, secret) = client_credentials().ok_or("Google sign-in isn't set up in this build")?;
     let stored = load_account(app).ok_or("Sign in to your Google account first")?;
-    let token = post_token(form(&[("client_id", &id), ("client_secret", &secret), ("refresh_token", &stored.refresh_token), ("grant_type", "refresh_token")])).await.map_err(|e| {
+    let refresh = stored.refresh_tokens.get(service).ok_or("Allow Briefcast to use your Google account for this first")?;
+    let token = post_token(form(&[("client_id", &id), ("client_secret", &secret), ("refresh_token", refresh), ("grant_type", "refresh_token")])).await.map_err(|e| {
         if e.contains("invalid_grant") {
             "Your Google sign-in has expired or was revoked - sign in again".to_string()
         } else {
@@ -191,7 +206,7 @@ async fn access_token(app: &AppHandle, state: &GoogleShareState) -> Result<Strin
         }
     })?;
     let until = Instant::now() + Duration::from_secs(token.expires_in.unwrap_or(3600));
-    *state.access.lock().unwrap_or_else(|e| e.into_inner()) = Some((token.access_token.clone(), until));
+    state.access.lock().unwrap_or_else(|e| e.into_inner()).insert(service.to_string(), (token.access_token.clone(), until));
     Ok(token.access_token)
 }
 
@@ -216,11 +231,15 @@ fn google_error(what: &str, status: u16, body: &str) -> String {
 pub struct GoogleStatus {
     configured: bool,
     account: Option<GoogleAccount>,
+    // The services ("youtube", "drive") the user has allowed so far.
+    services: Vec<String>,
 }
 
 #[tauri::command]
 pub async fn google_account_status(app: AppHandle) -> GoogleStatus {
-    GoogleStatus { configured: client_credentials().is_some(), account: load_account(&app).map(|a| a.account) }
+    let stored = load_account(&app);
+    let services = stored.as_ref().map(|s| s.refresh_tokens.keys().cloned().collect()).unwrap_or_default();
+    GoogleStatus { configured: client_credentials().is_some(), account: stored.map(|a| a.account), services }
 }
 
 #[tauri::command]
@@ -232,7 +251,8 @@ pub async fn google_cancel_sign_in(state: State<'_, GoogleShareState>) -> Result
 }
 
 #[tauri::command]
-pub async fn google_sign_in(app: AppHandle, state: State<'_, GoogleShareState>) -> Result<GoogleAccount, String> {
+pub async fn google_sign_in(app: AppHandle, state: State<'_, GoogleShareState>, service: String) -> Result<GoogleStatus, String> {
+    let scopes = scopes_for(&service)?;
     let (id, secret) = client_credentials().ok_or("Google sign-in isn't set up in this build")?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Couldn't start the sign-in: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -246,7 +266,7 @@ pub async fn google_sign_in(app: AppHandle, state: State<'_, GoogleShareState>) 
             ("client_id", &id),
             ("redirect_uri", &redirect),
             ("response_type", "code"),
-            ("scope", SCOPES),
+            ("scope", scopes),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
             ("state", &csrf),
@@ -282,23 +302,36 @@ pub async fn google_sign_in(app: AppHandle, state: State<'_, GoogleShareState>) 
         name: info["name"].as_str().map(String::from),
         picture: info["picture"].as_str().map(String::from),
     };
-    save_account(&app, &StoredAccount { refresh_token: refresh, account: account.clone() })?;
+    // A second service keeps the first one's token - unless it was granted by a different Google
+    // account, whose token then no longer belongs with this one.
+    let mut refresh_tokens = match load_account(&app) {
+        Some(prev) if prev.account.email == account.email => prev.refresh_tokens,
+        _ => {
+            state.access.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            HashMap::new()
+        }
+    };
+    refresh_tokens.insert(service.clone(), refresh);
+    let services = refresh_tokens.keys().cloned().collect();
+    save_account(&app, &StoredAccount { refresh_tokens, account: account.clone() })?;
     let until = Instant::now() + Duration::from_secs(token.expires_in.unwrap_or(3600));
-    *state.access.lock().unwrap_or_else(|e| e.into_inner()) = Some((token.access_token, until));
-    Ok(account)
+    state.access.lock().unwrap_or_else(|e| e.into_inner()).insert(service, (token.access_token, until));
+    Ok(GoogleStatus { configured: true, account: Some(account), services })
 }
 
 #[tauri::command]
 pub async fn google_sign_out(app: AppHandle, state: State<'_, GoogleShareState>) -> Result<(), String> {
-    *state.access.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state.access.lock().unwrap_or_else(|e| e.into_inner()).clear();
     if let Some(stored) = load_account(&app) {
         // Revoked at Google too, so the access really ends - best effort.
-        let _ = http()
-            .post(REVOKE_URL)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(form(&[("token", &stored.refresh_token)]))
-            .send()
-            .await;
+        for token in stored.refresh_tokens.values() {
+            let _ = http()
+                .post(REVOKE_URL)
+                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(form(&[("token", token)]))
+                .send()
+                .await;
+        }
     }
     if let Ok(path) = account_path(&app) {
         let _ = std::fs::remove_file(path);
@@ -412,6 +445,8 @@ struct UploadJob<'a> {
     app: &'a AppHandle,
     window: &'a Window,
     state: &'a GoogleShareState,
+    // Which service's token the upload runs under (YOUTUBE or DRIVE).
+    service: &'static str,
     job_id: String,
     cancel: Arc<AtomicBool>,
 }
@@ -426,7 +461,7 @@ impl UploadJob<'_> {
     // response's JSON.
     async fn upload(&self, init_url: &str, metadata: &serde_json::Value, path: &PathBuf, mime: &str) -> Result<serde_json::Value, String> {
         let total = std::fs::metadata(path).map_err(|e| format!("Can't read the video: {e}"))?.len();
-        let token = access_token(self.app, self.state).await?;
+        let token = access_token(self.app, self.state, self.service).await?;
         let resp = http()
             .post(init_url)
             .bearer_auth(&token)
@@ -449,7 +484,7 @@ impl UploadJob<'_> {
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 // Tell Google to drop the partial upload; ignore the answer.
-                let _ = http().delete(&session).bearer_auth(&access_token(self.app, self.state).await.unwrap_or_default()).send().await;
+                let _ = http().delete(&session).bearer_auth(&access_token(self.app, self.state, self.service).await.unwrap_or_default()).send().await;
                 return Err("Upload cancelled".into());
             }
             let len = ((total - offset) as usize).min(CHUNK);
@@ -457,7 +492,7 @@ impl UploadJob<'_> {
             file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
             file.read_exact(&mut chunk).map_err(|e| format!("Can't read the video: {e}"))?;
             let range = if total == 0 { "bytes */0".to_string() } else { format!("bytes {}-{}/{}", offset, offset + len as u64 - 1, total) };
-            let token = access_token(self.app, self.state).await?;
+            let token = access_token(self.app, self.state, self.service).await?;
             let sent = http().put(&session).bearer_auth(&token).header(reqwest::header::CONTENT_RANGE, range).body(chunk).timeout(Duration::from_secs(300)).send().await;
             match sent {
                 Ok(resp) if resp.status().is_success() => {
@@ -509,7 +544,7 @@ impl UploadJob<'_> {
 
     // Where an interrupted upload stands: PUT with "bytes */total".
     async fn resume_offset(&self, session: &str, total: u64) -> Option<u64> {
-        let token = access_token(self.app, self.state).await.ok()?;
+        let token = access_token(self.app, self.state, self.service).await.ok()?;
         let resp = http().put(session).bearer_auth(&token).header(reqwest::header::CONTENT_RANGE, format!("bytes */{total}")).header(reqwest::header::CONTENT_LENGTH, "0").send().await.ok()?;
         match resp.status().as_u16() {
             308 => Some(confirmed_offset(&resp)),
@@ -636,7 +671,7 @@ pub async fn youtube_upload(app: AppHandle, window: Window, state: State<'_, Goo
     }
     let metadata = serde_json::json!({ "snippet": snippet, "status": { "privacyStatus": privacy, "selfDeclaredMadeForKids": r.made_for_kids, "embeddable": true } });
     let cancel = register_upload(&state, &r.job_id);
-    let job = UploadJob { app: &app, window: &window, state: &state, job_id: r.job_id.clone(), cancel };
+    let job = UploadJob { app: &app, window: &window, state: &state, service: YOUTUBE, job_id: r.job_id.clone(), cancel };
     let result = job.upload("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status", &metadata, &path, mime_for(&path)).await;
     let video = match result {
         Ok(v) => v,
@@ -672,7 +707,7 @@ fn valid_language(lang: &str) -> bool {
 
 // captions.insert as a multipart/related upload: the caption's metadata, then the .srt itself.
 async fn upload_captions(app: &AppHandle, state: &GoogleShareState, video_id: &str, language: &str, srt: &str) -> Result<(), String> {
-    let token = access_token(app, state).await?;
+    let token = access_token(app, state, YOUTUBE).await?;
     let boundary = format!("briefcast-{}", random_token(12));
     let meta = serde_json::json!({ "snippet": { "videoId": video_id, "language": language, "name": "", "isDraft": false } });
     let body = format!(
@@ -721,12 +756,12 @@ pub async fn drive_share_link(app: AppHandle, window: Window, state: State<'_, G
     let name: String = r.name.replace(['/', '\\'], "-").trim().chars().take(200).collect();
     let metadata = serde_json::json!({ "name": if name.is_empty() { "Video".to_string() } else { name }, "mimeType": mime_for(&path) });
     let cancel = register_upload(&state, &r.job_id);
-    let job = UploadJob { app: &app, window: &window, state: &state, job_id: r.job_id.clone(), cancel };
+    let job = UploadJob { app: &app, window: &window, state: &state, service: DRIVE, job_id: r.job_id.clone(), cancel };
     let result = job.upload("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id", &metadata, &path, mime_for(&path)).await;
     unregister_upload(&state, &r.job_id);
     let file = result?;
     let file_id = file["id"].as_str().ok_or("Drive didn't say where the file went")?.to_string();
-    let token = access_token(&app, &state).await?;
+    let token = access_token(&app, &state, DRIVE).await?;
     // Anyone with the link can watch; only the owner can change or delete it.
     let resp = http()
         .post(format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions"))

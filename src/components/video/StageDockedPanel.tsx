@@ -15,10 +15,22 @@ import { parseStageColor } from "../../utils/stage/stageColor";
 import { MdFormatAlignCenter, MdFormatAlignLeft, MdFormatAlignRight } from "react-icons/md";
 import { STICKER_ICONS, StickerIcon, drawStickerIcon, searchIcons } from "../../utils/stickerIcons";
 import { FontSection, SliderRow, Swatches } from "./OverlayDockedPanels";
+import { IconButton, Section, Segmented, STAGE_INKS, Toggle, field } from "./StagePanelParts";
+import { FollowSection, GroupSection, ValuesSection, WhenSection } from "./StageValuesPanel";
+import { MotionSection } from "./StageMotionPanel";
+import { MathEditor } from "./StageMathPanel";
+import { GraphEditor } from "./StageGraphPanel";
+import { ArrangeSection } from "./StageArrangePanel";
+import { ShapeGallery, ShapeSection } from "./StageShapePanel";
+import type { ShapePreset } from "../../utils/stage/stageShapes";
+import { valueToken } from "../../utils/stage/stageValues";
 import {
   addBeat,
   addElement,
+  beatIndexAt,
   beatRestTime,
+  duplicateElement,
+  renameElement,
   beatStarts,
   deleteBeat,
   deleteElement,
@@ -26,6 +38,9 @@ import {
   makeConnectorElement,
   makeIconElement,
   makeImageElement,
+  makeMathElement,
+  makeGraphElement,
+  reinkScene,
   makeShapeElement,
   makeTextElement,
   sceneDuration,
@@ -47,62 +62,9 @@ interface Props {
   onDuplicate: () => void;
   onDelete: () => void;
   // What's on the stage now (stage units) - new elements are placed clear of it.
-  occupied?: { x: number; y: number; width: number; height: number }[];
+  occupied?: { id?: string; x: number; y: number; width: number; height: number }[];
 }
 
-const Section: React.FC<{ title: React.ReactNode; aside?: React.ReactNode; children: React.ReactNode }> = ({ title, aside, children }) => (
-  <div className="flex flex-col gap-2">
-    <div className="flex items-center gap-2 min-h-[20px]">
-      <span className="flex-1 min-w-0 truncate text-[10px] font-medium uppercase tracking-wider text-white/40">{title}</span>
-      {aside}
-    </div>
-    {children}
-  </div>
-);
-
-// One choice of a few, as a row of pressed/unpressed buttons.
-function Segmented<T extends string>({ options, value, onChange }: { options: { value: T; label: React.ReactNode; title?: string }[]; value: T; onChange: (v: T) => void }) {
-  return (
-    <div className="flex gap-0.5 rounded-lg bg-white/[0.06] p-0.5">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          title={o.title}
-          aria-pressed={o.value === value}
-          onClick={() => onChange(o.value)}
-          className={`flex-1 h-7 flex items-center justify-center gap-1 rounded-md text-[11px] transition-colors ${o.value === value ? "bg-teal-500 text-white shadow-sm" : "text-white/65 hover:text-white hover:bg-white/10"}`}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-const Toggle: React.FC<{ label: React.ReactNode; value: boolean; onChange: (v: boolean) => void; title?: string }> = ({ label, value, onChange, title }) => (
-  <button type="button" role="switch" aria-checked={value} title={title} onClick={() => onChange(!value)} className="flex items-center gap-2 py-0.5 text-left text-[11px] text-white/70 hover:text-white">
-    <span className="flex-1">{label}</span>
-    <span className={`relative w-7 h-4 rounded-full transition-colors ${value ? "bg-teal-500" : "bg-white/15"}`}>
-      <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white shadow transition-[left] ${value ? "left-3.5" : "left-0.5"}`} />
-    </span>
-  </button>
-);
-
-const IconButton: React.FC<{ title: string; onClick: () => void; disabled?: boolean; danger?: boolean; children: React.ReactNode }> = ({ title, onClick, disabled, danger, children }) => (
-  <button
-    type="button"
-    title={title}
-    aria-label={title}
-    disabled={disabled}
-    onClick={onClick}
-    className={`w-6 h-6 flex items-center justify-center rounded-md text-white/50 disabled:opacity-30 disabled:pointer-events-none ${danger ? "hover:text-red-300 hover:bg-red-500/15" : "hover:text-white hover:bg-white/10"}`}
-  >
-    {children}
-  </button>
-);
-
-const STAGE_INKS = ["#111111", "#9a9a9a", "#ffffff", "#7a1f3d", "#2fbf5b", "#ef4444", "#3b82f6", "#f59e0b"];
 const STAGE_BACKGROUNDS = [undefined, "#f2f1ee", "#ffffff", "#e8e8e6", "#111111", "#0b1020", "#1e3a8a"];
 const MOTIONS: { value: SpringPreset; label: string; title: string }[] = [
   { value: "slow", label: "Slow", title: "A long, even settle" },
@@ -111,14 +73,17 @@ const MOTIONS: { value: SpringPreset; label: string; title: string }[] = [
   { value: "snappy", label: "Snappy", title: "Fast and crisp" },
   { value: "bouncy", label: "Bouncy", title: "A visible overshoot and settle" },
 ];
-const SOFT_SHADOW = { color: "rgba(0,0,0,0.18)", blur: 48, y: 18 };
 
-const field = "w-full rounded-md bg-black/30 ring-1 ring-white/10 focus:ring-teal-400 px-2 py-1.5 text-[12px] text-white outline-none placeholder:text-white/30";
 
 function label(e: StageElement, scene: StageScene): string {
   if (e.name) return e.name;
   if (e.kind === "text") return (e.props.text ?? "Text").slice(0, 28) || "Text";
   if (e.kind === "shape") return "Shape";
+  if (e.kind === "math") return `Equation${e.props.text ? ` · ${e.props.text.slice(0, 18)}` : ""}`;
+  if (e.kind === "graph") {
+    const f = e.props.graph?.series.find((s) => s.kind === "function")?.expr;
+    return `Graph${f ? ` · ${f.slice(0, 18)}` : ""}`;
+  }
   if (e.kind === "image") return e.image?.src.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "Picture";
   if (e.kind === "icon") return STICKER_ICONS.find((i) => i.value === e.icon?.name)?.label ?? "Icon";
   if (e.kind === "connector") {
@@ -155,8 +120,18 @@ const IconThumb: React.FC<{ name: string; size?: number }> = ({ name, size = 20 
   return <canvas ref={ref} style={{ width: size, height: size }} />;
 };
 
+// A tiny axes-and-curve mark for graphs.
+const GraphGlyph: React.FC<{ size: number }> = ({ size }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+    <path d="M2 2v12h12" />
+    <path d="M4 11c2-6 4-6 5-3s2 3 5-4" />
+  </svg>
+);
+
 const KindIcon: React.FC<{ e: StageElement }> = ({ e }) => {
   if (e.kind === "text") return <IoText size={12} />;
+  if (e.kind === "math") return <span className="text-[12px] leading-none font-serif">∑</span>;
+  if (e.kind === "graph") return <GraphGlyph size={12} />;
   if (e.kind === "icon") return <IconThumb name={e.icon?.name ?? "star"} size={12} />;
   if (e.kind === "connector") return <IoEllipsisHorizontal size={12} />;
   if (e.kind === "stack") return <IoFolderOutline size={12} />;
@@ -206,6 +181,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
   // Typing edits a draft; it lands in the scene when the field is left (or on Enter), so a word
   // isn't recompiled letter by letter.
   const [draft, setDraft] = useState<string | null>(null);
+  const textRef = React.useRef<HTMLTextAreaElement>(null);
   useEffect(() => setDraft(null), [selectedElementId, beat]);
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   useEffect(() => setNameDraft(null), [scene.id]);
@@ -217,7 +193,6 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
   const inBeat = (patch: Parameters<typeof setElementProps>[3]) => element && onUpdate((s) => setElementProps(s, beat, element.id, patch));
   const own = (edit: (e: StageElement) => StageElement) => element && onUpdate((s) => ({ ...s, elements: s.elements.map((e) => (e.id === element.id ? edit(e) : e)) }));
   const look = (patch: Partial<StageTextLook>) => own((e) => ({ ...e, textLook: { ...(e.textLook ?? { fontSize: 44 }), ...patch } }));
-  const shapeOf = (patch: Partial<NonNullable<StageElement["shape"]>>) => own((e) => ({ ...e, shape: { ...e.shape, ...patch } }));
   const line = (patch: Partial<StageConnector>) => own((e) => (e.connector ? { ...e, connector: { ...e.connector, ...patch } } : e));
   const commitDraft = () => {
     if (draft !== null && here && draft !== here.text) inBeat({ text: draft });
@@ -239,7 +214,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
   // A spot clear of what's on the stage: the centre if it's free, else the nearest free one around
   // it (below, above, beside, the corners), inside the frame. With nowhere free, the centre, stepped
   // past anything placed there before.
-  const placeAt = (w: number, h: number) => {
+  const placeAt = (w: number, h: number, shrink = false): { x: number; y: number; scale: number } => {
     const cx = scene.width / 2 - w / 2;
     const cy = STAGE_HEIGHT / 2 - h / 2;
     const margin = 24;
@@ -257,7 +232,41 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
     for (const [i, j] of steps) {
       const x = Math.round(cx + i * (w + margin * 2));
       const y = Math.round(cy + j * (h + margin * 2));
-      if (clear(x, y)) return { x, y };
+      if (clear(x, y)) return { x, y, scale: 1 };
+    }
+    // Something big (a graph) would rather be smaller than sit on what's there: the largest size,
+    // down to half, that fits a clear spot - searched across the frame, nearest the centre first.
+    if (shrink && taken.length) {
+      for (let scale = 0.92; scale >= 0.5; scale -= 0.04) {
+        const sw = w * scale;
+        const sh = h * scale;
+        let found: { x: number; y: number; d: number } | null = null;
+        for (let gx = 0; gx <= 16; gx++)
+          for (let gy = 0; gy <= 16; gy++) {
+            const x = Math.round(margin + ((scene.width - sw - margin * 2) * gx) / 16);
+            const y = Math.round(margin + ((STAGE_HEIGHT - sh - margin * 2) * gy) / 16);
+            const ok = !taken.some((o) => x < o.x + o.width + margin && x + sw + margin > o.x && y < o.y + o.height + margin && y + sh + margin > o.y);
+            const d = Math.hypot(x + sw / 2 - scene.width / 2, y + sh / 2 - STAGE_HEIGHT / 2);
+            if (ok && (!found || d < found.d)) found = { x, y, d };
+          }
+        if (found) return { x: found.x, y: found.y, scale };
+      }
+    }
+    // Too big for a clear spot (a graph, a large picture): the place inside the frame covering the
+    // least of what's there, searched on a grid, ties going to the one nearest the centre.
+    if (taken.length && w < scene.width && h < STAGE_HEIGHT) {
+      const cover = (x: number, y: number) =>
+        taken.reduce((sum, o) => sum + Math.max(0, Math.min(x + w, o.x + o.width) - Math.max(x, o.x)) * Math.max(0, Math.min(y + h, o.y + o.height) - Math.max(y, o.y)), 0);
+      let best = { x: Math.round(cx), y: Math.round(cy), c: cover(cx, cy), d: 0 };
+      for (let gx = 0; gx <= 12; gx++)
+        for (let gy = 0; gy <= 12; gy++) {
+          const x = Math.round(margin + ((scene.width - w - margin * 2) * gx) / 12);
+          const y = Math.round(margin + ((STAGE_HEIGHT - h - margin * 2) * gy) / 12);
+          const c = cover(x, y);
+          const d = Math.hypot(x - cx, y - cy);
+          if (c < best.c - 1 || (Math.abs(c - best.c) <= 1 && d < best.d)) best = { x, y, c, d };
+        }
+      if (best.c < cover(cx, cy)) return { x: best.x, y: best.y, scale: 1 };
     }
     let x = Math.round(cx);
     let y = Math.round(cy);
@@ -265,7 +274,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
       x += 36;
       y += 36;
     }
-    return { x, y };
+    return { x, y, scale: 1 };
   };
   // New elements land where they can be seen: the playhead comes into the scene first when it's out.
   const place = (made: StageElement) => {
@@ -275,14 +284,19 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
     setAdding(null);
   };
   const addText = () => place(makeTextElement(scene.width, { text: "New text", fontSize: 56, color: ink, y: placeAt(scene.width * 0.6, 73).y }));
+  const addMath = () => {
+    const made = makeMathElement({ ...placeAt(480, 140), color: ink });
+    place(made);
+    // Straight into its editor, ready to type.
+    window.setTimeout(() => window.dispatchEvent(new CustomEvent("stage-edit-math", { detail: made.id })), 60);
+  };
+  const addGraph = () => {
+    const at = placeAt(1000, 620, true);
+    place(makeGraphElement({ x: at.x, y: at.y, width: Math.round(1000 * at.scale), height: Math.round(620 * at.scale), color: ink, curve: lightBg ? "#2563eb" : undefined }));
+  };
   const addIcon = (name: string) => place(makeIconElement({ ...placeAt(96, 96), size: 96, name, color: ink }));
-  const SHAPES: { id: string; label: string; w: number; h: number; radius: (w: number, h: number) => number }[] = [
-    { id: "rect", label: "Rectangle", w: 320, h: 200, radius: () => 0 },
-    { id: "rounded", label: "Rounded", w: 320, h: 200, radius: () => 24 },
-    { id: "circle", label: "Circle", w: 220, h: 220, radius: (w) => w / 2 },
-    { id: "pill", label: "Pill", w: 360, h: 96, radius: (_w, h) => h / 2 },
-  ];
-  const addShape = (kind: (typeof SHAPES)[number]) => place(makeShapeElement({ ...placeAt(kind.w, kind.h), width: kind.w, height: kind.h, radius: kind.radius(kind.w, kind.h), color: ink }));
+  const addShape = (p: ShapePreset) =>
+    place(makeShapeElement({ ...placeAt(p.w, p.h), width: p.w, height: p.h, radius: (p.round ?? 0) * Math.min(p.w, p.h), color: lightBg ? "#2563eb" : "#58c4dd", form: p.form, sides: p.sides, inner: p.inner, sweep: p.sweep }));
   // Elements a line can run between; a new line starts at the selected one.
   const connectable = scene.elements.filter((e) => e.kind !== "stack" && e.kind !== "connector");
   const addLine = () => {
@@ -306,6 +320,23 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
   const icons = (iconQuery.trim() ? searchIcons(iconQuery) : STICKER_ICONS).filter((i) => i.value !== "none");
   const changedHere = scene.beats[beat]?.changes ?? {};
   const duration = sceneDuration(scene);
+  // Going to a beat just added: the seek waits until the scene holding it is the one on screen -
+  // sooner, the timeline is still the old length and the playhead is held back in the old beat,
+  // so the next edit would land in the wrong one.
+  const [pendingSeek, setPendingSeek] = useState<null | { beats: number; t: number }>(null);
+  useEffect(() => {
+    if (!pendingSeek || scene.beats.length < pendingSeek.beats) return;
+    const t = pendingSeek.t;
+    setPendingSeek(null);
+    // A frame later, once the player has the new length too.
+    requestAnimationFrame(() => requestAnimationFrame(() => onSeek(t)));
+  }, [scene, pendingSeek, onSeek]);
+  const goToBeat = (target: { scene: StageScene; index: number }) => {
+    const t = beatRestTime(target.scene, target.index);
+    if (target.scene === scene) return onSeek(t);
+    onUpdate(() => target.scene);
+    setPendingSeek({ beats: target.scene.beats.length, t });
+  };
   const local = playhead - scene.startTime;
   const fallbackName = scene.elements.find((e) => e.kind === "text")?.props.text ?? "Scene";
 
@@ -351,13 +382,25 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
           beat={beat}
           local={local}
           onPick={(i) => onSeek(beatRestTime(scene, i))}
-          onAdd={() => {
-            const { scene: next, index } = addBeat(scene, beat);
+          onAdd={() => goToBeat(addBeat(scene, beat))}
+        />
+        <SliderRow
+          label="Holds"
+          value={scene.beats[beat]?.hold ?? 2}
+          min={0.3}
+          max={10}
+          step={0.1}
+          format={(v) => `${v.toFixed(1)}s`}
+          onChange={(v) => {
+            // Shortened past the playhead, the beat would slip out from under it - and the next edit
+            // land in the beat after. The playhead stays in this beat.
+            const next = setBeatHold(scene, beat, v);
             onUpdate(() => next);
-            onSeek(beatRestTime(next, index));
+            // Past the end of the last beat counts too - the stage would show nothing at all.
+            const start = beatStarts(next)[beat] ?? 0;
+            if (local < start || local >= start + v || beatIndexAt(next, Math.max(0, local)) !== beat) onSeek(beatRestTime(next, beat));
           }}
         />
-        <SliderRow label="Holds" value={scene.beats[beat]?.hold ?? 2} min={0.3} max={10} step={0.1} format={(v) => `${v.toFixed(1)}s`} onChange={(v) => onUpdate((s) => setBeatHold(s, beat, v))} />
       </Section>
 
       <Section title="Elements" aside={<span className="text-[10px] text-white/30 normal-case tracking-normal">● changes in this beat</span>}>
@@ -402,7 +445,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
           })}
           {scene.elements.length === 0 && <span className="px-2 py-3 text-center text-[11px] text-white/40">Nothing in the scene yet - add something below.</span>}
         </div>
-        <div className="grid grid-cols-5 gap-0.5 rounded-lg bg-white/[0.06] p-0.5">
+        <div className="grid grid-cols-7 gap-0.5 rounded-lg bg-white/[0.06] p-0.5">
           {[
             { kind: "text" as const, icon: <IoText size={14} />, text: "Text", title: `Add text arriving in beat ${beat + 1}` },
             { kind: "shape" as const, icon: <IoSquareOutline size={14} />, text: "Shape", title: "Choose a shape to add" },
@@ -420,6 +463,14 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
               {b.text}
             </button>
           ))}
+          <button type="button" title={`Add an equation arriving in beat ${beat + 1} - typeset TeX that can rewrite itself beat to beat`} onClick={addMath} className="h-11 flex flex-col items-center justify-center gap-0.5 rounded-md text-[10px] text-white/70 hover:text-white hover:bg-white/10">
+            <span className="text-[14px] leading-none font-serif">∑</span>
+            Maths
+          </button>
+          <button type="button" title={`Add a graph arriving in beat ${beat + 1} - functions you type, data you paste, points, areas and gradient descent, morphing beat to beat`} onClick={addGraph} className="h-11 flex flex-col items-center justify-center gap-0.5 rounded-md text-[10px] text-white/70 hover:text-white hover:bg-white/10">
+            <GraphGlyph size={14} />
+            Graph
+          </button>
           <button type="button" title={`Add a picture arriving in beat ${beat + 1} - a logo, product shot or screenshot`} onClick={() => void pickPicture()} className="h-11 flex flex-col items-center justify-center gap-0.5 rounded-md text-[10px] text-white/70 hover:text-white hover:bg-white/10">
             <IoImageOutline size={14} />
             Picture
@@ -437,13 +488,9 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
         </div>
         {/* Choose first, then it's placed - in this beat, in view, selected. */}
         {adding === "shape" && (
-          <div className="grid grid-cols-4 gap-1 rounded-lg bg-black/25 p-1.5">
-            {SHAPES.map((k) => (
-              <button key={k.id} type="button" title={`Add a ${k.label.toLowerCase()}`} onClick={() => addShape(k)} className="h-14 flex flex-col items-center justify-center gap-1 rounded-md text-[10px] text-white/70 hover:text-white hover:bg-white/10">
-                <span className="block bg-white/80" style={{ width: (k.w / Math.max(k.w, k.h)) * 26, height: (k.h / Math.max(k.w, k.h)) * 26, borderRadius: (k.radius(k.w, k.h) / Math.max(k.w, k.h)) * 26 }} />
-                {k.label}
-              </button>
-            ))}
+          <div className="flex flex-col gap-1 rounded-lg bg-black/25 p-1.5">
+            <ShapeGallery onPick={addShape} />
+            <span className="px-0.5 text-[10px] text-white/35">Every one resizes, rounds, outlines and morphs into another between beats.</span>
           </div>
         )}
         {adding === "icon" && (
@@ -472,31 +519,95 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
         )}
       </Section>
 
+      <ValuesSection scene={scene} local={local} onUpdate={onUpdate} onSeekLocal={(t) => onSeek(scene.startTime + t)} />
+
       {element && here && (
         <Section
           title={
             <span className="flex items-center gap-1.5 normal-case tracking-normal text-[11px] text-white/80">
               <KindIcon e={element} />
-              <span className="truncate">{label(element, scene)}</span>
+              <input
+                key={element.id + (element.name ?? "")}
+                defaultValue={element.name ?? ""}
+                placeholder={label(element, scene)}
+                title="Name it - names show in the element list, in lines' ends and in rules"
+                onBlur={(e) => e.target.value !== (element.name ?? "") && onUpdate((s) => renameElement(s, element.id, e.target.value))}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  if (e.key === "Escape") {
+                    (e.target as HTMLInputElement).value = element.name ?? "";
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                className="min-w-0 flex-1 truncate bg-transparent rounded px-1 -ml-1 outline-none hover:bg-white/5 focus:bg-black/30 focus:ring-1 focus:ring-teal-400 placeholder:text-white/80"
+              />
             </span>
           }
           aside={
-            <IconButton
-              title="Delete it from the scene"
-              danger
-              onClick={() => {
-                onUpdate((s) => deleteElement(s, element.id));
-                onSelectElement(null);
-              }}
-            >
-              <IoTrashOutline size={12} />
-            </IconButton>
+            <span className="flex items-center">
+              {element.kind !== "stack" && (
+                <IconButton
+                  title="Duplicate it (Ctrl+D) - look, motion and every beat's changes"
+                  onClick={() => {
+                    let made = "";
+                    onUpdate((s) => {
+                      const r = duplicateElement(s, element.id);
+                      made = r.id;
+                      return r.scene;
+                    });
+                    window.setTimeout(() => made && onSelectElement(made), 0);
+                  }}
+                >
+                  <IoCopyOutline size={12} />
+                </IconButton>
+              )}
+              <IconButton
+                title="Delete it from the scene"
+                danger
+                onClick={() => {
+                  onUpdate((s) => deleteElement(s, element.id));
+                  onSelectElement(null);
+                }}
+              >
+                <IoTrashOutline size={12} />
+              </IconButton>
+            </span>
           }
         >
           <Toggle label={`Shown in beat ${beat + 1}`} value={here.visible} onChange={() => toggleShown(element.id)} title="Show or hide it from this beat on - it arrives or leaves with the scene's motion" />
+          {element.kind !== "connector" && <ArrangeSection scene={scene} beat={beat} element={element} here={here} onUpdate={onUpdate} lockByDefault={element.kind === "image" || element.kind === "math"} />}
+          {element.kind === "math" && (
+            <MathEditor
+              scene={scene}
+              beat={beat}
+              element={element}
+              here={here}
+              onUpdate={onUpdate}
+              onRewriteNext={() => {
+                const target = beat + 1 < scene.beats.length ? { scene, index: beat + 1 } : addBeat(scene, beat);
+                goToBeat(target);
+                window.setTimeout(() => window.dispatchEvent(new CustomEvent("stage-edit-math", { detail: element.id })), 120);
+              }}
+            />
+          )}
+          {element.kind === "graph" && (
+            <GraphEditor
+              scene={scene}
+              beat={beat}
+              element={element}
+              here={here}
+              onUpdate={onUpdate}
+              onNextBeat={() => {
+                const target = beat + 1 < scene.beats.length ? { scene, index: beat + 1 } : addBeat(scene, beat);
+                goToBeat(target);
+              }}
+            />
+          )}
           {element.kind === "text" && (
             <>
               <textarea
+                ref={textRef}
                 value={draft ?? here.text ?? ""}
                 onChange={(e) => setDraft(e.target.value)}
                 onBlur={commitDraft}
@@ -513,6 +624,31 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
                 placeholder="Text in this beat"
               />
               <span className="-mt-1 text-[10px] text-white/35">Words it keeps glide into place; new words write on. Shift+Enter for a new line.</span>
+              {(scene.channels ?? []).length > 0 && (
+                <div className="flex flex-wrap items-center gap-1">
+                  <span className="text-[10px] text-white/45 mr-0.5">Show live:</span>
+                  {(scene.channels ?? []).map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      title={`Put ${c.name ?? c.id} into the text at the cursor - it shows the value as it runs`}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        const current = draft ?? here.text ?? "";
+                        const el = textRef.current;
+                        const a = el && document.activeElement === el ? el.selectionStart : current.length;
+                        const b = el && document.activeElement === el ? el.selectionEnd : current.length;
+                        const next = current.slice(0, a) + valueToken(c) + current.slice(b);
+                        setDraft(null);
+                        inBeat({ text: next });
+                      }}
+                      className="rounded-full bg-teal-500/15 hover:bg-teal-500/30 px-2 py-0.5 text-[10px] text-teal-100"
+                    >
+                      {c.name ?? c.id}
+                    </button>
+                  ))}
+                </div>
+              )}
               <Swatches colors={STAGE_INKS} value={here.color} onPick={(c) => c && inBeat({ color: c })} custom />
               <SliderRow label="Size" value={element.textLook?.fontSize ?? 44} min={10} max={240} step={1} format={(v) => `${Math.round(v)}`} onChange={(v) => look({ fontSize: v })} />
               <Segmented
@@ -552,40 +688,10 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
               />
             </>
           )}
-          {(element.kind === "shape" || element.kind === "image") && (
-            <>
-              {element.kind === "shape" && <span className="text-[11px] text-white/60">Fill</span>}
-              {element.kind === "shape" && <Swatches colors={STAGE_INKS} value={here.color} onPick={(c) => c && inBeat({ color: c })} custom />}
-              <SliderRow label="Width" value={here.width} min={1} max={scene.width} step={1} format={(v) => `${Math.round(v)}`} onChange={(v) => inBeat({ width: v })} />
-              <SliderRow label="Height" value={here.height} min={1} max={STAGE_HEIGHT} step={1} format={(v) => `${Math.round(v)}`} onChange={(v) => inBeat({ height: v })} />
-              <SliderRow label="Corners" value={element.shape?.radius ?? 0} min={0} max={Math.max(1, Math.min(here.width, here.height) / 2)} step={1} format={(v) => `${Math.round(v)}`} onChange={(v) => shapeOf({ radius: v })} />
-              {element.kind === "shape" && <Toggle label="Gradient" value={!!element.shape?.gradient} onChange={(v) => shapeOf({ gradient: v ? { to: "#9aa0a8", angle: 135 } : undefined })} title="Fade the fill into a second colour" />}
-              {element.kind === "shape" && element.shape?.gradient && (
-                <div className="flex flex-col gap-2 pl-2 border-l border-white/10">
-                  <Swatches colors={STAGE_INKS} value={element.shape.gradient.to} onPick={(c) => c && shapeOf({ gradient: { ...element.shape!.gradient!, to: c } })} custom />
-                  <SliderRow label="Angle" value={element.shape.gradient.angle ?? 180} min={0} max={360} step={5} format={(v) => `${Math.round(v)}°`} reset={180} onChange={(v) => shapeOf({ gradient: { ...element.shape!.gradient!, angle: v } })} />
-                </div>
-              )}
-              <Toggle label="Outline" value={!!element.shape?.stroke} onChange={(v) => shapeOf({ stroke: v ? { color: "#111111", width: 3 } : undefined })} />
-              {element.shape?.stroke && (
-                <div className="flex flex-col gap-2 pl-2 border-l border-white/10">
-                  <Swatches colors={STAGE_INKS} value={element.shape.stroke.color} onPick={(c) => c && shapeOf({ stroke: { ...element.shape!.stroke!, color: c } })} custom />
-                  <SliderRow label="Weight" value={element.shape.stroke.width} min={0.5} max={24} step={0.5} format={(v) => `${v}`} onChange={(v) => shapeOf({ stroke: { ...element.shape!.stroke!, width: v } })} />
-                </div>
-              )}
-              <Toggle label="Soft shadow" value={!!element.shape?.shadow} onChange={(v) => shapeOf({ shadow: v ? SOFT_SHADOW : undefined })} title="A soft shadow beneath it, as if lifted off the page" />
-              {element.shape?.shadow && (
-                <div className="flex flex-col gap-2 pl-2 border-l border-white/10">
-                  <SliderRow label="Softness" value={element.shape.shadow.blur} min={0} max={160} step={1} format={(v) => `${Math.round(v)}`} reset={SOFT_SHADOW.blur} onChange={(v) => shapeOf({ shadow: { ...element.shape!.shadow!, blur: v } })} />
-                  <SliderRow label="Lift" value={element.shape.shadow.y ?? 0} min={0} max={80} step={1} format={(v) => `${Math.round(v)}`} reset={SOFT_SHADOW.y} onChange={(v) => shapeOf({ shadow: { ...element.shape!.shadow!, y: v } })} />
-                </div>
-              )}
-            </>
-          )}
+          {(element.kind === "shape" || element.kind === "image") && <ShapeSection scene={scene} beat={beat} element={element} here={here} onUpdate={onUpdate} />}
           {element.kind === "icon" && (
             <>
               <Swatches colors={STAGE_INKS} value={here.color} onPick={(c) => c && inBeat({ color: c })} custom />
-              <SliderRow label="Size" value={here.width} min={8} max={600} step={1} format={(v) => `${Math.round(v)}`} onChange={(v) => inBeat({ width: v, height: v })} />
               <Toggle
                 label="Framed"
                 value={!!element.icon?.frame}
@@ -657,6 +763,10 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
               )}
             </>
           )}
+          <FollowSection scene={scene} element={element} here={here} onUpdate={onUpdate} />
+          <WhenSection scene={scene} element={element} onUpdate={onUpdate} />
+          <GroupSection scene={scene} element={element} at={occupied.find((o) => o.id === element.id)} onUpdate={onUpdate} onSelect={onSelectElement} />
+          <MotionSection scene={scene} beat={beat} element={element} here={here} onUpdate={onUpdate} />
         </Section>
       )}
 
@@ -666,7 +776,17 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
           colors={STAGE_BACKGROUNDS}
           titles={["None - over the video", "Paper", "White", "Light grey", "Ink", "Night", "Blue"]}
           value={scene.background.kind === "color" ? scene.background.color : undefined}
-          onPick={(c) => onUpdate((s) => ({ ...s, background: c ? { kind: "color", color: c } : { kind: "none" } }))}
+          onPick={(c) =>
+            onUpdate((s) => {
+              const next: StageScene = { ...s, background: c ? { kind: "color", color: c } : { kind: "none" } };
+              // Light to dark (or back): the automatic inks follow, so nothing disappears.
+              const isLight = (sc: StageScene) => {
+                const rgb = sc.background.kind === "color" ? parseStageColor(sc.background.color) : null;
+                return !!rgb && (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 > 0.55;
+              };
+              return isLight(s) === isLight(next) ? next : reinkScene(next, !isLight(next));
+            })
+          }
           custom
         />
         <span className="text-[11px] text-white/60">Motion</span>

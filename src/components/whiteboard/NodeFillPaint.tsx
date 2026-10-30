@@ -115,7 +115,15 @@ export function nodeFillPaint(node: WhiteboardNode, imageSrc: string | null): Fi
   };
 }
 
-type ShapeDrawProps = { fill: string; fillOpacity?: number; opacity?: number; stroke?: string; strokeWidth?: number };
+type ShapeDrawProps = {
+  fill: string;
+  fillOpacity?: number;
+  opacity?: number;
+  stroke?: string;
+  strokeWidth?: number;
+  strokeDasharray?: string;
+  strokeOpacity?: number;
+};
 
 // Draws one shape element with its fill paint and stroke. With a pattern overlay the single element
 // splits into three passes - fill, pattern, then the stroke alone on top - so the faint pattern never
@@ -124,19 +132,23 @@ export function PaintedShape({
   paint,
   stroke,
   strokeWidth,
+  strokeDasharray,
+  strokeOpacity,
   draw,
 }: {
   paint: FillPaint;
   stroke: string;
   strokeWidth: number;
+  strokeDasharray?: string;
+  strokeOpacity?: number;
   draw: (props: ShapeDrawProps) => React.ReactElement;
 }) {
-  if (!paint.overlay) return draw({ fill: paint.fill, fillOpacity: paint.fillOpacity, stroke, strokeWidth });
+  if (!paint.overlay) return draw({ fill: paint.fill, fillOpacity: paint.fillOpacity, stroke, strokeWidth, strokeDasharray, strokeOpacity });
   return (
     <>
       {draw({ fill: paint.fill, fillOpacity: paint.fillOpacity, stroke: "none" })}
       {draw({ fill: paint.overlay, opacity: paint.overlayOpacity, stroke: "none" })}
-      {draw({ fill: "none", stroke, strokeWidth })}
+      {draw({ fill: "none", stroke, strokeWidth, strokeDasharray, strokeOpacity })}
     </>
   );
 }

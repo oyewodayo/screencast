@@ -6,9 +6,11 @@
 // unit is outputHeight / 1080 device pixels.
 //
 // What each element becomes:
-// - a shape, a text's box (pill, rounded, square) and the scene background: a rounded rectangle
-//   drawn by its signed distance - an exact edge at any size, an outline just inside it, a pill
-//   that grows without redrawing anything, and blur that just widens the edge;
+// - a shape, a text's box (pill, rounded, square) and the scene background: drawn by its signed
+//   distance - a rounded rectangle, an ellipse, a ring or arc, a pie slice, or any outline from
+//   stageShapes - an exact edge at any size, an outline inside, on or outside it, a pill that grows
+//   without redrawing anything, blur that just widens the edge, and one form morphing into another
+//   by blending the two distances;
 // - text at rest: one raster of its lines (stageRaster.ts) placed on whole pixels - crisp. Text of
 //   one colour is drawn white and tinted here, so a colour change (a line dimming) costs nothing;
 // - a text mid-morph: its letters from a glyph atlas in ONE instanced draw - each letter's place,
@@ -28,12 +30,35 @@ import { sampleStage, stageGlyphSets, stageTextStates } from "./stageEngine";
 import { hasTemplate } from "./stageChannels";
 import { parseStageColor } from "./stageColor";
 import type { MeasuredText } from "./stageLayout";
+import { FORM_INFO, FORM_KIND, MAX_VERTS, ShapeForm, formOutline, insetOutline } from "./stageShapes";
 import { canvasStageMeasure, layoutLiveLine, liveCharset, stageFont } from "./stageMeasure";
 import { GlyphAtlas, atlasCellKey, glyphAtlas, rasterStageText } from "./stageRaster";
 import type { StageColorRun, StageElement, StageTextLook, StageWeightRun } from "./stageTypes";
 import { DEFAULT_ENTER, DEFAULT_EXIT, STAGE_HEIGHT } from "./stageTypes";
 import { StickerIcon, drawStickerIcon } from "../stickerIcons";
 import { stageImage } from "./stageImages";
+import { MATH_INK, MathMorphPlan, drawMath, drawMathMorph, mathLayout, planMathMorph } from "./stageMath";
+import { GraphState, drawGraph } from "./stageGraph";
+
+// A graph state's identity for redraw decisions (states are replaced, never mutated).
+const graphIds = new WeakMap<GraphState, number>();
+let nextGraphId = 1;
+const graphId = (g: GraphState | undefined) => {
+  if (!g) return 0;
+  let id = graphIds.get(g);
+  if (!id) graphIds.set(g, (id = nextGraphId++));
+  return id;
+};
+
+const WIPE_KIND: Record<string, number> = { right: 0, left: 1, up: 2, down: 3, centre: 4 };
+
+export interface StageOffset {
+  dx: number;
+  dy: number;
+  dw?: number;
+  dh?: number;
+  dr?: number;
+}
 
 const VERTEX = /* glsl */ `
 out vec2 vUv;
@@ -52,10 +77,46 @@ uniform float margin;
 uniform float radius;
 uniform float blurPx;
 uniform float opacity;
-// A linear gradient from color to color2 along gradDir (useGrad = 1), across the box.
+// A linear gradient from color to color2 along gradDir (useGrad = 1), across the box - or, with
+// gradType = 1, radial from the centre to the box's edge.
 uniform vec4 color2;
 uniform vec2 gradDir;
 uniform float useGrad;
+uniform float gradType;
+// The form (stageShapes): A is drawn; mid-morph, B (the form it's leaving) is blended in by
+// 1 - shapeMix. Kinds: 0 rounded box, 1 ellipse, 2 polygon (verts, rounded by the radius), 3 ring or
+// arc, 4 pie or donut. params: (B's radius px, inner ratio, sweep rad, start rad); A's radius is
+// \`radius\`. caps: 1 round ends on an arc.
+uniform float formA;
+uniform float formB;
+uniform float shapeMix;
+uniform vec4 paramsA;
+uniform vec4 paramsB;
+uniform float capsA;
+uniform float capsB;
+uniform int countA;
+uniform int countB;
+// The outlines' points: row 0 for A, row 1 for B (a float texture, uploaded only when one changes).
+uniform sampler2D vertTex;
+// How far the outline reaches outside the edge (px): 0 inside, half its width centred, all of it outside.
+uniform float strokeOut;
+// A dashed (1) or dotted (2) outline: (style, dash length px, gap px, offset px - its march). Where
+// along the edge a point is comes from the outline in row 2 of vertTex (cumulative length in z), or
+// for rings and pies from the angle; perim is the edge's length.
+uniform vec4 dash;
+uniform float perim;
+uniform int countD;
+// A wipe (on = 1): a soft edge sweeping across the box toward a side - x right, y down, both 0..1
+// over the box - showing a share of it (y: 0 nothing, 1 all). Kinds: 0 toward the right, 1 left,
+// 2 up, 3 down, 4 out from the centre.
+uniform vec4 wipe;
+float wipeMask(vec2 q) {
+  if (wipe.x < 0.5) return 1.0;
+  float v = wipe.z < 0.5 ? q.x : wipe.z < 1.5 ? 1.0 - q.x : wipe.z < 2.5 ? 1.0 - q.y : wipe.z < 3.5 ? q.y : abs(q.x - 0.5) * 2.0;
+  float f = 0.08;
+  float edge = wipe.y * (1.0 + f);
+  return 1.0 - smoothstep(edge - f, edge, v);
+}
 // A drop shadow (px): offset, Gaussian sigma; straight-alpha colour. Outside the box only, as CSS.
 uniform vec4 shadowColor;
 uniform vec2 shadowOffset;
@@ -87,6 +148,124 @@ float sdRoundBox(vec2 p, vec2 b, float r) {
   vec2 q = abs(p) - b + r;
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
+float sdEllipse(vec2 p, vec2 ab) {
+  ab = max(ab, vec2(0.5));
+  float k0 = length(p / ab);
+  float k1 = length(p / (ab * ab));
+  return k1 > 0.0 ? k0 * (k0 - 1.0) / k1 : -min(ab.x, ab.y);
+}
+// Exact distance to a polygon (Inigo Quilez), negative inside.
+vec2 vert(int i, int side) {
+  return texelFetch(vertTex, ivec2(i, side), 0).xy;
+}
+float sdPoly(vec2 p, int side) {
+  int n = side == 0 ? countA : countB;
+  vec2 v0 = vert(0, side);
+  float d = dot(p - v0, p - v0);
+  float s = 1.0;
+  for (int i = 0; i < ${MAX_VERTS}; i++) {
+    if (i >= n) break;
+    int j = i == 0 ? n - 1 : i - 1;
+    vec2 vi = vert(i, side);
+    vec2 vj = vert(j, side);
+    vec2 e = vj - vi;
+    vec2 w = p - vi;
+    vec2 b = w - e * clamp(dot(w, e) / max(dot(e, e), 1e-6), 0.0, 1.0);
+    d = min(d, dot(b, b));
+    bvec3 c = bvec3(p.y >= vi.y, p.y < vj.y, e.x * w.y > e.y * w.x);
+    if (all(c) || all(not(c))) s = -s;
+  }
+  return s * sqrt(d);
+}
+// An infinite wedge about +y with half-aperture (sin, cos) = sc.
+float sdWedge(vec2 p, vec2 sc) {
+  p.x = abs(p.x);
+  float m = length(p - sc * max(dot(p, sc), 0.0));
+  return m * sign(sc.y * p.x - sc.x * p.y);
+}
+float shapeDist(vec2 p, int side) {
+  float form = side == 0 ? formA : formB;
+  vec4 prm = side == 0 ? paramsA : paramsB;
+  float rad = side == 0 ? radius : prm.x;
+  vec2 hs = size * 0.5;
+  if (form < 0.5) return sdRoundBox(p, hs, min(rad, min(hs.x, hs.y)));
+  if (form < 1.5) return sdEllipse(p, hs);
+  if (form < 2.5) return sdPoly(p, side) - rad;
+  // Rings and pies are worked out where the box is a circle of radius R.
+  float R = max(min(hs.x, hs.y), 0.5);
+  vec2 q = p * vec2(R / max(hs.x, 0.5), R / max(hs.y, 0.5));
+  float sweep = clamp(prm.z, 0.0, 6.2831853);
+  float mid = prm.w + sweep * 0.5;
+  vec2 dir = vec2(sin(mid), -cos(mid));
+  vec2 l = vec2(dot(q, vec2(-dir.y, dir.x)), dot(q, dir));
+  vec2 sc = vec2(sin(sweep * 0.5), cos(sweep * 0.5));
+  float inner = clamp(prm.y, 0.0, 0.995);
+  bool whole = sweep > 6.2825;
+  if (form < 3.5) {
+    float rb = R * (1.0 - inner) * 0.5;
+    float ra = R - rb;
+    float dRing = abs(length(q) - ra) - rb;
+    if (whole) return dRing;
+    if (sweep < 1e-4) return 1e6;
+    float caps = side == 0 ? capsA : capsB;
+    if (caps > 0.5) {
+      vec2 a = vec2(abs(l.x), l.y);
+      return ((sc.y * a.x > sc.x * a.y) ? length(a - sc * ra) : abs(length(a) - ra)) - rb;
+    }
+    return max(dRing, sdWedge(l, sc));
+  }
+  float d = length(q) - R;
+  if (!whole) d = sweep < 1e-4 ? 1e6 : max(d, sdWedge(l, sc));
+  if (inner > 0.0) d = max(d, R * inner - length(q));
+  return d;
+}
+float dist(vec2 p) {
+  return shapeMix >= 0.999 ? shapeDist(p, 0) : mix(shapeDist(p, 1), shapeDist(p, 0), shapeMix);
+}
+// How far along the edge (px) the point nearest p is.
+float edgeParam(vec2 p) {
+  if (countD == 0) {
+    // Rings and pies: by angle, clockwise from the top, round the box's circle.
+    float R = max(min(size.x, size.y) * 0.5, 0.5);
+    vec2 q = p * vec2(R / max(size.x * 0.5, 0.5), R / max(size.y * 0.5, 0.5));
+    float a = atan(q.x, -q.y);
+    if (a < 0.0) a += 6.2831853;
+    return a / 6.2831853 * perim;
+  }
+  float best = 1e20;
+  float at = 0.0;
+  for (int i = 0; i < ${MAX_VERTS}; i++) {
+    if (i >= countD) break;
+    int j = i + 1 >= countD ? 0 : i + 1;
+    vec4 vi = texelFetch(vertTex, ivec2(i, 2), 0);
+    vec2 vj = texelFetch(vertTex, ivec2(j, 2), 0).xy;
+    vec2 e = vj - vi.xy;
+    vec2 w = p - vi.xy;
+    float h = clamp(dot(w, e) / max(dot(e, e), 1e-6), 0.0, 1.0);
+    vec2 b = w - e * h;
+    float dd = dot(b, b);
+    if (dd < best) {
+      best = dd;
+      at = vi.z + h * length(e);
+    }
+  }
+  return at;
+}
+// The share of the outline shown at p: dashes along the edge, or round dots on its centre line
+// (cd: distance from the outline's centre line). The spacing is evened out so the pattern closes
+// seamlessly round the shape.
+float dashMask(vec2 p, float cd) {
+  float period = max(1.0, dash.y + dash.z);
+  float n = max(1.0, floor(perim / period + 0.5));
+  float per = perim / n;
+  float s = mod(edgeParam(p) + dash.w, per);
+  if (dash.x < 1.5) {
+    float len = dash.y * per / period;
+    return clamp(min(s + 0.5, len - s + 0.5), 0.0, 1.0);
+  }
+  float r = strokePx * 0.5;
+  return clamp(r - length(vec2(s - per * 0.5, cd)) + 0.5, 0.0, 1.0);
+}
 // Coverage of the inside of distance d: a one-pixel antialiased edge, widened by blur (a
 // Gaussian's edge is about 2.5 sigma across).
 float cover(float d, float w) {
@@ -95,17 +274,21 @@ float cover(float d, float w) {
 }
 void main() {
   vec2 p = vUv * (size + 2.0 * margin) - margin - size * 0.5;
-  float r = min(radius, 0.5 * min(size.x, size.y));
-  float d = sdRoundBox(p, size * 0.5, r);
+  float d = dist(p);
   float w = max(0.75, blurPx * 1.25);
-  float outer = cover(d, w);
-  // The fill inside the outline; the outline (just inside the edge) over it.
-  float inner = strokePx > 0.0 ? cover(d + strokePx, w) : outer;
+  float outer = cover(d - strokeOut, w);
+  // The fill inside the outline; the outline (inside, on or outside the edge) over it.
+  float inner = strokePx > 0.0 ? cover(d - strokeOut + strokePx, w) : outer;
   vec4 c = color;
   if (useGrad > 0.5) {
-    // 0 at the start corner side, 1 at the far side, for any direction.
-    float span = abs(gradDir.x) * size.x + abs(gradDir.y) * size.y;
-    c = mix(color, color2, clamp(dot(p, gradDir) / max(span, 1.0) + 0.5, 0.0, 1.0));
+    float g;
+    if (gradType > 0.5) g = length(p / max(size * 0.5, vec2(1.0)));
+    else {
+      // 0 at the start corner side, 1 at the far side, for any direction.
+      float span = abs(gradDir.x) * size.x + abs(gradDir.y) * size.y;
+      g = dot(p, gradDir) / max(span, 1.0) + 0.5;
+    }
+    c = mix(color, color2, clamp(g, 0.0, 1.0));
   }
   vec4 fill = vec4(c.rgb, 1.0) * c.a;
   float merged = 1.0;
@@ -133,19 +316,29 @@ void main() {
       fill = mix(dotted, fill, merged * merged);
     }
   }
-  fill *= inner;
   vec4 ring = vec4(strokeColor.rgb, 1.0) * strokeColor.a * (outer - inner);
+  vec4 body;
+  if (dash.x > 0.5 && strokePx > 0.0) {
+    // Broken outline: the fill runs to the edge under it, showing through the gaps.
+    float cd = d - strokeOut + strokePx * 0.5;
+    float m = dashMask(p, cd);
+    ring = vec4(strokeColor.rgb, 1.0) * strokeColor.a * (dash.x < 1.5 ? (outer - inner) * m : m);
+    fill *= cover(d, w);
+    body = ring * merged + fill * (1.0 - ring.a * merged);
+  } else {
+    fill *= inner;
+    body = fill + ring * merged;
+  }
   // A box thinner than a pixel covers only that much of one - an empty bar draws nothing.
   float thin = clamp(min(size.x, size.y), 0.0, 1.0);
-  vec4 body = fill + ring * merged;
   if (shadowColor.a > 0.0) {
     // The Gaussian's edge through the normal CDF (logistic approximation), from the distance to
     // the offset box - exact along the sides, close at the corners.
-    float ds = sdRoundBox(p - shadowOffset, size * 0.5, r);
+    float ds = dist(p - shadowOffset) - strokeOut;
     float sh = 1.0 / (1.0 + exp(1.702 * ds / max(shadowSigma, 0.5)));
     body += vec4(shadowColor.rgb, 1.0) * shadowColor.a * sh * (1.0 - outer) * merged;
   }
-  outColor = body * opacity * thin;
+  outColor = body * opacity * thin * wipeMask((p + size * 0.5) / max(size, vec2(1.0)));
 }`;
 
 // The Gaussian disc both texture shaders blur with: 32 taps over 3 sigma, from the mip level whose
@@ -184,10 +377,21 @@ uniform float blurPx;
 in vec2 vUv;
 out vec4 outColor;
 ${BLUR_GLSL}
+// A wipe (on = 1): a soft edge sweeping across the box toward a side - x right, y down, both 0..1
+// over the box - showing a share of it (y: 0 nothing, 1 all). Kinds: 0 toward the right, 1 left,
+// 2 up, 3 down, 4 out from the centre.
+uniform vec4 wipe;
+float wipeMask(vec2 q) {
+  if (wipe.x < 0.5) return 1.0;
+  float v = wipe.z < 0.5 ? q.x : wipe.z < 1.5 ? 1.0 - q.x : wipe.z < 2.5 ? 1.0 - q.y : wipe.z < 3.5 ? q.y : abs(q.x - 0.5) * 2.0;
+  float f = 0.08;
+  float edge = wipe.y * (1.0 + f);
+  return 1.0 - smoothstep(edge - f, edge, v);
+}
 void main() {
   vec4 c = blurred(map, vUv, vec4(0.0, 0.0, 1.0, 1.0), texSize, blurPx);
   if (useTint > 0.5) c = vec4(tint.rgb * c.a, c.a) * tint.a;
-  outColor = c * opacity;
+  outColor = c * opacity * wipeMask(vUv);
 }`;
 
 // Letters of a morphing text, one instance each: iRect = its quad in the element's box (stage
@@ -287,6 +491,17 @@ const premultipliedBlend = {
   blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
 } as const;
 
+// Three rows of outline points (RG = x, y in px; B = length along the outline so far), read exactly
+// by texelFetch: A's outline, B's, and the edge a dashed outline is measured along.
+function vertTexture(): THREE.DataTexture {
+  const t = new THREE.DataTexture(new Float32Array(MAX_VERTS * 3 * 4), MAX_VERTS, 3, THREE.RGBAFormat, THREE.FloatType);
+  t.minFilter = THREE.NearestFilter;
+  t.magFilter = THREE.NearestFilter;
+  t.generateMipmaps = false;
+  t.needsUpdate = true;
+  return t;
+}
+
 const boxMaterial = () =>
   new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -304,6 +519,22 @@ const boxMaterial = () =>
       color2: { value: new THREE.Vector4() },
       gradDir: { value: new THREE.Vector2(0, 1) },
       useGrad: { value: 0 },
+      gradType: { value: 0 },
+      formA: { value: 0 },
+      formB: { value: 0 },
+      shapeMix: { value: 1 },
+      paramsA: { value: new THREE.Vector4(0, 0, Math.PI * 2, 0) },
+      paramsB: { value: new THREE.Vector4(0, 0, Math.PI * 2, 0) },
+      capsA: { value: 1 },
+      capsB: { value: 1 },
+      countA: { value: 0 },
+      countB: { value: 0 },
+      vertTex: { value: vertTexture() },
+      strokeOut: { value: 0 },
+      dash: { value: new THREE.Vector4() },
+      perim: { value: 1 },
+      countD: { value: 0 },
+      wipe: { value: new THREE.Vector4() },
       shadowColor: { value: new THREE.Vector4() },
       shadowOffset: { value: new THREE.Vector2() },
       shadowSigma: { value: 1 },
@@ -323,7 +554,7 @@ const rasterMaterial = () =>
     glslVersion: THREE.GLSL3,
     vertexShader: VERTEX,
     fragmentShader: RASTER_FRAGMENT,
-    uniforms: { map: { value: null }, texSize: { value: new THREE.Vector2(1, 1) }, tint: { value: new THREE.Vector4(1, 1, 1, 1) }, useTint: { value: 0 }, opacity: { value: 1 }, blurPx: { value: 0 } },
+    uniforms: { map: { value: null }, texSize: { value: new THREE.Vector2(1, 1) }, tint: { value: new THREE.Vector4(1, 1, 1, 1) }, useTint: { value: 0 }, opacity: { value: 1 }, blurPx: { value: 0 }, wipe: { value: new THREE.Vector4() } },
     ...premultipliedBlend,
   });
 
@@ -429,6 +660,10 @@ interface ElementGfx {
   line?: Mesh;
   // An icon, drawn white once for its size (and tinted).
   icon?: { key: string; canvas: HTMLCanvasElement; texture: THREE.CanvasTexture };
+  // An equation, drawn at this resolution (and every frame while it rewrites itself).
+  math?: { key: string; canvas: HTMLCanvasElement; texture: THREE.CanvasTexture; mesh: Mesh; shape: string; plan?: { from: string; to: string; plan: MathMorphPlan } };
+  // A graph, drawn at this resolution - every frame while it animates, else only when it changes.
+  graph?: { key: string; canvas: HTMLCanvasElement; texture: THREE.CanvasTexture; mesh: Mesh; shape: string };
   box: Mesh | null;
   text: Mesh | null;
   // Every prepared text state, by key; plus one canvas a live text is redrawn into.
@@ -454,8 +689,9 @@ export class StageRenderer {
   // The scenes whose resources are kept (prepareAll) - the one playing and those about to.
   private prepared: CompiledStage[] = [];
   // Elements shifted while being dragged in the editor (setOffset) - moved at draw time, with
-  // everything inside them, so a drag never waits on the scene recompiling.
-  private readonly offsets = new Map<string, { dx: number; dy: number }>();
+  // everything inside them, so a drag never waits on the scene recompiling. A resize or turn by a
+  // handle (dw, dh, dr) changes the element itself only.
+  private readonly offsets = new Map<string, StageOffset>();
   // Work done since the counters were last read - for tests and profiling.
   readonly stats = { rasters: 0, atlases: 0 };
   private pxWidth = 1;
@@ -557,7 +793,8 @@ export class StageRenderer {
   }
 
   private layoutFor(element: StageElement, text: string, wrapWidth: number, weights?: StageWeightRun[]): MeasuredText {
-    const key = `${element.id}\u0000${wrapWidth}\u0000${weights?.length ? JSON.stringify(weights) : ""}\u0000${text}`;
+    // The look is part of it: a new size, font or spacing lays the same words out afresh.
+    const key = `${element.id}\u0000${JSON.stringify(element.textLook ?? null)}\u0000${wrapWidth}\u0000${weights?.length ? JSON.stringify(weights) : ""}\u0000${text}`;
     let m = this.layoutCache.get(key);
     if (!m) {
       if (this.layoutCache.size > 4000) this.layoutCache.clear();
@@ -573,8 +810,9 @@ export class StageRenderer {
   }
 
   // One colour is tinted at draw time, so it isn't part of the key; with runs the base colour is drawn in.
-  private rasterKey = (text: string, runs: StageColorRun[] | undefined, weights: StageWeightRun[] | undefined, wrapWidth: number, color: string | undefined) =>
-    `${text}\u0000${wrapWidth}\u0000${JSON.stringify(runs ?? null)}\u0000${JSON.stringify(weights ?? null)}\u0000${runs?.length ? color : ""}`;
+  // The look is part of the key, so resizing or restyling a text redraws it.
+  private rasterKey = (element: StageElement, text: string, runs: StageColorRun[] | undefined, weights: StageWeightRun[] | undefined, wrapWidth: number, color: string | undefined) =>
+    `${JSON.stringify(element.textLook ?? null)}\u0000${text}\u0000${wrapWidth}\u0000${JSON.stringify(runs ?? null)}\u0000${JSON.stringify(weights ?? null)}\u0000${runs?.length ? color : ""}`;
 
   private drawRaster(element: StageElement, text: string, runs: StageColorRun[] | undefined, weights: StageWeightRun[] | undefined, wrapWidth: number, color: string, into?: Raster): Raster {
     this.stats.rasters++;
@@ -639,7 +877,7 @@ export class StageRenderer {
       const keep = new Set<string>();
       for (const st of states) {
         const wrap = st.wrapWidth ?? element.props.width;
-        const key = this.rasterKey(st.text, st.colorRuns, st.weightRuns, wrap, st.color);
+        const key = this.rasterKey(element, st.text, st.colorRuns, st.weightRuns, wrap, st.color);
         keep.add(key);
         if (!g.rasters.has(key)) g.rasters.set(key, this.drawRaster(element, st.text, st.colorRuns, st.weightRuns, wrap, st.color ?? "#000000"));
       }
@@ -673,8 +911,9 @@ export class StageRenderer {
     return glyphSets;
   }
 
-  // Shifts element `id` (and everything inside it) by (dx, dy) stage units when drawn; null clears it.
-  setOffset(id: string, offset: { dx: number; dy: number } | null): void {
+  // Shifts element `id` (and everything inside it) by (dx, dy) stage units when drawn, and resizes or
+  // turns it by (dw, dh, dr); null clears it.
+  setOffset(id: string, offset: StageOffset | null): void {
     if (offset) this.offsets.set(id, offset);
     else this.offsets.delete(id);
   }
@@ -758,6 +997,118 @@ export class StageRenderer {
     return shared;
   }
 
+  // A dashed or dotted outline: its pattern, and the edge it's measured along (row 2) - the outline
+  // as drawn (corners rounded), or for rings and pies their circle. Worked out only when it changes.
+  private setDash(u: Record<string, THREE.IUniform>, form: ShapeForm, s: SampledElement, element: StageElement, stroke: NonNullable<StageElement["shape"]>["stroke"] | undefined, radiusPx: number, t: number): void {
+    const d = stroke?.dash;
+    const dash = u.dash.value as THREE.Vector4;
+    if (!d || !stroke) {
+      dash.set(0, 0, 0, 0);
+      return;
+    }
+    const scale = this.scale;
+    const w = s.width * scale;
+    const h = s.height * scale;
+    // Dots sit a dot apart by default; dashes as given.
+    const len = d.style === "dot" ? stroke.width * scale : Math.max(0.5, d.length * scale);
+    dash.set(d.style === "dot" ? 2 : 1, len, Math.max(0.5, d.gap * scale), -(d.flow ?? 0) * t * scale);
+    const kind = FORM_KIND[form] ?? 0;
+    const tex = u.vertTex.value as THREE.DataTexture & { userData: { dashKey?: string; dashCount?: number; dashPerim?: number } };
+    const inner = s.inner ?? FORM_INFO[form]?.inner?.default ?? 0;
+    const key = `${form}|${w.toFixed(1)}|${h.toFixed(1)}|${s.sides ?? 0}|${inner.toFixed(3)}|${radiusPx.toFixed(1)}`;
+    if (tex.userData.dashKey !== key) {
+      let pts: [number, number][] = [];
+      if (kind === 0) {
+        const r = Math.max(0, Math.min(radiusPx, w / 2, h / 2));
+        const corner = (cx: number, cy: number, a0: number) => {
+          const steps = r > 0.5 ? 8 : 0;
+          if (!steps) return void pts.push([cx, cy]);
+          for (let i = 0; i <= steps; i++) {
+            const a = a0 + (i / steps) * (Math.PI / 2);
+            pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+          }
+        };
+        corner(-w / 2 + r, -h / 2 + r, Math.PI);
+        corner(w / 2 - r, -h / 2 + r, -Math.PI / 2);
+        corner(w / 2 - r, h / 2 - r, 0);
+        corner(-w / 2 + r, h / 2 - r, Math.PI / 2);
+      } else if (kind === 1) {
+        for (let i = 0; i < MAX_VERTS; i++) {
+          const a = -Math.PI / 2 + (i / MAX_VERTS) * Math.PI * 2;
+          pts.push([(Math.cos(a) * w) / 2, (Math.sin(a) * h) / 2]);
+        }
+      } else if (kind === 2) {
+        pts = formOutline(form, w, h, s.sides ?? 0, inner, { flipX: element.shape?.flipX, flipY: element.shape?.flipY, tail: element.shape?.tail, round: radiusPx }) ?? [];
+      }
+      const data = tex.image.data as Float32Array;
+      const n = Math.min(MAX_VERTS, pts.length);
+      let along = 0;
+      for (let i = 0; i < n; i++) {
+        const o = (2 * MAX_VERTS + i) * 4;
+        data[o] = pts[i][0];
+        data[o + 1] = pts[i][1];
+        data[o + 2] = along;
+        const [nx, ny] = pts[(i + 1) % n];
+        along += Math.hypot(nx - pts[i][0], ny - pts[i][1]);
+      }
+      tex.needsUpdate = true;
+      tex.userData.dashKey = key;
+      tex.userData.dashCount = n;
+      // Rings and pies are measured round their circle.
+      tex.userData.dashPerim = n ? along : Math.PI * Math.min(w, h);
+    }
+    u.countD.value = tex.userData.dashCount ?? 0;
+    u.perim.value = Math.max(1, tex.userData.dashPerim ?? 1);
+  }
+
+  // A box's form into side A or B of its shader: the GPU kind, and for an outline its points at the
+  // box's size in pixels (rounded by insetting), or a ring's/pie's inner ratio, sweep and start.
+  private setForm(u: Record<string, THREE.IUniform>, side: "A" | "B", form: ShapeForm, s: SampledElement, element: StageElement, radiusPx: number): void {
+    const kind = FORM_KIND[form] ?? 0;
+    const scale = this.scale;
+    const w = s.width * scale;
+    const h = s.height * scale;
+    const params = u[`params${side}`].value as THREE.Vector4;
+    const inner = s.inner ?? FORM_INFO[form]?.inner?.default ?? 0;
+    params.set(radiusPx, inner, (Math.max(0, Math.min(360, s.sweep ?? 360)) * Math.PI) / 180, ((element.shape?.start ?? 0) * Math.PI) / 180);
+    u[`caps${side}`].value = (element.shape?.caps ?? "round") === "round" ? 1 : 0;
+    u[`form${side}`].value = kind;
+    if (side === "A") u.radius.value = kind === 0 ? radiusPx : 0;
+    if (kind !== 2) {
+      u[`count${side}`].value = 0;
+      return;
+    }
+    // The outline is worked out and uploaded only when something about it changed - a still shape
+    // costs nothing per frame.
+    const sh = element.shape;
+    const key = `${form}|${w.toFixed(2)}|${h.toFixed(2)}|${s.sides ?? 0}|${inner.toFixed(4)}|${radiusPx.toFixed(2)}|${sh?.flipX ? 1 : 0}${sh?.flipY ? 1 : 0}|${sh?.tail ?? ""}`;
+    const tex = u.vertTex.value as THREE.DataTexture & { userData: { keys?: string[]; counts?: number[]; radii?: number[] } };
+    const row = side === "A" ? 0 : 1;
+    const cache = (tex.userData.keys ??= ["", ""]);
+    const counts = (tex.userData.counts ??= [0, 0]);
+    const radii = (tex.userData.radii ??= [0, 0]);
+    if (cache[row] !== key) {
+      // A bubble carries its rounding in its points; a heart's many points are softened a touch.
+      const baked = form === "bubble";
+      if (form === "heart") radiusPx = Math.max(radiusPx, Math.min(w, h) * 0.03);
+      const outline = formOutline(form, w, h, s.sides ?? 0, inner, { flipX: sh?.flipX, flipY: sh?.flipY, tail: sh?.tail, round: radiusPx }) ?? [];
+      const { pts, r } = baked ? { pts: outline, r: 0 } : insetOutline(outline, Math.min(radiusPx, Math.min(w, h) * 0.5));
+      const data = tex.image.data as Float32Array;
+      const n = Math.min(MAX_VERTS, pts.length);
+      for (let i = 0; i < n; i++) {
+        data[(row * MAX_VERTS + i) * 4] = pts[i][0];
+        data[(row * MAX_VERTS + i) * 4 + 1] = pts[i][1];
+      }
+      tex.needsUpdate = true;
+      cache[row] = key;
+      counts[row] = n;
+      radii[row] = r;
+    }
+    u[`count${side}`].value = counts[row];
+    if (side === "A") u.radius.value = radii[row];
+    else params.x = radii[row];
+  }
+
   // The element's transform: box-relative stage units -> stage.
   private elementMatrix(s: SampledElement): THREE.Matrix4 {
     const ax = s.anchorX * s.width;
@@ -822,7 +1173,7 @@ export class StageRenderer {
 
     const byId = new Map(scene.elements.map((e) => [e.id, e]));
     // Dragged elements' shifts, passed down to everything inside them.
-    const shiftOf = (id: string): { dx: number; dy: number } | null => {
+    const shiftOf = (id: string): StageOffset | null => {
       for (let e = byId.get(id); e; e = e.parent ? byId.get(e.parent) : undefined) {
         const o = this.offsets.get(e.id);
         if (o) return o;
@@ -832,7 +1183,14 @@ export class StageRenderer {
     const drawn = new Set<string>();
     const samples = sampleStage(compiled, t).map((sampled) => {
       const shift = this.offsets.size ? shiftOf(sampled.id) : null;
-      return shift ? { ...sampled, x: sampled.x + shift.dx, y: sampled.y + shift.dy } : sampled;
+      if (!shift) return sampled;
+      const own = this.offsets.get(sampled.id) === shift;
+      return {
+        ...sampled,
+        x: sampled.x + shift.dx,
+        y: sampled.y + shift.dy,
+        ...(own && (shift.dw || shift.dh || shift.dr) ? { width: Math.max(1, sampled.width + (shift.dw ?? 0)), height: Math.max(1, sampled.height + (shift.dh ?? 0)), rotation: sampled.rotation + (shift.dr ?? 0) } : {}),
+      };
     });
     // Where every element is now - connectors run between them.
     const boxes = new Map(samples.map((x) => [x.id, x]));
@@ -852,11 +1210,24 @@ export class StageRenderer {
         const radius = boxed ? element.shape?.radius ?? 0 : frame ? frame.radius : look?.cornerStyle === "pill" ? s.height / 2 : look?.cornerStyle === "rounded" ? (look.fontSize ?? 40) * 0.3 : 0;
         const shadow = boxed ? element.shape?.shadow : undefined;
         const gradient = boxed ? element.shape?.gradient : undefined;
-        // Room for the blur, and for the shadow's offset and three sigma of it.
+        const stroke = boxed ? element.shape?.stroke : undefined;
+        // An outline on or outside the edge reaches past the box.
+        const strokeOut = stroke ? (stroke.align === "outside" ? stroke.width : stroke.align === "center" ? stroke.width / 2 : 0) : 0;
+        // Room for the blur, the outline, and for the shadow's offset and three sigma of it.
         const shadowReach = shadow ? Math.max(Math.abs(shadow.x ?? 0), Math.abs(shadow.y ?? 0)) + shadow.blur * 1.5 : 0;
-        const marginStage = Math.ceil(blurPx * 3 + 2 + shadowReach * scale) / scale;
+        const marginStage = Math.ceil(blurPx * 3 + 2 + (shadowReach + strokeOut) * scale) / scale;
         const u = g.box.material.uniforms;
+        u.strokeOut.value = strokeOut * scale;
         u.useGrad.value = gradient ? 1 : 0;
+        u.gradType.value = gradient?.type === "radial" ? 1 : 0;
+        // Its form, and mid-morph the form it's leaving.
+        const shapeRadius = boxed && s.radius !== undefined ? s.radius : radius;
+        this.setForm(u, "A", boxed ? s.form ?? "rect" : "rect", s, element, shapeRadius * scale);
+        if (boxed && s.morphShape && s.morph !== undefined && s.morph < 1) {
+          this.setForm(u, "B", s.morphShape.form, { ...s, sides: s.morphShape.sides }, element, shapeRadius * scale);
+          const m = Math.max(0, Math.min(1, s.morph));
+          u.shapeMix.value = m * m * (3 - 2 * m);
+        } else u.shapeMix.value = 1;
         if (gradient) {
           setRgba(u.color2.value, undefined, gradient.to);
           const a = ((gradient.angle ?? 180) * Math.PI) / 180;
@@ -886,7 +1257,7 @@ export class StageRenderer {
           const texelsPerPx = (picture.width * (cover ? u.uvScale.value.x : 1)) / Math.max(1, s.width * scale);
           u.mapLod.value = Math.max(0, Math.log2(Math.max(1, texelsPerPx * Math.max(1, blurPx * 0.75))));
         }
-        const dots = element.kind === "image" && element.image?.reveal === "dots";
+        const dots = element.kind === "image" && element.image?.reveal === "dots" && !s.wipe;
         // The spring that drives `draw` front-loads its travel; eased back so the dots take their time
         // arriving and the picture resolves at the end, as in the reference (~1.2 s on "gentle").
         u.dotT.value = dots ? Math.pow(s.draw, 2.2) : 1;
@@ -899,13 +1270,12 @@ export class StageRenderer {
           }
         }
         // A framed icon's outline is the icon's own colour, animating with it.
-        const stroke = boxed ? element.shape?.stroke : undefined;
         if (frame) setRgba(u.strokeColor.value, s.rgba, s.color ?? "#111111");
         else setRgba(u.strokeColor.value, undefined, stroke?.color);
         u.strokePx.value = stroke ? stroke.width * scale : frame ? frame.width * scale : 0;
+        this.setDash(u, boxed ? s.form ?? "rect" : "rect", s, element, stroke, (boxed && s.radius !== undefined ? s.radius : radius) * scale, t);
         u.size.value.set(s.width * scale, s.height * scale);
         u.margin.value = marginStage * scale;
-        u.radius.value = radius * scale;
         u.blurPx.value = blurPx;
         u.opacity.value = s.opacity;
         this.place(g.box, s, -marginStage, -marginStage, s.width + 2 * marginStage, s.height + 2 * marginStage, order++);
@@ -915,13 +1285,26 @@ export class StageRenderer {
       else this.hideText(g);
       if (element.kind === "icon") order = this.drawIcon(element, s, g, blurPx, order);
       else if (g.text && element.kind !== "text") g.text.visible = false;
+      if (element.kind === "math") order = this.drawEquation(element, s, g, blurPx, order);
+      else if (g.math) g.math.mesh.visible = false;
+      if (element.kind === "graph") order = this.drawGraphElement(compiled, element, s, g, blurPx, order, t);
+      else if (g.graph) g.graph.mesh.visible = false;
       if (element.kind === "connector") order = this.drawConnector(element, s, g, boxes, t, order);
       else if (g.line) g.line.visible = false;
+      // A wipe on or off: everything it's drawn with is masked by the same sweeping edge.
+      const wiping = s.wipe && element.kind !== "graph" && element.kind !== "connector" ? s.wipe : undefined;
+      for (const m of [g.box, g.text, g.math?.mesh]) {
+        const wu = m?.material.uniforms.wipe;
+        if (!wu) continue;
+        (wu.value as THREE.Vector4).set(wiping ? 1 : 0, s.draw, WIPE_KIND[wiping ?? "right"], 0);
+      }
     }
     for (const [id, g] of this.gfx) {
       if (drawn.has(id)) continue;
       if (g.box) g.box.visible = false;
       if (g.line) g.line.visible = false;
+      if (g.math) g.math.mesh.visible = false;
+      if (g.graph) g.graph.mesh.visible = false;
       this.hideText(g);
     }
     this.renderer.render(this.scene, this.camera);
@@ -945,6 +1328,129 @@ export class StageRenderer {
     const k = Math.min(s.width, s.height) / box;
     const w = (icon.canvas.width / scale) * k;
     this.place(g.text, s, s.width / 2 - w / 2, s.height / 2 - w / 2, w, w, order++);
+    return order;
+  }
+
+  // A graph filling its box, drawn into a canvas at the output's resolution (stageGraph.drawGraph).
+  private drawGraphElement(compiled: CompiledStage, element: StageElement, s: SampledElement, g: ElementGfx, blurPx: number, order: number, t: number): number {
+    const state = s.graph;
+    if (!state) {
+      if (g.graph) g.graph.mesh.visible = false;
+      return order;
+    }
+    const scale = this.scale;
+    const margin = rasterMargin(element);
+    const w = Math.max(1, s.width);
+    const h = Math.max(1, s.height);
+    const ink = s.color ?? "#111111";
+    const morphing = !!s.morphGraph && s.morph !== undefined && s.morph < 1;
+    // Still: the same picture until the state, box, colour or draw-on changes. Animating: every frame.
+    const key = s.moving
+      ? `live\u0000${t}\u0000${w}x${h}\u0000${s.draw}\u0000${ink}`
+      : `${graphId(state)}\u0000${scale}\u0000${w.toFixed(1)}x${h.toFixed(1)}\u0000${ink}\u0000${s.draw.toFixed(4)}`;
+    if (!g.graph || g.graph.key !== key) {
+      const canvas = g.graph?.canvas ?? document.createElement("canvas");
+      const pw = Math.ceil((w + 2 * margin) * scale);
+      const ph = Math.ceil((h + 2 * margin) * scale);
+      if (canvas.width !== pw || canvas.height !== ph) {
+        canvas.width = pw;
+        canvas.height = ph;
+      }
+      const ctx = canvas.getContext("2d")!;
+      ctx.clearRect(0, 0, pw, ph);
+      drawGraph(ctx, state, { scale, width: w, height: h, ink, draw: s.draw, t, since: s.graphSince ?? 0, channels: compiled.channels, from: morphing ? s.morphGraph : undefined, progress: s.morph }, margin * scale, margin * scale);
+      const animated = s.moving || morphing;
+      const shape = `${pw}x${ph}x${animated ? 0 : 1}`;
+      if (g.graph && g.graph.shape === shape) {
+        g.graph.texture.needsUpdate = true;
+        g.graph.key = key;
+      } else {
+        g.graph?.texture.dispose();
+        const texture = canvasTexture(canvas);
+        texture.generateMipmaps = !animated;
+        texture.minFilter = animated ? THREE.LinearFilter : THREE.LinearMipmapLinearFilter;
+        this.renderer.initTexture(texture);
+        g.graph = { key, canvas, texture, mesh: g.graph?.mesh ?? this.mesh(rasterMaterial()), shape };
+      }
+    }
+    const m = g.graph!;
+    const u = m.mesh.material.uniforms;
+    u.map.value = m.texture;
+    u.texSize.value.set(m.canvas.width, m.canvas.height);
+    u.useTint.value = 0;
+    u.opacity.value = s.opacity;
+    u.blurPx.value = blurPx;
+    const cw = m.canvas.width / scale;
+    const ch = m.canvas.height / scale;
+    this.place(m.mesh, s, s.width / 2 - cw / 2, s.height / 2 - ch / 2, cw, ch, order++);
+    return order;
+  }
+
+  // An equation centred in its box, drawn from its TeX layout at this resolution - or, mid-rewrite,
+  // the frame of the old one becoming the new (stageMath.drawMathMorph).
+  private drawEquation(element: StageElement, s: SampledElement, g: ElementGfx, blurPx: number, order: number): number {
+    const scale = this.scale;
+    const size = element.textLook?.fontSize ?? 64;
+    const tex = s.text ?? "";
+    const to = mathLayout(tex, size, MATH_INK);
+    const from = s.morphFrom !== undefined ? mathLayout(s.morphFrom, size, MATH_INK) : null;
+    if (!to) {
+      if (g.math) g.math.mesh.visible = false;
+      return order;
+    }
+    const ink = s.color ?? "#111111";
+    const margin = rasterMargin(element);
+    const w = Math.max(s.width, to.width, from?.width ?? 0);
+    const h = Math.max(s.height, to.height, from?.height ?? 0);
+    const morphing = !!from && s.morph !== undefined && s.morph < 1;
+    const key = `${tex}\u0000${size}\u0000${scale}\u0000${ink}\u0000${Math.ceil(w)}x${Math.ceil(h)}\u0000${morphing ? `${s.morphFrom}\u0000${s.morph!.toFixed(4)}` : ""}`;
+    if (!g.math || g.math.key !== key) {
+      const canvas = g.math?.canvas ?? document.createElement("canvas");
+      const pw = Math.ceil((w + 2 * margin) * scale);
+      const ph = Math.ceil((h + 2 * margin) * scale);
+      if (canvas.width !== pw || canvas.height !== ph) {
+        canvas.width = pw;
+        canvas.height = ph;
+      }
+      const ctx = canvas.getContext("2d")!;
+      ctx.clearRect(0, 0, pw, ph);
+      if (morphing && from) {
+        if (!g.math?.plan || g.math.plan.from !== s.morphFrom || g.math.plan.to !== tex) {
+          if (g.math) g.math.plan = { from: s.morphFrom!, to: tex, plan: planMathMorph(from, to) };
+        }
+        const plan = g.math?.plan?.plan ?? planMathMorph(from, to);
+        drawMathMorph(ctx, from, to, plan, s.morph!, scale, margin, margin, ink, { a: [from.width, from.height], b: [to.width, to.height], at: [w, h] });
+      } else {
+        drawMath(ctx, to, scale, margin + (w - to.width) / 2, margin + (h - to.height) / 2, ink);
+      }
+      // The same size and mip mode: the texture is refreshed in place; otherwise made anew (a WebGL
+      // texture can't change size once allocated).
+      const shape = `${pw}x${ph}x${morphing ? 0 : 1}`;
+      if (g.math && g.math.shape === shape) {
+        g.math.texture.needsUpdate = true;
+        g.math.key = key;
+      } else {
+        g.math?.texture.dispose();
+        const texture = canvasTexture(canvas);
+        // Rewritten every frame of a morph: no mip chain to rebuild each time.
+        texture.generateMipmaps = !morphing;
+        texture.minFilter = morphing ? THREE.LinearFilter : THREE.LinearMipmapLinearFilter;
+        this.renderer.initTexture(texture);
+        const mesh = g.math?.mesh ?? this.mesh(rasterMaterial());
+        g.math = { key, canvas, texture, mesh, shape, plan: g.math?.plan };
+      }
+    }
+    const m = g.math!;
+    const u = m.mesh.material.uniforms;
+    u.map.value = m.texture;
+    u.texSize.value.set(m.canvas.width, m.canvas.height);
+    u.useTint.value = 0;
+    u.opacity.value = s.opacity;
+    u.blurPx.value = blurPx;
+    // The box springs; the equation stays its typeset size, centred in it.
+    const cw = m.canvas.width / scale;
+    const ch = m.canvas.height / scale;
+    this.place(m.mesh, s, s.width / 2 - cw / 2, s.height / 2 - ch / 2, cw, ch, order++);
     return order;
   }
 
@@ -1120,7 +1626,7 @@ export class StageRenderer {
     if (g.glyphs) g.glyphs.mesh.visible = false;
 
     const wrapWidth = s.wrapWidth ?? s.width;
-    const key = this.rasterKey(s.text!, s.colorRuns, s.weightRuns, wrapWidth, s.color);
+    const key = this.rasterKey(element, s.text!, s.colorRuns, s.weightRuns, wrapWidth, s.color);
     let raster = g.rasters.get(key);
     if (!raster) {
       // Not prepared: a text showing a live value, or one with part-colours whose base colour is
@@ -1237,7 +1743,10 @@ export class StageRenderer {
     for (const r of g.rasters.values()) r.texture.dispose();
     g.live?.texture.dispose();
     g.icon?.texture.dispose();
-    for (const m of [g.box, g.text, g.glyphs?.mesh, g.line]) {
+    g.math?.texture.dispose();
+    g.graph?.texture.dispose();
+    (g.box?.material.uniforms.vertTex?.value as THREE.Texture | undefined)?.dispose();
+    for (const m of [g.box, g.text, g.glyphs?.mesh, g.line, g.math?.mesh, g.graph?.mesh]) {
       if (!m) continue;
       this.scene.remove(m);
       m.material.dispose();
@@ -1251,6 +1760,7 @@ export class StageRenderer {
     this.gfx.clear();
     for (const p of this.pictures.values()) p.texture.dispose();
     this.pictures.clear();
+    (this.background.material.uniforms.vertTex?.value as THREE.Texture | undefined)?.dispose();
     this.background.material.dispose();
     this.quad.dispose();
     this.renderer.dispose();

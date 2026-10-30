@@ -10,12 +10,14 @@
 // 1920 x 1080 units, a 9:16 one 607.5 x 1080), so layout gaps and type sizes keep their proportions
 // at any export resolution. Times are seconds from the scene's own start.
 import type { SpringPreset } from "./springs";
+import type { GraphState } from "./stageGraph";
 import type { StageChannel } from "./stageChannels";
+import type { ShapeForm } from "./stageShapes";
 
 // A stack draws nothing itself: it lays out the elements whose `parent` it is (stageLayout.ts). An
 // icon is a line icon from the shared set (stickerIcons.ts) filling its box. A connector is a line
 // between two other elements, following them wherever they go.
-export type StageElementKind = "text" | "shape" | "image" | "stack" | "icon" | "connector";
+export type StageElementKind = "text" | "shape" | "image" | "stack" | "icon" | "connector" | "math" | "graph";
 
 // What a beat can set on an element. The numbers and `color` spring from beat to beat; the rest
 // switch when the element's move into the beat begins.
@@ -36,6 +38,8 @@ export interface StageProps {
   rotateX?: number;
   rotateY?: number;
   z?: number;
+  // A graph's axes, curves and markers (stageGraph) - its state in a beat; it morphs between beats.
+  graph?: GraphState;
   opacity: number;
   // Gaussian blur radius in stage units.
   blur: number;
@@ -46,6 +50,15 @@ export interface StageProps {
   // How much of a connector is drawn, from its start (0..1; undefined = all of it). Springs, without
   // overshoot - a line drawing itself on.
   draw?: number;
+  // A shape's (or a picture's mask's) form (stageShapes) - a change of form morphs - with its number
+  // of sides or points. Its corner radius (stage units), inner ratio (a star's depth, a ring's hole,
+  // an arrow's shaft...) and a ring's or pie's sweep (degrees) spring between beats like any number;
+  // left out, the element's own corners and the form's defaults.
+  form?: ShapeForm;
+  sides?: number;
+  radius?: number;
+  inner?: number;
+  sweep?: number;
   // Colours for parts of the text - character ranges of `text` [start, end).
   colorRuns?: StageColorRun[];
   // Font weights for parts of the text (a medium label beside a regular description), same ranges.
@@ -95,7 +108,7 @@ export interface StageStack {
 
 // A property following a channel (stageChannels.ts): the channel's `from` range mapped onto `to`,
 // held at the ends unless `extrapolate`. It follows the value exactly - no spring.
-export type StageBindableProp = "x" | "y" | "width" | "height" | "scale" | "rotation" | "opacity";
+export type StageBindableProp = "x" | "y" | "width" | "height" | "scale" | "rotation" | "opacity" | "sweep" | "inner" | "radius";
 export interface StageBinding {
   channel: string;
   from: [number, number];
@@ -122,6 +135,46 @@ export interface StageTransitionStyle {
   draw?: number;
   // Opacity it arrives from (default 0 - faded in).
   opacity?: number;
+  // Turned (degrees), and tilted in depth, as it arrives or leaves - a spin, a card flipping in.
+  rotate?: number;
+  rotateX?: number;
+  rotateY?: number;
+  // Revealed (or hidden) by a soft edge sweeping across it toward this side: `draw` is how far.
+  wipe?: StageWipe;
+}
+
+export type StageWipe = "right" | "left" | "up" | "down" | "centre";
+
+// A motion an element keeps doing on its own - a pulse, a float, a spin - over a run of beats
+// ([from, until), beat indexes; open-ended to the scene's end). It eases in and out at the ends,
+// and a spin always comes to rest on a whole turn. `amount` and `period` (seconds a cycle) are the
+// kind's own (see stageLoops).
+export type StageLoopKind = "pulse" | "heartbeat" | "float" | "bounce" | "spin" | "sway" | "wiggle" | "shake" | "tilt" | "orbit" | "breathe" | "blink";
+export interface StageLoop {
+  kind: StageLoopKind;
+  amount?: number;
+  period?: number;
+  from?: number;
+  until?: number;
+  // 0..1 of a cycle - so a row of elements can float out of step.
+  phase?: number;
+}
+
+// How a text arrives (and, with `exit`, leaves) unit by unit: letters, words or lines one after
+// another, `stagger` seconds apart, each in the given style.
+export interface StageTextReveal {
+  by: "letter" | "word" | "line";
+  style: "rise" | "fade" | "pop" | "blur" | "drop" | "type" | "slide" | "zoom";
+  stagger?: number;
+  exit?: boolean;
+}
+
+// The route an element takes into a beat when it moves: bent off the straight line by `bend` (a
+// fraction of the distance, sideways; negative bends the other way), turning to face along it with
+// `orient`.
+export interface StagePath {
+  bend: number;
+  orient?: boolean;
 }
 
 // A line between two elements, from the edge of one toward the other, `gap` short of each.
@@ -154,11 +207,21 @@ export interface StageElement {
   // A shape's corners (stage units; half its height makes a pill) and an outline just inside its edge.
   // A gradient runs from the element's colour to `to`, at a CSS angle (180 = top to bottom); a
   // shadow is CSS's box-shadow: offset, blur radius (stage units), colour.
+  // A ring's or pie's start (degrees clockwise from the top) and its ends (round: a progress ring's);
+  // mirrored forms (a right triangle, an arrow, a bubble's tail); where along the bottom the tail is.
+  // The outline can sit inside the edge (default), on it, or outside it. A radial gradient runs from
+  // the centre outward.
   shape?: {
     radius?: number;
-    stroke?: { color: string; width: number };
-    gradient?: { to: string; angle?: number };
+    // dash: a dashed or dotted outline, `length` and `gap` in stage units, marching at `flow` units a second.
+    stroke?: { color: string; width: number; align?: "inside" | "center" | "outside"; dash?: { style: "dash" | "dot"; length: number; gap: number; flow?: number } };
+    gradient?: { to: string; angle?: number; type?: "linear" | "radial" };
     shadow?: { color: string; blur: number; x?: number; y?: number };
+    start?: number;
+    caps?: "round" | "flat";
+    flipX?: boolean;
+    flipY?: boolean;
+    tail?: number;
   };
   // An icon's name in the shared set (stickerIcons.ts). With a frame, it sits smaller inside a
   // rounded outline of its own colour (stage units), on `fill` if given.
@@ -179,6 +242,8 @@ export interface StageElement {
   spring?: SpringPreset;
   enter?: Partial<StageTransitionStyle>;
   exit?: Partial<StageTransitionStyle>;
+  loops?: StageLoop[];
+  textReveal?: StageTextReveal;
 }
 
 export interface StageBeat {
@@ -190,6 +255,8 @@ export interface StageBeat {
   stagger?: number;
   // Element id -> what changes in this beat.
   changes: Record<string, Partial<StageProps>>;
+  // Element id -> the route it takes as it moves into this beat (straight when absent).
+  paths?: Record<string, StagePath>;
 }
 
 export type StageBackground = { kind: "none" } | { kind: "color"; color: string };

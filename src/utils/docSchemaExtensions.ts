@@ -167,7 +167,7 @@ export const docProseClassName = [
   // ProseMirror wraps each item's text in inherits paragraph spacing on top of that - unlike the
   // deliberate mt-4 rhythm above (which is *between* blocks), a real gap *within* one list reads as
   // much too loose between items, nothing like Word/Docs' tightly-packed list rendering. Zero both.
-  "[&_.ProseMirror_li]:my-0 [&_.ProseMirror_li>p]:my-0",
+  "[&_.ProseMirror_li]:my-0 [&_.ProseMirror_li>p]:my-0 [&_.ProseMirror_img]:my-0",
   // Code blocks: full card width (not sized to content), a real monospace stack, and a small
   // static "Code" label so it reads as a distinct block at a glance. Per-language token colors
   // come from docCodeHighlight.css's .hljs-* rules, not this string.

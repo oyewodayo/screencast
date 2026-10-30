@@ -6,6 +6,8 @@
 // being dragged, which the drawing layer applies without recompiling anything.
 import { CompiledStage, compileStage } from "./stageEngine";
 import { loadStageImages } from "./stageImages";
+import { loadStageMath } from "./stageMath";
+import { loadStageGraphs } from "./stageGraph";
 import { canvasStageMeasure, loadStageFonts } from "./stageMeasure";
 import type { StageScene } from "./stageTypes";
 
@@ -21,7 +23,7 @@ export function whenCompiled(scene: StageScene): Promise<CompiledStage> {
   if (ready) return Promise.resolve(ready);
   let p = pending.get(scene);
   if (!p) {
-    p = Promise.all([loadStageFonts(scene), loadStageImages(scene)]).then(() => {
+    p = Promise.all([loadStageFonts(scene), loadStageImages(scene), loadStageMath(scene), loadStageGraphs(scene)]).then(() => {
       const c = compileStage(scene, canvasStageMeasure);
       compiled.set(scene, c);
       return c;
@@ -38,6 +40,10 @@ export function whenCompiled(scene: StageScene): Promise<CompiledStage> {
 export interface StageDragOffset {
   dx: number;
   dy: number;
+  // A resize or turn by a handle: the change of size and rotation.
+  dw?: number;
+  dh?: number;
+  dr?: number;
   from: CompiledStage | null;
 }
 export const stageDrag = {

@@ -229,3 +229,26 @@ describe("depth and reveals", () => {
     expect(run("gentle")).toBeGreaterThan(run("slow") + 10);
   });
 });
+
+describe("equations", () => {
+  const eq = (text: string, props: Partial<StageProps> = {}): StageElement => ({ id: "eq", kind: "math", textLook: { fontSize: 64 }, props: defaultStageProps({ width: 400, height: 100, text, color: "#ffffff", ...props }) });
+
+  it("rewrites itself over a second when its TeX changes in a beat - moving the whole time, the old TeX carried", () => {
+    const s = scene([eq("a^2+b^2")], [beat(1), beat(2, { eq: { text: "a^2+b^2=c^2" } })]);
+    const c = compileStage(s);
+    expect(sampleStage(c, 0.95).find((e) => e.id === "eq")!.morphFrom).toBeUndefined();
+    const mid = sampleStage(c, 1.5).find((e) => e.id === "eq")!;
+    expect(mid.text).toBe("a^2+b^2=c^2");
+    expect(mid.morphFrom).toBe("a^2+b^2");
+    expect(mid.morph).toBeCloseTo(0.5, 2);
+    expect(mid.moving).toBe(true);
+    expect(stageIsMoving(c, 1.9)).toBe(true);
+    const after = sampleStage(c, 2.1).find((e) => e.id === "eq")!;
+    expect(after.morphFrom).toBeUndefined();
+  });
+
+  it("arrives fresh rather than morphing from nothing", () => {
+    const s = scene([eq("x", { visible: false })], [beat(1), beat(2, { eq: { visible: true, text: "y" } })]);
+    expect(sampleStage(compileStage(s), 1.3).find((e) => e.id === "eq")!.morphFrom).toBeUndefined();
+  });
+});

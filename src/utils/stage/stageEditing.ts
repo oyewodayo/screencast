@@ -6,6 +6,9 @@
 // that same property itself; a value set back to what the element already looks like there stops
 // being a change at all. Removing a beat folds its changes into the beat after, so every later beat
 // still looks exactly as it did.
+import { parseStageColor } from "./stageColor";
+import { defaultGraph } from "./stageGraph";
+import type { ShapeForm } from "./stageShapes";
 import { resolvedBeats } from "./stageEngine";
 import { StageBeat, StageElement, StageProps, StageScene, STAGE_HEIGHT, defaultStageProps } from "./stageTypes";
 
@@ -18,7 +21,9 @@ const newId = () => (typeof crypto !== "undefined" && "randomUUID" in crypto ? c
 export const stageWidthFor = (frameWidth: number, frameHeight: number) => (frameHeight > 0 ? Math.round((STAGE_HEIGHT * frameWidth * 1000) / frameHeight) / 1000 : 1920);
 
 // A new scene: a light stage, one centred title in a centring stack, one beat.
-export function makeStageScene(opts: { startTime: number; frameWidth: number; frameHeight: number }): StageScene {
+// A new scene; `like` (the scene before it) lends it its background, motion and depth - and its title
+// takes the matching ink - so a run of scenes reads as one piece.
+export function makeStageScene(opts: { startTime: number; frameWidth: number; frameHeight: number; like?: StageScene }): StageScene {
   const width = stageWidthFor(opts.frameWidth, opts.frameHeight);
   const centre: StageElement = {
     id: newId(),
@@ -28,7 +33,7 @@ export function makeStageScene(opts: { startTime: number; frameWidth: number; fr
     props: defaultStageProps({ x: 0, y: 0, width, height: STAGE_HEIGHT }),
   };
   const title = makeTextElement(width, { text: "Your title", fontSize: 72, fontFamily: "inter-semibold", parent: centre.id });
-  return {
+  const fresh: StageScene = {
     id: newId(),
     startTime: Math.max(0, opts.startTime),
     width,
@@ -40,6 +45,21 @@ export function makeStageScene(opts: { startTime: number; frameWidth: number; fr
     stagger: 0.05,
     wordStagger: 0.06,
   };
+  const like = opts.like;
+  if (!like) return fresh;
+  const inherited: StageScene = { ...fresh, background: like.background, spring: like.spring, stagger: like.stagger, wordStagger: like.wordStagger, perspective: like.perspective };
+  const light = (sc: StageScene) => {
+    const rgb = sc.background.kind === "color" ? parseStageColor(sc.background.color) : null;
+    return !!rgb && (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 > 0.55;
+  };
+  return light(fresh) === light(inherited) ? inherited : reinkScene(inherited, !light(inherited));
+}
+
+// The scene a new one at `t` follows: the latest that starts at or before it.
+export function sceneBefore(scenes: StageScene[] | undefined, t: number): StageScene | undefined {
+  let best: StageScene | undefined;
+  for (const sc of scenes ?? []) if (sc.startTime <= t + 1e-6 && (!best || sc.startTime > best.startTime)) best = sc;
+  return best;
 }
 
 export function makeTextElement(stageWidth: number, opts: { text?: string; fontSize?: number; fontFamily?: string; parent?: string; x?: number; y?: number; color?: string } = {}): StageElement {
@@ -54,12 +74,13 @@ export function makeTextElement(stageWidth: number, opts: { text?: string; fontS
   };
 }
 
-export function makeShapeElement(opts: { x: number; y: number; width?: number; height?: number; color?: string; radius?: number }): StageElement {
+export function makeShapeElement(opts: { x: number; y: number; width?: number; height?: number; color?: string; radius?: number; form?: ShapeForm; sides?: number; inner?: number; sweep?: number }): StageElement {
+  const form = opts.form && opts.form !== "rect" ? { form: opts.form, ...(opts.sides ? { sides: opts.sides } : {}), ...(opts.inner !== undefined ? { inner: opts.inner } : {}), ...(opts.sweep !== undefined && opts.sweep < 360 ? { sweep: opts.sweep } : {}) } : {};
   return {
     id: newId(),
     kind: "shape",
     shape: { radius: opts.radius ?? 12 },
-    props: defaultStageProps({ x: opts.x, y: opts.y, width: opts.width ?? 240, height: opts.height ?? 140, color: opts.color ?? "#3b82f6" }),
+    props: defaultStageProps({ x: opts.x, y: opts.y, width: opts.width ?? 240, height: opts.height ?? 140, color: opts.color ?? "#3b82f6", ...form }),
   };
 }
 
@@ -144,6 +165,32 @@ export function addElement(s: StageScene, b: number, element: StageElement): Sta
 }
 
 // The element and everything it holds gone from the scene, with every beat's changes to them.
+// A copy of an element - its look, motion, loops, rules and every beat's changes - placed `offset`
+// stage units down and right (in every beat it moves in), just above the original, named after it.
+// Returns the scene and the copy's id. A line's copy keeps its ends and style (pick its new end after);
+// groups aren't copied this way.
+export function duplicateElement(s: StageScene, id: string, offset = 24): { scene: StageScene; id: string } {
+  const i = s.elements.findIndex((e) => e.id === id);
+  const e = s.elements[i];
+  if (!e || e.kind === "stack") return { scene: s, id };
+  if (e.kind === "connector") offset = 0;
+  const copyId = newId();
+  const inGroup = !!e.parent && s.elements.find((x) => x.id === e.parent)?.kind === "stack";
+  const shift = (p: Partial<StageProps>): Partial<StageProps> => (inGroup ? p : { ...p, ...(p.x !== undefined ? { x: p.x + offset } : {}), ...(p.y !== undefined ? { y: p.y + offset } : {}) });
+  const base = (e.name ?? "").replace(/\s+\d+$/, "");
+  const taken = new Set(s.elements.map((x) => x.name));
+  let name: string | undefined;
+  if (base) for (let n = 2; !name; n++) if (!taken.has(`${base} ${n}`)) name = `${base} ${n}`;
+  const copy: StageElement = { ...structuredClone(e), id: copyId, name, props: shift(e.props) as StageProps };
+  const elements = [...s.elements.slice(0, i + 1), copy, ...s.elements.slice(i + 1)];
+  const beats = s.beats.map((b) => (b.changes[id] ? { ...b, changes: { ...b.changes, [copyId]: shift(structuredClone(b.changes[id])) } } : b));
+  return { scene: { ...s, elements, beats }, id: copyId };
+}
+
+export function renameElement(s: StageScene, id: string, name: string): StageScene {
+  return { ...s, elements: s.elements.map((e) => (e.id === id ? { ...e, name: name.trim() || undefined } : e)) };
+}
+
 export function deleteElement(s: StageScene, id: string): StageScene {
   const doomed = new Set([id]);
   let grew = true;
@@ -244,5 +291,63 @@ export function makeImageElement(stageWidth: number, src: string, natural: { wid
     image: { src, fit: "cover" },
     shape: { radius: 24 },
     props: defaultStageProps({ x: Math.round(stageWidth / 2 - width / 2), y: Math.round(STAGE_HEIGHT / 2 - height / 2), width, height }),
+  };
+}
+
+// An equation (TeX), its box fitted once it's typeset (StageMathPanel).
+// The inks chosen for a light background and their partners on a dark one. When a scene's
+// background flips between light and dark, whatever still wears the old automatic ink - text,
+// equations, shapes, a graph's axes and first curve - takes the new one, so nothing vanishes.
+export const AUTO_INKS: [light: string, dark: string][] = [
+  ["#111111", "#f5f5f4"],
+  ["#2563eb", "#58c4dd"],
+];
+
+export function reinkScene(s: StageScene, toDark: boolean): StageScene {
+  // By colour, not by spelling: #111111, rgb(17,17,17) and rgba(17, 17, 17, 1) are the same ink.
+  const key = (c: string) => {
+    const p = parseStageColor(c);
+    return p && p[3] > 0.99 ? `${p[0]},${p[1]},${p[2]}` : null;
+  };
+  const map = new Map(AUTO_INKS.map(([l, d]) => (toDark ? [key(l), d] : [key(d), l])));
+  const swap = (c: string | undefined) => {
+    const k = c ? key(c) : null;
+    return (k && map.get(k)) ?? c;
+  };
+  const props = (p: Partial<StageProps>): Partial<StageProps> => {
+    let out = p;
+    if (p.color !== undefined && swap(p.color) !== p.color) out = { ...out, color: swap(p.color) };
+    if (p.graph) {
+      const series = p.graph.series.map((x) => (swap(x.color) !== x.color ? { ...x, color: swap(x.color)! } : x));
+      if (series.some((x, i) => x !== p.graph!.series[i])) out = { ...out, graph: { ...p.graph, series } };
+    }
+    return out;
+  };
+  return {
+    ...s,
+    elements: s.elements.map((e) => ({ ...e, props: props(e.props) as StageProps })),
+    beats: s.beats.map((b) => ({ ...b, changes: Object.fromEntries(Object.entries(b.changes).map(([id, c]) => [id, props(c)])) })),
+  };
+}
+
+// A graph: axes and a first curve that draw themselves on, slowly enough to follow.
+export function makeGraphElement(opts: { x: number; y: number; width?: number; height?: number; color?: string; curve?: string }): StageElement {
+  const graph = defaultGraph();
+  if (opts.curve) graph.series[0].color = opts.curve;
+  return {
+    id: newId(),
+    kind: "graph",
+    spring: "slow",
+    enter: { dx: 0, dy: 0, scale: 1, blur: 0, draw: 0, opacity: 1 },
+    props: defaultStageProps({ x: opts.x, y: opts.y, width: opts.width ?? 1000, height: opts.height ?? 620, color: opts.color ?? "#111111", graph }),
+  };
+}
+
+export function makeMathElement(opts: { x: number; y: number; tex?: string; size?: number; color?: string }): StageElement {
+  return {
+    id: newId(),
+    kind: "math",
+    textLook: { fontSize: opts.size ?? 72 },
+    props: defaultStageProps({ x: opts.x, y: opts.y, width: 480, height: 140, text: opts.tex ?? "y = mx + b", color: opts.color ?? "#111111" }),
   };
 }
