@@ -701,8 +701,16 @@ pub async fn youtube_upload(app: AppHandle, window: Window, state: State<'_, Goo
     })
 }
 
+// A BCP-47 style code YouTube accepts ("en", "pt-BR"). The caption language setting can also be
+// "auto" (let Whisper detect it), which isn't a language - sending it as the video's defaultLanguage
+// makes YouTube refuse the whole upload with a 400, so it falls through to the callers' defaults.
 fn valid_language(lang: &str) -> bool {
-    !lang.is_empty() && lang.len() <= 12 && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    let mut parts = lang.split('-');
+    let primary = parts.next().unwrap_or("");
+    lang.len() <= 12
+        && (2..=3).contains(&primary.len())
+        && primary.chars().all(|c| c.is_ascii_alphabetic())
+        && parts.all(|p| !p.is_empty() && p.len() <= 8 && p.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 // captions.insert as a multipart/related upload: the caption's metadata, then the .srt itself.
@@ -818,6 +826,17 @@ mod tests {
         let code = wait_for_redirect(listener, "abc", &cancel).unwrap();
         assert_eq!(code, "4/0Ab-x_y");
         assert!(client.join().unwrap().contains("signed in"));
+    }
+
+    #[test]
+    fn only_real_language_codes_are_sent_to_youtube() {
+        for ok in ["en", "fr", "pt-BR", "zh-Hans", "yue"] {
+            assert!(valid_language(ok), "{ok}");
+        }
+        // "auto" is the caption setting for "detect it", and the old check let it through.
+        for bad in ["", "auto", "AUTO", "e", "en-", "en--US", "english", "en_US", "en US"] {
+            assert!(!valid_language(bad), "{bad}");
+        }
     }
 
     #[test]
