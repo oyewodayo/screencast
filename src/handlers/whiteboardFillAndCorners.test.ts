@@ -178,19 +178,21 @@ describe("connector transforms, routing, and unified layer ordering", () => {
     expect(vFlipped.target).toEqual({ x: 200, y: 50 });
   });
 
-  it("reverses a connector's direction and swaps its arrowheads", () => {
+  it("reverses a connector's direction, keeping each arrowhead on its own end of the path", () => {
     const e = {
       ...createDefaultWhiteboardEdge("e1", { x: 10, y: 20 }, { x: 110, y: 20 }),
       startArrowType: "none" as const,
-      endArrowType: "arrow" as const,
+      endArrowType: "triangle" as const,
       waypoints: [{ x: 40, y: 10 }, { x: 80, y: 30 }],
       curveBow: 0.4,
     };
     const rev = reverseEdgeDirection(e);
     expect(rev.source).toEqual({ x: 110, y: 20 });
     expect(rev.target).toEqual({ x: 10, y: 20 });
-    expect(rev.startArrowType).toBe("arrow");
-    expect(rev.endArrowType).toBe("none");
+    // Arrowheads stay on the path's own start/end, so after the endpoints swap the head lands on
+    // the opposite physical end - that is what makes the connector visibly point the other way.
+    expect(rev.startArrowType).toBe("none");
+    expect(rev.endArrowType).toBe("triangle");
     expect(rev.waypoints).toEqual([{ x: 80, y: 30 }, { x: 40, y: 10 }]);
     expect(rev.curveBow).toBeCloseTo(-0.4);
   });
@@ -205,14 +207,15 @@ describe("connector transforms, routing, and unified layer ordering", () => {
   });
 
   it("routes an orthogonal free-floating connector with rounded corners when cornerRadius > 0", () => {
-    const path = buildEdgePath({ x: 0, y: 0 }, { x: 100, y: 80 }, "orthogonal", null, null, undefined, undefined, 12);
-    expect(path.d).toContain("Q");
+    const path = buildEdgePath({ x: 0, y: 0, side: null }, { x: 100, y: 80, side: null }, "orthogonal", undefined, undefined, 12);
+    expect(path).toContain("Q");
   });
 
-  it("interpolates edgePointAtFraction along straight, curved, and orthogonal connectors", () => {
-    const e = createDefaultWhiteboardEdge("e1", { x: 0, y: 0 }, { x: 100, y: 0 });
-    expect(edgePointAtFraction(e, { x: 0, y: 0 }, { x: 100, y: 0 }, null, null, 0.25)).toEqual({ x: 25, y: 0 });
-    expect(edgePointAtFraction(e, { x: 0, y: 0 }, { x: 100, y: 0 }, null, null, 0.75)).toEqual({ x: 75, y: 0 });
+  it("interpolates edgePointAtFraction along a straight connector", () => {
+    const from = { x: 0, y: 0, side: null };
+    const to = { x: 100, y: 0, side: null };
+    expect(edgePointAtFraction(from, to, "straight", undefined, undefined, 0.25)).toEqual({ x: 25, y: 0 });
+    expect(edgePointAtFraction(from, to, "straight", undefined, undefined, 0.75)).toEqual({ x: 75, y: 0 });
   });
 
   it("orders and reorders nodes and connectors in a unified layer stack (front, back, forward, backward)", () => {
@@ -221,22 +224,26 @@ describe("connector transforms, routing, and unified layer ordering", () => {
     const e1 = createDefaultWhiteboardEdge("e1", { x: 0, y: 0 }, { x: 100, y: 100 });
     const page: WhiteboardPage = { id: "p1", name: "Page 1", nodes: [n1, n2], edges: [e1] };
 
+    // resolvePageLayerOrder maps each id to its rank; read the stack back bottom-to-top.
+    const stackOrder = (p: WhiteboardPage) =>
+      [...resolvePageLayerOrder(p).entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
+
     // Default order: nodes first (n1, n2), then edges (e1)
-    expect(resolvePageLayerOrder(page).map((x) => x.item.id)).toEqual(["n1", "n2", "e1"]);
+    expect(stackOrder(page)).toEqual(["n1", "n2", "e1"]);
 
     // Send e1 to back -> e1 should now be behind n1 and n2
-    const sentBack = reorderPageItems(page, new Set(["e1"]), "back")!;
-    const pageAfterBack: WhiteboardPage = { ...page, nodes: sentBack.afterNodes, edges: sentBack.afterEdges };
-    expect(resolvePageLayerOrder(pageAfterBack).map((x) => x.item.id)).toEqual(["e1", "n1", "n2"]);
+    const sentBack = reorderPageItems(page, new Set(["e1"]), "back");
+    const pageAfterBack: WhiteboardPage = { ...page, nodes: sentBack.nodes, edges: sentBack.edges };
+    expect(stackOrder(pageAfterBack)).toEqual(["e1", "n1", "n2"]);
 
     // Bring e1 forward one step -> between n1 and n2
-    const forward = reorderPageItems(pageAfterBack, new Set(["e1"]), "forward")!;
-    const pageAfterForward: WhiteboardPage = { ...page, nodes: forward.afterNodes, edges: forward.afterEdges };
-    expect(resolvePageLayerOrder(pageAfterForward).map((x) => x.item.id)).toEqual(["n1", "e1", "n2"]);
+    const forward = reorderPageItems(pageAfterBack, new Set(["e1"]), "forward");
+    const pageAfterForward: WhiteboardPage = { ...page, nodes: forward.nodes, edges: forward.edges };
+    expect(stackOrder(pageAfterForward)).toEqual(["n1", "e1", "n2"]);
 
     // Bring n1 to front -> n1 on top of everything
-    const front = reorderPageItems(pageAfterForward, new Set(["n1"]), "front")!;
-    const pageAfterFront: WhiteboardPage = { ...page, nodes: front.afterNodes, edges: front.afterEdges };
-    expect(resolvePageLayerOrder(pageAfterFront).map((x) => x.item.id)).toEqual(["e1", "n2", "n1"]);
+    const front = reorderPageItems(pageAfterForward, new Set(["n1"]), "front");
+    const pageAfterFront: WhiteboardPage = { ...page, nodes: front.nodes, edges: front.edges };
+    expect(stackOrder(pageAfterFront)).toEqual(["e1", "n2", "n1"]);
   });
 });

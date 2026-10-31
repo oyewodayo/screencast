@@ -4312,23 +4312,21 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <Field label="Offset">
                   <div className="grid grid-cols-2 gap-1.5 w-full">
                     <PrefixedNumber
-                      key={`eshx-${edgeIds}`}
+                      resetKey={`eshx-${edgeIds}`}
                       prefix="X"
                       title="Horizontal shadow offset in pixels"
                       value={firstEdge.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
                       min={-100}
                       max={100}
-                      step={1}
                       onCommit={(x) => updateEdge({ shadowOffsetX: x })}
                     />
                     <PrefixedNumber
-                      key={`eshy-${edgeIds}`}
+                      resetKey={`eshy-${edgeIds}`}
                       prefix="Y"
                       title="Vertical shadow offset in pixels"
                       value={firstEdge.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
                       min={-100}
                       max={100}
-                      step={1}
                       onCommit={(y) => updateEdge({ shadowOffsetY: y })}
                     />
                   </div>
@@ -4372,13 +4370,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <div className="flex items-center gap-1.5">
                   <div className="w-24 shrink-0">
                     <PrefixedNumber
-                      key={`elfs-${edgeIds}`}
+                      resetKey={`elfs-${edgeIds}`}
                       prefix={<TbTextSize size={12} />}
                       title="Label font size in pixels"
                       value={firstEdge.labelFontSize ?? 12}
                       min={8}
                       max={72}
-                      step={1}
                       onCommit={(n) => updateEdge({ labelFontSize: n })}
                     />
                   </div>
