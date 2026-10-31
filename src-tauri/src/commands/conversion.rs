@@ -5499,6 +5499,8 @@ fn noise_reduction_afftdn_params(strength: Option<f64>) -> Option<(f64, f64)> {
 // `sample_secs` is set when the caller has prepended a noise sample of that length to the stream
 // (see audio_branch / cleanup_noise_sample): afftdn learns its profile from exactly that prefix via
 // asendcmd, and the prefix is trimmed off again right after the denoiser.
+const ARNNDN_NAN_GUARD: &str = "aeval=if(isnan(val(0))\\,0\\,val(0)):c=same";
+
 fn audio_cleanup_filters(strength: Option<f64>, cleanup: Option<&AudioCleanup>, rnnoise_model: Option<&str>) -> Vec<String> {
     audio_cleanup_filters_with_sample(strength, cleanup, rnnoise_model, None)
 }
@@ -5528,6 +5530,12 @@ fn audio_cleanup_filters_with_sample(
             if strength > 0.0 {
                 // mix: 1 = fully denoised, lower blends the original back in (sample-aligned).
                 filters.push(format!("arnndn=m='{}':mix={:.2}", model, strength));
+                // arnndn's last frame comes out as NaN (any ffmpeg build tried, any input), and the
+                // stages after it - speechnorm above all - never return once one reaches them: a
+                // "Remove" clean-up or "Make it sound pro" sat at a fixed percentage forever on
+                // clips of every length. Zeroing the NaN costs nothing audible (it's the final
+                // 10 ms) and lets the chain finish.
+                filters.push(ARNNDN_NAN_GUARD.to_string());
             }
         }
         _ => {
@@ -10355,7 +10363,7 @@ mod tests {
     #[test]
     fn audio_cleanup_filters_remove_mode_uses_arnndn_and_falls_back_without_a_model() {
         let cleanup = AudioCleanup { mode: Some("remove".into()), ..Default::default() };
-        assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), Some("C\\:/m.rnnn")), ["arnndn=m='C\\:/m.rnnn':mix=1.00"]);
+        assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), Some("C\\:/m.rnnn")), ["arnndn=m='C\\:/m.rnnn':mix=1.00", ARNNDN_NAN_GUARD]);
         assert_eq!(audio_cleanup_filters(Some(1.0), Some(&cleanup), None), ["afftdn=nr=40.00:nf=-20.0"]);
     }
 

@@ -12,7 +12,7 @@ import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary, MdOutlineSettingsVoice } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -4404,7 +4404,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }}
             className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${soundProAnchor ? "bg-neutral-700 text-amber-300" : "text-neutral-300 hover:bg-neutral-700 hover:text-amber-200"}`}
           >
-            <IoSparklesOutline size={15} />
+            <MdOutlineSettingsVoice size={16} />
           </button>
           </div>
         </div>

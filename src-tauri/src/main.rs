@@ -22,6 +22,8 @@ mod commands {
     pub mod object_find;
     pub mod face_find;
     pub mod music_library;
+    // The AI voice's commands - see services/tts.rs.
+    pub mod tts;
     pub mod native_playback;
     pub mod snip;
     pub mod screen_color;
@@ -75,6 +77,10 @@ mod services {
     pub mod trash;
     pub mod utility;
     pub mod whisper_model;
+    // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
+    pub mod tts;
+    pub mod tts_text;
+    pub mod tts_vocab;
     pub mod video_edits;
     pub mod mindmaps;
     pub mod whiteboards;
@@ -563,6 +569,13 @@ fn main() {
             commands::audio_tracks::download_separation_engine,
             commands::audio_tracks::cancel_separation_engine_download,
             commands::audio_tracks::cancel_voice_music_separation,
+            commands::tts::tts_status,
+            commands::tts::download_tts,
+            commands::tts::cancel_tts_download,
+            commands::tts::tts_synthesize,
+            commands::tts::cancel_tts,
+            commands::tts::tts_preview,
+            commands::tts::tts_release,
             commands::music_library::get_music_catalog,
             commands::music_library::get_music_track_file,
             commands::music_library::restore_music_track,

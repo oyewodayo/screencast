@@ -8,7 +8,8 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoCheckmarkCircle, IoClose, IoEllipseOutline, IoPause, IoPlay, IoSparkles } from "react-icons/io5";
+import { IoCheckmarkCircle, IoClose, IoEllipseOutline, IoPause, IoPlay } from "react-icons/io5";
+import { MdOutlineSettingsVoice } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { planSoundPro, SOUND_DESTINATIONS, type SoundDestination, type SoundProInput, type SoundProStep, type SoundRole } from "../../utils/soundPro";
 import type { VideoEditCommand } from "../../utils/videoEditTypes";
@@ -93,7 +94,7 @@ const SoundProPopover: React.FC<SoundProPopoverProps> = ({ anchor, input, apply,
       className="w-72 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-3"
     >
       <div className="flex items-center gap-2">
-        <IoSparkles size={14} className="text-amber-300" />
+        <MdOutlineSettingsVoice size={15} className="text-amber-300" />
         <span className="flex-1 text-xs font-medium">{done ? (hearing === "after" ? "Sounds pro." : "The original") : "Make it sound pro"}</span>
         <button type="button" title="Close" onClick={onClose} className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white">
           <IoClose size={14} />
