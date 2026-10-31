@@ -14,8 +14,9 @@ pub struct ScreenSample {
     pub rgb: Vec<u8>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn sample_screen_at_cursor(radius: u32) -> Result<ScreenSample, String> {
+    let _serial = crate::services::responsiveness::serial();
     platform::sample(radius.min(32))
 }
 

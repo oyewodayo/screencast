@@ -69,14 +69,16 @@ fn same_pair(link: &ItemLink, a: &LinkEnd, b: &LinkEnd) -> bool {
     (&link.a == a && &link.b == b) || (&link.a == b && &link.b == a)
 }
 
-#[command]
+#[command(async)]
 pub fn list_links() -> Result<Vec<ItemLink>, String> {
+    let _serial = crate::services::responsiveness::serial();
     Ok(read_all())
 }
 
 // Idempotent: linking a pair that's already linked returns the existing link.
-#[command]
+#[command(async)]
 pub fn add_link(a: LinkEnd, b: LinkEnd) -> Result<ItemLink, String> {
+    let _serial = crate::services::responsiveness::serial();
     validate(&a)?;
     validate(&b)?;
     if a == b {
@@ -103,8 +105,9 @@ pub fn add_link(a: LinkEnd, b: LinkEnd) -> Result<ItemLink, String> {
     Ok(link)
 }
 
-#[command]
+#[command(async)]
 pub fn remove_link(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut links = read_all();
     let before = links.len();
     links.retain(|l| l.id != id);
@@ -115,8 +118,9 @@ pub fn remove_link(id: String) -> Result<(), String> {
 }
 
 // A renamed/moved file keeps its links - mirrors docs.rs's relink_doc_path for stale paths.
-#[command]
+#[command(async)]
 pub fn relink_file_path(old_path: String, new_path: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut links = read_all();
     let mut changed = false;
     for link in links.iter_mut() {
