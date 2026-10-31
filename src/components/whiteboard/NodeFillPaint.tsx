@@ -21,7 +21,8 @@ import {
   resolveGradientStops,
   resolveNodeFill,
 } from "../../utils/whiteboardTypes";
-import { fillPatternTile, linearGradientPoints } from "../../handlers/whiteboardHandlers";
+import { fillImageRect, fillPatternTile, linearGradientPoints } from "../../handlers/whiteboardHandlers";
+import { getCachedWhiteboardImage } from "../../utils/whiteboardImageCache";
 
 export interface FillPaint {
   fill: string;
@@ -75,11 +76,26 @@ export function nodeFillPaint(node: WhiteboardNode, imageSrc: string | null): Fi
     fillOpacity = opacity;
   } else if (type === "image") {
     const fit = node.fillImageFit ?? "cover";
+    const ox = node.fillImageOffsetX ?? 0;
+    const oy = node.fillImageOffsetY ?? 0;
+    const s = Math.max(0.1, node.fillImageScale ?? 1);
+    const cachedImg = imageSrc ? getCachedWhiteboardImage(imageSrc) : null;
+    const rect =
+      cachedImg && cachedImg.naturalWidth > 0 && cachedImg.naturalHeight > 0
+        ? fillImageRect(fit, w, h, cachedImg.naturalWidth, cachedImg.naturalHeight, ox, oy, s)
+        : { x: (w - w * s) / 2 + ox * w, y: (h - h * s) / 2 + oy * h, w: w * s, h: h * s };
     fillDef = (
       <pattern id={fillId} patternUnits="userSpaceOnUse" x={0} y={0} width={w} height={h}>
         {fit === "contain" && node.fillColor && <rect width={w} height={h} fill={node.fillColor} />}
         {imageSrc ? (
-          <image href={imageSrc} x={0} y={0} width={w} height={h} preserveAspectRatio={IMAGE_ASPECT[fit]} />
+          <image
+            href={imageSrc}
+            x={rect.x}
+            y={rect.y}
+            width={rect.w}
+            height={rect.h}
+            preserveAspectRatio={cachedImg ? "none" : IMAGE_ASPECT[fit]}
+          />
         ) : (
           <rect width={w} height={h} fill={node.fillColor ?? "#f3f4f6"} />
         )}

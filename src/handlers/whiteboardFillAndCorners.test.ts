@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { createDefaultWhiteboardNode, nodeHasFill, resolveFillType, resolveGradientStops, WhiteboardNode } from "../utils/whiteboardTypes";
+import { createDefaultWhiteboardEdge, createDefaultWhiteboardNode, nodeHasFill, resolveFillType, resolveGradientStops, WhiteboardNode, WhiteboardPage } from "../utils/whiteboardTypes";
 import {
+  buildEdgePath,
   dashArrayFor,
   detectShapeCorners,
+  edgePointAtFraction,
   fillImageRect,
   fillPatternTile,
+  flipEdge,
   hexToRgba,
   linearGradientPoints,
   nodeDropShadowCSS,
+  reorderPageItems,
   resolveBoxCornerRadii,
+  resolvePageLayerOrder,
+  reverseEdgeDirection,
   roundedPolygonD,
+  scaleEdgeLength,
   shapeOutlineFor,
   supportsCornerRadius,
 } from "./whiteboardHandlers";
@@ -116,10 +123,11 @@ describe("fill paint", () => {
     expect(diag.y2).toBeCloseTo(100);
   });
 
-  it("fits an image fill by cover/contain/fill", () => {
+  it("fits an image fill by cover/contain/fill and applies pan/zoom offsets", () => {
     expect(fillImageRect("cover", 100, 100, 200, 100)).toEqual({ x: -50, y: 0, w: 200, h: 100 });
     expect(fillImageRect("contain", 100, 100, 200, 100)).toEqual({ x: 0, y: 25, w: 100, h: 50 });
     expect(fillImageRect("fill", 100, 100, 200, 100)).toEqual({ x: 0, y: 0, w: 100, h: 100 });
+    expect(fillImageRect("cover", 100, 100, 200, 100, 0.25, -0.1, 1.5)).toEqual({ x: -75, y: -35, w: 300, h: 150 });
   });
 
   it("builds a non-empty tile for every pattern", () => {
@@ -155,5 +163,80 @@ describe("shadow and stroke helpers", () => {
     expect(dashArrayFor(undefined, 2)).toBeUndefined();
     expect(dashArrayFor("dashed", 2)).toBe("8,6");
     expect(dashArrayFor("dotted", 2)).toBe("1,6.2");
+  });
+});
+
+describe("connector transforms, routing, and unified layer ordering", () => {
+  it("flips a free-floating connector horizontally and vertically around its bounds", () => {
+    const e = createDefaultWhiteboardEdge("e1", { x: 100, y: 50 }, { x: 200, y: 150 });
+    const hFlipped = flipEdge(e, "horizontal", new Map());
+    expect(hFlipped.source).toEqual({ x: 200, y: 50 });
+    expect(hFlipped.target).toEqual({ x: 100, y: 150 });
+
+    const vFlipped = flipEdge(e, "vertical", new Map());
+    expect(vFlipped.source).toEqual({ x: 100, y: 150 });
+    expect(vFlipped.target).toEqual({ x: 200, y: 50 });
+  });
+
+  it("reverses a connector's direction and swaps its arrowheads", () => {
+    const e = {
+      ...createDefaultWhiteboardEdge("e1", { x: 10, y: 20 }, { x: 110, y: 20 }),
+      startArrowType: "none" as const,
+      endArrowType: "arrow" as const,
+      waypoints: [{ x: 40, y: 10 }, { x: 80, y: 30 }],
+      curveBow: 0.4,
+    };
+    const rev = reverseEdgeDirection(e);
+    expect(rev.source).toEqual({ x: 110, y: 20 });
+    expect(rev.target).toEqual({ x: 10, y: 20 });
+    expect(rev.startArrowType).toBe("arrow");
+    expect(rev.endArrowType).toBe("none");
+    expect(rev.waypoints).toEqual([{ x: 80, y: 30 }, { x: 40, y: 10 }]);
+    expect(rev.curveBow).toBeCloseTo(-0.4);
+  });
+
+  it("scales a free-floating connector's length symmetrically around its midpoint", () => {
+    const e = createDefaultWhiteboardEdge("e1", { x: 100, y: 50 }, { x: 200, y: 50 });
+    const scaled = scaleEdgeLength(e, 200);
+    expect(scaled.source.x).toBeCloseTo(50);
+    expect(scaled.target.x).toBeCloseTo(250);
+    expect(scaled.source.y).toBeCloseTo(50);
+    expect(scaled.target.y).toBeCloseTo(50);
+  });
+
+  it("routes an orthogonal free-floating connector with rounded corners when cornerRadius > 0", () => {
+    const path = buildEdgePath({ x: 0, y: 0 }, { x: 100, y: 80 }, "orthogonal", null, null, undefined, undefined, 12);
+    expect(path.d).toContain("Q");
+  });
+
+  it("interpolates edgePointAtFraction along straight, curved, and orthogonal connectors", () => {
+    const e = createDefaultWhiteboardEdge("e1", { x: 0, y: 0 }, { x: 100, y: 0 });
+    expect(edgePointAtFraction(e, { x: 0, y: 0 }, { x: 100, y: 0 }, null, null, 0.25)).toEqual({ x: 25, y: 0 });
+    expect(edgePointAtFraction(e, { x: 0, y: 0 }, { x: 100, y: 0 }, null, null, 0.75)).toEqual({ x: 75, y: 0 });
+  });
+
+  it("orders and reorders nodes and connectors in a unified layer stack (front, back, forward, backward)", () => {
+    const n1 = createDefaultWhiteboardNode("n1", "rectangle", 0, 0);
+    const n2 = createDefaultWhiteboardNode("n2", "ellipse", 50, 50);
+    const e1 = createDefaultWhiteboardEdge("e1", { x: 0, y: 0 }, { x: 100, y: 100 });
+    const page: WhiteboardPage = { id: "p1", name: "Page 1", nodes: [n1, n2], edges: [e1] };
+
+    // Default order: nodes first (n1, n2), then edges (e1)
+    expect(resolvePageLayerOrder(page).map((x) => x.item.id)).toEqual(["n1", "n2", "e1"]);
+
+    // Send e1 to back -> e1 should now be behind n1 and n2
+    const sentBack = reorderPageItems(page, new Set(["e1"]), "back")!;
+    const pageAfterBack: WhiteboardPage = { ...page, nodes: sentBack.afterNodes, edges: sentBack.afterEdges };
+    expect(resolvePageLayerOrder(pageAfterBack).map((x) => x.item.id)).toEqual(["e1", "n1", "n2"]);
+
+    // Bring e1 forward one step -> between n1 and n2
+    const forward = reorderPageItems(pageAfterBack, new Set(["e1"]), "forward")!;
+    const pageAfterForward: WhiteboardPage = { ...page, nodes: forward.afterNodes, edges: forward.afterEdges };
+    expect(resolvePageLayerOrder(pageAfterForward).map((x) => x.item.id)).toEqual(["n1", "e1", "n2"]);
+
+    // Bring n1 to front -> n1 on top of everything
+    const front = reorderPageItems(pageAfterForward, new Set(["n1"]), "front")!;
+    const pageAfterFront: WhiteboardPage = { ...page, nodes: front.afterNodes, edges: front.afterEdges };
+    expect(resolvePageLayerOrder(pageAfterFront).map((x) => x.item.id)).toEqual(["e1", "n2", "n1"]);
   });
 });

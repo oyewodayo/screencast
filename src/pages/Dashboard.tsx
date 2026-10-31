@@ -28,6 +28,20 @@ import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-sh
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
 import SidebarFileIcon from "../components/SidebarFileIcon";
+import {
+  canMoveFolder,
+  folderMatchesQuery,
+  getPinnedFolders,
+  getSidebarViewMode,
+  movedFolderKey,
+  orderFolders,
+  pinRank,
+  repathFolderKey,
+  repathPinnedFolders,
+  saveSidebarViewMode,
+  togglePinnedFolder,
+  type SidebarViewMode,
+} from "../utils/sidebarFolders";
 import VideoPlayer, { EditTimeline, VideoPlayerHandle } from "../components/VideoPlayer";
 import { seekTimeline, timelineTime } from "../utils/timelineTransport";
 import { chapterAtOutputTime, outputChapters } from "../utils/videoChapters";
@@ -180,6 +194,8 @@ import {
   IoAdd,
   IoPin,
   IoPinOutline,
+  IoGridOutline,
+  IoListOutline,
   IoCreateOutline,
   IoSwapHorizontalOutline,
   IoLocateOutline,
@@ -566,6 +582,10 @@ const Dashboard = () => {
   // folder while searching (isFolderEmpty-style filtering already takes over then) and the root
   // is never eligible to be hidden.
   const [hideEmptyFolders, setHideEmptyFolders] = useState<boolean>(false);
+  // Folders pinned to the top of the sidebar (a work folder kept in reach while editing) and the
+  // list/grid choice - both remembered across restarts, see utils/sidebarFolders.ts.
+  const [pinnedFolders, setPinnedFolders] = useState<string[]>(() => getPinnedFolders());
+  const [sidebarViewMode, setSidebarViewMode] = useState<SidebarViewMode>(() => getSidebarViewMode());
   const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
   const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
     const sorted = [...fileList];
@@ -584,6 +604,13 @@ const Dashboard = () => {
   // presently over (for the drop-target highlight). Both null outside a drag gesture.
   const [draggingFiles, setDraggingFiles] = useState<FileEntry[] | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  // A folder header being dragged (to move the whole folder) and the "Move folder to…" popover.
+  const [draggingFolder, setDraggingFolder] = useState<string | null>(null);
+  // Where the user was before a folder gallery took over the main pane (an open video being edited,
+  // a board, a document...), so the gallery can offer a one-click way back. `restore` closes over
+  // what was on screen at that moment.
+  const [returnPoint, setReturnPoint] = useState<{ label: string; restore: () => void } | null>(null);
+  const [folderMoveMenu, setFolderMoveMenu] = useState<{ folder: string; anchor: { left: number; top: number } } | null>(null);
   // Sidebar-file-to-timeline dragging runs on plain pointer events, not the native HTML5 drag-and-
   // drop API (draggable/onDragStart/onDrop) that the folder-move feature above uses - the same
   // root cause as the external Explorer-drag investigation turned out to be broader than just
@@ -619,7 +646,7 @@ const Dashboard = () => {
     sidebarDragRef.current = null;
     if (!drag?.isDragging) {
       // No real drag happened - a plain tap, handled the same as clicking the filename always has.
-      handleFileClick(file);
+      void openFileFromSidebar(file);
       return;
     }
     setDraggingFiles(null);
@@ -3236,6 +3263,21 @@ const setScreen = () => {
 	}
 	};
 
+	// A plain click on a sidebar file. Mid-edit it would swap the editor out for that file, so it
+	// asks first - same prompt as opening a folder (openFolderGallery).
+	const openFileFromSidebar = async (file: FileEntry): Promise<void> => {
+		if (editingVideoRef.current && file.path !== selectedFile?.sourcePath) {
+			const proceed = await ask(`You are about to open "${file.name}". The video you're editing will be closed.`, {
+				title: "Open file?",
+				kind: "warning",
+				okLabel: "Open",
+				cancelLabel: "Close",
+			});
+			if (!proceed) return;
+		}
+		await handleFileClick(file);
+	};
+
 	const handleFileClick = async (file: FileEntry) => {
 		await loadFileForPlayback(file.path, file.name);
 	};
@@ -3793,11 +3835,11 @@ const setScreen = () => {
 	// decided applies (see its comment). Files already in destFolder are silently skipped rather
 	// than erroring, since a multi-selection spanning folders will often already include some
 	// that are exactly where they're being dropped.
-	const handleMoveFiles = async (fileList: FileEntry[], destFolder: string) => {
+	const handleMoveFiles = async (fileList: FileEntry[], destFolder: string, quiet = false): Promise<number> => {
 		setOpenMenu(null);
 		setDragOverFolder(null);
 		const toMove = fileList.filter((file) => findFileFolder(file.path) !== destFolder);
-		if (toMove.length === 0) return;
+		if (toMove.length === 0) return 0;
 		try {
 			const results = await Promise.allSettled(
 				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
@@ -3838,14 +3880,78 @@ const setScreen = () => {
 			if (failedCount > 0) {
 				const firstError = results.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
 				setError(`Moved ${toMove.length - failedCount} of ${toMove.length} file(s) — ${failedCount} failed: ${firstError}`);
-			} else if (toMove.length === 1) {
+			} else if (quiet) {
+					// the caller reports the combined result
+				} else if (toMove.length === 1) {
 				setMessage(`Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`);
 			} else {
 				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}`);
 			}
+			return failedCount;
 		} catch (error) {
 			console.error("Error moving files:", error);
 			setError(`Failed to move files: ${error}`);
+			return fileList.length;
+		}
+	};
+
+	// Moves a whole folder (its files and subfolders) under another folder, or to the root ("").
+	// Done file by file through handleMoveFiles rather than one directory rename, so every file
+	// keeps what travels with it - saved edits, linked notes, pins, playback position. The old
+	// folders are removed afterwards, deepest first; delete_folder refuses a non-empty one, so a
+	// folder still holding something that couldn't be moved stays put instead of losing it.
+	const handleMoveFolder = async (folder: string, destFolder: string): Promise<void> => {
+		setDragOverFolder(null);
+		setDraggingFolder(null);
+		setFolderMoveMenu(null);
+		if (!canMoveFolder(folder, destFolder)) return;
+		const newKey = movedFolderKey(folder, destFolder);
+		if (newKey in files) {
+			setError(`"${folderDisplayName(destFolder)}" already has a folder named "${folderDisplayName(folder)}"`);
+			return;
+		}
+		const subtree = Object.keys(files)
+			.filter((key) => key === folder || key.startsWith(`${folder}/`))
+			.sort((a, b) => folderDepth(a) - folderDepth(b) || a.localeCompare(b));
+		const target = (key: string): string => newKey + key.slice(folder.length);
+		try {
+			for (const key of subtree) {
+				const to = target(key);
+				const slash = to.lastIndexOf("/");
+				await invoke<string>("create_folder", { parentPath: slash === -1 ? "" : to.slice(0, slash), name: to.slice(slash + 1) });
+			}
+			let failed = 0;
+			let movedCount = 0;
+			for (const key of subtree) {
+				const list = files[key] ?? [];
+				movedCount += list.length;
+				failed += await handleMoveFiles(list, target(key), true);
+			}
+			const leftovers: string[] = [];
+			for (const key of [...subtree].reverse()) {
+				try {
+					await invoke("delete_folder", { folderPath: key });
+				} catch {
+					leftovers.push(key);
+				}
+			}
+			if (leftovers.length === 0) {
+				setPinnedFolders(repathPinnedFolders(folder, newKey));
+				setCollapsedFolders((prev) => new Set([...prev].map((k) => repathFolderKey(k, folder, newKey))));
+				setSelectedFolder((prev) => (prev === null ? prev : repathFolderKey(prev, folder, newKey)));
+			}
+			await handleDirectoryFiles();
+			if (failed > 0 || leftovers.length > 0) {
+				setError(
+					`Moved "${folderDisplayName(folder)}" to ${folderDisplayName(destFolder)}, but ${failed || "some"} item(s) could not be moved, so the original folder was kept`
+				);
+			} else {
+				setMessage(`Moved folder "${folderDisplayName(folder)}" (${movedCount} file${movedCount === 1 ? "" : "s"}) to ${folderDisplayName(destFolder)}`);
+			}
+		} catch (error) {
+			console.error("Error moving folder:", error);
+			await handleDirectoryFiles();
+			setError(`Failed to move folder: ${error}`);
 		}
 	};
 
@@ -4255,25 +4361,88 @@ const setScreen = () => {
 	// tab happens to be open. Sorted lexicographically on the relative-path key, which conveniently
 	// also sorts every folder after its own parent ("Workshops" before "Workshops/Papers") and
 	// puts the root ("") first, so this doubles as the hierarchical display order.
+	// Clicking a folder's name loads its files as a thumbnail grid in the main board (gallery
+	// categories only - the audio tab has no gallery view yet). Mid-edit that would swap the
+	// editor out from under the user, so it asks first. Collapsing is the caret's job alone.
+	const openFolderGallery = async (folder: string): Promise<void> => {
+		if (!GALLERY_CATEGORIES.includes(activeFileCategory)) return;
+		if (editingVideoRef.current) {
+			const proceed = await ask(`You are about to open the folder "${folderDisplayName(folder)}". The video you're editing will be closed.`, {
+				title: "Open folder?",
+				kind: "warning",
+				okLabel: "Open",
+				cancelLabel: "Close",
+			});
+			if (!proceed) return;
+		}
+		const somethingOpen = selectedFile !== null || !!boardScreen || !!docsScreen || !!whiteboardScreen || !!videoEditorScreen;
+		if (somethingOpen) {
+			const prev = { selectedFile, boardScreen, docsScreen, whiteboardScreen, videoEditorScreen, dockerMode };
+			const label = prev.selectedFile
+				? `${editingVideoRef.current ? "editing " : ""}${truncateFileName(prev.selectedFile.name)}`
+				: prev.docsScreen
+				? "your document"
+				: prev.whiteboardScreen
+				? "your whiteboard"
+				: prev.boardScreen
+				? "your board"
+				: "the video editor";
+			setReturnPoint({
+				label,
+				restore: () => {
+					setSelectedFolder(null);
+					setBoardScreen(prev.boardScreen);
+					setDocsScreen(prev.docsScreen);
+					setWhiteboardScreen(prev.whiteboardScreen);
+					setVideoEditorScreen(prev.videoEditorScreen);
+					setSelectedFile(prev.selectedFile);
+					setDockerMode(prev.dockerMode);
+					setReturnPoint(null);
+				},
+			});
+		} else if (selectedFolder === null) {
+			setReturnPoint(null);
+		}
+		setSelectedFolder(folder);
+		setSelectedFile(null);
+		setBoardScreen(null);
+		setDocsScreen(null);
+		setWhiteboardScreen(null);
+		// The main board is about to show this folder's gallery, so no tool screen can still be
+		// the thing on it.
+		setVideoEditorScreen(null);
+	};
 	const normalizedSearchQuery = fileSearchQuery.trim().toLowerCase();
 	const isSearchingFiles = normalizedSearchQuery.length > 0;
-	const filteredEntries = Object.entries(files)
-		.map(([folder, fileList]) => [
-			folder,
-			sortFileList(
-				fileList.filter(
-					(file) => getFileCategory(file.name) === activeFileCategory && (!isSearchingFiles || file.name.toLowerCase().includes(normalizedSearchQuery))
-				)
-			),
-		] as [string, FileEntry[]])
+	// Search also matches folder names: a folder whose path matches shows all of its files (and
+	// stays listed even if it holds none in this tab), otherwise only files whose name matches.
+	const filteredEntriesUnordered = Object.entries(files)
+		.map(([folder, fileList]) => {
+			const folderMatches = folderMatchesQuery(folder, normalizedSearchQuery);
+			return [
+				folder,
+				sortFileList(
+					fileList.filter(
+						(file) =>
+							getFileCategory(file.name) === activeFileCategory &&
+							(!isSearchingFiles || folderMatches || file.name.toLowerCase().includes(normalizedSearchQuery))
+					)
+				),
+				folderMatches,
+			] as [string, FileEntry[], boolean];
+		})
 		// A folder with zero matches is only worth hiding while actively searching - normally
 		// every real folder stays visible (even empty ones, per this file's own comment above)
 		// so it's still usable as a create-subfolder/move/drop target. hideEmptyFolders is the
 		// opt-in exception: user has explicitly asked to declutter, so folders with nothing in
 		// the active category are dropped too (root exempted - it's never hidden).
-		.filter(([, fileList]) => !isSearchingFiles || fileList.length > 0)
+		.filter(([, fileList, folderMatches]) => !isSearchingFiles || fileList.length > 0 || folderMatches)
 		.filter(([folder, fileList]) => !hideEmptyFolders || fileList.length > 0 || folder === "")
-		.sort(([a], [b]) => a.localeCompare(b));
+		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]);
+	// Pinned folders (and what's inside them) first, then the usual path order.
+	const filteredEntries = orderFolders(filteredEntriesUnordered, pinnedFolders);
+	const isGridView = sidebarViewMode === "grid";
+	const firstUnpinnedIndex = filteredEntries.findIndex(([folder]) => pinRank(folder, pinnedFolders) === -1);
 	const filteredTrashItems = isSearchingFiles
 		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
 		: trashItems;
@@ -4403,7 +4572,9 @@ const setScreen = () => {
                         setActiveFileCategory(category);
                         setSelectedFilePaths(new Set());
                         setSelectedFolder(null);
-                        void restoreLastOpenedForCategory(category);
+                        // Mid-edit these tabs only switch which files the sidebar lists - reopening the
+                        // category's last file would replace the editor with it.
+                        if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
                       }}
                       className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                         activeFileCategory === category
@@ -4439,7 +4610,7 @@ const setScreen = () => {
                       type="text"
                       value={fileSearchQuery}
                       onChange={(e) => setFileSearchQuery(e.target.value)}
-                      placeholder="Search files"
+                      placeholder="Search files and folders"
                       className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
                     />
                     {fileSearchQuery && (
@@ -4499,6 +4670,24 @@ const setScreen = () => {
                         className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
                       >
                         <IoSwapVerticalOutline size={15} />
+                      </button>
+                    )}
+                    {activeFileCategory !== "trash" && (
+                      <button
+                        type="button"
+                        title={isGridView ? "Switch to list view" : "Switch to grid view (thumbnails)"}
+                        onClick={() => {
+                          const next: SidebarViewMode = isGridView ? "list" : "grid";
+                          setSidebarViewMode(next);
+                          saveSidebarViewMode(next);
+                        }}
+                        className={`p-1 rounded transition-colors ${
+                          isGridView
+                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
+                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        {isGridView ? <IoListOutline size={15} /> : <IoGridOutline size={15} />}
                       </button>
                     )}
                     {activeFileCategory !== "trash" && (
@@ -4674,7 +4863,7 @@ const setScreen = () => {
                     of chaining into whatever's behind it (the main content pane, the tools panel)
                     once you scroll past its own content - each panel should scroll on its own. */}
                 <div
-                  className="p-3 pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200"
+                  className={`px-3 ${selectedFile ? "pt-0" : "pt-3"} pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200`}
                 >
                 {/* "Now open" banner - pinned to the top of this scrolling list (not the whole
                     sidebar; the search box/tabs/Files header above it never scroll away in the
@@ -4690,7 +4879,7 @@ const setScreen = () => {
                     type="button"
                     onClick={handleJumpToOpenFile}
                     title={`Locate "${selectedFile.name}" in the sidebar`}
-                    className="sticky top-0 z-10 -mx-3 -mt-3 mb-2 flex w-[calc(100%+1.5rem)] items-center gap-2 border-b border-blue-200 bg-blue-50/95 px-3 py-2 text-left backdrop-blur-sm transition-colors hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/15 dark:hover:bg-blue-500/25"
+                    className="sticky top-0 z-10 -mx-3 mb-2 flex w-[calc(100%+1.5rem)] items-center gap-2 border-b border-blue-200 bg-blue-50/95 px-3 py-2 text-left backdrop-blur-sm transition-colors hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/15 dark:hover:bg-blue-500/25"
                   >
                     <span className="shrink-0 text-blue-500 dark:text-blue-400">
                       {categoryIcon(getFileCategory(selectedFile.name))}
@@ -4767,7 +4956,7 @@ const setScreen = () => {
                 ) : filteredEntries.length === 0 ? (
                   <p>{isSearchingFiles ? `No ${activeFileCategory} files match "${fileSearchQuery.trim()}"` : `No ${activeFileCategory} files found`}</p>
                 ) : (
-                  filteredEntries.map(([folder, fileList]) => (
+                  filteredEntries.map(([folder, fileList], folderIndex) => (
                     <div
                       key={folder}
                       className="mb-3"
@@ -4782,21 +4971,47 @@ const setScreen = () => {
                       // where the real file paths are available), not in onDrop below — a plain
                       // HTML5 drop of an OS file never carries a usable path here.
                       onDragOver={(e) => {
-                        if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
+                        if (draggingFolder !== null) {
+                          if (!canMoveFolder(draggingFolder, folder)) return;
+                        } else if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
                         e.preventDefault();
                         if (dragOverFolder !== folder) setDragOverFolder(folder);
                       }}
                       onDragLeave={() => setDragOverFolder((prev) => (prev === folder ? null : prev))}
                       onDrop={(e) => {
                         e.preventDefault();
-                        if (draggingFiles) handleMoveFiles(draggingFiles, folder);
+                        if (draggingFolder !== null) void handleMoveFolder(draggingFolder, folder);
+                        else if (draggingFiles) handleMoveFiles(draggingFiles, folder);
                       }}
                     >
+                      {folderIndex === 0 && firstUnpinnedIndex !== 0 && (
+                        <div className="flex items-center gap-1 -mx-1 px-1 mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-500 dark:text-blue-400">
+                          <IoPin size={10} /> Pinned
+                        </div>
+                      )}
+                      {folderIndex === firstUnpinnedIndex && firstUnpinnedIndex > 0 && (
+                        <div className="-mx-1 px-1 mb-1 pt-2 border-t border-gray-200 dark:border-neutral-700 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-neutral-500">
+                          All folders
+                        </div>
+                      )}
                       <div
                         className={`group/folder flex items-center justify-between gap-1 -mx-1 px-1 py-0.5 rounded transition-colors ${
                           dragOverFolder === folder ? "bg-blue-100 dark:bg-blue-500/20 ring-1 ring-blue-400" : ""
                         }`}
                         style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
+                        // Drag a folder onto another folder (or the Briefcast root) to move all of it.
+                        draggable={folder !== ""}
+                        onDragStart={(e) => {
+                          if (folder === "") return;
+                          e.stopPropagation();
+                          setDraggingFolder(folder);
+                          e.dataTransfer.effectAllowed = "move";
+                          e.dataTransfer.setData("text/plain", folder);
+                        }}
+                        onDragEnd={() => {
+                          setDraggingFolder(null);
+                          setDragOverFolder(null);
+                        }}
                       >
                         <h4
                           className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
@@ -4808,31 +5023,38 @@ const setScreen = () => {
                           // two folders sharing a name at different nesting depths - e.g. two
                           // "MSC Research" folders - are distinguishable on hover instead of both
                           // showing an identical tooltip.
-                          title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
-                          onClick={() => {
-                            toggleFolderCollapsed(folder);
-                            // Gallery categories only (see GALLERY_CATEGORIES): clicking a folder
-                            // also loads its files as a thumbnail grid in the main board (see
-                            // selectedFolder above) - the audio tab doesn't have a gallery view yet,
-                            // so this is a no-op for it beyond the existing
-                            // expand/collapse.
-                            if (GALLERY_CATEGORIES.includes(activeFileCategory)) {
-                              setSelectedFolder(folder);
-                              setSelectedFile(null);
-                              setBoardScreen(null);
-                              setDocsScreen(null);
-                              setWhiteboardScreen(null);
-                              // The main board is about to show this folder's gallery, so no tool
-                              // screen can still be the thing on it.
-                              setVideoEditorScreen(null);
-                            }
-                          }}
+                          title={`Open "${folder || "Briefcast"}"`}
                         >
-                          <IoChevronForward size={10} className={`shrink-0 transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
-                          <IoFolderOutline size={12} className="shrink-0" />
-                          <span className="truncate">{folderDisplayName(folder)}</span>
+                          <button
+                            type="button"
+                            title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleFolderCollapsed(folder);
+                            }}
+                            className="shrink-0 p-1 -m-1 rounded hover:bg-gray-200 dark:hover:bg-neutral-700"
+                          >
+                            <IoChevronForward size={10} className={`transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
+                          </button>
+                          <span className="flex items-center gap-1 min-w-0 ml-1" onClick={() => void openFolderGallery(folder)}>
+                            <IoFolderOutline size={12} className="shrink-0" />
+                            <span className="truncate">{folderDisplayName(folder)}</span>
+                          </span>
+                          {pinnedFolders.includes(folder) && <IoPin size={11} className="shrink-0 text-blue-500 dark:text-blue-400" />}
                         </h4>
                         <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity shrink-0">
+                          {folder !== "" && (
+                            <button
+                              type="button"
+                              title={pinnedFolders.includes(folder) ? "Unpin folder" : "Pin folder to the top"}
+                              onClick={() => setPinnedFolders(togglePinnedFolder(folder))}
+                              className={`p-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 ${
+                                pinnedFolders.includes(folder) ? "text-blue-500 dark:text-blue-400" : "text-gray-400 hover:text-blue-500"
+                              }`}
+                            >
+                              {pinnedFolders.includes(folder) ? <IoPin size={13} /> : <IoPinOutline size={13} />}
+                            </button>
+                          )}
                           {isFolderEmpty(folder) && (
                             <button
                               type="button"
@@ -4841,6 +5063,19 @@ const setScreen = () => {
                               className="p-0.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
                             >
                               <IoTrashOutline size={13} />
+                            </button>
+                          )}
+                          {folder !== "" && (
+                            <button
+                              type="button"
+                              title="Move folder to…"
+                              onClick={(e) => {
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                setFolderMoveMenu({ folder, anchor: { left: rect.left, top: rect.bottom + 4 } });
+                              }}
+                              className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
+                            >
+                              <IoFolderOpenOutline size={13} />
                             </button>
                           )}
                           <button
@@ -4880,7 +5115,7 @@ const setScreen = () => {
                           No {activeFileCategory} files
                         </p>
                       ) : (
-                        <ul className="mt-1 space-y-0.5" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
+                        <ul className={isGridView ? "mt-1 grid grid-cols-2 gap-2" : "mt-1 space-y-0.5"} style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
                           {fileList.map((file) => (
                             <li
                               key={file.path}
@@ -4901,7 +5136,7 @@ const setScreen = () => {
                                 setDraggingFiles(null);
                                 setDragOverFolder(null);
                               }}
-                              className={`flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md hover:bg-gray-50 dark:hover:bg-neutral-800 ${
+                              className={`${isGridView ? "relative flex flex-col gap-1 min-w-0 group cursor-pointer p-1 rounded-lg" : "flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md"} hover:bg-gray-50 dark:hover:bg-neutral-800 ${
                                 selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
                               } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
                             >
@@ -4911,18 +5146,41 @@ const setScreen = () => {
                                 onClick={(e) => e.stopPropagation()}
                                 onChange={() => toggleFileSelected(file.path)}
                                 title="Select for bulk move"
-                                className={`shrink-0 accent-blue-500 transition-opacity ${
+                                className={`shrink-0 accent-blue-500 transition-opacity ${isGridView ? "absolute top-2 left-2 z-10" : ""} ${
                                   selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
                                 }`}
                               />
-                              <SidebarFileIcon
-                                name={file.name}
-                                path={file.path}
-                                isImage={getFileCategory(file.name) === "image"}
-                                resolveThumbnailUrl={resolveImageThumbnailUrl}
-                                fallbackIcon={categoryIcon(getFileCategory(file.name))}
-                                fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
-                              />
+                              {isGridView ? (
+                                // Same tap-to-open / drag-to-timeline gesture as the filename in list view.
+                                <div
+                                  className="w-full"
+                                  title={file.name}
+                                  onPointerDown={handleSidebarFilePointerDown(file)}
+                                  onPointerMove={handleSidebarFilePointerMove}
+                                  onPointerUp={handleSidebarFilePointerUp(file)}
+                                >
+                                  <SidebarFileIcon
+                                    large
+                                    name={file.name}
+                                    path={file.path}
+                                    isImage={["image", "video"].includes(getFileCategory(file.name) ?? "")}
+                                    resolveThumbnailUrl={getFileCategory(file.name) === "video" ? resolveVideoThumbnailUrl : resolveImageThumbnailUrl}
+                                    fallbackIcon={categoryIcon(getFileCategory(file.name))}
+                                    fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
+                                  />
+                                </div>
+                              ) : (
+                                <SidebarFileIcon
+                                  name={file.name}
+                                  path={file.path}
+                                  isImage={getFileCategory(file.name) === "image"}
+                                  resolveThumbnailUrl={resolveImageThumbnailUrl}
+                                  fallbackIcon={categoryIcon(getFileCategory(file.name))}
+                                  fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
+                                />
+                              )}
+                              {/* Name + badges: one row under the tile in grid view, plain siblings of the row in list view. */}
+                              <div className={isGridView ? "flex items-center gap-1 min-w-0 px-0.5 text-xs" : "contents"}>
                               {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
                               {renamingFile === file.path && !renameInGallery ? (
                                 <InlineRenameInput
@@ -4961,6 +5219,17 @@ const setScreen = () => {
                                 />
                               )}
 
+                              </div>
+                              {/* Add + menu: floating over the tile's corner in grid view (on hover, or while a menu is open). */}
+                              <div
+                                className={
+                                  isGridView
+                                    ? `absolute top-2 right-2 z-10 flex items-center gap-0.5 rounded-md bg-white/90 dark:bg-neutral-900/85 shadow-sm transition-opacity ${
+                                      openMenu === file.path || addMenuFor === file.path ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                                    }`
+                                    : "contents"
+                                }
+                              >
                               {/* Add to the video being edited: insert, append, or show on the picture. */}
                               {editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "") && file.path !== selectedFile?.sourcePath && (
                                 <div className="relative">
@@ -5257,6 +5526,7 @@ const setScreen = () => {
                                   </>
                                 )}
                               </div>
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -5278,6 +5548,34 @@ const setScreen = () => {
             />
           )}
 
+          {folderMoveMenu && (
+            <>
+              <div className="fixed inset-0 z-40" onPointerDown={() => setFolderMoveMenu(null)} />
+              <div
+                style={{ left: Math.max(8, Math.min(folderMoveMenu.anchor.left - 180, window.innerWidth - 248)), top: Math.min(folderMoveMenu.anchor.top, window.innerHeight - 300) }}
+                className="fixed z-50 w-60 max-h-72 overflow-y-auto rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 py-1 text-sm text-neutral-700 dark:text-neutral-200"
+              >
+                <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-neutral-500 truncate">
+                  Move "{folderDisplayName(folderMoveMenu.folder)}" to
+                </div>
+                {Object.keys(files)
+                  .sort((a, b) => a.localeCompare(b))
+                  .filter((dest) => canMoveFolder(folderMoveMenu.folder, dest) && !(movedFolderKey(folderMoveMenu.folder, dest) in files))
+                  .map((dest) => (
+                    <button
+                      key={dest || "__root"}
+                      type="button"
+                      onClick={() => void handleMoveFolder(folderMoveMenu.folder, dest)}
+                      className="w-full flex items-center gap-2 pr-3 py-1.5 text-left hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                      style={{ paddingLeft: 12 + folderDepth(dest) * 12 }}
+                    >
+                      <IoFolderOutline size={14} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                      <span className="truncate">{dest === "" ? "Briefcast (top level)" : folderDisplayName(dest)}</span>
+                    </button>
+                  ))}
+              </div>
+            </>
+          )}
           {transferMenu && (
             <MoveCopyMenu files={transferMenu.files} options={fileTransferOptions} anchor={transferMenu.anchor} onClose={() => setTransferMenu(null)} />
           )}
@@ -5372,6 +5670,21 @@ const setScreen = () => {
               >
                 <IoChevronBack size={14} />
                 Back to {folderDisplayName(selectedFolder)}
+              </button>
+            </div>
+          )}
+
+          {/* Folder gallery on screen after leaving something open: one click back to it. */}
+          {selectedFolder !== null && !selectedFile && !boardScreen && !docsScreen && !whiteboardScreen && !videoEditorScreen && returnPoint && (
+            <div className="shrink-0 px-3 pt-3">
+              <button
+                type="button"
+                onClick={returnPoint.restore}
+                title={`Go back to ${returnPoint.label}`}
+                className="flex items-center gap-1 pl-2 pr-3 py-1 rounded-full bg-white/90 dark:bg-neutral-900/90 border border-gray-200 dark:border-neutral-800 text-xs font-medium text-gray-700 dark:text-neutral-200 hover:border-blue-400 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 shadow-sm transition-colors"
+              >
+                <IoArrowUndoOutline size={13} />
+                Back to {returnPoint.label}
               </button>
             </div>
           )}

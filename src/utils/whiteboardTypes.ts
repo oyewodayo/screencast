@@ -587,6 +587,9 @@ interface WhiteboardItemBase {
   id: string;
   createdAt: number;
   updatedAt: number;
+  // Explicit layer rank across both nodes and edges on a page (higher = further in front). Absent -
+  // falls back to array order (nodes in page.nodes order, then edges in page.edges order).
+  zIndex?: number;
 }
 
 // Geometry is a plain axis-aligned x/y/width/height box - `rotation` (below) is purely a rendering
@@ -660,6 +663,11 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // "contain" fits the whole picture inside it (fillColor shows in the margin), "fill" stretches.
   // Absent - "cover".
   fillImageFit?: "cover" | "contain" | "fill";
+  // "image" only - horizontal/vertical pan offset as a fraction of the shape's box (0,0 = centered)
+  // and zoom multiplier (1 = default fit size), adjusted by dragging the image in the style panel.
+  fillImageOffsetX?: number;
+  fillImageOffsetY?: number;
+  fillImageScale?: number;
   // A line/dot pattern drawn OVER the fill (whatever its type), clipped to the shape - graph-paper
   // grids, ruled lines, hatching. Independent of the fill so a gradient or photo can carry a grid
   // too. Absent/"none" - no pattern.
@@ -1162,10 +1170,41 @@ export interface WhiteboardEdge extends WhiteboardItemBase {
   kind: "edge";
   source: WhiteboardEndpoint;
   target: WhiteboardEndpoint;
+  // Same meaning as WhiteboardNode.groupId - a connector grouped with shapes selects, moves and
+  // flips together with them. Absent = not in a group.
+  groupId?: string;
   label: string;
   strokeColor: string;
   strokeWidth: number;
   strokeStyle: "solid" | "dashed" | "dotted";
+  // Line cap for solid/dashed strokes ("dotted" always uses round caps for dot rendering).
+  strokeCap?: "butt" | "round" | "square";
+  // Stroke opacity (0-1). Absent - resolves to 1 (solid).
+  strokeOpacity?: number;
+  // Overall edge opacity (0-1), affecting stroke, arrowheads, and label. Absent - resolves to 1.
+  opacity?: number;
+  // Prevents this edge from being moved, reattached, nudged, or having its waypoints edited until
+  // unlocked again - same pin semantics as WhiteboardNode.locked.
+  locked?: boolean;
+  // Rounds the bends of orthogonal routes or manual waypoint polylines (0/absent = sharp corners).
+  cornerRadius?: number;
+  // Drop-shadow properties - same fields and defaults as WhiteboardNode's shadow.
+  shadowEnabled?: boolean;
+  shadowColor?: string;
+  shadowOpacity?: number;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  // Optional label styling overrides.
+  labelFontSize?: number;
+  labelColor?: string;
+  labelBold?: boolean;
+  labelItalic?: boolean;
+  // Position of the label along the connector path (0 = source, 0.5 = midpoint, 1 = target).
+  labelPosition?: number;
+  // Whether to draw a contrasting halo/pill behind the label text (default true).
+  labelShowBackground?: boolean;
+  labelBackgroundColor?: string;
   // "straight" draws one segment source->target; "orthogonal" (draw.io's default connector style)
   // routes it as one or two right-angle bends; "curved" is a smooth cubic-bezier route that still
   // leaves/arrives perpendicular to whichever side it's anchored on, just without the hard corners
@@ -1215,16 +1254,29 @@ export type WhiteboardCommand =
   | { type: "add-edge"; item: WhiteboardEdge }
   | { type: "delete-edge"; item: WhiteboardEdge }
   | { type: "edit-edge"; before: WhiteboardEdge; after: WhiteboardEdge }
+  | { type: "batch-edit-edges"; before: WhiteboardEdge[]; after: WhiteboardEdge[] }
   // Full replacement order for the whole nodes array - z-order (last = topmost), same convention
   // as boardTypes.ts's own 'reorder'. Used by "Bring to front" / "Send to back".
   | { type: "reorder-nodes"; before: WhiteboardNode[]; after: WhiteboardNode[] }
+  // Unified z-order reorder across both nodes and edges ("Bring to front", "Bring forward",
+  // "Send backward", "Send to back").
+  | {
+      type: "reorder-items";
+      beforeNodes: WhiteboardNode[];
+      afterNodes: WhiteboardNode[];
+      beforeEdges: WhiteboardEdge[];
+      afterEdges: WhiteboardEdge[];
+    }
   // Clipboard paste - any number of nodes AND edges added together as ONE undo step (a multi-node
   // copy/paste, including whatever connectors ran between the copied nodes). Deliberately a
   // standalone pair with "delete-items" as its exact mirror (see invertCommand) rather than reusing
   // "delete-node"'s own node+edges shape the way undoDeleteNode does - that one is scoped to
   // exactly one node's own cascade-deleted edges, not an arbitrary set of both.
   | { type: "paste-items"; nodes: WhiteboardNode[]; edges: WhiteboardEdge[] }
-  | { type: "delete-items"; nodes: WhiteboardNode[]; edges: WhiteboardEdge[] };
+  | { type: "delete-items"; nodes: WhiteboardNode[]; edges: WhiteboardEdge[] }
+  // Nodes AND edges replaced together as ONE undo step - group/ungroup, dragging or flipping a
+  // selection that mixes shapes with connectors.
+  | { type: "batch-edit-items"; beforeNodes: WhiteboardNode[]; afterNodes: WhiteboardNode[]; beforeEdges: WhiteboardEdge[]; afterEdges: WhiteboardEdge[] };
 
 // One page's worth of diagram content - see this file's own top comment for why a whiteboard is a
 // set of these rather than one flat nodes/edges pair.
@@ -1635,7 +1687,7 @@ const FREEHAND_MIN_SIZE = 8;
 // Builds a freehand node from a raw drag gesture's collected document-space points - computes the
 // stroke's own bounding box for the node's x/y/width/height, then re-expresses every point as a
 // 0-1 fraction of that box (see WhiteboardNode.points's own doc comment for why).
-export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number; y: number }[]): WhiteboardNode {
+export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number; y: number }[], style?: { color?: string; width?: number }): WhiteboardNode {
   const now = Date.now();
   const xs = rawPoints.map((p) => p.x);
   const ys = rawPoints.map((p) => p.y);
@@ -1653,8 +1705,8 @@ export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number;
     height,
     text: "",
     fillColor: null,
-    strokeColor: "#111111",
-    strokeWidth: 2.5,
+    strokeColor: style?.color ?? "#111111",
+    strokeWidth: style?.width ?? 2.5,
     cornerRadius: 0,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,

@@ -30,6 +30,7 @@ import useCanvasWheel from "../../hooks/useCanvasWheel";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
 import WhiteboardTable from "./WhiteboardTable";
 import { FillPaint, nodeFillPaint, PaintedShape } from "./NodeFillPaint";
+import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
 import {
   ArrowheadType,
   CHART_ANNOTATION_SHAPES,
@@ -61,6 +62,7 @@ import {
   DEFAULT_AMP_OUTPUT_LEAD_LENGTH,
   DEFAULT_CURVE_BOW,
   edgeBoundingBox,
+  edgePointAtFraction,
   fillImageSrc,
   hexToRgba,
   imageDestRect,
@@ -75,6 +77,7 @@ import {
   resolveAnchorPoint,
   resolveBoxCornerRadii,
   resolveEdgeEndpoints,
+  resolvePageLayerOrder,
   roundedRectSvgD,
   SERIES_FILL_OPACITY,
   shapeOutlineFor,
@@ -471,16 +474,25 @@ function edgeWorldPoint(node: WhiteboardNode, edge: "w" | "e"): { x: number; y: 
   return { x: center.x + world.x, y: center.y + world.y };
 }
 
-// Given a set of already-selected node ids, adds every OTHER node sharing a groupId with one of
-// them - a group is meant to act as one unit once formed (see WhiteboardNode.groupId's own doc
-// comment), so any selection that catches part of a group (a marquee that only overlaps some of
+// Given already-selected node and edge ids, adds every OTHER node AND edge sharing a groupId with
+// one of them - a group is meant to act as one unit once formed (see WhiteboardNode.groupId's own
+// doc comment), so any selection that catches part of a group (a marquee that only overlaps some of
 // its members, e.g.) gets topped up to the whole group rather than leaving it half-selected.
-function expandGroupSelection(ids: Set<string>, nodes: WhiteboardNode[]): Set<string> {
-  const groupIds = new Set(nodes.filter((n) => n.groupId && ids.has(n.id)).map((n) => n.groupId!));
-  if (groupIds.size === 0) return ids;
-  const expanded = new Set(ids);
-  for (const n of nodes) if (n.groupId && groupIds.has(n.groupId)) expanded.add(n.id);
-  return expanded;
+function expandGroupSelection(
+  nodeIds: Set<string>,
+  edgeIds: Set<string>,
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[]
+): { nodeIds: Set<string>; edgeIds: Set<string> } {
+  const groupIds = new Set<string>();
+  for (const n of nodes) if (n.groupId && nodeIds.has(n.id)) groupIds.add(n.groupId);
+  for (const e of edges) if (e.groupId && edgeIds.has(e.id)) groupIds.add(e.groupId);
+  if (groupIds.size === 0) return { nodeIds, edgeIds };
+  const nextNodes = new Set(nodeIds);
+  const nextEdges = new Set(edgeIds);
+  for (const n of nodes) if (n.groupId && groupIds.has(n.groupId)) nextNodes.add(n.id);
+  for (const e of edges) if (e.groupId && groupIds.has(e.groupId)) nextEdges.add(e.id);
+  return { nodeIds: nextNodes, edgeIds: nextEdges };
 }
 
 const ANCHOR_SIDES: Exclude<WhiteboardAnchorSide, "auto">[] = ["top", "right", "bottom", "left"];
@@ -504,6 +516,9 @@ type Interaction =
       startClientX: number;
       startClientY: number;
       startNodes: WhiteboardNode[];
+      // Selected connectors (grouped with these nodes, or just selected alongside them) riding
+      // along by the same dx/dy - see nudgeEdgeBy for which of their points actually move.
+      startEdges: WhiteboardEdge[];
       // The actually-clicked node (always a member of startNodes) - what snapping (see
       // isSnapEnabled) measures against when several nodes move together as a group, so the WHOLE
       // group's relative layout is preserved (one shared dx/dy) while still landing the node the
@@ -688,6 +703,8 @@ interface WhiteboardCanvasProps {
   onAddNodeWithEdge: (node: WhiteboardNode, edge: WhiteboardEdge) => void;
   onEditNode: (before: WhiteboardNode, after: WhiteboardNode) => void;
   onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
+  // Shapes and connectors edited together as one undo step - dragging/nudging a mixed selection.
+  onBatchEditItems: (beforeNodes: WhiteboardNode[], afterNodes: WhiteboardNode[], beforeEdges: WhiteboardEdge[], afterEdges: WhiteboardEdge[]) => void;
   onDeleteNode: (node: WhiteboardNode) => void;
   onAddEdge: (edge: WhiteboardEdge) => void;
   onEditEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
@@ -697,6 +714,9 @@ interface WhiteboardCanvasProps {
   // "freehand": the pen tool stays armed across strokes (see handlePointerUp's freehand branch) so
   // sketching several strokes in a row doesn't need re-clicking the tool each time.
   armedShapeType: WhiteboardShapeType | null;
+  // Ink color/width the pen tool draws new strokes with (the toolbar's pen popover owns them).
+  penColor?: string;
+  penWidth?: number;
   onShapePlaced: () => void;
   // The edge-drawing tool's own armed state, kept separate from armedShapeType so a shape and the
   // connector tool can never both be "in progress" at once - see WhiteboardEditor's toolbar. Unlike
@@ -732,6 +752,7 @@ interface WhiteboardCanvasProps {
   // angle popover, the amplifier lead handles) don't need this prop at all - they already read
   // `liveNodes`/`interactionRef` directly during render.
   onLiveNodesChange?: (nodes: WhiteboardNode[] | null) => void;
+  onLiveEdgesChange?: (edges: WhiteboardEdge[] | null) => void;
   // A "table" node's own currently-selected cell/row/column range (or null) - see
   // WhiteboardTable.tsx's own onRangeChange prop doc comment for why this needs to reach
   // WhiteboardStylePanel.tsx (its "Cell" background/border-style controls). Fired with the owning
@@ -763,6 +784,7 @@ interface WhiteboardCanvasProps {
   // 3D mesh rebuild) on every pixel of travel - see LiveRangeSlider's own doc comment in
   // WhiteboardStylePanel.tsx for the incident that established this.
   previewNodes?: WhiteboardNode[] | null;
+  previewEdges?: WhiteboardEdge[] | null;
 }
 
 function clampZoom(z: number): number {
@@ -868,11 +890,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onAddNodeWithEdge,
   onEditNode,
   onBatchEditNodes,
+  onBatchEditItems,
   onDeleteNode,
   onAddEdge,
   onEditEdge,
   onDeleteEdge,
   armedShapeType,
+  penColor = "#111111",
+  penWidth = 2.5,
   onShapePlaced,
   connectorArmed,
   armedConnectorOverrides,
@@ -880,12 +905,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onQuickConnectArrowClick,
   onItemContextMenu,
   onLiveNodesChange,
+  onLiveEdgesChange,
   onTableRangeChange,
   imageSrcFor,
   onImageDrop,
   croppingNodeId,
   setCroppingNodeId,
   previewNodes,
+  previewEdges,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -904,6 +931,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // far - keeps the drag preview showing the SAME direction the committed edge will actually get,
   // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
   const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
+  const penStyleRef = useRef({ color: penColor, width: penWidth });
+  penStyleRef.current = { color: penColor, width: penWidth };
   const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
   // The laser pointer's trail - each point stamped with when it was recorded (performance.now(),
   // ms) so rendering can age it out smoothly. Never touches the document/undo stack - see
@@ -925,6 +954,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // pattern liveNodes uses for node drags, so a drag becomes one undo step instead of one per
   // pointermove tick.
   const [liveEdges, setLiveEdges] = useState<WhiteboardEdge[] | null>(null);
+  useEffect(() => {
+    onLiveEdgesChange?.(liveEdges);
+  }, [liveEdges, onLiveEdgesChange]);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
@@ -949,9 +981,27 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     const byId = new Map(previewNodes.map((n) => [n.id, n]));
     return page.nodes.map((n) => byId.get(n.id) ?? n);
   }, [previewNodes, page.nodes]);
+  const previewedEdges = useMemo(() => {
+    if (!previewEdges) return null;
+    const byId = new Map(previewEdges.map((ed) => [ed.id, ed]));
+    return page.edges.map((ed) => byId.get(ed.id) ?? ed);
+  }, [previewEdges, page.edges]);
   const nodes = liveNodes ?? previewedNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
-  const edges = liveEdges ?? page.edges;
+  const edges = liveEdges ?? previewedEdges ?? page.edges;
+  const layerOrder = useMemo(() => resolvePageLayerOrder({ nodes, edges }), [nodes, edges]);
+
+  const [, setFillImageTick] = useState(0);
+  useEffect(() => {
+    for (const n of nodes) {
+      const src = fillImageSrc(n, imageSrcFor);
+      if (src && !getCachedWhiteboardImage(src)) {
+        preloadWhiteboardImage(src)
+          .then(() => setFillImageTick((t) => t + 1))
+          .catch(() => {});
+      }
+    }
+  }, [nodes, imageSrcFor]);
 
   const clientToDoc = useCallback(
     (clientX: number, clientY: number): { x: number; y: number } => {
@@ -1071,18 +1121,16 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const step = e.shiftKey ? 10 : 1;
         const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
         const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
-        if (selectedNodeIds.size > 0) {
-          const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id) && !n.locked);
-          if (selected.length > 0) {
-            const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
-            if (after.length === 1) onEditNode(selected[0], after[0]);
-            else onBatchEditNodes(selected, after);
-          }
-        }
-        for (const id of selectedEdgeIds) {
-          const edge = page.edges.find((ed) => ed.id === id);
-          if (edge) onEditEdge(edge, nudgeEdgeBy(edge, dx, dy));
-        }
+        const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id) && !n.locked);
+        const selectedEdges = page.edges.filter((ed) => selectedEdgeIds.has(ed.id) && !ed.locked);
+        const after = selected.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+        const afterEdges = selectedEdges.map((ed) => nudgeEdgeBy(ed, dx, dy));
+        // One undo step however the selection mixes shapes and connectors.
+        if (selected.length > 0 && selectedEdges.length > 0) onBatchEditItems(selected, after, selectedEdges, afterEdges);
+        else if (selected.length === 1) onEditNode(selected[0], after[0]);
+        else if (selected.length > 1) onBatchEditNodes(selected, after);
+        else if (selectedEdges.length === 1) onEditEdge(selectedEdges[0], afterEdges[0]);
+        else if (selectedEdges.length > 1) onBatchEditItems([], [], selectedEdges, afterEdges);
       } else if (e.key === "Escape") {
         interactionRef.current = null;
         setConnectorPreview(null);
@@ -1095,7 +1143,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onEditEdge]);
+  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onBatchEditItems, onEditEdge]);
 
   // ---- Node move / resize ----------------------------------------------------------------------
   const beginMoveNode = useCallback(
@@ -1105,23 +1153,32 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // moving it below already relies on - clicking (or shift-clicking) just one member would
       // otherwise leave the group only partly selected, which then only partly drags.
       const clickedGroup = node.groupId ? page.nodes.filter((n) => n.groupId === node.groupId).map((n) => n.id) : [node.id];
+      const clickedGroupEdges = node.groupId ? page.edges.filter((ed) => ed.groupId === node.groupId).map((ed) => ed.id) : [];
       let nextSelected = selectedNodeIds;
+      let nextEdges = selectedEdgeIds;
       if (additive) {
         nextSelected = new Set(selectedNodeIds);
+        nextEdges = new Set(selectedEdgeIds);
         const alreadyIn = clickedGroup.some((id) => nextSelected.has(id));
         for (const id of clickedGroup) {
           if (alreadyIn) nextSelected.delete(id);
           else nextSelected.add(id);
         }
+        for (const id of clickedGroupEdges) {
+          if (alreadyIn) nextEdges.delete(id);
+          else nextEdges.add(id);
+        }
       } else if (!selectedNodeIds.has(node.id)) {
         nextSelected = new Set(clickedGroup);
+        nextEdges = new Set(clickedGroupEdges);
       }
-      onSelectionChange(nextSelected, additive ? selectedEdgeIds : new Set());
+      onSelectionChange(nextSelected, nextEdges);
       // Locked (see WhiteboardNode.locked's own doc comment) still selects normally - just doesn't
       // stage a "move" drag - so a locked node stays reachable to unlock again via the style panel
       // even though clicking-and-dragging its body no longer does anything.
       if (node.locked) return;
-      const ids = nextSelected.has(node.id) ? Array.from(nextSelected) : [node.id];
+      const inSelection = nextSelected.has(node.id);
+      const ids = inSelection ? Array.from(nextSelected) : [node.id];
       lastDragClientRef.current = null;
       interactionRef.current = {
         mode: "move",
@@ -1129,11 +1186,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         startClientX: e.clientX,
         startClientY: e.clientY,
         startNodes: page.nodes.filter((n) => ids.includes(n.id)),
+        startEdges: inSelection ? page.edges.filter((ed) => nextEdges.has(ed.id) && !ed.locked) : [],
         anchorId: node.id,
       };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
-    [selectedNodeIds, selectedEdgeIds, onSelectionChange, page.nodes]
+    [selectedNodeIds, selectedEdgeIds, onSelectionChange, page.nodes, page.edges]
   );
 
   const beginResizeNode = useCallback(
@@ -1343,6 +1401,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
 
   const beginConnectorReattach = useCallback(
     (edge: WhiteboardEdge, end: "source" | "target", e: React.PointerEvent) => {
+      if (edge.locked) return;
       e.stopPropagation();
       onSelectionChange(new Set(), new Set([edge.id]));
       const fixed = end === "source" ? edge.target : edge.source;
@@ -1365,6 +1424,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // when the edge is selected).
   const beginWaypointDrag = useCallback(
     (edge: WhiteboardEdge, index: number, e: React.PointerEvent) => {
+      if (edge.locked) return;
       e.stopPropagation();
       onSelectionChange(new Set(), new Set([edge.id]));
       const startWaypoints = [...(edge.waypoints ?? [])];
@@ -1389,6 +1449,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // every click, single or double), so "grab the line" and "add a point" can no longer race.
   const insertWaypointAtDoubleClick = useCallback(
     (edge: WhiteboardEdge, source: { x: number; y: number }, target: { x: number; y: number }, waypoints: { x: number; y: number }[], e: React.MouseEvent) => {
+      if (edge.locked) return;
       e.stopPropagation();
       const point = clientToDoc(e.clientX, e.clientY);
       const insertAt = nearestSegmentInsertIndex(point, source, target, waypoints);
@@ -1404,6 +1465,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // to dragging one of the midpoint handles to ADD one.
   const removeWaypoint = useCallback(
     (edge: WhiteboardEdge, index: number, e: React.MouseEvent) => {
+      if (edge.locked) return;
       e.stopPropagation();
       const next = (edge.waypoints ?? []).filter((_, i) => i !== index);
       onEditEdge(edge, { ...edge, waypoints: next });
@@ -1420,11 +1482,40 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   const beginMoveEdge = useCallback(
     (edge: WhiteboardEdge, e: React.PointerEvent) => {
       e.stopPropagation();
-      onSelectionChange(new Set(), new Set([edge.id]));
+      // A connector grouped with shapes grabs the WHOLE group - selects every member and drags
+      // them together, exactly as grabbing one of the group's shapes does.
+      const groupNodes = edge.groupId ? page.nodes.filter((n) => n.groupId === edge.groupId) : [];
+      if (groupNodes.length > 0 && !e.shiftKey) {
+        const groupEdges = page.edges.filter((ed) => ed.groupId === edge.groupId);
+        onSelectionChange(new Set(groupNodes.map((n) => n.id)), new Set(groupEdges.map((ed) => ed.id)));
+        const movable = groupNodes.filter((n) => !n.locked);
+        if (edge.locked || movable.length === 0) return;
+        lastDragClientRef.current = null;
+        interactionRef.current = {
+          mode: "move",
+          ids: movable.map((n) => n.id),
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          startNodes: movable,
+          startEdges: groupEdges.filter((ed) => !ed.locked),
+          anchorId: movable[0].id,
+        };
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+        return;
+      }
+      if (e.shiftKey) {
+        const nextEdges = new Set(selectedEdgeIds);
+        if (nextEdges.has(edge.id)) nextEdges.delete(edge.id);
+        else nextEdges.add(edge.id);
+        onSelectionChange(selectedNodeIds, nextEdges);
+      } else if (!selectedEdgeIds.has(edge.id)) {
+        onSelectionChange(new Set(), new Set([edge.id]));
+      }
+      if (edge.locked) return;
       interactionRef.current = { mode: "moveEdge", id: edge.id, startClientX: e.clientX, startClientY: e.clientY, startEdge: edge };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
-    [onSelectionChange]
+    [onSelectionChange, selectedEdgeIds, selectedNodeIds, page.nodes, page.edges]
   );
 
   // How far (doc units) a hover-arrow-placed shape lands from the node it was placed off of - see
@@ -1545,6 +1636,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
         const movedById = new Map(interaction.startNodes.map((n) => [n.id, { ...n, x: n.x + dx, y: n.y + dy }]));
         setLiveNodes(page.nodes.map((n) => movedById.get(n.id) ?? n));
+        if (interaction.startEdges.length > 0) {
+          const movedEdges = new Map(interaction.startEdges.map((ed) => [ed.id, nudgeEdgeBy(ed, dx, dy)]));
+          setLiveEdges(page.edges.map((ed) => movedEdges.get(ed.id) ?? ed));
+        }
         return;
       }
 
@@ -1844,11 +1939,24 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           interaction.lastPathClientX = e.clientX;
           interaction.lastPathClientY = e.clientY;
         }
-        // Snap the dragged endpoint to whichever node the pointer is currently over (excluding the
-        // fixed endpoint's own node, so a self-loop back onto the same shape isn't offered).
-        const target = nodes.find(
-          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
-        );
+        // Only a connector that started anchored to a node (dragged out from a shape's connection
+        // dot) snaps its dragged end onto another node's perimeter; a free-floating line drawn with
+        // the Arrows/Line toolbar tool (or reattaching one of its free endpoints) stays at the
+        // exact document point the user drags to, so lines can be drawn directly across or inside
+        // large background shapes (e.g. markings on a football pitch).
+        const target = interaction.fixed.nodeId
+          ? [...nodes]
+              .reverse()
+              .find(
+                (n) =>
+                  n.id !== interaction.fixed.nodeId &&
+                  isConnectableShape(n.shapeType) &&
+                  cur.x >= n.x &&
+                  cur.x <= n.x + n.width &&
+                  cur.y >= n.y &&
+                  cur.y <= n.y + n.height
+              )
+          : undefined;
         setConnectorHoverNodeId(target?.id ?? null);
         const fixedPoint = interaction.fixed.nodeId ? nodeCenter(nodesById.get(interaction.fixed.nodeId)!) : { x: interaction.fixed.x ?? 0, y: interaction.fixed.y ?? 0 };
         // A free-floating endpoint (not hovering a node) snaps to the lattice; one landing ON a
@@ -1881,9 +1989,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       if (interaction.mode === "move" && liveNodes) {
         const idSet = new Set(interaction.ids);
         const after = liveNodes.filter((n) => idSet.has(n.id));
-        if (after.length === 1) onEditNode(interaction.startNodes[0], after[0]);
+        if (interaction.startEdges.length > 0 && liveEdges) {
+          const edgeIdSet = new Set(interaction.startEdges.map((ed) => ed.id));
+          onBatchEditItems(interaction.startNodes, after, interaction.startEdges, liveEdges.filter((ed) => edgeIdSet.has(ed.id)));
+        } else if (after.length === 1) onEditNode(interaction.startNodes[0], after[0]);
         else onBatchEditNodes(interaction.startNodes, after);
         setLiveNodes(null);
+        setLiveEdges(null);
       } else if (interaction.mode === "resize" && liveNodes) {
         const after = liveNodes.find((n) => n.id === interaction.id);
         if (after) onEditNode(interaction.startNode, after);
@@ -1934,7 +2046,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             const box = edgeBoundingBox(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, edge.waypoints ?? []);
             return box.x < marqueeRect.x + marqueeRect.width && box.x + box.width > marqueeRect.x && box.y < marqueeRect.y + marqueeRect.height && box.y + box.height > marqueeRect.y;
           });
-          onSelectionChange(expandGroupSelection(new Set(enclosed.map((n) => n.id)), page.nodes), new Set(enclosedEdges.map((edge) => edge.id)));
+          const expanded = expandGroupSelection(new Set(enclosed.map((n) => n.id)), new Set(enclosedEdges.map((edge) => edge.id)), page.nodes, page.edges);
+          onSelectionChange(expanded.nodeIds, expanded.edgeIds);
         } else {
           onSelectionChange(new Set(), new Set());
         }
@@ -1946,7 +2059,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // A tap with (almost) no movement isn't a meaningful stroke - drop it rather than saving a
         // near-invisible dot, same "don't save a no-op gesture" spirit as marquee's width>2 check.
         if (points.length >= 2) {
-          const node = createFreehandWhiteboardNode(crypto.randomUUID(), points);
+          const node = createFreehandWhiteboardNode(crypto.randomUUID(), points, { color: penStyleRef.current.color, width: penStyleRef.current.width });
           onAddNode(node);
           onSelectionChange(new Set([node.id]), new Set());
         }
@@ -1955,9 +2068,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // sketching several strokes in a row doesn't need re-arming the tool each time.
       } else if (interaction.mode === "connector") {
         const cur = clientToDoc(e.clientX, e.clientY);
-        const droppedOnNode = nodes.find(
-          (n) => n.id !== interaction.fixed.nodeId && isConnectableShape(n.shapeType) && cur.x >= n.x && cur.x <= n.x + n.width && cur.y >= n.y && cur.y <= n.y + n.height
-        );
+        const droppedOnNode = interaction.fixed.nodeId
+          ? [...nodes]
+              .reverse()
+              .find(
+                (n) =>
+                  n.id !== interaction.fixed.nodeId &&
+                  isConnectableShape(n.shapeType) &&
+                  cur.x >= n.x &&
+                  cur.x <= n.x + n.width &&
+                  cur.y >= n.y &&
+                  cur.y <= n.y + n.height
+              )
+          : undefined;
         const freePoint = snapEnabled ? snapPoint(cur) : cur;
         const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: freePoint.x, y: freePoint.y };
 
@@ -2022,7 +2145,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setLiveEdges(null);
       }
     },
-    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
+    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onBatchEditItems, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
@@ -2143,17 +2266,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     const combos = new Map<string, { type: Exclude<ArrowheadType, "none">; color: string }>();
     if (previewEdgeStyle.startArrowType !== "none") combos.set(markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.startArrowType, color: previewEdgeStyle.strokeColor });
     if (previewEdgeStyle.endArrowType !== "none") combos.set(markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor), { type: previewEdgeStyle.endArrowType, color: previewEdgeStyle.strokeColor });
-    for (const edge of page.edges) {
+    for (const edge of edges) {
       if (edge.startArrowType !== "none") combos.set(markerId(edge.startArrowType, edge.strokeColor), { type: edge.startArrowType, color: edge.strokeColor });
       if (edge.endArrowType !== "none") combos.set(markerId(edge.endArrowType, edge.strokeColor), { type: edge.endArrowType, color: edge.strokeColor });
     }
-    for (const node of page.nodes) {
+    for (const node of nodes) {
       if (node.shapeType !== "freehand" && node.shapeType !== "vector") continue;
       if (node.startArrowType && node.startArrowType !== "none") combos.set(markerId(node.startArrowType, node.strokeColor), { type: node.startArrowType, color: node.strokeColor });
       if (node.endArrowType && node.endArrowType !== "none") combos.set(markerId(node.endArrowType, node.strokeColor), { type: node.endArrowType, color: node.strokeColor });
     }
     return Array.from(combos.values());
-  }, [page.edges, page.nodes, previewEdgeStyle]);
+  }, [edges, nodes, previewEdgeStyle]);
 
   // Raw doc-space dash pattern for a COMMITTED edge's own rendered path - deliberately NOT divided
   // by zoom (unlike the UI-chrome elements below: hit-test stroke, selection halo, resize/
@@ -2206,113 +2329,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }}
     >
       <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
-        {/* Edges layer - one SVG so paths can overlap nodes correctly (drawn before nodes = behind
-            them, matching draw.io's own connector-under-shape stacking). overflow visible since
-            the svg itself has no intrinsic size; each path uses absolute doc-space coordinates. */}
-        <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
-          <defs>
-            {markerCombos.map(({ type, color }) => (
-              <marker key={markerId(type, color)} id={markerId(type, color)} markerWidth="10" markerHeight="10" refX={MARKER_REF[type]} refY="5" orient="auto" markerUnits="userSpaceOnUse">
-                {markerContentFor(type, color)}
-              </marker>
-            ))}
-          </defs>
-          {edges.map((edge) => {
-            const { source, target } = resolveEdgeEndpoints(edge, nodesById);
-            const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
-            const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints);
-            const selected = selectedEdgeIds.has(edge.id);
-            return (
-              <g key={edge.id}>
-                <path
-                  d={d}
-                  fill="none"
-                  stroke="transparent"
-                  strokeWidth={HIT_STROKE_SCREEN_WIDTH / zoom}
-                  style={{ pointerEvents: "stroke", cursor: "grab" }}
-                  onPointerDown={(e) => {
-                    // Same "let an armed tool's click through to the container" reasoning as the
-                    // node div's own onPointerDown guard above - an edge's fat invisible hit-stroke
-                    // is an easy, easy-to-hit-by-accident target for a click that was meant to
-                    // place a new shape/text/stroke on top of it. laserArmed additionally means
-                    // "just pointing, not editing" - clicks should do nothing at all while it's on.
-                    if (armedShapeType || laserArmed) return;
-                    // beginMoveEdge both selects this edge AND stages a "moveEdge" drag - a plain
-                    // click (no real movement before pointerup) still ends up just selecting it, the
-                    // same way a node's own beginMoveNode covers both click-to-select and drag-to-
-                    // move with one gesture instead of two different handlers.
-                    beginMoveEdge(edge, e);
-                  }}
-                  onDoubleClick={(e) => insertWaypointAtDoubleClick(edge, source, target, waypoints, e)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const nextEdgeIds = selectedEdgeIds.has(edge.id) ? selectedEdgeIds : new Set([edge.id]);
-                    const nextNodeIds = selectedEdgeIds.has(edge.id) ? selectedNodeIds : new Set<string>();
-                    onSelectionChange(nextNodeIds, nextEdgeIds);
-                    onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
-                  }}
-                />
-                {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={edge.strokeWidth + 5} strokeLinecap="round" opacity={0.35} />}
-                <path
-                  d={d}
-                  fill="none"
-                  stroke={edge.strokeColor}
-                  strokeWidth={edge.strokeWidth}
-                  strokeDasharray={dashArrayFor(edge.strokeStyle, edge.strokeWidth)}
-                  strokeLinecap={edge.strokeStyle === "dotted" ? "round" : "butt"}
-                  markerEnd={edge.endArrowType !== "none" ? `url(#${markerId(edge.endArrowType, edge.strokeColor)})` : undefined}
-                  markerStart={edge.startArrowType !== "none" ? `url(#${markerId(edge.startArrowType, edge.strokeColor)})` : undefined}
-                  style={{ pointerEvents: "none" }}
-                />
-                {edge.label && (
-                  <text x={(source.x + target.x) / 2} y={(source.y + target.y) / 2} fontSize={13 / zoom} fill="#374151" textAnchor="middle" style={{ pointerEvents: "none", paintOrder: "stroke" }} stroke="#f7f7f8" strokeWidth={3 / zoom}>
-                    {edge.label}
-                  </text>
-                )}
-                {selected && (
-                  <>
-                    {/* No more "drag from a midpoint dot" affordance for inserting a new bend point
-                        - see insertWaypointAtDoubleClick's own doc comment for why that competed
-                        with dragging the edge's body. Double-click anywhere on the line itself
-                        (the hit-stroke's own onDoubleClick above) does it instead. */}
-                    {waypoints.map((wp, i) => (
-                      <circle
-                        key={`wp-${i}`}
-                        cx={wp.x}
-                        cy={wp.y}
-                        r={5.5 / zoom}
-                        fill="#2563eb"
-                        stroke="#ffffff"
-                        strokeWidth={1.5 / zoom}
-                        style={{ pointerEvents: "auto", cursor: "grab" }}
-                        onPointerDown={(e) => beginWaypointDrag(edge, i, e)}
-                        onDoubleClick={(e) => removeWaypoint(edge, i, e)}
-                      />
-                    ))}
-                    <circle cx={source.x} cy={source.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "source", e)} />
-                    <circle cx={target.x} cy={target.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "target", e)} />
-                  </>
-                )}
-              </g>
-            );
-          })}
-          {connectorPreview && (
-            <path
-              d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow)}
-              fill="none"
-              stroke={previewEdgeStyle.strokeColor}
-              strokeWidth={previewEdgeStyle.strokeWidth / zoom}
-              strokeDasharray={dashArrayFor(previewEdgeStyle.strokeStyle, previewEdgeStyle.strokeWidth) ?? `${6 / zoom},${4 / zoom}`}
-              markerEnd={previewEdgeStyle.endArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor)})` : undefined}
-              markerStart={previewEdgeStyle.startArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor)})` : undefined}
-            />
-          )}
-          {freehandPreview && freehandPreview.length > 1 && (
-            <path d={smoothedPathD(freehandPreview)} fill="none" stroke="#111111" strokeWidth={2.5 / zoom} strokeLinecap="round" strokeLinejoin="round" />
-          )}
-        </svg>
-
         {/* Nodes layer */}
         {nodes.map((node) => {
           const selected = selectedNodeIds.has(node.id);
@@ -2347,6 +2363,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 top: node.y,
                 width: node.width,
                 height: node.height,
+                zIndex: layerOrder.get(node.id) ?? 0,
                 // Rotate listed FIRST, flip SECOND - CSS composes a `transform` list right-to-left
                 // (the last-listed function applies to the element's own local points first), so
                 // this ordering flips in local space BEFORE rotating the already-flipped result,
@@ -2359,21 +2376,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               onPointerEnter={() => setHoveredNodeId(node.id)}
               onPointerLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
               onPointerDown={(e) => {
-                if (connectorArmed && isConnectable) {
-                  beginConnectorFromNode(node, "auto", e, true);
-                  return;
-                }
-                // A tool being armed (shape/text/freehand) means the next click anywhere should
-                // place a new item there, even if it happens to land on top of an existing one -
+                // A tool being armed (shape/text/freehand/connector) means the next click anywhere
+                // should place or start a new item there, even if it happens to land on top of an
+                // existing shape (for example, drawing a line across a large background rectangle) -
                 // returning without stopPropagation lets the event bubble up to the container's
                 // handleContainerPointerDown, which owns that placement logic. Without this guard,
                 // beginMoveNode's own stopPropagation would swallow the click first and move THIS
                 // node instead, silently breaking every tool for any target that overlaps existing
-                // content (easy to hit in practice: fit-to-content's own pan/zoom can put an
-                // existing shape right under a click meant for empty canvas). laserArmed also
-                // returns here (not just from the container) so a click doesn't select/move THIS
-                // node while the laser tool is meant to be purely non-interactive.
-                if (armedShapeType || laserArmed) return;
+                // content. laserArmed also returns here (not just from the container) so a click
+                // doesn't select/move THIS node while the laser tool is meant to be purely
+                // non-interactive.
+                if (armedShapeType || connectorArmed || laserArmed) return;
                 beginMoveNode(node, e, e.shiftKey);
               }}
               onDoubleClick={(e) => {
@@ -3085,10 +3098,184 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           );
         })}
 
+        {/* Shared arrowhead <defs> for all edges and freehand/vector shapes */}
+        <svg style={{ position: "absolute", left: 0, top: 0, width: 0, height: 0, overflow: "visible", pointerEvents: "none" }}>
+          <defs>
+            {markerCombos.map(({ type, color }) => (
+              <marker key={markerId(type, color)} id={markerId(type, color)} markerWidth="10" markerHeight="10" refX={MARKER_REF[type]} refY="5" orient="auto" markerUnits="userSpaceOnUse">
+                {markerContentFor(type, color)}
+              </marker>
+            ))}
+          </defs>
+        </svg>
+
+        {/* Edges layer - each edge is rendered in its own positioned <svg> carrying its unified
+            layerOrder zIndex, so edges and shapes can be freely interleaved via Bring to front /
+            Send to back while defaulting to rendering above shapes when zIndex is unset. */}
+        {edges.map((edge) => {
+          const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+          const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
+          const cornerRadius = edge.cornerRadius ?? 0;
+          const d = buildEdgePath(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints, cornerRadius);
+          const selected = selectedEdgeIds.has(edge.id);
+          const edgeShadowFilter = nodeDropShadowCSS(edge);
+          const edgeOpacity = edge.opacity ?? 1;
+          const strokeOpacity = edge.strokeOpacity ?? 1;
+          const strokeCap = edge.strokeStyle === "dotted" ? "round" : edge.strokeCap ?? "butt";
+          const labelPt = edge.label
+            ? edgePointAtFraction(source, target, edge.routing, edge.curveBow ?? DEFAULT_CURVE_BOW, waypoints, edge.labelPosition ?? 0.5)
+            : null;
+          const labelFontSize = edge.labelFontSize ?? 13;
+          const labelPadX = 6;
+          const labelPadY = 3;
+          const labelBoxW = edge.label ? Math.max(24, edge.label.length * labelFontSize * 0.6 + labelPadX * 2) : 0;
+          const labelBoxH = labelFontSize + labelPadY * 2;
+          return (
+            <svg
+              key={edge.id}
+              style={{
+                position: "absolute",
+                left: 0,
+                top: 0,
+                overflow: "visible",
+                pointerEvents: "none",
+                zIndex: layerOrder.get(edge.id) ?? 0,
+              }}
+              width={1}
+              height={1}
+            >
+              <g>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={HIT_STROKE_SCREEN_WIDTH / zoom}
+                  style={{ pointerEvents: "stroke", cursor: edge.locked ? "default" : "grab" }}
+                  onPointerDown={(e) => {
+                    // Same "let an armed tool's click through to the container" reasoning as the
+                    // node div's own onPointerDown guard above - an edge's fat invisible hit-stroke
+                    // is an easy, easy-to-hit-by-accident target for a click that was meant to
+                    // place a new shape/text/stroke/line on top of it. laserArmed additionally means
+                    // "just pointing, not editing" - clicks should do nothing at all while it's on.
+                    if (armedShapeType || connectorArmed || laserArmed) return;
+                    // beginMoveEdge both selects this edge AND stages a "moveEdge" drag - a plain
+                    // click (no real movement before pointerup) still ends up just selecting it, the
+                    // same way a node's own beginMoveNode covers both click-to-select and drag-to-
+                    // move with one gesture instead of two different handlers.
+                    beginMoveEdge(edge, e);
+                  }}
+                  onDoubleClick={(e) => insertWaypointAtDoubleClick(edge, source, target, waypoints, e)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const nextEdgeIds = selectedEdgeIds.has(edge.id) ? selectedEdgeIds : new Set([edge.id]);
+                    const nextNodeIds = selectedEdgeIds.has(edge.id) ? selectedNodeIds : new Set<string>();
+                    onSelectionChange(nextNodeIds, nextEdgeIds);
+                    onItemContextMenu(nextNodeIds, nextEdgeIds, { x: e.clientX, y: e.clientY });
+                  }}
+                />
+                {selected && <path d={d} fill="none" stroke="#2563eb" strokeWidth={edge.strokeWidth + 5} strokeLinecap="round" opacity={0.35} style={{ pointerEvents: "none" }} />}
+                <g style={{ opacity: edgeOpacity, filter: edgeShadowFilter, pointerEvents: "none" }}>
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke={edge.strokeColor}
+                    strokeWidth={edge.strokeWidth}
+                    strokeOpacity={strokeOpacity}
+                    strokeDasharray={dashArrayFor(edge.strokeStyle, edge.strokeWidth)}
+                    strokeLinecap={strokeCap}
+                    strokeLinejoin="round"
+                    markerEnd={edge.endArrowType !== "none" ? `url(#${markerId(edge.endArrowType, edge.strokeColor)})` : undefined}
+                    markerStart={edge.startArrowType !== "none" ? `url(#${markerId(edge.startArrowType, edge.strokeColor)})` : undefined}
+                    style={{ pointerEvents: "none" }}
+                  />
+                  {edge.label && labelPt && (
+                    <g style={{ pointerEvents: "none" }}>
+                      {edge.labelShowBackground && (
+                        <rect
+                          x={labelPt.x - labelBoxW / 2}
+                          y={labelPt.y - labelBoxH / 2}
+                          width={labelBoxW}
+                          height={labelBoxH}
+                          rx={4}
+                          ry={4}
+                          fill={edge.labelBackgroundColor ?? "#ffffff"}
+                          stroke="#e5e7eb"
+                          strokeWidth={1 / zoom}
+                        />
+                      )}
+                      <text
+                        x={labelPt.x}
+                        y={labelPt.y}
+                        fontSize={labelFontSize / zoom}
+                        fontWeight={edge.labelBold ? "bold" : "normal"}
+                        fontStyle={edge.labelItalic ? "italic" : "normal"}
+                        fill={edge.labelColor ?? "#374151"}
+                        textAnchor="middle"
+                        dominantBaseline="central"
+                        style={{ pointerEvents: "none", paintOrder: "stroke" }}
+                        stroke={edge.labelShowBackground ? undefined : "#f7f7f8"}
+                        strokeWidth={edge.labelShowBackground ? undefined : 3 / zoom}
+                      >
+                        {edge.label}
+                      </text>
+                    </g>
+                  )}
+                </g>
+                {selected && !edge.locked && (
+                  <>
+                    {/* No more "drag from a midpoint dot" affordance for inserting a new bend point
+                        - see insertWaypointAtDoubleClick's own doc comment for why that competed
+                        with dragging the edge's body. Double-click anywhere on the line itself
+                        (the hit-stroke's own onDoubleClick above) does it instead. */}
+                    {waypoints.map((wp, i) => (
+                      <circle
+                        key={`wp-${i}`}
+                        cx={wp.x}
+                        cy={wp.y}
+                        r={5.5 / zoom}
+                        fill="#2563eb"
+                        stroke="#ffffff"
+                        strokeWidth={1.5 / zoom}
+                        style={{ pointerEvents: "auto", cursor: "grab" }}
+                        onPointerDown={(e) => beginWaypointDrag(edge, i, e)}
+                        onDoubleClick={(e) => removeWaypoint(edge, i, e)}
+                      />
+                    ))}
+                    <circle cx={source.x} cy={source.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "source", e)} />
+                    <circle cx={target.x} cy={target.y} r={6 / zoom} fill="#ffffff" stroke="#2563eb" strokeWidth={2 / zoom} style={{ pointerEvents: "auto", cursor: "grab" }} onPointerDown={(e) => beginConnectorReattach(edge, "target", e)} />
+                  </>
+                )}
+              </g>
+            </svg>
+          );
+        })}
+
+        {/* Live connector / freehand drag preview layer - always sits above all nodes and edges */}
+        {(connectorPreview || (freehandPreview && freehandPreview.length > 1)) && (
+          <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none", zIndex: nodes.length + edges.length + 10 }} width={1} height={1}>
+            {connectorPreview && (
+              <path
+                d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow)}
+                fill="none"
+                stroke={previewEdgeStyle.strokeColor}
+                strokeWidth={previewEdgeStyle.strokeWidth / zoom}
+                strokeDasharray={dashArrayFor(previewEdgeStyle.strokeStyle, previewEdgeStyle.strokeWidth) ?? `${6 / zoom},${4 / zoom}`}
+                markerEnd={previewEdgeStyle.endArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+                markerStart={previewEdgeStyle.startArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor)})` : undefined}
+                style={{ pointerEvents: "none" }}
+              />
+            )}
+            {freehandPreview && freehandPreview.length > 1 && (
+              <path d={smoothedPathD(freehandPreview)} fill="none" stroke={penColor} strokeWidth={penWidth / zoom} strokeLinecap="round" strokeLinejoin="round" style={{ pointerEvents: "none" }} />
+            )}
+          </svg>
+        )}
+
         {marqueeRect && (
           <div
             className="absolute border border-blue-500 bg-blue-500/10 pointer-events-none"
-            style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.width, height: marqueeRect.height }}
+            style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.width, height: marqueeRect.height, zIndex: nodes.length + edges.length + 20 }}
           />
         )}
 
@@ -3102,7 +3289,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             const now = performance.now();
             const head = laserTrail[laserTrail.length - 1];
             return (
-              <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none" }} width={1} height={1}>
+              <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none", zIndex: nodes.length + edges.length + 30 }} width={1} height={1}>
                 <circle cx={head.x} cy={head.y} r={16 / zoom} fill="#ef4444" opacity={0.18} />
                 <circle cx={head.x} cy={head.y} r={9 / zoom} fill="#ef4444" opacity={0.35} />
                 {/* Connected segments between CONSECUTIVE points, not a dot per point - a dot per
