@@ -17,6 +17,8 @@ import PdfSidebar, { PdfSidebarView } from "./pdf/PdfSidebar";
 import PdfMagnifierLens from "./pdf/PdfMagnifierLens";
 import { loadSettings } from "../utils/appSettings";
 import Toast from "./custom/Toast";
+import LinksControl from "./links/LinksControl";
+import { fileRef } from "../utils/itemLinks";
 
 const IMAGE_MAX_DIMENSION_PX = 2048; // downscale threshold before embedding into the sidecar JSON
 const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, at 100% zoom, an inserted image is capped to
@@ -925,7 +927,7 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
             <SaveIndicator isSaving={store.isSaving} saveError={store.saveError} exportProgress={exportProgress} />
           </div>
           {/* Centered on the same vertical axis as the Edit button / tools dock below it. */}
-          <div className="absolute top-4 right-[26px] z-30">
+          <div className="absolute top-4 right-[26px] z-30 flex flex-col items-center gap-2">
             <ZoomControl
               zoom={zoom}
               minZoom={MIN_ZOOM}
@@ -936,6 +938,11 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
               magnifierActive={magnifierActive}
               onToggleMagnifier={handleToggleMagnifier}
             />
+            {/* Links to videos, images, notes, whiteboards...: its own small pill under the zoom
+                column, so a presenter can hop to the related material and back. */}
+            <div className="flex flex-col items-center p-0.5 rounded-full bg-white/80 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_16px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.05] dark:ring-white/[0.08]">
+              <LinksControl self={fileRef(sourcePath)} title={sourcePath.split(/[\\/]/).pop() ?? "PDF"} variant="pill" placement="left" />
+            </div>
           </div>
 
           {/* Bottom-right stack: the tools dock rises out of the Edit button; the page navigator

@@ -51,6 +51,9 @@ import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import { BoardEditorHandle } from "../components/board/BoardEditor";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
+import { ItemLinksProvider } from "../contexts/ItemLinksContext";
+import LinksControl from "../components/links/LinksControl";
+import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
@@ -3325,6 +3328,17 @@ const setScreen = () => {
 			setMindmapScreen({ mode: "editor", mindmapId: item.id });
 		}
 	};
+	// Cross-links (contexts/ItemLinksContext): every viewer's "Linked" control lands here to switch
+	// to the other end, whatever it is.
+	const openLinkedItem = (target: ItemRef) => {
+		if (target.kind === "file") {
+			const wanted = normalizePath(target.id);
+			const file = allLibraryFiles.find((f) => normalizePath(f.path) === wanted);
+			if (file) handleFileClick(file);
+			return;
+		}
+		openHomeItem({ kind: target.kind, id: target.id } as HomeItem);
+	};
 	const HOME_KIND: Record<Exclude<HomeItem["kind"], "file">, { label: string; icon: React.ReactNode; color: string }> = {
 		doc: { label: "Document", icon: <IoDocumentTextOutline size={18} />, color: "text-blue-500 dark:text-blue-400" },
 		whiteboard: { label: "Whiteboard", icon: <IoGitNetworkOutline size={18} />, color: "text-amber-500 dark:text-amber-400" },
@@ -3804,7 +3818,7 @@ const setScreen = () => {
 			// loop rather than per-file, to avoid redundant list_docs calls during a bulk move.
 			const relinkResults = await Promise.allSettled(
 				results
-					.map((result, i) => (result.status === "fulfilled" ? invoke("relink_doc_path", { oldPath: toMove[i].path, newPath: result.value }) : null))
+					.map((result, i) => (result.status === "fulfilled" ? Promise.all([invoke("relink_doc_path", { oldPath: toMove[i].path, newPath: result.value }), invoke("relink_file_path", { oldPath: toMove[i].path, newPath: result.value })]) as Promise<unknown> : null))
 					.filter((p): p is Promise<unknown> => p !== null)
 			);
 			if (relinkResults.length > 0) await refreshDocsIndex();
@@ -4125,6 +4139,7 @@ const setScreen = () => {
 					setRecentPaths(recent);
 					repathPlaybackState(file.path, newPath);
 					await invoke("relink_doc_path", { oldPath: file.path, newPath }).catch((error) => console.error("Failed to repair doc links after move:", error));
+				await invoke("relink_file_path", { oldPath: file.path, newPath }).catch((error) => console.error("Failed to repair item links after move:", error));
 					if (isOpen) reopen = { path: newPath, name: pathName(newPath) };
 				}
 			} catch (error) {
@@ -4185,6 +4200,7 @@ const setScreen = () => {
 			repathPlaybackState(file.path, newPath);
 			try {
 				await invoke("relink_doc_path", { oldPath: file.path, newPath });
+				await invoke("relink_file_path", { oldPath: file.path, newPath });
 				await refreshDocsIndex();
 			} catch (error) {
 				console.error("Failed to repair doc links after rename:", error);
@@ -4309,6 +4325,7 @@ const setScreen = () => {
     ) : undefined;
 
   return (
+    <ItemLinksProvider files={allLibraryFiles} onOpen={openLinkedItem}>
     <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
     <ToolPanelOpenContext.Provider value={isEditingVideo ? openToolsPanel : null}>
     <div className="w-full h-screen flex flex-col bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100">
@@ -5744,7 +5761,12 @@ const setScreen = () => {
                     : undefined
                 }
                 contentInset={screenContentInset}
-                controlsLeading={playerBackButton}
+                controlsLeading={
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    {playerBackButton}
+                    <LinksControl self={fileRef(selectedFile.sourcePath)} title={selectedFile.name} variant="player" />
+                  </div>
+                }
                 onSidebarPanelChange={handlePlayerSidebarPanelChange}
                 trackVolume={editStore.videoAudioVolume}
                 trackMuted={editStore.videoAudioMuted || !!activeClipEffects?.muted || silencedBySolo(mixerSession, VIDEO_CHANNEL)}
@@ -6179,6 +6201,7 @@ const setScreen = () => {
     </div>
     </ToolPanelOpenContext.Provider>
     </ToolPanelHostContext.Provider>
+    </ItemLinksProvider>
   );
 };
 

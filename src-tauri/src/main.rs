@@ -44,6 +44,7 @@ mod services {
     pub mod citations;
     pub mod docs;
     pub mod docs_search;
+    pub mod links;
     pub mod file_watcher;
     pub mod google_share;
     pub mod image_annotations;
@@ -661,6 +662,10 @@ fn main() {
             services::docs::link_doc_to_file,
             services::docs::unlink_doc,
             services::docs::find_docs_linked_to,
+            services::links::list_links,
+            services::links::add_link,
+            services::links::remove_link,
+            services::links::relink_file_path,
             services::docs::relink_doc_path,
             services::docs::export_doc,
             services::docs::export_doc_binary,

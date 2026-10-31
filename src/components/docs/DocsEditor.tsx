@@ -13,8 +13,9 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
-import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
-import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdIosShare, MdMailOutline, MdPrint } from "react-icons/md";
+import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
+import LinksControl from "../links/LinksControl";
+import { MdArrowDropDown, MdDescription, MdFileDownload, MdIosShare, MdMailOutline, MdPrint } from "react-icons/md";
 import { TbBooks, TbListTree, TbTypography } from "react-icons/tb";
 import DocHelpPanel from "./DocHelpPanel";
 import DocStyleDialog from "./DocStyleDialog";
@@ -392,12 +393,11 @@ const headerIconClass = (active = false) =>
       : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.06] dark:hover:bg-white/10"
   }`;
 
-const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
+const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
   const store = useDocsEditStore(docId);
   const [linkOpen, setLinkOpen] = useState(false);
-  const [headerMenu, setHeaderMenu] = useState<"export" | "pageSetup" | "linkFile" | null>(null);
+  const [headerMenu, setHeaderMenu] = useState<"export" | "pageSetup" | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [fileFilter, setFileFilter] = useState("");
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [showFindReplace, setShowFindReplace] = useState(false);
   const [showComments, setShowComments] = useState(false);
@@ -443,7 +443,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     setShowHelp((v) => !v);
   }, []);
 
-  const menuProps = (id: "export" | "pageSetup" | "linkFile") => ({
+  const menuProps = (id: "export" | "pageSetup") => ({
     open: headerMenu === id,
     onOpenChange: (next: boolean) => setHeaderMenu((cur) => (next ? id : cur === id ? null : cur)),
   });
@@ -843,12 +843,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, [editor, editor?.state.doc]);
 
   const openComments = store.comments.filter((c) => !c.resolved_at).length;
-  const linkedFile = useMemo(() => libraryFiles.find((f) => f.path === store.linkedTo), [libraryFiles, store.linkedTo]);
-  const filteredLibraryFiles = useMemo(() => {
-    const q = fileFilter.trim().toLowerCase();
-    if (!q) return libraryFiles;
-    return libraryFiles.filter((f) => f.name.toLowerCase().includes(q));
-  }, [libraryFiles, fileFilter]);
 
   const statusNotice: Notice | null = dictation.message ? { text: dictation.message } : notice;
   const showRuler = rulerVisible && !store.loading && !store.loadError;
@@ -978,29 +972,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                 {pageCount > 1 && ` · ${pageCount} pages`}
               </span>
             )}
-            {linkedFile && (
-              <span className="inline-flex items-center gap-1 min-w-0">
-                ·
-                <button
-                  type="button"
-                  data-tip="Open linked recording"
-                  onClick={() => onOpenLinkedFile?.(linkedFile.path, linkedFile.name)}
-                  className="inline-flex items-center gap-1 min-w-0 hover:text-blue-600 dark:hover:text-blue-400"
-                >
-                  <MdInsertLink size={14} className="shrink-0" />
-                  <span className="truncate max-w-[14rem]">{linkedFile.name}</span>
-                </button>
-                <button
-                  type="button"
-                  data-tip="Unlink recording"
-                  aria-label="Unlink recording"
-                  onClick={() => void store.unlinkDoc()}
-                  className="p-0.5 rounded hover:bg-black/[0.06] dark:hover:bg-white/10 hover:text-red-500"
-                >
-                  <IoClose size={12} />
-                </button>
-              </span>
-            )}
             {statusNotice && (
               <span className={`inline-flex items-center gap-1.5 min-w-0 ${statusNotice.error ? "text-red-600 dark:text-red-400" : "text-blue-700 dark:text-blue-300"}`}>
                 <span className="truncate">· {statusNotice.text}</span>
@@ -1067,45 +1038,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </span>
           )}
         </button>
-        {!store.linkedTo && (
-          <Dropdown
-            {...menuProps("linkFile")}
-            label="Link to a recording"
-            align="right"
-            keepSelection={false}
-            trigger={<MdInsertLink size={20} />}
-            triggerClassName={headerIconClass(headerMenu === "linkFile")}
-            panelClassName="w-64 p-1.5"
-          >
-            <input
-              autoFocus
-              value={fileFilter}
-              onChange={(e) => setFileFilter(e.target.value)}
-              placeholder="Filter recordings…"
-              className="w-full mb-1 px-2 py-1.5 text-sm rounded-md border border-neutral-300 dark:border-neutral-600 bg-transparent outline-none focus:border-blue-500 text-neutral-800 dark:text-neutral-100"
-            />
-            <div className="max-h-60 overflow-y-auto">
-              {filteredLibraryFiles.length === 0 ? (
-                <p className="px-2 py-1.5 text-xs text-neutral-400 dark:text-neutral-500">No matching files</p>
-              ) : (
-                filteredLibraryFiles.map((f) => (
-                  <button
-                    key={f.path}
-                    type="button"
-                    onClick={() => {
-                      void store.linkDoc(f.path);
-                      setHeaderMenu(null);
-                      setFileFilter("");
-                    }}
-                    className={`${menuItemClass} rounded-md truncate`}
-                  >
-                    <span className="truncate">{f.name}</span>
-                  </button>
-                ))
-              )}
-            </div>
-          </Dropdown>
-        )}
+        <LinksControl self={{ kind: "doc", id: docId }} title={store.title || "Untitled note"} variant="header" />
         <Dropdown
           {...menuProps("pageSetup")}
           label="Page setup"

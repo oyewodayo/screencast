@@ -59,6 +59,7 @@ import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAsset
 import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
+import LinksControl from "../links/LinksControl";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 
@@ -1447,6 +1448,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <IoMagnetOutline size={16} />
         </ToolbarButton>
         <div className="flex-1" />
+        <LinksControl self={{ kind: "whiteboard", id: whiteboardId }} title={doc.name} variant="header" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
         {exportError && <span className="text-xs text-red-500 dark:text-red-400 mr-2">{exportError}</span>}
         {imageError && (
