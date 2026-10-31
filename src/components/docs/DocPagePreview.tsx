@@ -17,9 +17,10 @@ import "katex/dist/katex.min.css";
 import "./docStructure.css";
 import "./docFonts.css";
 import "./docLayout.css";
+import "./docLinks.css";
 import { docProseClassName } from "../../utils/docSchemaExtensions";
 import { bodyStyleVars } from "../../utils/docLayout";
-import { DEFAULT_PAGE, isDarkPageColor, pageWidthPx } from "../../utils/docPageGeometry";
+import { DEFAULT_PAGE, inToPx, isDarkPageColor, pageWidthPx } from "../../utils/docPageGeometry";
 import { buildCitationContext, formatBibliography, formatCitation, styleInfo } from "../../utils/docCitationStyles";
 import type { DocPreviewData } from "../../utils/docPreview";
 
@@ -46,7 +47,7 @@ function finishPage(root: HTMLElement, preview: DocPreviewData): void {
     if (table.parentElement?.classList.contains("tableWrapper")) return;
     const wrapper = document.createElement("div");
     wrapper.className = "tableWrapper";
-    for (const name of ["data-rules", "data-fit", "data-span"]) {
+    for (const name of ["data-rules", "data-fit", "data-span", "data-space-before", "data-space-after", "style"]) {
       const value = table.getAttribute(name);
       if (value !== null) wrapper.setAttribute(name, value);
     }
@@ -104,7 +105,7 @@ function finishPage(root: HTMLElement, preview: DocPreviewData): void {
   for (const node of citeNodes) {
     const ids = (node.getAttribute("data-cite") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     const citation = formatCitation(ids, node.getAttribute("data-locator"), lookup, ctx);
-    node.replaceChildren(citation.superscript ? el("sup", citation.text) : document.createTextNode(` ${citation.text}`));
+    node.replaceChildren(citation.superscript ? el("sup", citation.text) : document.createTextNode(`\u00a0${citation.text}`));
   }
   const numeric = styleInfo(preview.citationStyle).numeric;
   root.querySelectorAll<HTMLElement>("[data-bibliography]").forEach((list) => {
@@ -205,7 +206,9 @@ const DocPagePreview: React.FC<DocPagePreviewProps> = ({ preview, aspectClassNam
               top: 0,
               left: 0,
               width: pageWidth,
-              padding: PAGE_MARGIN_PX * 0.75,
+              padding: preview?.margins
+                ? `${inToPx(preview.margins.top)}px ${inToPx(preview.margins.right)}px ${inToPx(preview.margins.bottom)}px ${inToPx(preview.margins.left)}px`
+                : PAGE_MARGIN_PX * 0.75,
               transform: `scale(${scale})`,
               transformOrigin: "top left",
             }}

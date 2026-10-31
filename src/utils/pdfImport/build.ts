@@ -117,7 +117,7 @@ function pageSetup(pages: PageAnalysis[], lines: FlowLine[]): { page: PageFormat
   const top = tops.length ? Math.min(...tops) : 72;
   const bottom = bottoms.length ? median(bottoms) : 72;
   const gutter = twoCol.length ? median(twoCol.map((p) => p.columns.right[0] - p.columns.left[1])) : 18;
-  const clampIn = (pt: number) => Math.max(0.25, Math.min(2.5, toIn(pt)));
+  const clampIn = (pt: number) => Math.max(0.12, Math.min(2.5, toIn(pt)));
   return { page, margins: { top: clampIn(top), bottom: clampIn(bottom), left: clampIn(left), right: clampIn(right) }, columns, gutterIn: toIn(Math.max(6, gutter)) };
 }
 
@@ -146,6 +146,7 @@ function textMarks(run: Extract<Inline, { kind: "text" }>, ctx: InlineContext, o
   if (run.script === "sup") marks.push({ type: "superscript" });
   if (run.script === "sub") marks.push({ type: "subscript" });
   const style: Record<string, unknown> = {};
+  if (opts.baseBold && textual && !run.font.bold) style.fontWeight = "normal";
   const stack = ctx.assets.fontStack(run.font);
   if (stack && stack !== ctx.bodyStack) style.fontFamily = stack;
   const base = opts.baseSize ?? ctx.bodySize;

@@ -11,7 +11,7 @@
 //
 // The stage on the right plays the very project the editor will open with (buildStyledProject,
 // drawn by ProjectStage) - in time with the song's preview when there is one.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -24,6 +24,7 @@ import {
   IoVideocam,
   IoPause,
   IoPlay,
+  IoSearch,
   IoShuffle,
   IoSparkles,
   IoVolumeHighOutline,
@@ -58,6 +59,8 @@ import TitleLookTile from "./TitleLookTile";
 import { photoFillPath } from "../../utils/photoFill";
 import { BRAND_INTROS, BrandIntroStyle, BrandOptions, VideoInfo } from "../../utils/videoStyleTemplates";
 import { getFileCategory } from "../../utils/fileCategory";
+import { useBatchedRecord } from "../../hooks/useBatchedRecord";
+import { buildMediaIndex, searchMedia } from "../../utils/mediaSearch";
 
 export interface NewVideoProjectRequest {
   name: string;
@@ -258,14 +261,26 @@ const TextField: React.FC<{ value: string; onChange: (v: string) => void; placeh
 );
 
 // A style template's card: its colours, with its signature word drawn in its own title look.
-const TemplateCard: React.FC<{ template: StyleTemplate | null; active: boolean; onClick: () => void; onHover: (on: boolean) => void }> = ({ template, active, onClick, onHover }) => {
+// Memoized with stable callbacks, so hovering or picking one card re-renders only the cards whose
+// state changed.
+const TemplateCard = memo(function TemplateCard({
+  template,
+  active,
+  onPick,
+  onHover,
+}: {
+  template: StyleTemplate | null;
+  active: boolean;
+  onPick: (template: StyleTemplate | null) => void;
+  onHover: (template: StyleTemplate | null, on: boolean) => void;
+}) {
   const look = template ? titleStyle(template.cardStyle)?.look : null;
   return (
     <button
       type="button"
-      onClick={onClick}
-      onMouseEnter={() => onHover(true)}
-      onMouseLeave={() => onHover(false)}
+      onClick={() => onPick(template)}
+      onMouseEnter={() => onHover(template, true)}
+      onMouseLeave={() => onHover(template, false)}
       title={template?.blurb ?? "Set every part yourself"}
       className={`group shrink-0 w-[112px] text-left rounded-xl p-1 outline-none transition-all focus-visible:ring-2 focus-visible:ring-blue-400 ${
         active ? "bg-white shadow-sm ring-2 ring-blue-500 dark:bg-neutral-800" : "hover:bg-white/80 dark:hover:bg-white/[0.06]"
@@ -287,7 +302,136 @@ const TemplateCard: React.FC<{ template: StyleTemplate | null; active: boolean; 
       <span className="block px-0.5 pt-1 text-[12px] font-semibold text-neutral-800 dark:text-neutral-100 truncate">{template?.label ?? "Custom"}</span>
     </button>
   );
-};
+});
+
+// ---------- the media grid ----------
+
+interface MediaItem {
+  name: string;
+  path: string;
+  video: boolean;
+}
+
+// Tiles mount a page at a time as the grid scrolls - a library can hold thousands, and mounting
+// them all at once is what made the dialog slow to open.
+const GRID_PAGE = 120;
+
+const MediaTile = memo(function MediaTile({
+  item,
+  order,
+  thumbUrl,
+  duration,
+  onToggle,
+}: {
+  item: MediaItem;
+  // Place in the sequence, -1 when not picked.
+  order: number;
+  thumbUrl: string | undefined;
+  duration: number | undefined;
+  onToggle: (path: string) => void;
+}) {
+  const on = order >= 0;
+  return (
+    <button
+      data-thumb={item.path}
+      type="button"
+      onClick={() => onToggle(item.path)}
+      title={item.name}
+      className={`group relative aspect-square rounded-xl overflow-hidden bg-neutral-100 dark:bg-white/[0.04] flex items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-blue-400 transition-all ${
+        on ? "ring-[3px] ring-blue-500 ring-offset-2 ring-offset-white dark:ring-offset-neutral-900" : ""
+      }`}
+    >
+      <span className={`absolute inset-0 transition-transform duration-300 ${on ? "scale-[0.97]" : "group-hover:scale-105"}`}>
+        <span className="absolute inset-0 flex items-center justify-center">
+          {thumbUrl ? (
+            <img src={thumbUrl} alt="" className="w-full h-full object-cover" draggable={false} decoding="async" />
+          ) : (
+            <IoImageOutline size={20} className="text-neutral-300 dark:text-neutral-600" />
+          )}
+        </span>
+      </span>
+      <span className={`absolute inset-0 transition-colors ${on ? "bg-blue-500/15" : "bg-black/0 group-hover:bg-black/10"}`} />
+      {item.video && (
+        <span className="absolute left-1.5 bottom-1.5 flex items-center gap-1 px-1.5 h-5 rounded-md bg-black/65 text-[10.5px] font-semibold text-white tabular-nums">
+          <IoVideocam size={11} />
+          {duration !== undefined ? formatLength(duration) : ""}
+        </span>
+      )}
+      <span
+        className={`absolute top-2 right-2 min-w-[22px] h-[22px] px-1 rounded-full text-[11px] font-semibold flex items-center justify-center tabular-nums transition-all ${
+          on ? "bg-blue-500 text-white shadow" : "bg-black/25 text-transparent ring-1 ring-white/80 opacity-0 group-hover:opacity-100"
+        }`}
+      >
+        {on ? order + 1 : <IoCheckmark size={12} />}
+      </span>
+    </button>
+  );
+});
+
+// Memoized: the dialog re-renders on every style hover and click, and none of that touches the grid.
+const MediaGrid = memo(function MediaGrid({
+  media,
+  picked,
+  thumbUrls,
+  videoInfo,
+  scrollRef,
+  onToggle,
+  onNearView,
+}: {
+  media: MediaItem[];
+  picked: string[];
+  thumbUrls: Record<string, string>;
+  videoInfo: Record<string, VideoInfo>;
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  onToggle: (path: string) => void;
+  // Paths of tiles that came near view - their thumbnails are asked for then.
+  onNearView: (paths: string[]) => void;
+}) {
+  const [limit, setLimit] = useState(GRID_PAGE);
+  const [limitFor, setLimitFor] = useState(media);
+  // Back to the first page when the filter changes (set during render, so no extra frame of the old count).
+  if (limitFor !== media) {
+    setLimitFor(media);
+    setLimit(GRID_PAGE);
+  }
+  const shown = useMemo(() => (media.length > limit ? media.slice(0, limit) : media), [media, limit]);
+  const orderOf = useMemo(() => new Map(picked.map((p, i) => [p, i])), [picked]);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const seen = entries.filter((e) => e.isIntersecting && e.target !== sentinelRef.current).map((e) => (e.target as HTMLElement).dataset.thumb ?? "");
+        if (seen.length) onNearView(seen);
+        if (entries.some((e) => e.isIntersecting && e.target === sentinelRef.current)) setLimit((l) => l + GRID_PAGE * 2);
+      },
+      { root, rootMargin: "400px 0px" }
+    );
+    root.querySelectorAll<HTMLElement>("[data-thumb]").forEach((el) => io.observe(el));
+    if (sentinelRef.current) io.observe(sentinelRef.current);
+    return () => io.disconnect();
+  }, [shown, scrollRef, onNearView]);
+
+  return (
+    <>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 p-1.5 -mx-1.5">
+        {shown.map((item) => (
+          <MediaTile
+            key={item.path}
+            item={item}
+            order={orderOf.get(item.path) ?? -1}
+            thumbUrl={thumbUrls[item.path]}
+            duration={videoInfo[item.path]?.duration}
+            onToggle={onToggle}
+          />
+        ))}
+      </div>
+      {shown.length < media.length && <div ref={sentinelRef} className="h-px" />}
+    </>
+  );
+});
 
 // ---------- the dialog ----------
 
@@ -325,12 +469,16 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const [isCreating, setIsCreating] = useState(false);
   const [creatingStep, setCreatingStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
+  const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
   const [stagePictures, setStagePictures] = useState<Map<string, StagePicture>>(new Map());
   const [aspects, setAspects] = useState<Record<string, number>>({});
   // Picked videos' length and shape (get_conversion_info) - a video takes part once it's known.
   const [videoInfo, setVideoInfo] = useState<Record<string, VideoInfo>>({});
   const [mediaFilter, setMediaFilter] = useState<"all" | "photos" | "videos">("all");
+  const [mediaQuery, setMediaQuery] = useState("");
+  // The grid re-filters behind the keystroke, so typing stays instant on a library of thousands.
+  const deferredMediaQuery = useDeferredValue(mediaQuery);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [brand, setBrandState] = useState<BrandOptions>(readBrand);
   const setBrand = (patch: Partial<BrandOptions>) =>
     setBrandState((prev) => {
@@ -348,6 +496,13 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !isCreating) onClose();
+      // Ctrl+F, or "/" when not typing, jumps to the media search.
+      const typing = event.target instanceof HTMLElement && (event.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName));
+      if (((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") || (event.key === "/" && !typing)) {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
@@ -374,7 +529,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       .filter((path) => !thumbUrls[path])
       .forEach((path) => {
         thumbnailLimiter(() => (isVideoPath(path) ? resolveVideoThumbnailUrl : resolveThumbnailUrl)({ name: baseName(path), path }))
-          .then((url) => !cancelled && setThumbUrls((prev) => (prev[path] ? prev : { ...prev, [path]: url })))
+          .then((url) => !cancelled && putThumbUrl(path, url))
           .catch((err) => console.error("Failed to resolve thumbnail for", path, err));
       });
     return () => {
@@ -423,7 +578,8 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [picked, thumbUrls]);
 
-  const togglePicked = (path: string) => setPicked((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path]));
+  const togglePicked = useCallback((path: string) => setPicked((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path])), []);
+  const markNearView = useCallback((paths: string[]) => setNearView((prev) => (paths.every((p) => prev.has(p)) ? prev : new Set([...prev, ...paths]))), []);
 
   // Reordering the sequence follows the pointer (captured), not HTML drag and drop - the window's
   // native file-drop handling swallows HTML drag events in the WebView, so those never arrive.
@@ -600,10 +756,19 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const shownStyle: StyleId = hoverStyle ?? (trying ? (shownTemplate ? "template" : "mix") : style);
   // Recomputed when a video's poster (its thumbnail) arrives, so the stage can show it.
   const videoPostersKey = stagePaths.filter(isVideoPath).map((p) => (thumbUrls[p] ? 1 : 0)).join("");
+  // The stage rebuilds its project from these in a deferred render, so a style click or hover shows
+  // as picked at once and the (heavier) new preview follows a beat later instead of holding it up.
+  const stageInputs = useDeferredValue(
+    useMemo(
+      () => ({ template: shownTemplate, trying, style: shownStyle, optionsFor, frame, frameId: resolvedFrameId }),
+      [shownTemplate, trying, shownStyle, optionsFor, frame, resolvedFrameId]
+    )
+  );
   const stageProject = useMemo(() => {
     const ready = stagePaths.filter((p) => stagePictures.has(p) && (!isVideoPath(p) || videoInfo[p]));
     if (!ready.length) return null;
-    return buildStyledProject(ready, frame, optionsFor(shownTemplate, trying, shownStyle, stageMusic), {
+    const { template: t, trying: tryingIt, style: transitionStyle, optionsFor: optionsOf, frame: stageFrame } = stageInputs;
+    return buildStyledProject(ready, stageFrame, optionsOf(t, tryingIt, transitionStyle, stageMusic), {
       aspectOf: (p) => {
         const pic = stagePictures.get(p);
         return pic ? pic.width / pic.height : 1;
@@ -612,7 +777,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
       videoOf,
       fillVideos: blurFill,
     });
-  }, [stagePaths, stagePictures, frame, optionsFor, shownTemplate, trying, shownStyle, stageMusic, fontsReady, videoInfo, videoOf, blurFill]);
+  }, [stagePaths, stagePictures, stageInputs, stageMusic, fontsReady, videoInfo, videoOf, blurFill]);
 
   // Decode the stage's pictures (full files, scaled down), a few at a time.
   useEffect(() => {
@@ -738,6 +903,12 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     setScenesOn(true);
   };
 
+  // Stable for the memoized cards; applyTemplate reads the latest brand through the ref.
+  const applyTemplateRef = useRef(applyTemplate);
+  applyTemplateRef.current = applyTemplate;
+  const pickTemplate = useCallback((t: StyleTemplate | null) => applyTemplateRef.current(t), []);
+  const hoverTemplate = useCallback((t: StyleTemplate | null, on: boolean) => setHoverTemplateId(on ? t?.id ?? null : undefined), []);
+
   // ---- create ----
 
   const handleCreate = async () => {
@@ -811,27 +982,23 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
     );
 
   const projectLength = stageProject && picked.length && picked.length <= STAGE_MAX_PHOTOS ? stageProject.clips.reduce((s, c) => s + c.end - c.start, 0) : picked.length * perPhoto;
-  const media = useMemo(
-    () => [
-      ...(mediaFilter !== "videos" ? libraryImages.map((m) => ({ ...m, video: false })) : []),
-      ...(mediaFilter !== "photos" ? libraryVideos.map((m) => ({ ...m, video: true })) : []),
-    ],
-    [libraryImages, libraryVideos, mediaFilter]
+  const mediaIndex = useMemo(
+    () => buildMediaIndex<MediaItem>([...libraryImages.map((m) => ({ ...m, video: false })), ...libraryVideos.map((m) => ({ ...m, video: true }))]),
+    [libraryImages, libraryVideos]
   );
-  const allPicked = media.length > 0 && media.every((i) => picked.includes(i.path));
+  const mediaSearch = useMemo(() => searchMedia(mediaIndex, deferredMediaQuery), [mediaIndex, deferredMediaQuery]);
+  const media = useMemo(
+    () => (mediaFilter === "all" ? mediaSearch.items : mediaSearch.items.filter((m) => m.video === (mediaFilter === "videos"))),
+    [mediaSearch, mediaFilter]
+  );
+  const searching = deferredMediaQuery.trim() !== "";
+  const matchedVideos = useMemo(() => (searching ? mediaSearch.items.filter((m) => m.video).length : libraryVideos.length), [searching, mediaSearch, libraryVideos]);
+  const matchedPhotos = searching ? mediaSearch.items.length - matchedVideos : libraryImages.length;
+  // Best matches sort first - show them, not wherever the grid was scrolled to.
   useEffect(() => {
-    const root = gridScrollRef.current;
-    if (!root) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        const seen = entries.filter((e) => e.isIntersecting).map((e) => (e.target as HTMLElement).dataset.thumb ?? "");
-        if (seen.length) setNearView((prev) => (seen.every((p) => prev.has(p)) ? prev : new Set([...prev, ...seen])));
-      },
-      { root, rootMargin: "400px 0px" }
-    );
-    root.querySelectorAll<HTMLElement>("[data-thumb]").forEach((el) => io.observe(el));
-    return () => io.disconnect();
-  }, [media]);
+    gridScrollRef.current?.scrollTo({ top: 0 });
+  }, [deferredMediaQuery]);
+  const allPicked = media.length > 0 && media.every((i) => picked.includes(i.path));
   const musicTitle = music ? (music.kind === "library" ? music.track.title : music.name) : null;
   const musicArtist = music?.kind === "library" ? music.track.artist : music ? "From your computer" : null;
   const shownLook = trying ? shownTemplate?.look ?? null : look;
@@ -879,9 +1046,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
               <div className="flex gap-0.5 p-0.5 rounded-full bg-neutral-100 dark:bg-white/[0.06]">
                 {(
                   [
-                    ["all", `All ${libraryImages.length + libraryVideos.length}`],
-                    ["photos", `Photos ${libraryImages.length}`],
-                    ["videos", `Videos ${libraryVideos.length}`],
+                    ["all", `All ${matchedPhotos + matchedVideos}`],
+                    ["photos", `Photos ${matchedPhotos}`],
+                    ["videos", `Videos ${matchedVideos}`],
                   ] as const
                 ).map(([id, label]) => (
                   <button
@@ -896,6 +1063,55 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                   </button>
                 ))}
               </div>
+              <label
+                className={`group/search flex items-center gap-1.5 h-8 pl-2.5 pr-1 flex-1 min-w-[140px] max-w-[300px] rounded-full ring-1 transition-colors cursor-text ${
+                  mediaQuery
+                    ? "bg-white ring-blue-400/70 dark:bg-white/[0.06] dark:ring-blue-400/50"
+                    : "bg-neutral-100 ring-transparent hover:bg-neutral-200/70 focus-within:bg-white focus-within:ring-blue-400/70 dark:bg-white/[0.06] dark:hover:bg-white/[0.09] dark:focus-within:ring-blue-400/50"
+                }`}
+              >
+                <IoSearch size={14} className={mediaQuery ? "text-blue-500 shrink-0" : "text-neutral-400 shrink-0"} />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={mediaQuery}
+                  onChange={(e) => setMediaQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && mediaQuery) {
+                      // First Esc clears the search; the next one closes the dialog.
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      setMediaQuery("");
+                    } else if (e.key === "Enter" && media.length === 1) {
+                      togglePicked(media[0].path);
+                    }
+                  }}
+                  placeholder="Search names, folders, dates"
+                  aria-label="Search your media"
+                  spellCheck={false}
+                  className="flex-1 min-w-0 bg-transparent text-[12.5px] text-neutral-900 dark:text-white placeholder:text-neutral-400 outline-none"
+                />
+                {mediaQuery ? (
+                  <>
+                    <span className="shrink-0 text-[11px] font-medium tabular-nums text-neutral-400">{media.length}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMediaQuery("");
+                        searchInputRef.current?.focus();
+                      }}
+                      aria-label="Clear search"
+                      className="shrink-0 p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-black/[0.06] dark:hover:text-white dark:hover:bg-white/10"
+                    >
+                      <IoClose size={13} />
+                    </button>
+                  </>
+                ) : (
+                  <kbd className="shrink-0 mr-1.5 px-1.5 rounded border border-neutral-200 dark:border-white/10 text-[10px] font-sans text-neutral-400 opacity-0 group-hover/search:opacity-100 transition-opacity">
+                    Ctrl F
+                  </kbd>
+                )}
+              </label>
               <span className="flex-1" />
               {media.length > 0 && (
                 <button
@@ -903,7 +1119,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                   onClick={() => setPicked(allPicked ? picked.filter((p) => !media.some((m) => m.path === p)) : [...picked, ...media.map((i) => i.path).filter((p) => !picked.includes(p))])}
                   className="h-8 px-3 rounded-full text-[12.5px] font-medium text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-white/[0.08]"
                 >
-                  {allPicked ? "Clear all" : "Select all"}
+                  {allPicked ? "Clear all" : searching ? `Select ${media.length}` : "Select all"}
                 </button>
               )}
               <button
@@ -917,43 +1133,34 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
             </div>
 
             <div ref={gridScrollRef} className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
-              {media.length > 0 ? (
-                <div className="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-2.5 p-1.5 -mx-1.5">
-                  {media.map((image) => {
-                    const order = picked.indexOf(image.path);
-                    const on = order >= 0;
-                    return (
-                      <button
-                        key={image.path}
-                        data-thumb={image.path}
-                        type="button"
-                        onClick={() => togglePicked(image.path)}
-                        title={image.name}
-                        className={`group relative aspect-square rounded-xl overflow-hidden bg-neutral-100 dark:bg-white/[0.04] flex items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-blue-400 transition-all ${
-                          on ? "ring-[3px] ring-blue-500 ring-offset-2 ring-offset-white dark:ring-offset-neutral-900" : ""
-                        }`}
-                      >
-                        <span className={`absolute inset-0 transition-transform duration-300 ${on ? "scale-[0.97]" : "group-hover:scale-105"}`}>
-                          <span className="absolute inset-0 flex items-center justify-center">{renderThumb(image.path)}</span>
-                        </span>
-                        <span className={`absolute inset-0 transition-colors ${on ? "bg-blue-500/15" : "bg-black/0 group-hover:bg-black/10"}`} />
-                        {image.video && (
-                          <span className="absolute left-1.5 bottom-1.5 flex items-center gap-1 px-1.5 h-5 rounded-md bg-black/65 text-[10.5px] font-semibold text-white tabular-nums">
-                            <IoVideocam size={11} />
-                            {videoInfo[image.path] ? formatLength(videoInfo[image.path].duration) : ""}
-                          </span>
-                        )}
-                        <span
-                          className={`absolute top-2 right-2 min-w-[22px] h-[22px] px-1 rounded-full text-[11px] font-semibold flex items-center justify-center tabular-nums transition-all ${
-                            on ? "bg-blue-500 text-white shadow" : "bg-black/25 text-transparent ring-1 ring-white/80 opacity-0 group-hover:opacity-100"
-                          }`}
-                        >
-                          {on ? order + 1 : <IoCheckmark size={12} />}
-                        </span>
-                      </button>
-                    );
-                  })}
+              {searching && mediaSearch.fuzzy && media.length > 0 && (
+                <p className="pb-2 text-[12px] text-neutral-500 dark:text-neutral-400">
+                  No exact match for &ldquo;{deferredMediaQuery.trim()}&rdquo; - showing close matches.
+                </p>
+              )}
+              {searching && media.length === 0 ? (
+                <div className="w-full h-full min-h-[220px] flex flex-col items-center justify-center gap-2 text-neutral-500 dark:text-neutral-400">
+                  <IoSearch size={26} className="text-neutral-300 dark:text-neutral-600" />
+                  <span className="text-[13px] font-medium">Nothing matches &ldquo;{deferredMediaQuery.trim()}&rdquo;</span>
+                  <span className="text-[12px]">Try part of a file name, a folder, or a month like &ldquo;aug 2026&rdquo;</span>
+                  <button
+                    type="button"
+                    onClick={() => setMediaQuery("")}
+                    className="mt-1 h-8 px-3 rounded-full text-[12.5px] font-medium text-blue-600 bg-blue-50 hover:bg-blue-100 dark:text-blue-300 dark:bg-blue-500/10 dark:hover:bg-blue-500/20"
+                  >
+                    Clear search
+                  </button>
                 </div>
+              ) : media.length > 0 ? (
+                <MediaGrid
+                  media={media}
+                  picked={picked}
+                  thumbUrls={thumbUrls}
+                  videoInfo={videoInfo}
+                  scrollRef={gridScrollRef}
+                  onToggle={togglePicked}
+                  onNearView={markNearView}
+                />
               ) : (
                 <button
                   type="button"
@@ -1023,12 +1230,12 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
                 {stageProject ? (
                   <ProjectStage
                     project={stageProject}
-                    frame={frame}
+                    frame={stageInputs.frame}
                     images={stagePictures}
                     blurFill={blurFill}
                     videoPaths={pickedVideos}
                     playing={playing}
-                    restartKey={`${shownStyle}|${resolvedFrameId}|${shownTemplate?.id ?? ""}`}
+                    restartKey={`${stageInputs.style}|${stageInputs.frameId}|${stageInputs.template?.id ?? ""}`}
                     songClock={music ? songClock : null}
                   />
                 ) : (
@@ -1063,13 +1270,14 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
 
             {/* Style templates */}
             <div className="shrink-0 px-4 pt-3">
-              <div className="flex items-center justify-between px-1 mb-1.5">
+              <div className="flex items-center justify-between px-1 mb-0.5">
                 <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-500 dark:text-neutral-400">Style</h3>
                 <span className="text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate ml-2">{(shownTemplate ?? template)?.blurb ?? "Your own pace, transitions and look"}</span>
               </div>
-              <div className="flex gap-1.5 overflow-x-auto pb-2 -mx-1 px-1" onMouseLeave={() => setHoverTemplateId(undefined)}>
+              {/* pt-1: a scroller clips vertically too, and the active card's ring sits outside its box. */}
+              <div className="flex gap-1.5 overflow-x-auto pt-1 pb-2 -mx-1 px-1" onMouseLeave={() => setHoverTemplateId(undefined)}>
                 {[null, ...STYLE_TEMPLATES].map((t) => (
-                  <TemplateCard key={t?.id ?? "custom"} template={t} active={(t?.id ?? null) === templateId} onClick={() => applyTemplate(t)} onHover={(on) => setHoverTemplateId(on ? t?.id ?? null : undefined)} />
+                  <TemplateCard key={t?.id ?? "custom"} template={t} active={(t?.id ?? null) === templateId} onPick={pickTemplate} onHover={hoverTemplate} />
                 ))}
               </div>
             </div>
@@ -1368,7 +1576,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
             type="button"
             onClick={() => void handleCreate()}
             disabled={isCreating}
-            className="flex items-center gap-1.5 h-10 px-5 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 text-white text-[13.5px] font-semibold shadow-md shadow-blue-600/25 hover:brightness-110 disabled:opacity-60 outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2"
+            className="flex items-center gap-1.5 h-10 px-5 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white text-[13.5px] font-semibold shadow-md shadow-blue-600/25 disabled:opacity-60 transition-all outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2"
           >
             <IoAdd size={17} />
             {isCreating ? "Creating…" : picked.length > 0 ? "Create video" : "Start blank"}

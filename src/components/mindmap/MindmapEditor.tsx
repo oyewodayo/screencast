@@ -56,6 +56,7 @@ import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHand
 import MindmapCanvas, { MindmapCanvasHandle } from "./MindmapCanvas";
 import MindmapPanel from "./MindmapPanel";
 import MindmapLiveView from "./MindmapLiveView";
+import LinksControl from "../links/LinksControl";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 
@@ -750,6 +751,7 @@ const MindmapEditor: React.FC<MindmapEditorProps> = ({ mindmapId, onBack }) => {
         </button>
 
         <div className="ml-auto flex items-center gap-2">
+          <LinksControl self={{ kind: "mindmap", id: mindmapId }} title={doc.name} variant="header" />
           {exportError && <span className="text-xs text-red-500">{exportError}</span>}
           {store.isSaving && <span className="text-[11px] text-gray-400">Saving…</span>}
           <button

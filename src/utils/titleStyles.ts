@@ -7,7 +7,7 @@
 import type { TextOverlay } from "./videoEditTypes";
 
 export type TitleLook = Partial<
-  Pick<TextOverlay, "fontFamily" | "color" | "fill" | "strokeColor" | "strokeWidth" | "glow" | "shadow" | "letterSpacing" | "backgroundColor" | "cornerStyle" | "padding">
+  Pick<TextOverlay, "fontFamily" | "color" | "fill" | "strokeColor" | "strokeWidth" | "glow" | "shadow" | "letterSpacing" | "backgroundColor" | "cornerStyle" | "padding" | "paddingX" | "boxFill" | "boxBorder">
 >;
 
 export interface TitleStyle {
@@ -31,6 +31,9 @@ export const CLEAR_LOOK: { [K in Exclude<keyof TitleLook, "color">]-?: undefined
   backgroundColor: undefined,
   cornerStyle: undefined,
   padding: undefined,
+  paddingX: undefined,
+  boxFill: undefined,
+  boxBorder: undefined,
 };
 
 const soft = { color: "rgba(0,0,0,0.55)", x: 0, y: 0.04, blur: 0.12 };
@@ -83,5 +86,5 @@ export const lookPatch = (look: TitleLook): TitleLook => ({ ...CLEAR_LOOK, ...lo
 export function wearsTitleStyle(o: Partial<TextOverlay>, style: TitleStyle): boolean {
   const full = lookPatch(style.look);
   if (style.look.color && style.look.color.toLowerCase() !== (o.color ?? "").toLowerCase()) return false;
-  return (Object.keys(full) as (keyof TitleLook)[]).every((k) => k === "padding" || k === "color" || JSON.stringify(full[k] ?? null) === JSON.stringify(o[k] ?? null));
+  return (Object.keys(full) as (keyof TitleLook)[]).every((k) => k === "padding" || k === "paddingX" || k === "color" || JSON.stringify(full[k] ?? null) === JSON.stringify(o[k] ?? null));
 }

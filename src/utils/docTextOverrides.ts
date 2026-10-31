@@ -37,6 +37,11 @@ const DocTextOverrides = Extension.create({
             parseHTML: (el: HTMLElement) => (el.style.fontStyle === "normal" ? "normal" : null),
             renderHTML: (attrs: Record<string, unknown>) => (attrs.fontStyle === "normal" ? { style: "font-style: normal" } : {}),
           },
+          tabAlign: {
+            default: null,
+            parseHTML: (el: HTMLElement) => (el.style.float === "right" ? "right" : null),
+            renderHTML: (attrs: Record<string, unknown>) => (attrs.tabAlign === "right" ? { style: "float: right" } : {}),
+          },
         },
       },
     ];

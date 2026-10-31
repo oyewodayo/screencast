@@ -155,7 +155,9 @@ pub async fn remove_bleed(app_handle: AppHandle, request: BleedRequest) -> Resul
     result?
 }
 
-#[tauri::command]
+// Only flips a flag behind its own mutex, so it skips serial(): a cancel must never queue behind
+// other commands.
+#[tauri::command(async)]
 pub fn cancel_bleed(job: String) {
     if let Some(flag) = running().lock().ok().and_then(|m| m.get(&job).cloned()) {
         flag.store(true, Ordering::SeqCst);

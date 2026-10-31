@@ -104,7 +104,7 @@ const MIN_TRACK_SECS: f64 = 0.25;
 // Following an appearance accepts a slightly weaker match than discovering one (it's expected there).
 const FOLLOW_SLACK: f32 = 0.08;
 
-fn jobs() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+pub(crate) fn jobs() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     static JOBS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -133,7 +133,13 @@ fn decoder(ffmpeg: &std::path::Path, source: &str, from: f64, seconds: f64, fps:
     let mut cmd = Command::new(ffmpeg);
     #[cfg(windows)]
     hide_console_window(&mut cmd);
-    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{:.4}", from.max(0.0)), "-i", source, "-t", &format!("{:.4}", seconds.max(0.001))]);
+    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{:.4}", from.max(0.0))]);
+    // A photo clip shows its picture for as long as it lasts: looped, it decodes as that many frames
+    // of it (a single frame couldn't be followed into an appearance).
+    if crate::commands::conversion::is_still_image_path(source) {
+        cmd.args(["-loop", "1"]);
+    }
+    cmd.args(["-i", source, "-t", &format!("{:.4}", seconds.max(0.001))]);
     cmd.args(["-an", "-sn", "-vf", &format!("fps={fps:.4},scale={aw}:{ah}:flags=area,format=gray"), "-f", "rawvideo", "pipe:1"]);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.spawn().map_err(|e| format!("Couldn't start ffmpeg: {e}"))

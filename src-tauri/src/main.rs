@@ -20,9 +20,14 @@ mod commands {
     pub mod file_info;
     pub mod motion_tracking;
     pub mod object_find;
+    pub mod face_find;
     pub mod music_library;
+    // The AI voice's commands - see services/tts.rs.
+    pub mod tts;
     pub mod native_playback;
     pub mod snip;
+    pub mod screen_color;
+    pub mod stage_render;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
@@ -39,6 +44,7 @@ mod services {
     pub mod citations;
     pub mod docs;
     pub mod docs_search;
+    pub mod links;
     pub mod file_watcher;
     pub mod google_share;
     pub mod image_annotations;
@@ -72,6 +78,10 @@ mod services {
     pub mod trash;
     pub mod utility;
     pub mod whisper_model;
+    // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
+    pub mod tts;
+    pub mod tts_text;
+    pub mod tts_vocab;
     pub mod video_edits;
     pub mod mindmaps;
     pub mod whiteboards;
@@ -517,10 +527,21 @@ fn main() {
             commands::conversion::transcribe_doc_audio,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::get_export_frame_rate,
+            commands::stage_render::stage_render_open,
+            commands::stage_render::stage_render_frame,
+            commands::stage_render::stage_render_finish,
+            commands::stage_render::stage_render_discard,
             commands::background_removal::background_removal_status,
             commands::recording::load_bubble_sidecar,
             commands::object_find::find_objects,
             commands::object_find::cancel_find_objects,
+            commands::face_find::face_matching_status,
+            commands::face_find::download_face_matching,
+            commands::face_find::cancel_face_matching_download,
+            commands::face_find::outline_kind_at,
+            commands::face_find::prepare_face_matching,
+            commands::face_find::find_person,
             commands::camera_effects::camera_effect_start,
             commands::camera_effects::camera_effect_status,
             commands::camera_effects::camera_effect_preview,
@@ -549,6 +570,13 @@ fn main() {
             commands::audio_tracks::download_separation_engine,
             commands::audio_tracks::cancel_separation_engine_download,
             commands::audio_tracks::cancel_voice_music_separation,
+            commands::tts::tts_status,
+            commands::tts::download_tts,
+            commands::tts::cancel_tts_download,
+            commands::tts::tts_synthesize,
+            commands::tts::cancel_tts,
+            commands::tts::tts_preview,
+            commands::tts::tts_release,
             commands::music_library::get_music_catalog,
             commands::music_library::get_music_track_file,
             commands::music_library::restore_music_track,
@@ -563,6 +591,7 @@ fn main() {
             commands::native_playback::get_next_audio_chunk,
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
+            commands::screen_color::sample_screen_at_cursor,
             commands::snip::snip_begin,
             commands::snip::snip_info,
             commands::snip::snip_frame,
@@ -633,6 +662,10 @@ fn main() {
             services::docs::link_doc_to_file,
             services::docs::unlink_doc,
             services::docs::find_docs_linked_to,
+            services::links::list_links,
+            services::links::add_link,
+            services::links::remove_link,
+            services::links::relink_file_path,
             services::docs::relink_doc_path,
             services::docs::export_doc,
             services::docs::export_doc_binary,

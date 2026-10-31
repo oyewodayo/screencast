@@ -31,7 +31,11 @@ interface GoogleAccount {
 interface GoogleStatus {
   configured: boolean;
   account: GoogleAccount | null;
+  // Which Google services the user has allowed so far - each is its own consent, asked for the
+  // first time it's used (Google won't take YouTube and Drive permissions in one request).
+  services: GoogleService[];
 }
+type GoogleService = "youtube" | "drive";
 interface YouTubeResult {
   videoId: string;
   url: string;
@@ -108,7 +112,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
   }, [body, includeChapters, chapterInfo]);
 
   useEffect(() => {
-    invoke<GoogleStatus>("google_account_status").then(setStatus).catch(() => setStatus({ configured: false, account: null }));
+    invoke<GoogleStatus>("google_account_status").then(setStatus).catch(() => setStatus({ configured: false, account: null, services: [] }));
   }, []);
   useEffect(() => {
     const p = listen<{ jobId: string; sent: number; total: number; stage: string }>("share-upload-progress", (e) => {
@@ -127,12 +131,11 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose, upload]);
 
-  const signIn = async () => {
+  const signIn = async (service: GoogleService) => {
     setSigningIn(true);
     setError(null);
     try {
-      const account = await invoke<GoogleAccount>("google_sign_in");
-      setStatus((s) => ({ configured: s?.configured ?? true, account }));
+      setStatus(await invoke<GoogleStatus>("google_sign_in", { service }));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -141,7 +144,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
   };
   const signOut = async () => {
     await invoke("google_sign_out").catch(() => {});
-    setStatus((s) => (s ? { ...s, account: null } : s));
+    setStatus((s) => (s ? { ...s, account: null, services: [] } : s));
   };
 
   const uploadToYouTube = async () => {
@@ -193,7 +196,10 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
   const cancelUpload = () => upload && void invoke("cancel_share_upload", { jobId: upload.jobId });
 
   const needsGoogle = tab === "youtube" || tab === "link";
+  const service: GoogleService = tab === "link" ? "drive" : "youtube";
   const account = status?.account ?? null;
+  // Signed in *for this tab*: the other tab's service may not have been allowed yet.
+  const allowed = !!account && !!status?.services.includes(service);
   const pct = upload ? Math.min(100, Math.round((upload.sent / Math.max(1, upload.total)) * 100)) : 0;
   const tabBtn = (t: Tab, icon: React.ReactNode, label: string) => (
     <button
@@ -254,7 +260,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
         )}
         {needsGoogle && status?.configured && (
           <div className="flex items-center gap-2 text-[12px] rounded-lg bg-white/[0.04] px-2.5 py-2">
-            {account ? (
+            {allowed && account ? (
               <>
                 {account.picture ? <img src={account.picture} alt="" className="w-6 h-6 rounded-full" referrerPolicy="no-referrer" /> : <span className="w-6 h-6 rounded-full bg-white/10" />}
                 <span className="flex-1 min-w-0 truncate">
@@ -267,13 +273,15 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
               </>
             ) : (
               <>
-                <span className="flex-1 text-white/60">{signingIn ? "Finish signing in in your browser…" : "Sign in to your Google account to upload"}</span>
+                <span className="flex-1 text-white/60">
+                  {signingIn ? "Finish signing in in your browser…" : service === "youtube" ? "Sign in to Google to upload to YouTube" : "Sign in to Google to use your Drive for share links"}
+                </span>
                 {signingIn ? (
                   <button type="button" onClick={() => void invoke("google_cancel_sign_in")} className="px-2.5 py-1 rounded-md text-white/70 hover:bg-white/10">
                     Cancel
                   </button>
                 ) : (
-                  <button type="button" onClick={() => void signIn()} className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-500 text-white font-medium">
+                  <button type="button" onClick={() => void signIn(service)} className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-500 text-white font-medium">
                     Sign in with Google
                   </button>
                 )}
@@ -283,7 +291,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
         )}
 
         {tab === "youtube" && (
-          <div className={`flex flex-col gap-2.5 ${!account || !status?.configured ? "opacity-50 pointer-events-none" : ""}`}>
+          <div className={`flex flex-col gap-2.5 ${!allowed || !status?.configured ? "opacity-50 pointer-events-none" : ""}`}>
             {ytResult ? (
               <div className="flex flex-col gap-2 rounded-lg bg-emerald-500/10 ring-1 ring-emerald-400/25 p-3 text-[12px]">
                 <span className="font-medium text-emerald-200">It's on YouTube{ytResult.privacy !== privacy ? ` (as ${ytResult.privacy})` : ""}.</span>
@@ -386,7 +394,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
         )}
 
         {tab === "link" && (
-          <div className={`flex flex-col gap-2.5 ${!account || !status?.configured ? "opacity-50 pointer-events-none" : ""}`}>
+          <div className={`flex flex-col gap-2.5 ${!allowed || !status?.configured ? "opacity-50 pointer-events-none" : ""}`}>
             <p className="text-[12px] leading-relaxed text-white/60">
               Puts the video on your Google Drive and makes a link anyone can watch it from - no sign-in needed to view. Only you can change or delete it, from Drive.
             </p>

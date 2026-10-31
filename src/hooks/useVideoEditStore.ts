@@ -5,6 +5,7 @@ import { hasShapeOrMask, layerMaskGreyPng, revealMaskMotion } from "../utils/lay
 import { compactTracks, exportFades, freeTrack, isTrackHidden, pipTrack, stackOrder } from "../utils/videoTracks";
 import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/audioFx";
 import { automationForExport, type GainPoint } from "../utils/audioAutomation";
+import { joinFades, NO_FADES } from "../utils/audioJoins";
 import { cleanedTrackPath, isCleaned } from "../utils/audioTrackCleanup";
 import { isNeutralMaster, masterForExport, type MasterBus } from "../utils/masterBus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,7 +14,10 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCapt
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, audioEndTime, blankClipsFor, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import type { StageScene } from "../utils/stage/stageTypes";
+import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
+import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
 import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
 import type { TimelineClipboardItems } from "../utils/timelineClipboard";
 import { exportBlendMode } from "../utils/blendModes";
@@ -27,6 +31,9 @@ import {
   buildViewSwitchOverlays,
   ViewSwitchEvent,
   bringOverlayToFront,
+  layerBehind,
+  layerInFront,
+  overlayStack,
   deleteClipAt as deleteClipAtHandler,
   deleteClips as deleteClipsHandler,
   duplicateClips as duplicateClipsHandler,
@@ -88,7 +95,7 @@ export interface SplitScreenCell {
 }
 import { renderAssetFrames } from "../utils/videoAssets";
 import { keystrokesForExport, loadClipRecordings, screenStyleExport, withPointerLayers } from "../utils/screenPolish";
-import type { ScreenStyle } from "../utils/screenStyle";
+import { screenContentRect, type ScreenStyle } from "../utils/screenStyle";
 import type { PointerStyle } from "../utils/pointerTrack";
 import type { KeystrokeStyle } from "../utils/keystrokes";
 
@@ -176,13 +183,14 @@ function exportOverlayAnimation(animation: OverlayAnimation | undefined): string
 }
 
 type TextOverlayContentPatch = Partial<
-  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track" | "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "padding" | "rotation">
+  Pick<TextOverlay, "text" | "color" | "backgroundColor" | "colorRuns" | "boldRuns" | "italicRuns" | "textAlign" | "strokeColor" | "strokeWidth" | "cornerStyle" | "animation" | "x" | "y" | "width" | "height" | "fontSize" | "keyframes" | "reveal" | "blendMode" | "track" | "fontFamily" | "letterSpacing" | "fill" | "glow" | "shadow" | "padding" | "paddingX" | "lineHeight" | "textCase" | "boxFill" | "boxBorder" | "rotation">
 >;
 type ImageOverlayContentPatch = Partial<
   Pick<ImageOverlay, "x" | "y" | "width" | "height" | "opacity" | "cornerRadius" | "rotation" | "borderColor" | "shadow" | "flipHorizontal" | "flipVertical" | "src" | "keyframes" | "asset" | "reveal" | "blendMode" | "track">
 >;
 type BlurOverlayContentPatch = Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation" | "keyframes" | "track">>;
 export type AdjustmentLayerPatch = Partial<Omit<AdjustmentLayer, "id" | "createdAt" | "updatedAt">>;
+export type SoundProPatch = Pick<EditableFields, "clips" | "audioOverlays" | "master" | "videoAudioFx">;
 type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec" | "fadeOutSec" | "muted" | "src" | "bpm" | "beats" | "duckUnderSpeech" | "duckLevel" | "fx" | "noiseReduction" | "audioCleanup" | "bleed">>;
 // What a caller can set up front on a new audio overlay beyond its timing (a library song arrives
 // with its part, title, licence, beats and ducking already decided).
@@ -236,6 +244,8 @@ export interface UseVideoEditStoreResult {
   deleteImageOverlay: (id: string) => void;
   duplicateImageOverlay: (id: string) => string;
   bringImageOverlayToFront: (id: string) => void;
+  // Several pictures/elements at once (a sticker set), one undo step, stacked on top in order.
+  addImageOverlays: (images: ImageOverlay[]) => string[];
   sendImageOverlayToBack: (id: string) => void;
   // Blurred regions - same frame-relative x/y/width/height basis as image overlays, but with no
   // z-order of their own (see BlurOverlay's own doc comment in videoEditTypes.ts for why) and no
@@ -255,6 +265,14 @@ export interface UseVideoEditStoreResult {
   moveAdjustmentLayerTime: (id: string, newStartTime: number) => void;
   deleteAdjustmentLayer: (id: string) => void;
   duplicateAdjustmentLayer: (id: string) => string;
+  // Motion-graphics scenes (Stage). updateScene takes the scene to its next state (stageEditing.ts);
+  // a run of quick edits to one scene (a drag, a slider) is one undo step.
+  scenes: StageScene[];
+  addScene: (startTime: number, frame: { width: number; height: number }) => string;
+  updateScene: (id: string, edit: (scene: StageScene) => StageScene) => void;
+  moveSceneTime: (id: string, startTime: number) => void;
+  deleteScene: (id: string) => void;
+  duplicateScene: (id: string) => string;
   // Chapters (videoChapters.ts), anchored to source moments; replaced as a whole list.
   chapters: VideoChapter[];
   setChapters: (chapters: VideoChapter[]) => void;
@@ -281,6 +299,10 @@ export interface UseVideoEditStoreResult {
   moveAudioOverlayTime: (id: string, newStartTime: number) => void;
   deleteAudioOverlay: (id: string) => void;
   duplicateAudioOverlay: (id: string) => string;
+  // Plays this audio's part again and again, back to back, until `until` (output seconds) - the
+  // last repeat cut short to end there. Its fade-in stays on the first, its fade-out (or `fadeOutSec`)
+  // moves to the last, so the run sounds like one piece. One undo step.
+  repeatAudioOverlayToFill: (id: string, until: number, fadeOutSec?: number) => void;
   // "Unlink" the primary video's own sound: adds one audio overlay per already-extracted clip
   // audio file AND mutes the video track, as a single undo step - so the result can be trimmed,
   // lowered, muted or deleted per piece without touching the picture. Replaces any overlays a
@@ -422,6 +444,12 @@ export interface UseVideoEditStoreResult {
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
+  // The kind of the step an undo (or a redo) would take back - "Make it sound pro"'s Before/After
+  // is an undo and a redo of its own step, so long as that's still the one on top.
+  undoTopLabel: VideoEditCommand["label"] | null;
+  redoTopLabel: VideoEditCommand["label"] | null;
+  // "Make it sound pro" (soundPro.ts): its clips, tracks and master in one undo step.
+  applySoundPro: (patch: SoundProPatch) => void;
   canRedo: boolean;
   isExporting: boolean;
   exportProgress: number | null;
@@ -447,8 +475,21 @@ export interface UseVideoEditStoreResult {
 export default function useVideoEditStore(sourcePath: string | undefined): UseVideoEditStoreResult {
   const [state, setState] = useState<VideoEditState | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [undoStack, setUndoStack] = useState<VideoEditCommand[]>([]);
-  const [redoStack, setRedoStack] = useState<VideoEditCommand[]>([]);
+  const [undoStack, setUndoStackState] = useState<VideoEditCommand[]>([]);
+  const [redoStack, setRedoStackState] = useState<VideoEditCommand[]>([]);
+  // The stacks as of right now, kept in step with every change - so undo/redo read and write them
+  // directly instead of from inside a state updater (React runs updaters twice in development's
+  // Strict Mode, which pushed every undone step onto the redo stack twice, and back).
+  const undoStackRef = useRef<VideoEditCommand[]>([]);
+  const redoStackRef = useRef<VideoEditCommand[]>([]);
+  const setUndoStack = useCallback((next: VideoEditCommand[] | ((prev: VideoEditCommand[]) => VideoEditCommand[])) => {
+    undoStackRef.current = typeof next === "function" ? next(undoStackRef.current) : next;
+    setUndoStackState(undoStackRef.current);
+  }, []);
+  const setRedoStack = useCallback((next: VideoEditCommand[] | ((prev: VideoEditCommand[]) => VideoEditCommand[])) => {
+    redoStackRef.current = typeof next === "function" ? next(redoStackRef.current) : next;
+    setRedoStackState(redoStackRef.current);
+  }, []);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -496,11 +537,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   }, []);
   // A project of sound alone plays over its own canvas (the file the player already has open) for as
   // long as the audio runs - available at once, nothing to load.
-  const audioOnly = !!sourcePath && isVideoProjectPath(sourcePath) && !!state && state.clips.length === 0 && state.audioOverlays.length > 0;
-  const audioOnlyEnd = audioOnly && state ? audioEndTime(state.audioOverlays) : 0;
+  // A project with sound or scenes but no clips plays on its blank canvas for as long as they run.
+  const canvasEnd = !!sourcePath && isVideoProjectPath(sourcePath) && !!state && state.clips.length === 0 ? canvasEndTime(state) : 0;
   const playbackClips = useMemo(
-    () => (audioOnly && sourcePath ? blankClipsFor(sourcePath, audioOnlyEnd, VIDEO_CANVAS_SECONDS) : state?.clips ?? []),
-    [audioOnly, sourcePath, audioOnlyEnd, state?.clips]
+    () => (canvasEnd > 0 && sourcePath ? blankClipsFor(sourcePath, canvasEnd, VIDEO_CANVAS_SECONDS) : state?.clips ?? []),
+    [canvasEnd, sourcePath, state?.clips]
   );
 
   const registerSourceDuration = useCallback((path: string, duration: number) => {
@@ -565,6 +606,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 audioOverlays: parsed.audioOverlays ?? [],
                 pipOverlays: parsed.pipOverlays ?? [],
                 adjustmentLayers: parsed.adjustmentLayers ?? [],
+                scenes: parsed.scenes ?? [],
                 chapters: parsed.chapters ?? [],
                 videoAudioMuted: parsed.videoAudioMuted ?? false,
                 videoAudioVolume: parsed.videoAudioVolume ?? 1,
@@ -584,6 +626,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           } catch (err) {
             console.error("Failed to parse video edit state:", err);
           }
+        } else if (isVideoProjectPath(sourcePath)) {
+          // A project whose timeline file is missing (deleted, not synced yet) starts as an empty
+          // canvas rather than one nothing can be added to - setDuration never seeds a project.
+          setState((prev) => prev ?? { ...createEmptyState(sourcePath, 0), clips: [] });
         }
         setLoading(false);
       },
@@ -755,6 +801,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     screenStyle: current.screenStyle,
     pointerStyle: current.pointerStyle,
     keystrokeStyle: current.keystrokeStyle,
+    scenes: current.scenes ?? [],
     ...patch,
   });
 
@@ -1002,7 +1049,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (x: number, y: number, width: number, fontSize: number, startTime: number, endTime: number): string => {
       const current = stateRef.current;
       if (!current) return "";
-      const overlay = makeTextOverlay(x, y, width, fontSize, startTime, endTime);
+      // New text lands on top of everything already placed.
+      const overlay = { ...makeTextOverlay(x, y, width, fontSize, startTime, endTime), layer: layerInFront(current.imageOverlays, current.textOverlays, "") ?? undefined };
       const textOverlays = addOverlay(current.textOverlays, overlay);
       pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "add-text");
       return overlay.id;
@@ -1071,8 +1119,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const textOverlays = bringOverlayToFront(current.textOverlays, id);
-      if (textOverlays === current.textOverlays) return;
+      // Past every other picture and text (overlayStack), and to that end of its own list.
+      const layer = layerInFront(current.imageOverlays, current.textOverlays, id);
+      if (layer === null) return;
+      const textOverlays = bringOverlayToFront(current.textOverlays, id).map((o) => (o.id === id ? { ...o, layer, updatedAt: Date.now() } : o));
       pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
     },
     [pushCommand]
@@ -1082,8 +1132,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const textOverlays = sendOverlayToBack(current.textOverlays, id);
-      if (textOverlays === current.textOverlays) return;
+      // Past every other picture and text (overlayStack), and to that end of its own list.
+      const layer = layerBehind(current.imageOverlays, current.textOverlays, id);
+      if (layer === null) return;
+      const textOverlays = sendOverlayToBack(current.textOverlays, id).map((o) => (o.id === id ? { ...o, layer, updatedAt: Date.now() } : o));
       pushCommand(snapshot(current, {}), snapshot(current, { textOverlays }), "edit-text");
     },
     [pushCommand]
@@ -1093,7 +1145,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (src: string, x: number, y: number, width: number, height: number, startTime: number, endTime: number, asset?: OverlayAsset): string => {
       const current = stateRef.current;
       if (!current) return "";
-      const overlay = makeImageOverlay(src, x, y, width, height, startTime, endTime, asset);
+      // A new picture lands on top of everything already placed, text included.
+      const overlay = { ...makeImageOverlay(src, x, y, width, height, startTime, endTime, asset), layer: layerInFront(current.imageOverlays, current.textOverlays, "") ?? undefined };
       const imageOverlays = addOverlay(current.imageOverlays, overlay);
       pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "add-image");
       return overlay.id;
@@ -1159,8 +1212,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const imageOverlays = bringOverlayToFront(current.imageOverlays, id);
-      if (imageOverlays === current.imageOverlays) return;
+      // Past every other picture and text (overlayStack), and to that end of its own list.
+      const layer = layerInFront(current.imageOverlays, current.textOverlays, id);
+      if (layer === null) return;
+      const imageOverlays = bringOverlayToFront(current.imageOverlays, id).map((o) => (o.id === id ? { ...o, layer, updatedAt: Date.now() } : o));
       pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
     },
     [pushCommand]
@@ -1170,9 +1225,23 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const imageOverlays = sendOverlayToBack(current.imageOverlays, id);
-      if (imageOverlays === current.imageOverlays) return;
+      // Past every other picture and text (overlayStack), and to that end of its own list.
+      const layer = layerBehind(current.imageOverlays, current.textOverlays, id);
+      if (layer === null) return;
+      const imageOverlays = sendOverlayToBack(current.imageOverlays, id).map((o) => (o.id === id ? { ...o, layer, updatedAt: Date.now() } : o));
       pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+    },
+    [pushCommand]
+  );
+
+  const addImageOverlays = useCallback(
+    (images: ImageOverlay[]): string[] => {
+      const current = stateRef.current;
+      if (!current || images.length === 0) return [];
+      const top = layerInFront(current.imageOverlays, current.textOverlays, "") ?? 0;
+      const placed = images.map((o, i) => ({ ...o, layer: top + i }));
+      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays: [...current.imageOverlays, ...placed] }), "add-image");
+      return placed.map((o) => o.id);
     },
     [pushCommand]
   );
@@ -1253,6 +1322,58 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const copy = duplicateOverlay(original);
       const blurOverlays = addOverlay(current.blurOverlays, copy);
       pushCommand(snapshot(current, {}), snapshot(current, { blurOverlays }), "add-blur");
+      return copy.id;
+    },
+    [pushCommand]
+  );
+
+  // ---- Stage scenes -----------------------------------------------------------------------------
+
+  const addScene = useCallback(
+    (startTime: number, frame: { width: number; height: number }): string => {
+      const current = stateRef.current;
+      if (!current) return "";
+      const scene = makeStageScene({ startTime, frameWidth: frame.width, frameHeight: frame.height, like: sceneBefore(current.scenes, startTime) });
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), scene] }), "add-scene");
+      return scene.id;
+    },
+    [pushCommand]
+  );
+
+  const updateScene = useCallback(
+    (id: string, edit: (scene: StageScene) => StageScene) => {
+      const current = stateRef.current;
+      const scene = current?.scenes?.find((s) => s.id === id);
+      if (!current || !scene) return;
+      const next = edit(scene);
+      if (next === scene) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: (current.scenes ?? []).map((s) => (s.id === id ? next : s)) }), "edit-scene");
+    },
+    [pushCommand]
+  );
+
+  const moveSceneTime = useCallback(
+    (id: string, startTime: number) => updateScene(id, (s) => ({ ...s, startTime: Math.max(0, startTime) })),
+    [updateScene]
+  );
+
+  const deleteScene = useCallback(
+    (id: string) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: (current.scenes ?? []).filter((s) => s.id !== id) }), "delete-scene");
+    },
+    [pushCommand]
+  );
+
+  const duplicateScene = useCallback(
+    (id: string): string => {
+      const current = stateRef.current;
+      const original = current?.scenes?.find((s) => s.id === id);
+      if (!current || !original) return "";
+      // Right after the original.
+      const copy = duplicateStageScene(original, original.startTime + original.beats.reduce((sum, b) => sum + b.hold, 0));
+      pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), copy] }), "add-scene");
       return copy.id;
     },
     [pushCommand]
@@ -1423,6 +1544,37 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const audioOverlays = addOverlay(current.audioOverlays, copy);
       pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "add-audio");
       return copy.id;
+    },
+    [pushCommand]
+  );
+
+  const repeatAudioOverlayToFill = useCallback(
+    (id: string, until: number, fadeOutSec?: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const original = current.audioOverlays.find((o) => o.id === id);
+      if (!original) return;
+      const part = original.endTime - original.startTime;
+      if (part < 0.1 || until - original.endTime < 0.05) return;
+      const fadeOut = fadeOutSec ?? original.fadeOutSec;
+      const now = Date.now();
+      let audioOverlays = current.audioOverlays.map((o) => (o.id === id ? { ...o, fadeOutSec: undefined, updatedAt: now } : o));
+      let pieces = 0;
+      // A frame's slack, so float rounding never leaves a sliver of a repeat at the end.
+      for (let t = original.endTime; t < until - 0.05 && pieces < 1000; t += part, pieces++) {
+        const last = t + part >= until - 0.05;
+        audioOverlays = addOverlay(audioOverlays, {
+          ...original,
+          id: crypto.randomUUID(),
+          startTime: t,
+          endTime: last ? until : t + part,
+          fadeInSec: undefined,
+          fadeOutSec: last ? fadeOut : undefined,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      pushCommand(snapshot(current, {}), snapshot(current, { audioOverlays }), "add-audio");
     },
     [pushCommand]
   );
@@ -1742,6 +1894,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     [pushCommand]
   );
 
+  const applySoundPro = useCallback(
+    (patch: SoundProPatch) => {
+      const current = stateRef.current;
+      if (!current) return;
+      pushCommand(
+        snapshot(current, {}),
+        snapshot(current, { ...patch, videoAudioFx: tidyFx(patch.videoAudioFx), master: isNeutralMaster(patch.master) ? undefined : patch.master }),
+        "sound-pro"
+      );
+    },
+    [pushCommand]
+  );
+
   // A point drag streams updates - pushCommand folds a quick run of them into one undo step.
   const setAudioGain = useCallback(
     (id: string, gain: GainPoint[] | undefined) => {
@@ -1890,27 +2055,28 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
 
   const undo = useCallback(() => {
     lastCommandRef.current = null;
-    setUndoStack((prevUndo) => {
-      if (prevUndo.length === 0) return prevUndo;
-      const command = prevUndo[prevUndo.length - 1];
-      setState((prev) => (prev ? { ...prev, ...command.before, updatedAt: new Date().toISOString() } : prev));
-      setRedoStack((prevRedo) => [...prevRedo, command]);
-      scheduleAutosave();
-      return prevUndo.slice(0, -1);
-    });
-  }, [scheduleAutosave]);
+    const stack = undoStackRef.current;
+    if (stack.length === 0) return;
+    const command = stack[stack.length - 1];
+    // In step right away, as pushCommand keeps it - the next edit builds on what's undone.
+    if (stateRef.current) stateRef.current = { ...stateRef.current, ...command.before };
+    setState((prev) => (prev ? { ...prev, ...command.before, updatedAt: new Date().toISOString() } : prev));
+    setUndoStack(stack.slice(0, -1));
+    setRedoStack([...redoStackRef.current, command]);
+    scheduleAutosave();
+  }, [scheduleAutosave, setUndoStack, setRedoStack]);
 
   const redo = useCallback(() => {
     lastCommandRef.current = null;
-    setRedoStack((prevRedo) => {
-      if (prevRedo.length === 0) return prevRedo;
-      const command = prevRedo[prevRedo.length - 1];
-      setState((prev) => (prev ? { ...prev, ...applyCommand(command), updatedAt: new Date().toISOString() } : prev));
-      setUndoStack((prevUndo) => [...prevUndo, command]);
-      scheduleAutosave();
-      return prevRedo.slice(0, -1);
-    });
-  }, [scheduleAutosave]);
+    const stack = redoStackRef.current;
+    if (stack.length === 0) return;
+    const command = stack[stack.length - 1];
+    if (stateRef.current) stateRef.current = { ...stateRef.current, ...applyCommand(command) };
+    setState((prev) => (prev ? { ...prev, ...applyCommand(command), updatedAt: new Date().toISOString() } : prev));
+    setRedoStack(stack.slice(0, -1));
+    setUndoStack([...undoStackRef.current, command]);
+    scheduleAutosave();
+  }, [scheduleAutosave, setUndoStack, setRedoStack]);
 
   // Surfaces export_trimmed_video's progress (it runs through the same run_conversion machinery
   // every other conversion does, so it emits the same 'conversion-progress' event, keyed by the
@@ -1952,8 +2118,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const saved = override ?? stateRef.current;
       if (!sourcePath || !saved) return null;
       // Sound with no pictures saves as a video of a blank screen (blankClipsFor).
-      const audioOnly = saved.clips.length === 0 && isVideoProjectPath(sourcePath) && saved.audioOverlays.length > 0;
-      const current = audioOnly ? { ...saved, clips: blankClipsFor(await ensureBlankFrame(sourcePath), audioEndTime(saved.audioOverlays), IMAGE_CLIP_MAX_SECONDS) } : saved;
+      // Sound or scenes with no clips save as a video of the blank canvas they play on.
+      const canvasOnly = saved.clips.length === 0 && isVideoProjectPath(sourcePath) && canvasEndTime(saved) > 0;
+      const current = canvasOnly ? { ...saved, clips: blankClipsFor(await ensureBlankFrame(sourcePath), canvasEndTime(saved), IMAGE_CLIP_MAX_SECONDS) } : saved;
       if (current.clips.length === 0) return null;
       // Overlays, blur regions, picture-in-picture and captions are laid out on the FINAL frame -
       // the platform format's when one is chosen (export fits the video into it first).
@@ -1966,11 +2133,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         endTime: number;
         animation: string;
         keyframes?: ExportKeyframe[];
-        frames?: { unique: string[]; sequence: number[] };
+        frames?: { unique: string[]; sequence: number[]; fps: number };
         blendMode?: string;
+        onFrame?: boolean;
       }[] = [];
       if (videoPixelSize) {
-        const { width: pxW, height: pxH } = videoPixelSize;
+        // With a Screen Style, text and pictures are laid out on the picture in the frame's hole
+        // (as the preview places them) but composited over the frame itself, so they can sit on
+        // the padding around it: drawn at the hole's size, then moved to where it is.
+        const content = current.screenStyle ? screenContentRect(videoPixelSize.width, videoPixelSize.height, current.screenStyle) : null;
+        const { width: pxW, height: pxH } = content ?? videoPixelSize;
+        // Animated overlays are drawn at the rate export reads them at - the video's own (a 60fps
+        // recording's titles move at 60), so a frame sequence lines up with the video frame for frame.
+        const fps = await invoke<number>("get_export_frame_rate", { sourcePaths: current.clips.map((c) => c.sourcePath) }).catch(() => 30);
         // Keyframes in the export's terms: absolute output seconds, and the rendered PNG's own
         // top-left in pixels (offset from the overlay's x/y by however the renderer padded it).
         const exportKeyframes = (o: { x: number; y: number; startTime: number; keyframes?: OverlayKeyframe[] }, xPx: number, yPx: number) =>
@@ -1984,60 +2159,63 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 easing: k.easing,
               }))
             : undefined;
-        // Pictures and elements first, then text: the preview stacks text above them
-        // (VideoOverlayLayer draws its text boxes last), so the export does too.
-        for (const o of current.imageOverlays) {
-          const blendMode = exportBlendMode(o.blendMode);
-          if (o.asset) {
-            // A shape/animated element burns in as a frame sequence of its own animation -
-            // drawn by the same function as the preview (videoAssets.ts).
-            // eslint-disable-next-line no-await-in-loop
-            const seq = await renderAssetFrames(o, pxW, pxH);
-            if (seq)
-              overlays.push({
-                dataBase64: "",
-                x: seq.xPx,
-                y: seq.yPx,
-                startTime: o.startTime,
-                endTime: o.endTime,
-                animation: exportOverlayAnimation(o.animation),
-                keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                frames: { unique: seq.unique, sequence: seq.sequence },
-                blendMode,
-              });
-            continue;
-          }
-          if (imageOverlayAnimates(o)) {
-            // A revealing picture (imageReveal.ts) or one whose mask opens (layerMask.ts) burns in
-            // as a frame sequence.
-            // eslint-disable-next-line no-await-in-loop
-            const seq = await renderImageRevealFrames(o, pxW, pxH);
-            if (seq)
-              overlays.push({
-                dataBase64: "",
-                x: seq.xPx,
-                y: seq.yPx,
-                startTime: o.startTime,
-                endTime: o.endTime,
-                animation: exportOverlayAnimation(o.animation),
-                keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                frames: { unique: seq.unique, sequence: seq.sequence },
-                blendMode,
-              });
-            continue;
-          }
-          // eslint-disable-next-line no-await-in-loop
-          const rendered = await renderImageOverlayToPng(o, pxW, pxH);
-          if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
-        }
         // A canvas draws a title in the fallback face if its own isn't loaded yet.
         await loadTitleFonts(current.textOverlays.map((o) => o.fontFamily));
-        for (const o of current.textOverlays) {
+        // Bottom of the pile first (overlayStack), each composited over the ones before - the
+        // preview stacks text and pictures the same way.
+        for (const entry of overlayStack(current.imageOverlays, current.textOverlays)) {
+          if (entry.kind === "image") {
+            const o = entry.o;
+            const blendMode = exportBlendMode(o.blendMode);
+            if (o.asset) {
+              // A shape/animated element burns in as a frame sequence of its own animation -
+              // drawn by the same function as the preview (videoAssets.ts).
+              // eslint-disable-next-line no-await-in-loop
+              const seq = await renderAssetFrames(o, pxW, pxH, fps);
+              if (seq)
+                overlays.push({
+                  dataBase64: "",
+                  x: seq.xPx,
+                  y: seq.yPx,
+                  startTime: o.startTime,
+                  endTime: o.endTime,
+                  animation: exportOverlayAnimation(o.animation),
+                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                  frames: { unique: seq.unique, sequence: seq.sequence, fps },
+                  blendMode,
+                });
+              continue;
+            }
+            if (imageOverlayAnimates(o)) {
+              // A revealing picture (imageReveal.ts) or one whose mask opens (layerMask.ts) burns in
+              // as a frame sequence.
+              // eslint-disable-next-line no-await-in-loop
+              const seq = await renderImageRevealFrames(o, pxW, pxH, fps);
+              if (seq)
+                overlays.push({
+                  dataBase64: "",
+                  x: seq.xPx,
+                  y: seq.yPx,
+                  startTime: o.startTime,
+                  endTime: o.endTime,
+                  animation: exportOverlayAnimation(o.animation),
+                  keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
+                  frames: { unique: seq.unique, sequence: seq.sequence, fps },
+                  blendMode,
+                });
+              continue;
+            }
+            // eslint-disable-next-line no-await-in-loop
+            const rendered = await renderImageOverlayToPng(o, pxW, pxH);
+            if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
+            continue;
+          }
+          const o = entry.o;
           const blendMode = exportBlendMode(o.blendMode);
           if (isTextReveal(o.animation)) {
             // Letter-by-letter titles burn in as a frame sequence (textReveal.ts).
             // eslint-disable-next-line no-await-in-loop
-            const seq = await renderTextRevealFrames(o, pxW, pxH);
+            const seq = await renderTextRevealFrames(o, pxW, pxH, fps);
             if (seq)
               overlays.push({
                 dataBase64: "",
@@ -2047,7 +2225,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
                 endTime: o.endTime,
                 animation: "none",
                 keyframes: exportKeyframes(o, seq.xPx, seq.yPx),
-                frames: { unique: seq.unique, sequence: seq.sequence },
+                frames: { unique: seq.unique, sequence: seq.sequence, fps },
                 blendMode,
               });
             continue;
@@ -2055,6 +2233,13 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           const rendered = renderTextOverlayToPng(o, pxW, pxH);
           if (rendered) overlays.push({ dataBase64: rendered.dataUrl, x: rendered.xPx, y: rendered.yPx, startTime: o.startTime, endTime: o.endTime, animation: exportOverlayAnimation(o.animation), keyframes: exportKeyframes(o, rendered.xPx, rendered.yPx), blendMode });
         }
+        if (content)
+          for (const ov of overlays) {
+            ov.x += content.x;
+            ov.y += content.y;
+            ov.keyframes = ov.keyframes?.map((k) => ({ ...k, x: k.x + content.x, y: k.y + content.y }));
+            ov.onFrame = true;
+          }
       }
 
       // A plain rectangle has no fixed content to pre-render (it depends on whatever the
@@ -2162,6 +2347,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
         // eslint-disable-next-line no-await-in-loop
         if (!o.muted && isCleaned(o)) cleanedSrc.set(o.id, await cleanedTrackPath(o));
       }
+      // Fades as played: each piece's own, its crossfades and its click-proof edges (audioJoins.ts).
+      const fades = joinFades(current.audioOverlays);
       const audioOverlays = current.audioOverlays
         .filter((o) => !o.muted)
         .map((o) => ({
@@ -2170,8 +2357,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           endTime: o.endTime,
           trimStart: o.trimStart,
           volume: o.volume,
-          fadeIn: o.fadeInSec ?? 0,
-          fadeOut: o.fadeOutSec ?? 0,
+          fadeIn: (fades.get(o.id) ?? NO_FADES).fadeIn,
+          fadeOut: (fades.get(o.id) ?? NO_FADES).fadeOut,
+          fadeInCurve: (fades.get(o.id) ?? NO_FADES).fadeInCurve,
+          fadeOutCurve: (fades.get(o.id) ?? NO_FADES).fadeOutCurve,
           duck: duckEnvelopeFor(o, speech),
           fx: fxForExport(o.fx),
           gain: automationForExport(o),
@@ -2189,6 +2378,17 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const adjustmentLayers = videoPixelSize
         ? (current.adjustmentLayers ?? []).map((l) => adjustmentLayerExport(l, videoPixelSize.width, videoPixelSize.height)).filter((l) => l !== null)
         : [];
+
+      // Stage scenes: each rendered here, frame by frame, by the same renderer as the preview, at the
+      // final frame's size and the export's rate (composited before the screen frame goes round it).
+      const stageLayers: StageLayerSpec[] = [];
+      if (videoPixelSize && (current.scenes?.length ?? 0) > 0) {
+        const fps = await invoke<number>("get_export_frame_rate", { sourcePaths: current.clips.map((c) => c.sourcePath) }).catch(() => 30);
+        for (const scene of current.scenes!) {
+          // eslint-disable-next-line no-await-in-loop
+          stageLayers.push(await renderStageForExport(scene, { width: videoPixelSize.width, height: videoPixelSize.height, fps }));
+        }
+      }
 
       // Screen-recording polish (screenPolish.ts): the frame around the edited picture and the
       // shortcut chips, both on the final frame, and each clip's drawn pointer.
@@ -2219,6 +2419,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           master: masterForExport(current.master),
           screenStyle,
           keystrokes,
+          stageLayers,
         },
         sourcePath,
         durationSec: totalOutputDuration(current.clips),
@@ -2397,6 +2598,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteImageOverlay,
     duplicateImageOverlay,
     bringImageOverlayToFront,
+    addImageOverlays,
     sendImageOverlayToBack,
     addBlurOverlay,
     updateBlurOverlayContent,
@@ -2405,6 +2607,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     deleteBlurOverlay,
     duplicateBlurOverlay,
     adjustmentLayers: state?.adjustmentLayers ?? [],
+    scenes: state?.scenes ?? [],
+    addScene,
+    updateScene,
+    moveSceneTime,
+    deleteScene,
+    duplicateScene,
     addAdjustmentLayer,
     updateAdjustmentLayer,
     resizeAdjustmentLayerTime,
@@ -2422,6 +2630,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveAudioOverlayTime,
     deleteAudioOverlay,
     duplicateAudioOverlay,
+    repeatAudioOverlayToFill,
     addPipOverlay,
     addVideoLayers,
     liftWebcamBubble,
@@ -2484,6 +2693,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     redo,
     canUndo: undoStack.length > 0,
     canRedo: redoStack.length > 0,
+    undoTopLabel: undoStack[undoStack.length - 1]?.label ?? null,
+    redoTopLabel: redoStack[redoStack.length - 1]?.label ?? null,
+    applySoundPro,
     isExporting,
     exportProgress,
     exportError,

@@ -14,6 +14,10 @@ name: Release
 #   BRIEFCAST_POSTHOG_KEY               optional - usage analytics, PostHog project token (phc_...)
 #                                       (src-tauri/src/services/telemetry.rs)
 #   BRIEFCAST_SENTRY_DSN                optional - crash reports (same file)
+#   BRIEFCAST_GOOGLE_CLIENT_ID / BRIEFCAST_GOOGLE_CLIENT_SECRET
+#                                       needed for Share -> YouTube / Drive - the OAuth client of the
+#                                       desktop-app credential. Unset = the Share panel says Google
+#                                       sign-in isn't set up (src-tauri/src/services/google_share.rs)
 #   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
 #                                       optional - Windows code signing via Azure Trusted Signing
 # Variables (same page, Variables tab):
@@ -136,6 +140,9 @@ jobs:
           BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
           # Phone transfer's trusted HTTPS certificates (server/lan-certs) - unset compiles it out.
           BRIEFCAST_LAN_TLS_API: ${{ vars.BRIEFCAST_LAN_TLS_API }}
+          # Share -> YouTube / Drive sign-in, read at compile time (option_env!) - unset disables it.
+          BRIEFCAST_GOOGLE_CLIENT_ID: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_ID }}
+          BRIEFCAST_GOOGLE_CLIENT_SECRET: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_SECRET }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}

@@ -25,6 +25,10 @@ export const TITLE_FONTS: TitleFont[] = [
   { id: "bebas", label: "Bebas Neue", family: "Bebas Neue", weight: 400, category: "Display", caps: true },
   { id: "anton", label: "Anton", family: "Anton", weight: 400, category: "Display", caps: true },
   { id: "oswald", label: "Oswald", family: "Oswald", weight: 700, category: "Display", caps: true },
+  { id: "inter", label: "Inter", family: "Inter", weight: 400, category: "Clean" },
+  { id: "inter-medium", label: "Inter Medium", family: "Inter", weight: 500, category: "Clean" },
+  { id: "inter-semibold", label: "Inter Semibold", family: "Inter", weight: 600, category: "Clean" },
+  { id: "inter-bold", label: "Inter Bold", family: "Inter", weight: 700, category: "Clean" },
   { id: "montserrat", label: "Montserrat", family: "Montserrat", weight: 900, category: "Clean" },
   { id: "montserrat-italic", label: "Montserrat Italic", family: "Montserrat", weight: 900, italic: true, category: "Clean" },
   { id: "montserrat-bold", label: "Montserrat Bold", family: "Montserrat", weight: 800, category: "Clean" },
@@ -36,6 +40,8 @@ export const TITLE_FONTS: TitleFont[] = [
   { id: "dm-serif", label: "DM Serif", family: "DM Serif Display", weight: 400, category: "Serif" },
   { id: "dm-serif-italic", label: "DM Serif Italic", family: "DM Serif Display", weight: 400, italic: true, category: "Serif" },
   { id: "cinzel", label: "Cinzel", family: "Cinzel", weight: 700, category: "Serif", caps: true },
+  { id: "instrument-serif", label: "Instrument Serif", family: "Instrument Serif", weight: 400, category: "Serif" },
+  { id: "instrument-serif-italic", label: "Instrument Serif Italic", family: "Instrument Serif", weight: 400, italic: true, category: "Serif" },
   { id: "great-vibes", label: "Great Vibes", family: "Great Vibes", weight: 400, category: "Script" },
   { id: "pacifico", label: "Pacifico", family: "Pacifico", weight: 400, category: "Script" },
   { id: "dancing", label: "Dancing Script", family: "Dancing Script", weight: 700, category: "Script" },
@@ -46,6 +52,7 @@ export const TITLE_FONTS: TitleFont[] = [
   { id: "bangers", label: "Bangers", family: "Bangers", weight: 400, category: "Fun", caps: true },
   { id: "righteous", label: "Righteous", family: "Righteous", weight: 400, category: "Fun" },
   { id: "orbitron", label: "Orbitron", family: "Orbitron", weight: 800, category: "Tech", caps: true },
+  { id: "jetbrains-mono", label: "JetBrains Mono", family: "JetBrains Mono", weight: 400, category: "Tech" },
   { id: "monoton", label: "Monoton", family: "Monoton", weight: 400, category: "Tech", caps: true },
 ];
 
@@ -56,12 +63,13 @@ export const titleFont = (id: string | undefined): TitleFont | null => (id ? byI
 
 // The CSS `font` shorthand for a title in `id`'s face at `sizePx` (the system stack without one).
 // `bold`/`italic` are a run's own formatting on top of the face.
-export function titleFontCss(id: string | undefined, sizePx: number, run: { bold?: boolean; italic?: boolean } = {}): string {
+export function titleFontCss(id: string | undefined, sizePx: number, run: { bold?: boolean; italic?: boolean; weight?: number } = {}): string {
   const f = titleFont(id);
-  if (!f) return `${run.italic ? "italic " : ""}${run.bold ? "bold " : ""}${sizePx}px ${SYSTEM_FONT_STACK}`;
+  if (!f) return `${run.italic ? "italic " : ""}${run.weight ?? (run.bold ? "bold" : "")} ${sizePx}px ${SYSTEM_FONT_STACK}`.replace(/^ /, "");
   const italic = f.italic || run.italic;
-  // A bold run on a face that's already heavy has nowhere to go - it stays the face's own weight.
-  const weight = run.bold && f.weight < 700 ? 700 : f.weight;
+  // An explicit weight wins (a medium label in a regular line); a bold run on a face that's already
+  // heavy has nowhere to go - it stays the face's own weight.
+  const weight = run.weight ?? (run.bold && f.weight < 700 ? 700 : f.weight);
   return `${italic ? "italic " : ""}${weight} ${sizePx}px "${f.family}", ${SYSTEM_FONT_STACK}`;
 }
 

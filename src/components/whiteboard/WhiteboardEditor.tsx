@@ -54,11 +54,21 @@ import {
   WhiteboardShapeType,
 } from "../../utils/whiteboardTypes";
 import { canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
-import { computeContentBounds, renderWhiteboardToCanvas, shapeOutlineFor, CYLINDER_CAP_RATIO, SERIES_FILL_OPACITY } from "../../handlers/whiteboardHandlers";
+import {
+  computeContentBounds,
+  LayerReorderAction,
+  renderWhiteboardToCanvas,
+  reorderPageItems,
+  resolveEdgeEndpoints,
+  shapeOutlineFor,
+  CYLINDER_CAP_RATIO,
+  SERIES_FILL_OPACITY,
+} from "../../handlers/whiteboardHandlers";
 import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
 import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
+import LinksControl from "../links/LinksControl";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 
@@ -404,6 +414,8 @@ function ArrowPresetPreview({ preset }: { preset: ArrowPreset }) {
   );
 }
 
+const PEN_COLORS = ["#111111", "#e03131", "#f08c00", "#2f9e44", "#1971c2", "#9c36b5", "#868e96", "#ffffff"];
+
 function ToolbarButton({ active, disabled, onClick, title, children }: { active?: boolean; disabled?: boolean; onClick: () => void; title: string; children: React.ReactNode }) {
   return (
     <button
@@ -604,6 +616,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // transient selection state on this component already gets.
   const [tableRangeSelection, setTableRangeSelection] = useState<{ nodeId: string; range: { r0: number; c0: number; r1: number; c1: number } } | null>(null);
   const [armedShapeType, setArmedShapeType] = useState<WhiteboardShapeType | null>(null);
+  const [penColor, setPenColor] = useState("#111111");
+  const [penWidth, setPenWidth] = useState(2.5);
   const [armedNodeOverrides, setArmedNodeOverrides] = useState<Partial<WhiteboardNode> | undefined>(undefined);
   const [connectorArmed, setConnectorArmed] = useState(false);
   const [armedConnectorOverrides, setArmedConnectorOverrides] = useState<Partial<WhiteboardEdge> | undefined>(undefined);
@@ -679,12 +693,14 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // lead lengths, ...) should still track the shape changing in real time rather than sitting stale
   // until release.
   const [liveNodesOverride, setLiveNodesOverride] = useState<WhiteboardNode[] | null>(null);
+  const [liveEdgesOverride, setLiveEdgesOverride] = useState<WhiteboardEdge[] | null>(null);
 
   // The mirror image of liveNodesOverride: nodes the STYLE PANEL is previewing while one of its
   // sliders is mid-drag, pushed down into the canvas for display only. Committing on every tick
   // instead would be one undo entry (and one full rebuild) per pixel of travel - see
   // WhiteboardCanvas's previewNodes prop and LiveRangeSlider's own doc comment.
   const [previewNodes, setPreviewNodes] = useState<WhiteboardNode[] | null>(null);
+  const [previewEdges, setPreviewEdges] = useState<WhiteboardEdge[] | null>(null);
 
   // Applied to the panel's own view of the selection too, so a slider's paired numeric field tracks
   // the drag rather than sitting at the last committed value until release.
@@ -695,7 +711,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     const liveById = new Map(override.map((n) => [n.id, n]));
     return list.map((n) => liveById.get(n.id) ?? n);
   }, [page, selectedNodeIds, liveNodesOverride, previewNodes]);
-  const selectedEdges = useMemo(() => (page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : []), [page, selectedEdgeIds]);
+  const selectedEdges = useMemo(() => {
+    const list = page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : [];
+    const override = liveEdgesOverride ?? previewEdges;
+    if (!override) return list;
+    const liveById = new Map(override.map((e) => [e.id, e]));
+    return list.map((e) => liveById.get(e.id) ?? e);
+  }, [page, selectedEdgeIds, liveEdgesOverride, previewEdges]);
 
   useEffect(() => {
     if (!shapesMenuOpen) return;
@@ -740,29 +762,42 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   }, [page?.id]);
 
   const handleReorder = useCallback(
-    (toFront: boolean) => {
-      if (!page || selectedNodeIds.size === 0) return;
-      const selected = page.nodes.filter((n) => selectedNodeIds.has(n.id));
-      const rest = page.nodes.filter((n) => !selectedNodeIds.has(n.id));
-      store.reorderNodes(toFront ? [...rest, ...selected] : [...selected, ...rest]);
+    (action: LayerReorderAction) => {
+      if (!page || (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0)) return;
+      const selectedIds = new Set<string>([...selectedNodeIds, ...selectedEdgeIds]);
+      const reordered = reorderPageItems(page, selectedIds, action);
+      store.reorderItems(reordered.nodes, reordered.edges);
     },
-    [page, selectedNodeIds, store]
+    [page, selectedNodeIds, selectedEdgeIds, store]
   );
 
   // Group/Ungroup are plain batchEditNodes calls that set/clear WhiteboardNode.groupId - no
   // dedicated command type needed (see that field's own doc comment), which also means they're
   // undo-tracked for free the same way any other multi-node style edit already is.
+  // Selected connectors join the group too, so a free-floating line (a divider, a pitch's halfway
+  // line) moves and flips with the shapes around it instead of being left behind.
   const handleGroup = useCallback(() => {
-    if (selectedNodes.length < 2) return;
+    if (selectedNodes.length + selectedEdges.length < 2) return;
     const groupId = crypto.randomUUID();
-    store.batchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, groupId })));
-  }, [selectedNodes, store]);
+    store.batchEditItems(
+      selectedNodes,
+      selectedNodes.map((n) => ({ ...n, groupId })),
+      selectedEdges,
+      selectedEdges.map((e) => ({ ...e, groupId }))
+    );
+  }, [selectedNodes, selectedEdges, store]);
 
   const handleUngroup = useCallback(() => {
-    const grouped = selectedNodes.filter((n) => n.groupId);
-    if (grouped.length === 0) return;
-    store.batchEditNodes(grouped, grouped.map((n) => ({ ...n, groupId: undefined })));
-  }, [selectedNodes, store]);
+    const groupedNodes = selectedNodes.filter((n) => n.groupId);
+    const groupedEdges = selectedEdges.filter((e) => e.groupId);
+    if (groupedNodes.length === 0 && groupedEdges.length === 0) return;
+    store.batchEditItems(
+      groupedNodes,
+      groupedNodes.map((n) => ({ ...n, groupId: undefined })),
+      groupedEdges,
+      groupedEdges.map((e) => ({ ...e, groupId: undefined }))
+    );
+  }, [selectedNodes, selectedEdges, store]);
 
   const handleDuplicateNode = useCallback(
     (node: WhiteboardNode) => {
@@ -772,6 +807,27 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       setSelectedEdgeIds(new Set());
     },
     [store]
+  );
+
+  const handleDuplicateEdge = useCallback(
+    (edge: WhiteboardEdge) => {
+      const nodesById = new Map((page?.nodes ?? []).map((n) => [n.id, n]));
+      const resolved = resolveEdgeEndpoints(edge, nodesById);
+      const now = Date.now();
+      const copy: WhiteboardEdge = {
+        ...edge,
+        id: crypto.randomUUID(),
+        source: { x: resolved.source.x + 24, y: resolved.source.y + 24 },
+        target: { x: resolved.target.x + 24, y: resolved.target.y + 24 },
+        waypoints: edge.waypoints?.map((wp) => ({ x: wp.x + 24, y: wp.y + 24 })),
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.addEdge(copy);
+      setSelectedNodeIds(new Set());
+      setSelectedEdgeIds(new Set([copy.id]));
+    },
+    [page, store]
   );
 
   const handleSelectionChange = useCallback((nodeIds: Set<string>, edgeIds: Set<string>) => {
@@ -795,16 +851,30 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const pasteCountRef = useRef(0);
 
   const handleCopy = useCallback(() => {
-    if (!page || selectedNodeIds.size === 0) return;
+    if (!page || (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0)) return;
     const nodes = page.nodes.filter((n) => selectedNodeIds.has(n.id));
+    const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
     // Also copy any edge BETWEEN two copied nodes (not just ones explicitly selected) - pasting a
     // copied group should keep the connectors that ran between its own members, the same
     // expectation copy/paste of a diagram fragment in draw.io itself sets.
-    const edges = page.edges.filter(
-      (e) =>
-        selectedEdgeIds.has(e.id) ||
-        (!!e.source.nodeId && selectedNodeIds.has(e.source.nodeId) && !!e.target.nodeId && selectedNodeIds.has(e.target.nodeId))
-    );
+    // When an edge is copied WITHOUT one or both of its attached endpoint nodes, resolve that
+    // endpoint to its world coordinates so pasting/duplicating the edge creates a free-floating copy.
+    const edges = page.edges
+      .filter(
+        (e) =>
+          selectedEdgeIds.has(e.id) ||
+          (!!e.source.nodeId && selectedNodeIds.has(e.source.nodeId) && !!e.target.nodeId && selectedNodeIds.has(e.target.nodeId))
+      )
+      .map((e) => {
+        const resolved = resolveEdgeEndpoints(e, nodesById);
+        const keepSourceNode = !!e.source.nodeId && selectedNodeIds.has(e.source.nodeId);
+        const keepTargetNode = !!e.target.nodeId && selectedNodeIds.has(e.target.nodeId);
+        return {
+          ...e,
+          source: keepSourceNode ? e.source : { x: resolved.source.x, y: resolved.source.y },
+          target: keepTargetNode ? e.target : { x: resolved.target.x, y: resolved.target.y },
+        };
+      });
     // JSON round-trip rather than holding live references - every field here is already plain
     // JSON-serializable data (same assumption save/load already makes), and this guarantees a later
     // edit to the original items can never silently mutate what's sitting in the clipboard.
@@ -814,7 +884,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
 
   const handlePaste = useCallback(() => {
     const clipboard = clipboardRef.current;
-    if (!clipboard || clipboard.nodes.length === 0) return;
+    if (!clipboard || (clipboard.nodes.length === 0 && clipboard.edges.length === 0)) return;
     pasteCountRef.current += 1;
     const offset = pasteCountRef.current * 24;
     const idMap = new Map<string, string>();
@@ -824,9 +894,6 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       idMap.set(n.id, id);
       return { ...n, id, x: n.x + offset, y: n.y + offset, createdAt: now, updatedAt: now };
     });
-    // An edge whose endpoint doesn't resolve through idMap (shouldn't happen given handleCopy's own
-    // filter, but resolved defensively same as every other "stale reference" case in this feature)
-    // is dropped rather than pasted still pointing at the ORIGINAL (uncopied) node.
     const newEdges = clipboard.edges.flatMap((e) => {
       const sourceId = e.source.nodeId ? idMap.get(e.source.nodeId) : undefined;
       const targetId = e.target.nodeId ? idMap.get(e.target.nodeId) : undefined;
@@ -835,8 +902,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         {
           ...e,
           id: crypto.randomUUID(),
-          source: sourceId ? { ...e.source, nodeId: sourceId } : e.source,
-          target: targetId ? { ...e.target, nodeId: targetId } : e.target,
+          source: sourceId ? { ...e.source, nodeId: sourceId } : { x: (e.source.x ?? 0) + offset, y: (e.source.y ?? 0) + offset },
+          target: targetId ? { ...e.target, nodeId: targetId } : { x: (e.target.x ?? 0) + offset, y: (e.target.y ?? 0) + offset },
+          waypoints: e.waypoints?.map((wp) => ({ x: wp.x + offset, y: wp.y + offset })),
           createdAt: now,
           updatedAt: now,
         },
@@ -846,6 +914,16 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setSelectedNodeIds(new Set(newNodes.map((n) => n.id)));
     setSelectedEdgeIds(new Set(newEdges.map((e) => e.id)));
   }, [store]);
+
+  const handleDuplicateSelection = useCallback(() => {
+    if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
+    const prevClipboard = clipboardRef.current;
+    const prevPasteCount = pasteCountRef.current;
+    handleCopy();
+    handlePaste();
+    clipboardRef.current = prevClipboard;
+    pasteCountRef.current = prevPasteCount;
+  }, [selectedNodeIds, selectedEdgeIds, handleCopy, handlePaste]);
 
   // ---- Image nodes -------------------------------------------------------------------------------
   //
@@ -1011,7 +1089,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // to the in-memory shape clipboard.
   useEffect(() => {
     const onCopy = (e: ClipboardEvent) => {
-      if (isTypingInField() || selectedNodeIds.size === 0) return;
+      if (isTypingInField() || (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0)) return;
       handleCopy();
       writeInternalMarker(e, WHITEBOARD_CLIPBOARD_MARKER);
     };
@@ -1029,7 +1107,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       window.removeEventListener("copy", onCopy);
       window.removeEventListener("paste", onPaste);
     };
-  }, [selectedNodeIds, handleCopy, handlePaste, addImagesFromBlobs, addTextNode, viewportCenterDocPoint]);
+  }, [selectedNodeIds, selectedEdgeIds, handleCopy, handlePaste, addImagesFromBlobs, addTextNode, viewportCenterDocPoint]);
 
   // ---- Keyboard shortcuts: undo/redo (copy/paste are the native events above; Delete/Escape live inside WhiteboardCanvas,
   // which owns selection-adjacent state that undo/redo doesn't need) -------------------------------
@@ -1045,13 +1123,24 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
         e.preventDefault();
         store.redo();
+      } else if (mod && e.key.toLowerCase() === "d") {
+        // Duplicate the selection (also stops the webview's bookmark-page default). Goes through the
+        // copy/paste path so groups and the connectors between them come along, then restores the
+        // clipboard so a pending Ctrl+V still pastes what the user actually copied.
+        e.preventDefault();
+        handleDuplicateSelection();
+      } else if (mod && e.key.toLowerCase() === "g") {
+        // Ctrl+G groups, Ctrl+Shift+G ungroups - same as the panel's Group/Ungroup buttons.
+        e.preventDefault();
+        if (e.shiftKey) handleUngroup();
+        else handleGroup();
       } else if (e.key === "Escape" && (armedShapeType || connectorArmed || laserArmed)) {
         deselectTools();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools]);
+  }, [store, armedShapeType, connectorArmed, laserArmed, deselectTools, handleDuplicateSelection, handleGroup, handleUngroup]);
 
   // PNG and PDF share the one renderer - the PDF is that same canvas wrapped in a single page (see
   // canvasToPdfBytes), so the two formats can't drift into showing different diagrams.
@@ -1346,6 +1435,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         <ToolbarButton title="Insert image…" active={false} onClick={() => void handleInsertImage()}>
           <IoImageOutline size={16} />
         </ToolbarButton>
+        <div className="relative">
         <ToolbarButton
           title="Pen (freehand)"
           active={armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType}
@@ -1361,6 +1451,34 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         >
           <IoPencilOutline size={16} />
         </ToolbarButton>
+          {armedShapeType === "freehand" && !armedNodeOverrides?.endArrowType && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute left-1/2 -translate-x-1/2 top-full mt-1 w-[196px] bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl p-2.5 z-20 flex flex-col gap-2"
+            >
+              <div className="flex flex-wrap gap-1.5">
+                {PEN_COLORS.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    title={c}
+                    onClick={() => setPenColor(c)}
+                    className={`w-5 h-5 rounded-full ring-1 ring-inset ring-black/15 ${penColor.toLowerCase() === c ? "outline outline-2 outline-offset-1 outline-blue-500" : ""}`}
+                    style={{ backgroundColor: c }}
+                  />
+                ))}
+                <label className="relative w-5 h-5 rounded-full overflow-hidden ring-1 ring-inset ring-black/15 cursor-pointer" title="Custom color" style={{ background: "conic-gradient(red, yellow, lime, cyan, blue, magenta, red)" }}>
+                  <input type="color" value={penColor} onChange={(e) => setPenColor(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                </label>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-neutral-400">
+                <span>Size</span>
+                <input type="range" min={1} max={16} step={0.5} value={penWidth} onChange={(e) => setPenWidth(Number(e.target.value))} className="flex-1" />
+                <span className="w-6 text-right tabular-nums">{penWidth}</span>
+              </div>
+            </div>
+          )}
+        </div>
         <ToolbarButton
           title="Laser pointer"
           active={laserArmed}
@@ -1447,6 +1565,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <IoMagnetOutline size={16} />
         </ToolbarButton>
         <div className="flex-1" />
+        <LinksControl self={{ kind: "whiteboard", id: whiteboardId }} title={doc.name} variant="header" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
         {exportError && <span className="text-xs text-red-500 dark:text-red-400 mr-2">{exportError}</span>}
         {imageError && (
@@ -1505,6 +1624,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           croppingNodeId={croppingNodeId}
           setCroppingNodeId={setCroppingNodeId}
           previewNodes={previewNodes}
+          previewEdges={previewEdges}
           page={page}
           showGrid={doc.showGrid}
           snapToGrid={doc.snapToGrid}
@@ -1520,6 +1640,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onEditNode={store.editNode}
           onBatchEditNodes={store.batchEditNodes}
           onLiveNodesChange={setLiveNodesOverride}
+          onLiveEdgesChange={setLiveEdgesOverride}
           onDeleteNode={(node) => {
             store.deleteNode(node);
             setSelectedNodeIds((prev) => {
@@ -1531,6 +1652,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           }}
           onAddEdge={store.addEdge}
           onEditEdge={store.editEdge}
+          onBatchEditItems={store.batchEditItems}
           onDeleteEdge={(edge) => {
             store.deleteEdge(edge);
             setSelectedEdgeIds((prev) => {
@@ -1541,6 +1663,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             });
           }}
           armedShapeType={armedShapeType}
+          penColor={penColor}
+          penWidth={penWidth}
           onShapePlaced={() => {
             setArmedShapeType(null);
             setArmedNodeOverrides(undefined);
@@ -1555,9 +1679,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         <WhiteboardStylePanel
           selectedNodes={selectedNodes}
           selectedEdges={selectedEdges}
+          pageNodes={page.nodes}
           tableRangeSelection={tableRangeSelection}
           onBatchEditNodes={store.batchEditNodes}
           onEditEdge={store.editEdge}
+          onBatchEditEdges={store.batchEditEdges}
+          onBatchEditItems={store.batchEditItems}
           onDeleteNode={(node: WhiteboardNode) => {
             store.deleteNode(node);
             setSelectedNodeIds(new Set());
@@ -1567,8 +1694,11 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             setSelectedEdgeIds(new Set());
           }}
           onDuplicateNode={handleDuplicateNode}
-          onBringToFront={() => handleReorder(true)}
-          onSendToBack={() => handleReorder(false)}
+          onDuplicateEdge={handleDuplicateEdge}
+          onBringToFront={() => handleReorder("front")}
+          onBringForward={() => handleReorder("forward")}
+          onSendBackward={() => handleReorder("backward")}
+          onSendToBack={() => handleReorder("back")}
           onGroup={handleGroup}
           onUngroup={handleUngroup}
           onReplaceImage={(node) => void handleReplaceImage(node)}
@@ -1581,6 +1711,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           // committed store state show through again.
           onPreviewNodes={(patch) =>
             setPreviewNodes(patch === null ? null : (page ? page.nodes.filter((n) => selectedNodeIds.has(n.id)) : []).map((n) => ({ ...n, ...patch })))
+          }
+          onPreviewEdges={(patch) =>
+            setPreviewEdges(patch === null ? null : (page ? page.edges.filter((e) => selectedEdgeIds.has(e.id)) : []).map((e) => ({ ...e, ...patch })))
           }
         />
       </div>
@@ -1642,9 +1775,61 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           className="fixed z-30 w-52 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200"
           style={{
             left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 216)),
-            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 100)),
+            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 240)),
           }}
         >
+          <button
+            type="button"
+            onClick={() => {
+              setContextMenu(null);
+              handleDuplicateSelection();
+            }}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+          >
+            <IoCopyOutline size={14} /> Duplicate <span className="ml-auto text-[10px] text-gray-400">Ctrl+D</span>
+          </button>
+          <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
+          <button
+            type="button"
+            onClick={() => {
+              setContextMenu(null);
+              handleReorder("front");
+            }}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+          >
+            Bring to front
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setContextMenu(null);
+              handleReorder("forward");
+            }}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+          >
+            Bring forward
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setContextMenu(null);
+              handleReorder("backward");
+            }}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+          >
+            Send backward
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setContextMenu(null);
+              handleReorder("back");
+            }}
+            className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+          >
+            Send to back
+          </button>
+          <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
           <button
             type="button"
             disabled={exportingSelection}

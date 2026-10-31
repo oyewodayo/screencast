@@ -115,3 +115,99 @@ mod tests {
         assert!((total as i32 - 255).abs() <= 6, "{total}");
     }
 }
+
+/// Premultiplied RGBA (`src`, `width` x `height`, rows bottom first when `bottom_up`) to straight
+/// RGBA top first in `out`, rounded to nearest: c * 255 / a. Opaque and empty pixels - nearly all of
+/// a motion-graphics frame - pass straight through. (Stage scene export, commands/stage_render.rs.)
+pub fn unpremultiply_flip(src: &[u8], width: usize, height: usize, bottom_up: bool, out: &mut [u8]) {
+    let row = width * 4;
+    for (y, dst) in out.chunks_exact_mut(row).take(height).enumerate() {
+        let from = if bottom_up { (height - 1 - y) * row } else { y * row };
+        for (s, o) in src[from..from + row].chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let a = s[3] as u32;
+            if a == 255 {
+                o.copy_from_slice(s);
+            } else if a == 0 {
+                o.copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                for c in 0..3 {
+                    o[c] = ((s[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+                o[3] = s[3];
+            }
+        }
+    }
+}
+
+/// A Stage frame straight to a QOI file in one pass: premultiplied RGBA (`src`, rows bottom first
+/// when `bottom_up`) un-premultiplied (as `unpremultiply_flip`) and encoded as QOI - lossless,
+/// decoded by ffmpeg's image2 demuxer, and on flat motion graphics many times faster than PNG and
+/// about as small. Replaces whatever `out` held.
+pub fn qoi_from_premultiplied(src: &[u8], width: usize, height: usize, bottom_up: bool, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(width * height / 4 + 22);
+    out.extend_from_slice(b"qoif");
+    out.extend_from_slice(&(width as u32).to_be_bytes());
+    out.extend_from_slice(&(height as u32).to_be_bytes());
+    out.push(4); // RGBA
+    out.push(0); // sRGB colour, linear alpha
+    let mut index = [[0u8; 4]; 64];
+    let mut prev = [0u8, 0, 0, 255];
+    let mut run: u8 = 0;
+    let row = width * 4;
+    for y in 0..height {
+        let from = if bottom_up { (height - 1 - y) * row } else { y * row };
+        for s in src[from..from + row].chunks_exact(4) {
+            let a = s[3];
+            let px = match a {
+                255 => [s[0], s[1], s[2], 255],
+                0 => [0, 0, 0, 0],
+                _ => {
+                    let a32 = a as u32;
+                    let un = |c: u8| ((c as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+                    [un(s[0]), un(s[1]), un(s[2]), a]
+                }
+            };
+            if px == prev {
+                run += 1;
+                if run == 62 {
+                    out.push(0xc0 | (run - 1));
+                    run = 0;
+                }
+                continue;
+            }
+            if run > 0 {
+                out.push(0xc0 | (run - 1));
+                run = 0;
+            }
+            let slot = (px[0] as usize * 3 + px[1] as usize * 5 + px[2] as usize * 7 + px[3] as usize * 11) % 64;
+            if index[slot] == px {
+                out.push(slot as u8);
+            } else {
+                index[slot] = px;
+                if px[3] == prev[3] {
+                    let vr = px[0].wrapping_sub(prev[0]) as i8;
+                    let vg = px[1].wrapping_sub(prev[1]) as i8;
+                    let vb = px[2].wrapping_sub(prev[2]) as i8;
+                    let vg_r = vr.wrapping_sub(vg);
+                    let vg_b = vb.wrapping_sub(vg);
+                    if (-2..=1).contains(&vr) && (-2..=1).contains(&vg) && (-2..=1).contains(&vb) {
+                        out.push(0x40 | (((vr + 2) as u8) << 4) | (((vg + 2) as u8) << 2) | ((vb + 2) as u8));
+                    } else if (-32..=31).contains(&vg) && (-8..=7).contains(&vg_r) && (-8..=7).contains(&vg_b) {
+                        out.push(0x80 | ((vg + 32) as u8));
+                        out.push((((vg_r + 8) as u8) << 4) | ((vg_b + 8) as u8));
+                    } else {
+                        out.extend_from_slice(&[0xfe, px[0], px[1], px[2]]);
+                    }
+                } else {
+                    out.extend_from_slice(&[0xff, px[0], px[1], px[2], px[3]]);
+                }
+            }
+            prev = px;
+        }
+    }
+    if run > 0 {
+        out.push(0xc0 | (run - 1));
+    }
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+}

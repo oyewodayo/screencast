@@ -16,7 +16,7 @@ import { docContentSchema } from "./docTemplates";
 import { readLayout, DEFAULT_LAYOUT, type DocLayout } from "./docLayout";
 import { DEFAULT_CITATION_STYLE, isCitationStyle, type BibEntry, type CitationStyleId } from "./docBibliography";
 import { DEFAULT_PAGE, normalizePageColor, pageFormat, type PageFormat } from "./docPageGeometry";
-import type { DocOrientation, DocPageSize } from "./docTypes";
+import type { DocMargins, DocOrientation, DocPageSize } from "./docTypes";
 
 export interface DocPreviewData {
   html: string;
@@ -25,10 +25,11 @@ export interface DocPreviewData {
   citationStyle: CitationStyleId;
   // Paper size and orientation, and the paper colour (null = white) - from the doc's page setup.
   page: PageFormat;
+  margins?: DocMargins | null;
   pageColor: string | null;
 }
 
-export const EMPTY_PREVIEW: DocPreviewData = { html: "", layout: DEFAULT_LAYOUT, references: [], citationStyle: DEFAULT_CITATION_STYLE, page: DEFAULT_PAGE, pageColor: null };
+export const EMPTY_PREVIEW: DocPreviewData = { html: "", layout: DEFAULT_LAYOUT, references: [], citationStyle: DEFAULT_CITATION_STYLE, page: DEFAULT_PAGE, margins: null, pageColor: null };
 
 // Enough top-level blocks to fill a page - long docs aren't serialized past what the card shows.
 const PREVIEW_BLOCK_LIMIT = 30;
@@ -38,7 +39,7 @@ const cache = new Map<string, DocPreviewData>();
 let queue: Promise<unknown> = Promise.resolve();
 
 async function buildPreview(id: string): Promise<DocPreviewData> {
-  const result = await invoke<{ bytes: number[]; page_size: DocPageSize | null; orientation: DocOrientation | null; page_color: string | null }>("load_doc", { id });
+  const result = await invoke<{ bytes: number[]; page_size: DocPageSize | null; orientation: DocOrientation | null; margins?: DocMargins | null; page_color: string | null }>("load_doc", { id });
   const ydoc = new Y.Doc();
   try {
     Y.applyUpdate(ydoc, new Uint8Array(result.bytes));
@@ -54,6 +55,7 @@ async function buildPreview(id: string): Promise<DocPreviewData> {
       references,
       citationStyle: isCitationStyle(style) ? style : DEFAULT_CITATION_STYLE,
       page: pageFormat(result.page_size, result.orientation),
+      margins: result.margins ?? null,
       pageColor: normalizePageColor(result.page_color),
     };
   } finally {

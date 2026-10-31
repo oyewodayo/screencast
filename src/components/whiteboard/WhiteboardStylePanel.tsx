@@ -36,6 +36,8 @@ import {
   TbLayoutAlignMiddle,
   TbLayoutAlignTop,
   TbRotateClockwise,
+  TbShadow,
+  TbShadowOff,
   TbStackBack,
   TbStackFront,
   TbUnderline,
@@ -137,13 +139,26 @@ import {
   arrangeNodesInGrid,
   compileGraphExpression,
   DEFAULT_GRID_GAP,
+  DEFAULT_SHADOW_BLUR,
+  DEFAULT_SHADOW_COLOR,
+  DEFAULT_SHADOW_OFFSET_X,
+  DEFAULT_SHADOW_OFFSET_Y,
+  DEFAULT_SHADOW_OPACITY,
+  detectShapeCorners,
   distributeNodes,
+  fillImageRect,
   fillPatternTile,
+  flipEdge,
+  flipItems,
   nudgeEdgeBy,
   outlineOptionsFor,
+  resolveEdgeEndpoints,
   resolvePlotAxisStyle,
+  reverseEdgeDirection,
+  scaleEdgeLength,
   supportsCornerRadius,
 } from "../../handlers/whiteboardHandlers";
+import { preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
 import { exportLatticeLoop } from "../../handlers/latticeLoopExport";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
@@ -214,9 +229,42 @@ const ROUTING_OPTIONS: { value: WhiteboardEdge["routing"]; label: string }[] = [
   { value: "curved", label: "Curved" },
 ];
 
+type ShadowStylePatch = Pick<
+  WhiteboardNode,
+  "shadowEnabled" | "shadowColor" | "shadowOpacity" | "shadowBlur" | "shadowOffsetX" | "shadowOffsetY"
+>;
+
+const SHADOW_PRESETS: {
+  name: string;
+  config?: ShadowStylePatch;
+  makeConfig?: (n: { strokeColor?: string; fillColor?: string | null }) => ShadowStylePatch;
+}[] = [
+  { name: "Soft", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.18, shadowBlur: 12, shadowOffsetX: 0, shadowOffsetY: 4 } },
+  { name: "Medium", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.28, shadowBlur: 20, shadowOffsetX: 0, shadowOffsetY: 8 } },
+  { name: "Floating", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.35, shadowBlur: 32, shadowOffsetX: 0, shadowOffsetY: 16 } },
+  {
+    name: "Glow",
+    makeConfig: (n) => ({
+      shadowEnabled: true,
+      shadowColor:
+        n.strokeColor && n.strokeColor !== "#000000" && n.strokeColor !== "#111111"
+          ? n.strokeColor
+          : n.fillColor && n.fillColor !== "#ffffff"
+          ? n.fillColor
+          : "#3b82f6",
+      shadowOpacity: 0.55,
+      shadowBlur: 18,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    }),
+  },
+  { name: "Retro", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.85, shadowBlur: 0, shadowOffsetX: 5, shadowOffsetY: 5 } },
+];
+
 interface WhiteboardStylePanelProps {
   selectedNodes: WhiteboardNode[];
   selectedEdges: WhiteboardEdge[];
+  pageNodes?: WhiteboardNode[];
   // The active cell/row/column range within a selected "table" node (or null) - lifted up from
   // WhiteboardTable.tsx via WhiteboardCanvas.tsx/WhiteboardEditor.tsx (see their own doc comments on
   // this same field). Only acted on below when it names the SAME node currently selected here - a
@@ -225,10 +273,16 @@ interface WhiteboardStylePanelProps {
   tableRangeSelection: { nodeId: string; range: { r0: number; c0: number; r1: number; c1: number } } | null;
   onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
   onEditEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
+  onBatchEditEdges?: (before: WhiteboardEdge[], after: WhiteboardEdge[]) => void;
+  // Shapes and connectors edited together as one undo step - flipping/nudging a mixed selection.
+  onBatchEditItems?: (beforeNodes: WhiteboardNode[], afterNodes: WhiteboardNode[], beforeEdges: WhiteboardEdge[], afterEdges: WhiteboardEdge[]) => void;
   onDeleteNode: (node: WhiteboardNode) => void;
   onDeleteEdge: (edge: WhiteboardEdge) => void;
   onDuplicateNode: (node: WhiteboardNode) => void;
+  onDuplicateEdge?: (edge: WhiteboardEdge) => void;
   onBringToFront: () => void;
+  onBringForward?: () => void;
+  onSendBackward?: () => void;
   onSendToBack: () => void;
   onGroup: () => void;
   onUngroup: () => void;
@@ -245,6 +299,7 @@ interface WhiteboardStylePanelProps {
   // commits as one undo step - see LiveRangeSlider's own doc comment for why that split is
   // load-bearing rather than a nicety.
   onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
+  onPreviewEdges?: (patch: Partial<WhiteboardEdge> | null) => void;
   // Opens the image picker for an "image" fill and imports the choice into this whiteboard's
   // assets/ folder, resolving to the stored asset file name (null if cancelled). Owned by
   // WhiteboardEditor for the same reason onReplaceImage is.
@@ -1410,7 +1465,15 @@ function PrefixedNumber({
 // Position, size, rotation and flip for the selection, as one compact block: X/Y and W/H in a 2x2
 // grid (single shape only - a multi-selection shares no one position), then rotation and the flip
 // toggles side by side.
-function TransformBlock({ nodes, onCommit }: { nodes: WhiteboardNode[]; onCommit: (patch: Partial<WhiteboardNode>) => void }) {
+function TransformBlock({
+  nodes,
+  onCommit,
+  onFlip,
+}: {
+  nodes: WhiteboardNode[];
+  onCommit: (patch: Partial<WhiteboardNode>) => void;
+  onFlip: (axis: "horizontal" | "vertical") => void;
+}) {
   const node = nodes[0];
   const ids = nodes.map((n) => n.id).join(",");
   return (
@@ -1437,10 +1500,10 @@ function TransformBlock({ nodes, onCommit }: { nodes: WhiteboardNode[]; onCommit
           onCommit={(n) => onCommit({ rotation: n === 0 || n === 360 ? undefined : n })}
         />
         <Segmented stretch>
-          <SegmentButton active={node.flipHorizontal ?? false} onClick={() => onCommit({ flipHorizontal: !(node.flipHorizontal ?? false) })} title="Flip horizontal">
+          <SegmentButton active={false} onClick={() => onFlip("horizontal")} title="Flip horizontal (mirror left to right)">
             <TbFlipHorizontal size={14} />
           </SegmentButton>
-          <SegmentButton active={node.flipVertical ?? false} onClick={() => onCommit({ flipVertical: !(node.flipVertical ?? false) })} title="Flip vertical">
+          <SegmentButton active={false} onClick={() => onFlip("vertical")} title="Flip vertical (mirror top to bottom)">
             <TbFlipVertical size={14} />
           </SegmentButton>
         </Segmented>
@@ -1652,13 +1715,35 @@ function FillControls({
   const stop = stops[Math.min(selectedStop, stops.length - 1)];
   const stopIndex = Math.min(selectedStop, stops.length - 1);
   const [picking, setPicking] = React.useState(false);
+  const [imgNatural, setImgNatural] = React.useState<{ w: number; h: number } | null>(null);
+  const [dragOffset, setDragOffset] = React.useState<{ x: number; y: number } | null>(null);
+  const [boxSize, setBoxSize] = React.useState<{ w: number; h: number }>({ w: 240, h: 80 });
+  const previewBoxRef = React.useRef<HTMLDivElement>(null);
+  const dragRef = React.useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startOx: number;
+    startOy: number;
+    boxW: number;
+    boxH: number;
+    moved: boolean;
+  } | null>(null);
 
   const pickImage = async () => {
     if (!onPickFillImage || picking) return;
     setPicking(true);
     try {
       const asset = await onPickFillImage();
-      if (asset) updateNodes({ fillType: "image", fillImageAsset: asset });
+      if (asset) {
+        updateNodes({
+          fillType: "image",
+          fillImageAsset: asset,
+          fillImageOffsetX: undefined,
+          fillImageOffsetY: undefined,
+          fillImageScale: undefined,
+        });
+      }
     } finally {
       setPicking(false);
     }
@@ -1683,6 +1768,14 @@ function FillControls({
   const commitStops = (next: WhiteboardGradientStop[]) => updateNodes({ fillGradientStops: next });
   const imageUrl = node.fillImageAsset && assetUrlFor ? assetUrlFor(node.fillImageAsset) : null;
   const pattern = node.fillPattern ?? "none";
+
+  React.useEffect(() => {
+    if (!previewBoxRef.current) return;
+    const rect = previewBoxRef.current.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      setBoxSize({ w: rect.width, h: rect.height });
+    }
+  }, [type, imageUrl]);
 
   return (
     <>
@@ -1787,34 +1880,190 @@ function FillControls({
         </div>
       )}
 
-      {type === "image" && (
-        <div className="flex flex-col gap-1.5">
-          <button
-            type="button"
-            onClick={() => void pickImage()}
-            disabled={!onPickFillImage || picking}
-            title="Choose the picture this shape is filled with"
-            className={`group relative h-[72px] w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 ${CHECKER_BG}`}
-          >
-            {imageUrl && <img src={imageUrl} alt="" className="absolute inset-0 w-full h-full object-cover" draggable={false} />}
-            <span
-              className={`absolute inset-0 flex items-center justify-center gap-1.5 text-[11px] font-medium transition ${
-                imageUrl ? "bg-black/0 text-transparent group-hover:bg-black/45 group-hover:text-white" : "text-neutral-500"
-              }`}
-            >
-              <TbPhoto size={14} />
-              {picking ? "Choosing…" : imageUrl ? "Replace image" : "Choose image…"}
-            </span>
-          </button>
-          <Segmented stretch>
-            {(["cover", "contain", "fill"] as const).map((fit) => (
-              <SegmentButton key={fit} active={(node.fillImageFit ?? "cover") === fit} onClick={() => updateNodes({ fillImageFit: fit })} title={fit === "cover" ? "Crop to fill the shape" : fit === "contain" ? "Fit the whole picture inside" : "Stretch to the shape"}>
-                {fit === "cover" ? "Fill" : fit === "contain" ? "Fit" : "Stretch"}
-              </SegmentButton>
-            ))}
-          </Segmented>
-        </div>
-      )}
+      {type === "image" && (() => {
+        const fit = node.fillImageFit ?? "cover";
+        const ox = dragOffset ? dragOffset.x : (node.fillImageOffsetX ?? 0);
+        const oy = dragOffset ? dragOffset.y : (node.fillImageOffsetY ?? 0);
+        const scale = Math.max(0.1, node.fillImageScale ?? 1);
+        const hasTransform = ox !== 0 || oy !== 0 || Math.abs(scale - 1) > 1e-3;
+        const previewRect = imgNatural
+          ? fillImageRect(fit, boxSize.w, boxSize.h, imgNatural.w, imgNatural.h, ox, oy, scale)
+          : null;
+
+        return (
+          <div className="flex flex-col gap-1.5">
+            {imageUrl ? (
+              <div
+                ref={previewBoxRef}
+                title="Drag to move the image on the shape"
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  e.preventDefault();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const boxW = Math.max(1, rect.width);
+                  const boxH = Math.max(1, rect.height);
+                  setBoxSize({ w: boxW, h: boxH });
+                  const startOx = node.fillImageOffsetX ?? 0;
+                  const startOy = node.fillImageOffsetY ?? 0;
+                  dragRef.current = {
+                    pointerId: e.pointerId,
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    startOx,
+                    startOy,
+                    boxW,
+                    boxH,
+                    moved: false,
+                  };
+                  setDragOffset({ x: startOx, y: startOy });
+                }}
+                onPointerMove={(e) => {
+                  const d = dragRef.current;
+                  if (!d || d.pointerId !== e.pointerId) return;
+                  const dx = e.clientX - d.startX;
+                  const dy = e.clientY - d.startY;
+                  if (Math.abs(dx) > 1 || Math.abs(dy) > 1) d.moved = true;
+                  const nextOx = +(d.startOx + dx / d.boxW).toFixed(4);
+                  const nextOy = +(d.startOy + dy / d.boxH).toFixed(4);
+                  setDragOffset({ x: nextOx, y: nextOy });
+                  onPreviewNodes?.({ fillImageOffsetX: nextOx, fillImageOffsetY: nextOy });
+                }}
+                onPointerUp={(e) => {
+                  const d = dragRef.current;
+                  if (!d || d.pointerId !== e.pointerId) return;
+                  const dx = e.clientX - d.startX;
+                  const dy = e.clientY - d.startY;
+                  const moved = d.moved;
+                  const nextOx = +(d.startOx + dx / d.boxW).toFixed(4);
+                  const nextOy = +(d.startOy + dy / d.boxH).toFixed(4);
+                  dragRef.current = null;
+                  setDragOffset(null);
+                  onPreviewNodes?.(null);
+                  if (moved) {
+                    updateNodes({ fillImageOffsetX: nextOx, fillImageOffsetY: nextOy });
+                  }
+                }}
+                onPointerCancel={(e) => {
+                  if (!dragRef.current || dragRef.current.pointerId !== e.pointerId) return;
+                  dragRef.current = null;
+                  setDragOffset(null);
+                  onPreviewNodes?.(null);
+                }}
+                className={`group relative h-[80px] w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 cursor-grab active:cursor-grabbing select-none touch-none ${CHECKER_BG}`}
+              >
+                <img
+                  src={imageUrl}
+                  alt=""
+                  draggable={false}
+                  onLoad={(e) => {
+                    const nw = e.currentTarget.naturalWidth;
+                    const nh = e.currentTarget.naturalHeight;
+                    if (nw > 0 && nh > 0) setImgNatural({ w: nw, h: nh });
+                    void preloadWhiteboardImage(imageUrl);
+                  }}
+                  style={
+                    previewRect
+                      ? {
+                          position: "absolute",
+                          left: previewRect.x,
+                          top: previewRect.y,
+                          width: previewRect.w,
+                          height: previewRect.h,
+                          maxWidth: "none",
+                          maxHeight: "none",
+                          pointerEvents: "none",
+                        }
+                      : {
+                          position: "absolute",
+                          left: `${((1 - scale) / 2 + ox) * 100}%`,
+                          top: `${((1 - scale) / 2 + oy) * 100}%`,
+                          width: `${scale * 100}%`,
+                          height: `${scale * 100}%`,
+                          objectFit: fit,
+                          maxWidth: "none",
+                          maxHeight: "none",
+                          pointerEvents: "none",
+                        }
+                  }
+                />
+                <div
+                  onPointerDown={(e) => e.stopPropagation()}
+                  className="absolute top-1.5 right-1.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  {hasTransform && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateNodes({
+                          fillImageOffsetX: undefined,
+                          fillImageOffsetY: undefined,
+                          fillImageScale: undefined,
+                        })
+                      }
+                      title="Reset image position and zoom"
+                      className="h-5 px-1.5 rounded bg-black/65 hover:bg-black/80 text-white text-[10px] font-medium backdrop-blur-sm transition"
+                    >
+                      Reset
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void pickImage()}
+                    disabled={!onPickFillImage || picking}
+                    title="Replace image"
+                    className="h-5 px-1.5 rounded bg-black/65 hover:bg-black/80 text-white text-[10px] font-medium backdrop-blur-sm flex items-center gap-1 transition"
+                  >
+                    <TbPhoto size={11} />
+                    <span>{picking ? "…" : "Replace"}</span>
+                  </button>
+                </div>
+                <span className="pointer-events-none absolute bottom-1 left-1.5 px-1.5 py-0.5 rounded bg-black/55 text-white/90 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">
+                  Drag to move
+                </span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void pickImage()}
+                disabled={!onPickFillImage || picking}
+                title="Choose the picture this shape is filled with"
+                className={`group relative h-[72px] w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 ${CHECKER_BG}`}
+              >
+                <span className="absolute inset-0 flex items-center justify-center gap-1.5 text-[11px] font-medium text-neutral-500">
+                  <TbPhoto size={14} />
+                  {picking ? "Choosing…" : "Choose image…"}
+                </span>
+              </button>
+            )}
+            <Segmented stretch>
+              {(["cover", "contain", "fill"] as const).map((f) => (
+                <SegmentButton
+                  key={f}
+                  active={fit === f}
+                  onClick={() => updateNodes({ fillImageFit: f })}
+                  title={f === "cover" ? "Crop to fill the shape" : f === "contain" ? "Fit the whole picture inside" : "Stretch to the shape"}
+                >
+                  {f === "cover" ? "Fill" : f === "contain" ? "Fit" : "Stretch"}
+                </SegmentButton>
+              ))}
+            </Segmented>
+            {imageUrl && (
+              <SliderField
+                label="Zoom"
+                resetKey={`fis-${ids}`}
+                value={Math.round(scale * 100)}
+                min={25}
+                max={300}
+                step={5}
+                onCommit={(n) => updateNodes({ fillImageScale: n === 100 ? undefined : n / 100 })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillImageScale: n / 100 })}
+                title="Zoom the background image in or out"
+              />
+            )}
+          </div>
+        );
+      })()}
 
       {/* Fades only the interior - outline and text stay solid - so a shape can sit over the image or
           plot it annotates without hiding it. */}
@@ -2317,13 +2566,19 @@ function TableCellFields({
 const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   selectedNodes,
   selectedEdges,
+  pageNodes = [],
   tableRangeSelection,
   onBatchEditNodes,
   onEditEdge,
+  onBatchEditEdges,
+  onBatchEditItems,
   onDeleteNode,
   onDeleteEdge,
   onDuplicateNode,
+  onDuplicateEdge,
   onBringToFront,
+  onBringForward,
+  onSendBackward,
   onSendToBack,
   onGroup,
   onUngroup,
@@ -2331,6 +2586,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   croppingNodeId,
   onToggleCrop,
   onPreviewNodes,
+  onPreviewEdges,
   onPickFillImage,
   assetUrlFor,
   onSaveExport,
@@ -2338,6 +2594,15 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   const updateNodes = (patch: Partial<WhiteboardNode>) => {
     if (selectedNodes.length === 0) return;
     onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, ...patch })));
+  };
+
+  // Mirrors the whole selection - shapes AND any selected connectors - across its combined bounding
+  // box center (see flipItems), as one undo step.
+  const flipSelected = (axis: "horizontal" | "vertical") => {
+    if (selectedNodes.length === 0 && selectedEdges.length === 0) return;
+    const flipped = flipItems(selectedNodes, selectedEdges, axis, nodesById);
+    if (selectedEdges.length > 0 && onBatchEditItems) onBatchEditItems(selectedNodes, flipped.nodes, selectedEdges, flipped.edges);
+    else onBatchEditNodes(selectedNodes, flipped.nodes);
   };
 
   // Builds the live-preview callback for one node field - every slider gets one, so dragging updates
@@ -2353,14 +2618,44 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   // for a multi-selection of nodes that don't share one position.
   const nudgeSelected = (dx: number, dy: number) => {
     if (selectedNodes.length === 0) return;
-    onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy })));
+    const movedNodes = selectedNodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+    if (selectedEdges.length > 0 && onBatchEditItems) onBatchEditItems(selectedNodes, movedNodes, selectedEdges, selectedEdges.map((e) => nudgeEdgeBy(e, dx, dy)));
+    else onBatchEditNodes(selectedNodes, movedNodes);
   };
 
   const edge = selectedEdges.length === 1 ? selectedEdges[0] : null;
+  const firstEdge = selectedEdges[0] ?? null;
+  const edgeIds = selectedEdges.map((e) => e.id).join(",");
+  const nodesById = React.useMemo(() => new Map(pageNodes.map((n) => [n.id, n])), [pageNodes]);
+  const edgeEndpoints = edge ? resolveEdgeEndpoints(edge, nodesById) : null;
+  const edgeLength = edgeEndpoints
+    ? Math.round(Math.hypot(edgeEndpoints.target.x - edgeEndpoints.source.x, edgeEndpoints.target.y - edgeEndpoints.source.y))
+    : 0;
+
   const updateEdge = (patch: Partial<WhiteboardEdge>) => {
-    if (!edge) return;
-    onEditEdge(edge, { ...edge, ...patch });
+    if (selectedEdges.length === 0) return;
+    if (selectedEdges.length === 1) {
+      onEditEdge(selectedEdges[0], { ...selectedEdges[0], ...patch });
+    } else if (onBatchEditEdges) {
+      onBatchEditEdges(selectedEdges, selectedEdges.map((e) => ({ ...e, ...patch })));
+    } else {
+      selectedEdges.forEach((e) => onEditEdge(e, { ...e, ...patch }));
+    }
   };
+
+  const transformEdges = (fn: (e: WhiteboardEdge) => WhiteboardEdge) => {
+    if (selectedEdges.length === 0) return;
+    if (selectedEdges.length === 1) {
+      onEditEdge(selectedEdges[0], fn(selectedEdges[0]));
+    } else if (onBatchEditEdges) {
+      onBatchEditEdges(selectedEdges, selectedEdges.map(fn));
+    } else {
+      selectedEdges.forEach((e) => onEditEdge(e, fn(e)));
+    }
+  };
+
+  const previewEdgeField = (key: keyof WhiteboardEdge) => (n: number | null) =>
+    onPreviewEdges?.(n === null ? null : ({ [key]: n } as Partial<WhiteboardEdge>));
 
   if (selectedNodes.length === 0 && selectedEdges.length === 0) return null;
 
@@ -2375,7 +2670,10 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
     !["text", "freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
   const hasFill = selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
   const ids = selectedNodes.map((n) => n.id).join(",");
-  const allLocked = selectedNodes.length > 0 && selectedNodes.every((n) => n.locked ?? false);
+  const allLocked =
+    selectedNodes.length > 0
+      ? selectedNodes.every((n) => n.locked ?? false)
+      : selectedEdges.length > 0 && selectedEdges.every((e) => e.locked ?? false);
 
   return (
     <div className="absolute top-3 right-3 bottom-3 w-[264px] bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 animate-[wbPanelIn_180ms_ease-out]">
@@ -2384,7 +2682,9 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           persistent indication of WHAT the controls below are acting on. */}
       <div className="shrink-0 px-3 h-11 flex items-center gap-2 border-b border-black/[0.05] dark:border-white/[0.06]">
         <p className="text-[13px] font-semibold tracking-tight truncate">
-          {selectedNodes.length > 1
+          {selectedNodes.length > 0 && selectedEdges.length > 0
+            ? `${selectedNodes.length} ${selectedNodes.length === 1 ? "shape" : "shapes"} + ${selectedEdges.length} ${selectedEdges.length === 1 ? "connector" : "connectors"}`
+            : selectedNodes.length > 1
             ? `${selectedNodes.length} shapes`
             : selectedNodes.length === 1
               ? shapeLabel(selectedNodes[0].shapeType)
@@ -2397,28 +2697,54 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             {Math.round(selectedNodes[0].width)} × {Math.round(selectedNodes[0].height)}
           </span>
         )}
+        {selectedNodes.length === 0 && edge && (
+          <span className="ml-auto shrink-0 px-1.5 h-5 flex items-center rounded bg-black/[0.04] dark:bg-white/[0.06] text-[10px] font-medium tabular-nums text-neutral-500 dark:text-neutral-400">
+            {edgeLength} px
+          </span>
+        )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain flex flex-col [scrollbar-width:thin]">
       {selectedNodes.length > 0 && (
         <>
           <Section title="Arrange" dense>
-            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} />
-            <div className="flex items-center justify-between gap-2">
+            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} onFlip={flipSelected} />
+            <SliderField
+              label="Opacity"
+              resetKey={`lyo-${ids}`}
+              value={Math.round((selectedNodes[0].opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateNodes({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
+            />
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <NudgeBar onNudge={nudgeSelected} />
               <Segmented>
                 <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
                   <TbStackFront size={14} />
                 </SegmentButton>
+                {onBringForward && (
+                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward">
+                    <TbArrowUp size={13} />
+                  </SegmentButton>
+                )}
+                {onSendBackward && (
+                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward">
+                    <TbArrowDown size={13} />
+                  </SegmentButton>
+                )}
                 <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
                   <TbStackBack size={14} />
                 </SegmentButton>
-                {selectedNodes.length >= 2 && (
-                  <SegmentButton active={false} onClick={onGroup} title="Group">
+                {selectedNodes.length + selectedEdges.length >= 2 && (
+                  <SegmentButton active={false} onClick={onGroup} title="Group (Ctrl+G)">
                     <TbComponents size={14} />
                   </SegmentButton>
                 )}
-                {selectedNodes.some((n) => n.groupId) && (
-                  <SegmentButton active={false} onClick={onUngroup} title="Ungroup">
+                {(selectedNodes.some((n) => n.groupId) || selectedEdges.some((e) => e.groupId)) && (
+                  <SegmentButton active={false} onClick={onUngroup} title="Ungroup (Ctrl+Shift+G)">
                     <TbComponentsOff size={14} />
                   </SegmentButton>
                 )}
@@ -2485,6 +2811,172 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               />
             );
           })()}
+          {!selectedNodes.every((n) => n.shapeType === "freehand") && (
+            <Field label="Style">
+              <Segmented>
+                {LINE_STYLE_OPTIONS.map((opt) => (
+                  <SegmentButton
+                    key={opt.value}
+                    active={(selectedNodes[0].strokeStyle ?? "solid") === opt.value}
+                    onClick={() => updateNodes({ strokeStyle: opt.value })}
+                    title={opt.label}
+                  >
+                    <svg width={18} height={8} viewBox="0 0 18 8">
+                      <line
+                        x1={1}
+                        y1={4}
+                        x2={17}
+                        y2={4}
+                        stroke="currentColor"
+                        strokeWidth={1.75}
+                        strokeLinecap="round"
+                        strokeDasharray={opt.value === "dashed" ? "4 3" : opt.value === "dotted" ? "0.1 3.5" : undefined}
+                      />
+                    </svg>
+                  </SegmentButton>
+                ))}
+              </Segmented>
+            </Field>
+          )}
+          <SliderField
+            label="Opacity"
+            resetKey={`so-${ids}`}
+            value={Math.round((selectedNodes[0].strokeOpacity ?? 1) * 100)}
+            min={0}
+            max={100}
+            step={1}
+            onCommit={(n) => updateNodes({ strokeOpacity: n >= 100 ? undefined : n / 100 })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { strokeOpacity: n / 100 })}
+            title="Stroke opacity (100% solid, 0% invisible border)"
+          />
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+        <Section
+          title="Shadow"
+          dense
+          action={
+            <button
+              type="button"
+              onClick={() => {
+                const isEnabled = selectedNodes[0].shadowEnabled ?? false;
+                const next = !isEnabled;
+                updateNodes({
+                  shadowEnabled: next,
+                  ...(next && selectedNodes[0].shadowBlur === undefined
+                    ? {
+                        shadowColor: DEFAULT_SHADOW_COLOR,
+                        shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                        shadowBlur: DEFAULT_SHADOW_BLUR,
+                        shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                        shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                      }
+                    : {}),
+                });
+              }}
+              className={`p-1 rounded transition ${
+                selectedNodes[0].shadowEnabled
+                  ? "text-blue-600 dark:text-blue-400 hover:bg-blue-500/10"
+                  : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+              }`}
+              title={selectedNodes[0].shadowEnabled ? "Disable shadow" : "Enable shadow"}
+            >
+              {selectedNodes[0].shadowEnabled ? <TbShadow size={15} /> : <TbShadowOff size={15} />}
+            </button>
+          }
+        >
+          {selectedNodes[0].shadowEnabled ? (
+            <>
+              <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] py-0.5">
+                {SHADOW_PRESETS.map((preset) => (
+                  <button
+                    key={preset.name}
+                    type="button"
+                    onClick={() => {
+                      const patch = "makeConfig" in preset && preset.makeConfig ? preset.makeConfig(selectedNodes[0]) : preset.config ?? {};
+                      updateNodes(patch);
+                    }}
+                    className="px-2 py-0.5 shrink-0 rounded text-[11px] font-medium bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-600 dark:text-neutral-300 transition active:scale-95"
+                    title={`Apply ${preset.name} shadow preset`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+              </div>
+
+              <ColorField
+                label="Color"
+                value={selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR}
+                onChange={(shadowColor) => updateNodes({ shadowColor })}
+              />
+
+              <SliderField
+                label="Opacity"
+                resetKey={`sho-${ids}`}
+                value={Math.round((selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowOpacity: n / 100 })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { shadowOpacity: n / 100 })}
+                title="Shadow opacity (0% to 100%)"
+              />
+
+              <SliderField
+                label="Blur"
+                resetKey={`shb-${ids}`}
+                value={selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR}
+                min={0}
+                max={64}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowBlur: n })}
+                onPreview={previewField("shadowBlur")}
+                title="Shadow blur radius in pixels"
+              />
+
+              <Field label="Offset">
+                <div className="grid grid-cols-2 gap-1.5 w-full">
+                  <PrefixedNumber
+                    prefix="X"
+                    title="Horizontal shadow offset - drag to scrub"
+                    resetKey={`shx-${ids}`}
+                    value={selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
+                    min={-100}
+                    max={100}
+                    onCommit={(x) => updateNodes({ shadowOffsetX: x })}
+                  />
+                  <PrefixedNumber
+                    prefix="Y"
+                    title="Vertical shadow offset - drag to scrub"
+                    resetKey={`shy-${ids}`}
+                    value={selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
+                    min={-100}
+                    max={100}
+                    onCommit={(y) => updateNodes({ shadowOffsetY: y })}
+                  />
+                </div>
+              </Field>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                updateNodes({
+                  shadowEnabled: true,
+                  shadowColor: selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR,
+                  shadowOpacity: selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY,
+                  shadowBlur: selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR,
+                  shadowOffsetX: selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X,
+                  shadowOffsetY: selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y,
+                });
+              }}
+              className="w-full h-7 rounded-md border border-dashed border-black/15 dark:border-white/15 text-[12px] font-medium text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white hover:border-black/30 dark:hover:border-white/30 transition flex items-center justify-center gap-1.5"
+            >
+              <TbShadow size={14} />
+              <span>Add Shadow</span>
+            </button>
+          )}
         </Section>
       )}
 
@@ -2494,18 +2986,49 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           {/* Every straight-edged outline rounds (see whiteboardHandlers.ts's supportsCornerRadius);
               an image only when its mask is "rounded" - showing the slider anywhere else would be a
               control with no visible effect. */}
-          {selectedNodes.every(supportsCornerRadius) && (
-            <SliderField
-              label="Corner radius"
-              resetKey={`cr-${ids}`}
-              value={selectedNodes[0].cornerRadius ?? 0}
-              min={0}
-              max={Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2))}
-              step={1}
-              onCommit={(n) => updateNodes({ cornerRadius: n })}
-              onPreview={previewField("cornerRadius")}
-            />
-          )}
+          {selectedNodes.every(supportsCornerRadius) && (() => {
+            const maxRadius = Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2));
+            const corners = detectShapeCorners(selectedNodes[0]);
+            const buildCornerRadii = (node: WhiteboardNode, cornerIndex: number, nextRadius: number): (number | null)[] => {
+              const nodeCorners = detectShapeCorners(node);
+              const len = Math.max(nodeCorners.length, cornerIndex + 1);
+              return Array.from({ length: len }, (_, i) => (i === cornerIndex ? nextRadius : (node.cornerRadii?.[i] ?? null)));
+            };
+            return (
+              <>
+                <SliderField
+                  label="Corner radius"
+                  resetKey={`cr-${ids}`}
+                  value={selectedNodes[0].cornerRadius ?? 0}
+                  min={0}
+                  max={maxRadius}
+                  step={1}
+                  onCommit={(n) => updateNodes({ cornerRadius: n, cornerRadii: undefined })}
+                  onPreview={(n) => onPreviewNodes?.(n === null ? null : { cornerRadius: n, cornerRadii: undefined })}
+                />
+                {corners.map((corner) => {
+                  const val = selectedNodes[0].cornerRadii?.[corner.index] ?? selectedNodes[0].cornerRadius ?? 0;
+                  return (
+                    <SliderField
+                      key={`${selectedNodes[0].shapeType}-${corner.index}-${corner.label}`}
+                      label={corner.label}
+                      resetKey={`cr-${ids}-${corner.index}-${selectedNodes[0].cornerRadius ?? 0}`}
+                      value={val}
+                      min={0}
+                      max={maxRadius}
+                      step={1}
+                      onCommit={(n) => updateNodes({ cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) })}
+                      onPreview={(n) =>
+                        onPreviewNodes?.(
+                          n === null ? null : { cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) }
+                        )
+                      }
+                    />
+                  );
+                })}
+              </>
+            );
+          })()}
           {selectedNodes.every((n) => n.shapeType === "polygon") && (
             <Field label="Sides">
               <input
@@ -3445,17 +3968,145 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         </Section>
       )}
 
-      {edge && (
+      {selectedNodes.length === 0 && firstEdge && (
         <>
+          <Section title="Arrange" dense>
+            {edge && edgeEndpoints && !edge.source.nodeId && !edge.target.nodeId && (
+              <>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <PrefixedNumber
+                    resetKey={`ex-${edge.id}`}
+                    prefix="X"
+                    title="Horizontal position of the connector's left bound in document units - drag the label to scrub"
+                    value={Math.round(Math.min(edgeEndpoints.source.x, edgeEndpoints.target.x))}
+                    min={-100000}
+                    max={100000}
+                    onCommit={(x) => {
+                      const curMinX = Math.min(edgeEndpoints.source.x, edgeEndpoints.target.x);
+                      updateEdge(nudgeEdgeBy(edge, x - curMinX, 0));
+                    }}
+                  />
+                  <PrefixedNumber
+                    resetKey={`ey-${edge.id}`}
+                    prefix="Y"
+                    title="Vertical position of the connector's top bound in document units - drag the label to scrub"
+                    value={Math.round(Math.min(edgeEndpoints.source.y, edgeEndpoints.target.y))}
+                    min={-100000}
+                    max={100000}
+                    onCommit={(y) => {
+                      const curMinY = Math.min(edgeEndpoints.source.y, edgeEndpoints.target.y);
+                      updateEdge(nudgeEdgeBy(edge, 0, y - curMinY));
+                    }}
+                  />
+                  <PrefixedNumber
+                    resetKey={`el-${edge.id}`}
+                    prefix="L"
+                    title="End-to-end length in document units (scales symmetrically around the midpoint)"
+                    value={Math.max(1, edgeLength)}
+                    min={4}
+                    max={100000}
+                    onCommit={(len) => updateEdge(scaleEdgeLength(edge, len))}
+                  />
+                  <Segmented stretch>
+                    <SegmentButton
+                      active={false}
+                      onClick={() => transformEdges((e) => flipEdge(e, "horizontal", nodesById))}
+                      title="Flip Horizontal (mirror left to right)"
+                    >
+                      <TbFlipHorizontal size={14} />
+                    </SegmentButton>
+                    <SegmentButton
+                      active={false}
+                      onClick={() => transformEdges((e) => flipEdge(e, "vertical", nodesById))}
+                      title="Flip Vertical (mirror top to bottom)"
+                    >
+                      <TbFlipVertical size={14} />
+                    </SegmentButton>
+                  </Segmented>
+                </div>
+                <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />
+              </>
+            )}
+            {(!edge || edge.source.nodeId || edge.target.nodeId) && (
+              <Segmented stretch>
+                <SegmentButton
+                  active={false}
+                  onClick={() => transformEdges((e) => flipEdge(e, "horizontal", nodesById))}
+                  title="Flip Horizontal (mirror free endpoints and bend points left to right)"
+                >
+                  <TbFlipHorizontal size={14} />
+                </SegmentButton>
+                <SegmentButton
+                  active={false}
+                  onClick={() => transformEdges((e) => flipEdge(e, "vertical", nodesById))}
+                  title="Flip Vertical (mirror free endpoints and bend points top to bottom)"
+                >
+                  <TbFlipVertical size={14} />
+                </SegmentButton>
+              </Segmented>
+            )}
+            <SliderField
+              label="Opacity"
+              resetKey={`eo-${edgeIds}`}
+              value={Math.round((firstEdge.opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateEdge({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewEdges?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall connector opacity (100% solid, 0% fully transparent - affects line, arrowheads, and label)"
+            />
+            <div className="flex items-center justify-between gap-1.5">
+              <NudgeBar onNudge={(dx, dy) => transformEdges((e) => nudgeEdgeBy(e, dx, dy))} />
+              <Segmented>
+                <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
+                  <TbStackFront size={14} />
+                </SegmentButton>
+                {onBringForward && (
+                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward one layer">
+                    <TbArrowUp size={13} />
+                  </SegmentButton>
+                )}
+                {onSendBackward && (
+                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward one layer">
+                    <TbArrowDown size={13} />
+                  </SegmentButton>
+                )}
+                <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
+                  <TbStackBack size={14} />
+                </SegmentButton>
+              </Segmented>
+            </div>
+          </Section>
+
           <Section title="Line" dense>
-            <ColorField label="Color" value={edge.strokeColor} onChange={(strokeColor) => updateEdge({ strokeColor })} />
-            {/* No live preview here: previewNodes only replaces NODES, and an edge's width isn't part
-                of that channel. The thumb still tracks the drag, and the width commits on release. */}
-            <SliderField label="Width" resetKey={edge.id} value={edge.strokeWidth} min={0.5} max={40} sliderMax={12} step={0.5} onCommit={(n) => updateEdge({ strokeWidth: n })} />
+            <ColorField label="Color" value={firstEdge.strokeColor} onChange={(strokeColor) => updateEdge({ strokeColor })} />
+            <SliderField
+              label="Width"
+              resetKey={`ew-${edgeIds}`}
+              value={firstEdge.strokeWidth}
+              min={0.5}
+              max={64}
+              sliderMax={16}
+              step={0.5}
+              onCommit={(n) => updateEdge({ strokeWidth: n })}
+              onPreview={previewEdgeField("strokeWidth")}
+            />
+            <SliderField
+              label="Opacity"
+              resetKey={`eso-${edgeIds}`}
+              value={Math.round((firstEdge.strokeOpacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateEdge({ strokeOpacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewEdges?.(n === null ? null : { strokeOpacity: n / 100 })}
+              title="Line stroke opacity (leaves label opacity untouched)"
+            />
             <Field label="Style">
               <Segmented>
                 {LINE_STYLE_OPTIONS.map((opt) => (
-                  <SegmentButton key={opt.value} active={edge.strokeStyle === opt.value} onClick={() => updateEdge({ strokeStyle: opt.value })} title={opt.label}>
+                  <SegmentButton key={opt.value} active={firstEdge.strokeStyle === opt.value} onClick={() => updateEdge({ strokeStyle: opt.value })} title={opt.label}>
                     <svg width={18} height={8} viewBox="0 0 18 8">
                       <line
                         x1={1}
@@ -3472,10 +4123,30 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 ))}
               </Segmented>
             </Field>
+            {firstEdge.strokeStyle !== "dotted" && (
+              <Field label="Cap">
+                <Segmented>
+                  {([
+                    { value: "butt", label: "Flat cap" },
+                    { value: "round", label: "Round cap" },
+                    { value: "square", label: "Square cap" },
+                  ] as const).map((cap) => (
+                    <SegmentButton
+                      key={cap.value}
+                      active={(firstEdge.strokeCap ?? "round") === cap.value}
+                      onClick={() => updateEdge({ strokeCap: cap.value })}
+                      title={cap.label}
+                    >
+                      <span className="px-1 text-[10px] capitalize">{cap.value}</span>
+                    </SegmentButton>
+                  ))}
+                </Segmented>
+              </Field>
+            )}
             <Field label="Routing">
               <Segmented>
                 {ROUTING_OPTIONS.map((opt) => (
-                  <SegmentButton key={opt.value} active={edge.routing === opt.value} onClick={() => updateEdge({ routing: opt.value })} title={opt.label}>
+                  <SegmentButton key={opt.value} active={firstEdge.routing === opt.value} onClick={() => updateEdge({ routing: opt.value })} title={opt.label}>
                     <svg width={14} height={14} viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
                       {opt.value === "straight" ? <path d="M2,12 L12,2" /> : opt.value === "orthogonal" ? <path d="M2,12 V7 H12 V2" /> : <path d="M2,12 C2,4 12,10 12,2" />}
                     </svg>
@@ -3483,20 +4154,35 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 ))}
               </Segmented>
             </Field>
-            {edge.routing === "curved" && !(edge.waypoints && edge.waypoints.length > 0) && (
+            {firstEdge.routing === "curved" && !(firstEdge.waypoints && firstEdge.waypoints.length > 0) && (
               <Field label="Curve bow">
                 <LiveRangeSlider
                   min={-1}
                   max={1}
                   step={0.05}
-                  value={edge.curveBow ?? DEFAULT_CURVE_BOW}
+                  value={firstEdge.curveBow ?? DEFAULT_CURVE_BOW}
                   onCommit={(n) => updateEdge({ curveBow: n })}
+                  onPreview={previewEdgeField("curveBow")}
                   className={SLIDER_CLASS}
                   title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
                 />
               </Field>
             )}
-            {edge.waypoints && edge.waypoints.length > 0 && (
+            {(firstEdge.routing === "orthogonal" || (firstEdge.waypoints && firstEdge.waypoints.length > 0)) && (
+              <SliderField
+                label="Corner radius"
+                resetKey={`ecr-${edgeIds}`}
+                value={firstEdge.cornerRadius ?? 0}
+                min={0}
+                max={120}
+                sliderMax={48}
+                step={1}
+                onCommit={(n) => updateEdge({ cornerRadius: n <= 0 ? undefined : n })}
+                onPreview={previewEdgeField("cornerRadius")}
+                title="Rounds the sharp 90° turns and manual bend points along this connector"
+              />
+            )}
+            {firstEdge.waypoints && firstEdge.waypoints.length > 0 && (
               <Field label="Bend points">
                 <button
                   type="button"
@@ -3504,14 +4190,28 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   className={MINI_BUTTON_CLASS}
                   title="Remove every manually-dragged bend point on this connector, letting the routing style alone decide its path again"
                 >
-                  Clear ({edge.waypoints.length})
+                  Clear ({firstEdge.waypoints.length})
                 </button>
               </Field>
             )}
           </Section>
-          <Section title="Arrows" dense>
+
+          <Section
+            title="Arrows"
+            dense
+            action={
+              <button
+                type="button"
+                onClick={() => transformEdges((e) => reverseEdgeDirection(e))}
+                className="p-1 rounded text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] transition"
+                title="Swap start & end arrowheads and reverse connector direction"
+              >
+                <TbArrowsExchange size={14} />
+              </button>
+            }
+          >
             <Field label="Start">
-              <select value={edge.startArrowType} onChange={(e) => updateEdge({ startArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
+              <select value={firstEdge.startArrowType} onChange={(e) => updateEdge({ startArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
                 {ARROWHEAD_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
@@ -3520,7 +4220,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               </select>
             </Field>
             <Field label="End">
-              <select value={edge.endArrowType} onChange={(e) => updateEdge({ endArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
+              <select value={firstEdge.endArrowType} onChange={(e) => updateEdge({ endArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
                 {ARROWHEAD_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
@@ -3529,14 +4229,210 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               </select>
             </Field>
           </Section>
-          <Section title="Position" dense>
-            <Field label="Nudge">
-              <NudgeBar onNudge={(dx, dy) => updateEdge(nudgeEdgeBy(edge, dx, dy))} />
-            </Field>
-            {!edge.source.nodeId && !edge.target.nodeId && <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />}
+
+          <Section
+            title="Shadow"
+            dense
+            action={
+              <button
+                type="button"
+                onClick={() => {
+                  const isEnabled = firstEdge.shadowEnabled ?? false;
+                  const next = !isEnabled;
+                  updateEdge({
+                    shadowEnabled: next,
+                    ...(next && firstEdge.shadowBlur === undefined
+                      ? {
+                          shadowColor: DEFAULT_SHADOW_COLOR,
+                          shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                          shadowBlur: DEFAULT_SHADOW_BLUR,
+                          shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                          shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                        }
+                      : {}),
+                  });
+                }}
+                className={`p-1 rounded transition ${
+                  firstEdge.shadowEnabled
+                    ? "text-blue-600 dark:text-blue-400 hover:bg-blue-500/10"
+                    : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                }`}
+                title={firstEdge.shadowEnabled ? "Disable shadow" : "Enable shadow"}
+              >
+                {firstEdge.shadowEnabled ? <TbShadow size={15} /> : <TbShadowOff size={15} />}
+              </button>
+            }
+          >
+            {firstEdge.shadowEnabled ? (
+              <>
+                <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] py-0.5">
+                  {SHADOW_PRESETS.map((preset) => (
+                    <button
+                      key={preset.name}
+                      type="button"
+                      onClick={() => {
+                        const patch =
+                          "makeConfig" in preset && preset.makeConfig
+                            ? preset.makeConfig({ strokeColor: firstEdge.strokeColor, fillColor: firstEdge.strokeColor })
+                            : preset.config ?? {};
+                        updateEdge(patch);
+                      }}
+                      className="px-2 py-0.5 shrink-0 rounded text-[11px] font-medium bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-600 dark:text-neutral-300 transition active:scale-95"
+                      title={`Apply ${preset.name} shadow preset`}
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                </div>
+                <ColorField
+                  label="Color"
+                  value={firstEdge.shadowColor ?? DEFAULT_SHADOW_COLOR}
+                  onChange={(shadowColor) => updateEdge({ shadowColor })}
+                />
+                <SliderField
+                  label="Opacity"
+                  resetKey={`esho-${edgeIds}`}
+                  value={Math.round((firstEdge.shadowOpacity ?? DEFAULT_SHADOW_OPACITY) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  onCommit={(n) => updateEdge({ shadowOpacity: n / 100 })}
+                  onPreview={(n) => onPreviewEdges?.(n === null ? null : { shadowOpacity: n / 100 })}
+                />
+                <SliderField
+                  label="Blur"
+                  resetKey={`eshb-${edgeIds}`}
+                  value={firstEdge.shadowBlur ?? DEFAULT_SHADOW_BLUR}
+                  min={0}
+                  max={64}
+                  step={1}
+                  onCommit={(n) => updateEdge({ shadowBlur: n })}
+                  onPreview={previewEdgeField("shadowBlur")}
+                />
+                <Field label="Offset">
+                  <div className="grid grid-cols-2 gap-1.5 w-full">
+                    <PrefixedNumber
+                      resetKey={`eshx-${edgeIds}`}
+                      prefix="X"
+                      title="Horizontal shadow offset in pixels"
+                      value={firstEdge.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
+                      min={-100}
+                      max={100}
+                      onCommit={(x) => updateEdge({ shadowOffsetX: x })}
+                    />
+                    <PrefixedNumber
+                      resetKey={`eshy-${edgeIds}`}
+                      prefix="Y"
+                      title="Vertical shadow offset in pixels"
+                      value={firstEdge.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
+                      min={-100}
+                      max={100}
+                      onCommit={(y) => updateEdge({ shadowOffsetY: y })}
+                    />
+                  </div>
+                </Field>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() =>
+                  updateEdge({
+                    shadowEnabled: true,
+                    ...(firstEdge.shadowBlur === undefined
+                      ? {
+                          shadowColor: DEFAULT_SHADOW_COLOR,
+                          shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                          shadowBlur: DEFAULT_SHADOW_BLUR,
+                          shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                          shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                        }
+                      : {}),
+                  })
+                }
+                className="w-full h-7 rounded-md bg-black/[0.03] dark:bg-white/[0.04] hover:bg-black/[0.06] dark:hover:bg-white/[0.08] text-[11px] text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 transition flex items-center justify-center gap-1.5"
+              >
+                <TbShadow size={13} />
+                <span>Add Shadow</span>
+              </button>
+            )}
           </Section>
+
           <Section title="Label" dense>
-            <input type="text" value={edge.label} placeholder="Text shown on the line" onChange={(e) => updateEdge({ label: e.target.value })} className={`w-full h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px]`} />
+            <input
+              type="text"
+              value={firstEdge.label}
+              placeholder="Text shown on the line"
+              onChange={(e) => updateEdge({ label: e.target.value })}
+              className={`w-full h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px]`}
+            />
+            {firstEdge.label.trim().length > 0 && (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-24 shrink-0">
+                    <PrefixedNumber
+                      resetKey={`elfs-${edgeIds}`}
+                      prefix={<TbTextSize size={12} />}
+                      title="Label font size in pixels"
+                      value={firstEdge.labelFontSize ?? 12}
+                      min={8}
+                      max={72}
+                      onCommit={(n) => updateEdge({ labelFontSize: n })}
+                    />
+                  </div>
+                  <Segmented>
+                    <SegmentButton
+                      active={Boolean(firstEdge.labelBold)}
+                      onClick={() => updateEdge({ labelBold: !firstEdge.labelBold })}
+                      title="Bold label"
+                    >
+                      <TbBold size={13} />
+                    </SegmentButton>
+                    <SegmentButton
+                      active={Boolean(firstEdge.labelItalic)}
+                      onClick={() => updateEdge({ labelItalic: !firstEdge.labelItalic })}
+                      title="Italic label"
+                    >
+                      <TbItalic size={13} />
+                    </SegmentButton>
+                  </Segmented>
+                </div>
+                <ColorField
+                  label="Color"
+                  value={firstEdge.labelColor ?? "#1f2937"}
+                  onChange={(labelColor) => updateEdge({ labelColor })}
+                />
+                <SliderField
+                  label="Position"
+                  resetKey={`elp-${edgeIds}`}
+                  value={Math.round((firstEdge.labelPosition ?? 0.5) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  onCommit={(n) => updateEdge({ labelPosition: n / 100 })}
+                  onPreview={(n) => onPreviewEdges?.(n === null ? null : { labelPosition: n / 100 })}
+                  title="Position along the line from Start (0%) to End (100%)"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <label className="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={firstEdge.labelShowBackground ?? true}
+                      onChange={(e) => updateEdge({ labelShowBackground: e.target.checked })}
+                      className="rounded border-neutral-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <span>Pill background</span>
+                  </label>
+                  {(firstEdge.labelShowBackground ?? true) && (
+                    <div className="w-28">
+                      <HexColorInput
+                        value={firstEdge.labelBackgroundColor ?? "#ffffff"}
+                        onChange={(labelBackgroundColor) => updateEdge({ labelBackgroundColor })}
+                      />
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </Section>
         </>
       )}
@@ -3545,31 +4441,37 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
       {/* Pinned rather than at the end of the scroll, as in the Mindmap inspector: lock, duplicate and
           delete are the actions reached for most, and on a chart's long Style tab they used to be a
           scroll away. */}
-      {(selectedNodes.length > 0 || edge) && (
+      {(selectedNodes.length > 0 || selectedEdges.length > 0) && (
         <div className="shrink-0 flex items-center gap-0.5 px-2 h-11 border-t border-black/[0.05] dark:border-white/[0.06]">
-          {selectedNodes.length > 0 && (
-            <button
-              type="button"
-              onClick={() => updateNodes({ locked: !allLocked })}
-              aria-pressed={allLocked}
-              title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
-              className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[12px] font-medium transition active:scale-[0.97] ${
-                allLocked ? "bg-amber-500/12 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20" : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-900 dark:hover:text-neutral-100"
-              }`}
-            >
-              {allLocked ? <TbLock size={14} /> : <TbLockOpen size={14} />}
-              {allLocked ? "Locked" : "Lock"}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => (selectedNodes.length > 0 ? updateNodes({ locked: !allLocked }) : updateEdge({ locked: !allLocked }))}
+            aria-pressed={allLocked}
+            title="Prevents dragging, resizing, rotating, or nudging this item until unlocked again - handy while manually plotting onto a graph, or annotating around a shape or line you don't want to bump"
+            className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[12px] font-medium transition active:scale-[0.97] ${
+              allLocked ? "bg-amber-500/12 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20" : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-900 dark:hover:text-neutral-100"
+            }`}
+          >
+            {allLocked ? <TbLock size={14} /> : <TbLockOpen size={14} />}
+            {allLocked ? "Locked" : "Lock"}
+          </button>
           <div className="ml-auto flex items-center gap-0.5">
             {selectedNodes.length === 1 && (
-              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate" className={FOOTER_BUTTON_CLASS}>
+              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate (Ctrl+D)" className={FOOTER_BUTTON_CLASS}>
+                <IoCopyOutline size={15} />
+              </button>
+            )}
+            {selectedNodes.length === 0 && edge && onDuplicateEdge && (
+              <button type="button" onClick={() => onDuplicateEdge(edge)} title="Duplicate (Ctrl+D)" className={FOOTER_BUTTON_CLASS}>
                 <IoCopyOutline size={15} />
               </button>
             )}
             <button
               type="button"
-              onClick={() => (selectedNodes.length > 0 ? selectedNodes.forEach((n) => onDeleteNode(n)) : edge && onDeleteEdge(edge))}
+              onClick={() => {
+                if (selectedNodes.length > 0) selectedNodes.forEach((n) => onDeleteNode(n));
+                if (selectedEdges.length > 0) selectedEdges.forEach((e) => onDeleteEdge(e));
+              }}
               title="Delete"
               className={`${FOOTER_BUTTON_CLASS} hover:!text-red-600 dark:hover:!text-red-400 hover:!bg-red-500/10`}
             >

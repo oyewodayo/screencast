@@ -53,13 +53,14 @@ export interface ImageRevealState {
 export const imageRevealSeconds = (settings: ImageRevealSettings, duration: number): number =>
   Math.max(0.1, Math.min(settings.seconds ?? DEFAULT_SECONDS, duration * 0.45));
 
-// The picture's reveal state `t` seconds into an overlay `duration` long.
-export function imageRevealState(settings: ImageRevealSettings, t: number, duration: number): ImageRevealState {
+// The picture's reveal state `t` seconds into an overlay `duration` long. `fps`: the rate frames are
+// drawn at - keys tell apart every frame at that rate.
+export function imageRevealState(settings: ImageRevealSettings, t: number, duration: number, fps = IMAGE_REVEAL_FPS): ImageRevealState {
   const len = imageRevealSeconds(settings, duration);
   const exiting = !!settings.exit && t > duration - len;
   // Progress through the reveal - runs backwards over the exit.
   const p = exiting ? clamp01((duration - t) / len) : clamp01(t / len);
-  const k = Math.round(t * IMAGE_REVEAL_FPS);
+  const k = Math.round(t * fps);
   const state: ImageRevealState = { wipe: 1, soft: 0.18, shine: null, blur: 0, scale: 1, opacity: 1, key: "still" };
   const moving = p < 1;
 
@@ -94,7 +95,7 @@ export function imageRevealState(settings: ImageRevealSettings, t: number, durat
     const phase = since - Math.floor(since / every) * every;
     if (phase < SHINE_SEC) {
       state.shine = easeInOut(phase / SHINE_SEC);
-      state.key = `s${Math.round(phase * IMAGE_REVEAL_FPS)}`;
+      state.key = `s${Math.round(phase * fps)}`;
     }
   }
   return state;

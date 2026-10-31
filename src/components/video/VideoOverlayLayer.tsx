@@ -19,7 +19,7 @@
 // instead of it never having existed.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronDown, IoChevronUp, IoClose, IoImageOutline, IoShapesOutline, IoText } from "react-icons/io5";
+import { IoChevronDown, IoClose, IoImageOutline, IoShapesOutline, IoText } from "react-icons/io5";
 import { MdBlurOn } from "react-icons/md";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -31,30 +31,31 @@ import ImageRevealWrap from "./ImageRevealWrap";
 import RevealMaskBox from "./RevealMaskBox";
 import { isTextReveal } from "../../utils/textReveal";
 import AssetFloatingControls from "./AssetFloatingControls";
-import { assetEntry } from "../../utils/videoAssets";
+import { OverlayAsset, assetEntry } from "../../utils/videoAssets";
+import { stickerAspect, stickerHugs } from "../../utils/stickerAssets";
 import { OverlayKeyframe, keyframeStateAt } from "../../utils/keyframes";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { BLUR_SIGMA_FRACTION } from "../../utils/videoOverlayRender";
-import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
+import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay } from "../../utils/videoEditTypes";
 import { overlayAnimationStyle } from "../../utils/overlayAnimation";
 import { cssBlendMode } from "../../utils/blendModes";
 import { cachedLayerMaskAlphaUrl, DEFAULT_MASK, type LayerMask } from "../../utils/layerMask";
 import MaskEditor from "./MaskEditor";
-import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
+import { overlayStack, overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../../handlers/pdfAnnotationHandlers";
 import CanvasTextOverlay from "./CanvasTextOverlay";
-import { textStrokePx, usesCanvasText } from "../../utils/videoOverlayRender";
-import { titleFontStyle } from "../../utils/titleFonts";
+import { caseText, textBoxBackgroundCss, textBoxBorderCss, textCornerRadiusPx, textLineHeight, textPaddingPx, textStrokePx, usesCanvasText } from "../../utils/videoOverlayRender";
+import { titleFontCss, titleFontStyle } from "../../utils/titleFonts";
 import { lookPatch } from "../../utils/titleStyles";
 import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
-import TextNoteEditor from "../pdf/TextNoteEditor";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 import ImageOverlayCropPanel from "./ImageOverlayCropPanel";
-import { DOCKED_PANEL_CLASS, useToolPanelHost } from "../docker/ToolPanelHost";
-import { BlurDockedPanel, ImageDockedPanel, TextDockedPanel } from "./OverlayDockedPanels";
+import { DOCKED_PANEL_CLASS, useOpenToolPanel, useToolPanelHost } from "../docker/ToolPanelHost";
+import { BlurDockedPanel, ImageDockedPanel, TextDockedPanel, TextDockedPanelProps } from "./OverlayDockedPanels";
+import TextQuickBar from "./TextQuickBar";
 import VideoTextEditor, { VideoTextEditorHandle, VideoTextFormat } from "./VideoTextEditor";
 
 export const DEFAULT_OVERLAY_WIDTH_FRACTION = 0.4;
@@ -70,6 +71,8 @@ const placementStart = (playhead: number, total: number): number =>
 // visual size old overlays already render at, rather than a value that would visibly jump the box
 // the moment you touch any other field on the same overlay.
 const legacyPaddingFraction = (frameHeightPx: number): number => (frameHeightPx > 0 ? 2 / frameHeightPx : 0);
+const FRAME_BOUNDS = { x0: 0, y0: 0, x1: 1, y1: 1 };
+const clampTo = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
 const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
 const DEFAULT_BLUR_WIDTH_FRACTION = 0.18;
@@ -80,12 +83,6 @@ const DEFAULT_BLUR_HEIGHT_FRACTION = 0.18;
 const BLUR_PREVIEW_SCALE = BLUR_SIGMA_FRACTION;
 const MIN_BLUR_WIDTH_PX = 24;
 
-const TEXT_STYLE_PRESETS: { name: string; patch: TextOverlayContentPatch }[] = [
-  { name: "Clean", patch: { backgroundColor: undefined, strokeColor: undefined, strokeWidth: undefined, cornerStyle: "square" } },
-  { name: "Caption", patch: { backgroundColor: "rgba(0,0,0,0.65)", strokeColor: undefined, strokeWidth: undefined, cornerStyle: "pill" } },
-  { name: "Outline", patch: { backgroundColor: undefined, strokeColor: "#000000", strokeWidth: 3, cornerStyle: "square" } },
-];
-const CORNER_OPTIONS: TextOverlayCornerStyle[] = ["square", "rounded", "pill"];
 
 type TextOverlayContentPatch = Partial<
   Pick<
@@ -107,6 +104,11 @@ type TextOverlayContentPatch = Partial<
     | "height"
     | "fontSize"
     | "padding"
+    | "paddingX"
+    | "lineHeight"
+    | "textCase"
+    | "boxFill"
+    | "boxBorder"
     | "keyframes"
     | "reveal"
     | "blendMode"
@@ -226,6 +228,8 @@ interface EditingOverlayState {
   // continuously and should land as one undo step alongside the rest of this edit, not one per
   // pixel dragged.
   padding: number;
+  // Left/right padding, same basis - undefined follows `padding` (TextOverlay.paddingX).
+  paddingX?: number;
 }
 
 interface VideoOverlayLayerProps {
@@ -252,6 +256,9 @@ interface VideoOverlayLayerProps {
   onDuplicateTextOverlay: (id: string) => void;
   onBringTextOverlayToFront: (id: string) => void;
   onSendTextOverlayToBack: (id: string) => void;
+  // How far a picture's top-left may be dragged, in frame fractions - the picture itself (0..1)
+  // unless a Screen Style puts padding around it, which pictures and text may sit on too.
+  placeBounds?: { x0: number; y0: number; x1: number; y1: number };
   // Image tool armed the same way, but consumed immediately (opens the file picker as soon as
   // it's armed - no click-on-video step, unlike text, since an image's aspect ratio isn't known
   // until a file's actually picked, so there's nothing useful a pre-pick click position would add).
@@ -286,171 +293,6 @@ interface VideoOverlayLayerProps {
   // Starts motion tracking for an overlay (Dashboard runs the target picker and the track).
   onTrackMotion?: (kind: "text" | "image" | "blur", id: string) => void;
 }
-
-// A compact numeric stepper matching the image panel's own rotation input (a native
-// <input type="number">, which browsers already render with an up/down spinner) - up/down caret
-// buttons step the value in real time (tap once, hold to repeat), and clicking the value itself
-// types an exact number. Can't actually BE a native number input here, though: focusing one shifts
-// keyboard focus there, which blurs TextNoteEditor's textarea and fires its own onBlur={commit},
-// closing/deleting the whole editing session out from under the input the instant it's clicked
-// (TextNoteEditor is reused as-is - see this file's own top comment - so that behavior isn't
-// something this file can intercept). The caret buttons dodge this the same way every other button
-// in this panel does (onMouseDown={preventDefault} - a *button* just never takes focus at all), and
-// typing dodges it by never focusing anything either - a document-level keydown listener (capture
-// phase) intercepts digits while in type mode and preventDefault+stopPropagation keeps them from
-// reaching whatever's actually focused (the textarea). Purely local/session state in the caller
-// (onChangePx) - this component holds no value of its own beyond the transient typing buffer.
-interface SteppedNumberFieldProps {
-  valuePx: number;
-  min: number;
-  max: number;
-  step?: number;
-  title: string;
-  onChangePx: (px: number) => void;
-}
-const STEP_REPEAT_DELAY_MS = 350;
-const STEP_REPEAT_INTERVAL_MS = 60;
-const SteppedNumberField: React.FC<SteppedNumberFieldProps> = ({ valuePx, min, max, step = 1, title, onChangePx }) => {
-  const [editText, setEditText] = useState<string | null>(null);
-
-  // Tracks the in-progress value across repeated ticks independent of the `valuePx` prop, which
-  // only catches up once the parent re-renders after each onChangePx call (a render cycle behind
-  // during a fast hold) - reading the stale prop inside a setInterval closure would otherwise step
-  // from the same starting number every tick instead of accumulating.
-  const liveValueRef = useRef(valuePx);
-  const repeatTimeoutRef = useRef<number | null>(null);
-  const repeatIntervalRef = useRef<number | null>(null);
-
-  const stopRepeat = useCallback(() => {
-    if (repeatTimeoutRef.current != null) {
-      window.clearTimeout(repeatTimeoutRef.current);
-      repeatTimeoutRef.current = null;
-    }
-    if (repeatIntervalRef.current != null) {
-      window.clearInterval(repeatIntervalRef.current);
-      repeatIntervalRef.current = null;
-    }
-  }, []);
-  useEffect(() => stopRepeat, [stopRepeat]);
-
-  const stepOnce = useCallback(
-    (delta: number) => {
-      liveValueRef.current = Math.max(min, Math.min(max, Math.round(liveValueRef.current + delta)));
-      onChangePx(liveValueRef.current);
-    },
-    [min, max, onChangePx]
-  );
-  // Tap once to step, hold to ramp into continuous change - the standard spinner-button convention.
-  const beginRepeat = (delta: number) => {
-    liveValueRef.current = valuePx;
-    stepOnce(delta);
-    stopRepeat();
-    repeatTimeoutRef.current = window.setTimeout(() => {
-      repeatIntervalRef.current = window.setInterval(() => stepOnce(delta), STEP_REPEAT_INTERVAL_MS);
-    }, STEP_REPEAT_DELAY_MS);
-  };
-  // Window-level fallback so a release outside the button's own bounds (cursor drifted off it
-  // while holding) still stops the repeat, same "don't let a drag/hold get stuck" reasoning as the
-  // pointer-cancel handlers elsewhere in this file.
-  useEffect(() => {
-    window.addEventListener("mouseup", stopRepeat);
-    return () => window.removeEventListener("mouseup", stopRepeat);
-  }, [stopRepeat]);
-
-  const commitEdit = useCallback(() => {
-    setEditText((current) => {
-      if (current != null && current.length > 0) {
-        const parsed = parseInt(current, 10);
-        if (Number.isFinite(parsed)) onChangePx(Math.max(min, Math.min(max, parsed)));
-      }
-      return null;
-    });
-  }, [min, max, onChangePx]);
-
-  useEffect(() => {
-    if (editText == null) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key >= "0" && e.key <= "9") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText((prev) => ((prev ?? "") + e.key).slice(0, 4));
-      } else if (e.key === "Backspace") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText((prev) => (prev ?? "").slice(0, -1));
-      } else if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
-        e.stopPropagation();
-        commitEdit();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText(null);
-      } else {
-        // Blocks everything else (e.g. plain letters) from leaking through to whatever's actually
-        // focused underneath while this field is "typing" - it never takes real focus itself.
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown, true);
-    return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [editText, commitEdit]);
-
-  useEffect(() => {
-    if (editText == null) return;
-    document.addEventListener("pointerdown", commitEdit);
-    return () => document.removeEventListener("pointerdown", commitEdit);
-  }, [editText, commitEdit]);
-
-  return (
-    <div
-      title={editText != null ? "Type a value, Enter to confirm" : title}
-      className={`flex items-stretch h-5 rounded overflow-hidden select-none ${editText != null ? "ring-1 ring-blue-400" : ""}`}
-    >
-      <div
-        onClick={(e) => {
-          e.stopPropagation();
-          if (editText == null) setEditText(String(valuePx));
-        }}
-        onMouseDown={(e) => e.stopPropagation()}
-        className={`w-9 px-1 text-[10px] text-white flex items-center justify-center cursor-text ${editText != null ? "bg-blue-500/30" : "bg-white/10"}`}
-      >
-        {editText != null ? editText || "0" : valuePx}
-      </div>
-      <div className="flex flex-col w-3.5 bg-white/10 border-l border-black/30">
-        <button
-          type="button"
-          tabIndex={-1}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            beginRepeat(step);
-          }}
-          onMouseUp={stopRepeat}
-          onMouseLeave={stopRepeat}
-          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30"
-        >
-          <IoChevronUp size={7} />
-        </button>
-        <button
-          type="button"
-          tabIndex={-1}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            beginRepeat(-step);
-          }}
-          onMouseUp={stopRepeat}
-          onMouseLeave={stopRepeat}
-          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30 border-t border-black/30"
-        >
-          <IoChevronDown size={7} />
-        </button>
-      </div>
-    </div>
-  );
-};
 
 const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
   { value: "none", label: "None" },
@@ -567,12 +409,15 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange, text
 const OverlaySettingsPanel: React.FC<{
   title: string;
   icon: React.ReactNode;
-  floatingStyle: React.CSSProperties;
   onClose: () => void;
   docked: React.ReactNode;
   children: React.ReactNode;
-}> = ({ title, icon, floatingStyle, onClose, docked, children }) => {
+  // The floating content places and styles itself (the text quick bar) - no wrapper card.
+  bare?: boolean;
+  floatingStyle?: React.CSSProperties;
+}> = ({ title, icon, floatingStyle, onClose, docked, children, bare }) => {
   const host = useToolPanelHost();
+  if (!host && bare) return <>{children}</>;
   if (!host) {
     return (
       <div
@@ -663,6 +508,17 @@ const ToolbarOverflowMenu: React.FC<{ children: React.ReactNode }> = ({ children
   );
 };
 
+// The part of a box (frame fractions; scaled by `scale` about its centre, as CSS `scale` does) that
+// lies off the picture, as a clip-path inset in the box's own unscaled pixels - what keeps a blur
+// region from blurring past the picture's edge.
+const frameCut = (x: number, y: number, width: number, height: number, scale: number, W: number, H: number): string => {
+  const s = scale > 0 ? scale : 1;
+  const left = x + (width * (1 - s)) / 2;
+  const top = y + (height * (1 - s)) / 2;
+  const off = (v: number) => Math.max(0, v);
+  return `inset(${(off(-top) * H) / s}px ${(off(left + width * s - 1) * W) / s}px ${(off(top + height * s - 1) * H) / s}px ${(off(-left) * W) / s}px)`;
+};
+
 const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   frameRect,
   getOutputTime,
@@ -682,6 +538,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onDuplicateTextOverlay,
   onBringTextOverlayToFront,
   onSendTextOverlayToBack,
+  placeBounds = FRAME_BOUNDS,
   onSetOverlayTime,
   isPlacingImage,
   onPlacementImageConsumed,
@@ -747,7 +604,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // the box - its colour/style controls are the docked Text panel's), and the panel drives it
   // through textEditorRef. liveTextFormat mirrors the editor's whole-box formatting so the panel
   // can show what's current. Without a sidebar, TextNoteEditor and its own bar are used as before.
-  const dockHost = useToolPanelHost();
+  const openToolPanel = useOpenToolPanel();
   const textEditorRef = useRef<VideoTextEditorHandle>(null);
   const [liveTextFormat, setLiveTextFormat] = useState<VideoTextFormat | null>(null);
   useEffect(() => {
@@ -792,9 +649,19 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     // videoEditTypes.ts's TextOverlay doc comment on why x/width and y/fontSize are fractions of
     // different bases) - device px via frameRect is that common space; the resulting height is
     // converted back to a frameRect.height fraction to store alongside the rest.
-    const widthPx = session.width * frameRect.width;
+    // Measured as it's drawn: in its own face and tracking, wrapping inside the box less its side
+    // padding - and stored as the whole box, padding included (as templates store it), so the
+    // position pad centres the box itself.
+    const look = overlaysRef.current.find((o) => o.id === session.id);
+    const pad = textPaddingPx({ padding: session.padding, paddingX: session.paddingX }, frameRect.height);
     const fontSizePx = session.fontSize * frameRect.height;
-    const { height: heightPx } = measureTextBlock(text, fontSizePx, widthPx);
+    const wrapPx = Math.max(1, session.width * frameRect.width - pad.x * 2);
+    const { height: textHeightPx } = measureTextBlock(caseText(text, look?.textCase), fontSizePx, wrapPx, {
+      font: titleFontCss(look?.fontFamily, fontSizePx),
+      letterSpacing: (look?.letterSpacing ?? 0) * fontSizePx,
+      lineHeight: look ? textLineHeight(look) : undefined,
+    });
+    const heightPx = textHeightPx + pad.y * 2;
 
     onUpdateTextOverlayContent(session.id, {
       text,
@@ -808,8 +675,9 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       y: session.y,
       width: session.width,
       fontSize: session.fontSize,
-      height: frameRect.height > 0 ? heightPx / frameRect.height : session.fontSize * 1.3,
+      height: frameRect.height > 0 ? heightPx / frameRect.height : session.fontSize * (look ? textLineHeight(look) : 1.3) + session.padding * 2,
       padding: session.padding,
+      paddingX: session.paddingX,
     });
   }, [frameRect, onSelectOverlay, onUpdateTextOverlayContent, onDeleteTextOverlay]);
 
@@ -854,6 +722,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       width: existing.width,
       fontSize: existing.fontSize,
       padding: existing.padding ?? legacyPaddingFraction(frameRect.height),
+      paddingX: existing.paddingX,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedOverlayId]);
@@ -1099,7 +968,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         if (!prev) return prev;
         const dx = (latest.clientX - prev.startClientX) / frameRect.width;
         const dy = (latest.clientY - prev.startClientY) / frameRect.height;
-        return { ...prev, liveX: Math.max(0, Math.min(1, prev.startX + dx)), liveY: Math.max(0, Math.min(1, prev.startY + dy)) };
+        return { ...prev, liveX: clampTo(prev.startX + dx, placeBounds.x0, placeBounds.x1), liveY: clampTo(prev.startY + dy, placeBounds.y0, placeBounds.y1) };
       });
     });
   };
@@ -1378,10 +1247,10 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // composes with rotation and the entry animations without touching them. Kept on while dragging,
   // so a keyframed box moves from where it's shown; the drop is then turned into a keyframe at the
   // playhead (Dashboard's keyframeAwarePatch adds the drag's movement to the keyframed state).
-  const keyframedRef = useRef<{ id: string; x: number; y: number; startTime: number; keyframes: OverlayKeyframe[] }[]>([]);
+  const keyframedRef = useRef<{ id: string; x: number; y: number; width: number; height: number; startTime: number; keyframes: OverlayKeyframe[] }[]>([]);
   keyframedRef.current = [...overlays, ...imageOverlays, ...blurOverlays]
     .filter((o) => o.keyframes && o.keyframes.length > 0)
-    .map((o) => ({ id: o.id, x: o.x, y: o.y, startTime: o.startTime, keyframes: o.keyframes! }));
+    .map((o) => ({ id: o.id, x: o.x, y: o.y, width: "width" in o ? o.width : 0, height: "height" in o ? o.height : 0, startTime: o.startTime, keyframes: o.keyframes! }));
   const frameSizeRef = useRef({ w: frameRect.width, h: frameRect.height });
   frameSizeRef.current = { w: frameRect.width, h: frameRect.height };
   const currentOutputTimeRef = useRef(currentOutputTime);
@@ -1404,6 +1273,9 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           el.style.scale = String(state.scale);
           el.style.setProperty("--kf-opacity", String(state.opacity));
         }
+        // A blur region's cut at the picture's edge follows it too (see frameCut).
+        const cutEl = document.querySelector<HTMLElement>(`[data-frame-cut="${o.id}"]`);
+        if (cutEl) cutEl.style.clipPath = frameCut(state.x, state.y, o.width, o.height, state.scale, w, h);
       }
     };
     raf = requestAnimationFrame(tick);
@@ -1438,6 +1310,17 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     return o;
   });
   const selectedImageOverlayData = selectedImageOverlayId ? activeImageOverlays.find((o) => o.id === selectedImageOverlayId) : undefined;
+  const stackedActiveOverlays = overlayStack(activeImageOverlays, activeOverlays);
+
+  // An element's settings changed. A sticker sized to its words keeps its box fitted to them - same
+  // height and left edge, the width its words now need - so the outline matches what's drawn.
+  const assetPatch = (o: ImageOverlay, patch: Partial<OverlayAsset>): ImageOverlayContentPatch => {
+    const asset = { ...o.asset!, ...patch };
+    const aspect = stickerHugs(asset.kind) ? stickerAspect(asset) : null;
+    if (!aspect || frameRect.width <= 0 || frameRect.height <= 0) return { asset };
+    const width = Math.min(1.5, (o.height * frameRect.height * aspect) / frameRect.width);
+    return Math.abs(width - o.width) > 1e-4 ? { asset, width } : { asset };
+  };
 
   const activeBlurOverlays = onScreen(blurOverlays).map((o) => {
     if (blurDrag && o.id === blurDrag.id) return { ...o, x: blurDrag.liveX, y: blurDrag.liveY };
@@ -1450,11 +1333,6 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   });
   const selectedBlurOverlayData = selectedBlurOverlayId ? activeBlurOverlays.find((o) => o.id === selectedBlurOverlayId) : undefined;
 
-  const cornerRadiusCss = (style: TextOverlayCornerStyle | undefined, heightPx: number): number => {
-    if (style === "pill") return heightPx / 2;
-    if (style === "rounded") return 8;
-    return 0;
-  };
 
   const PANEL_HEIGHT_PX = 38;
   // Same .video-container overflow:hidden clipping the rotate handle's own comment explains -
@@ -1524,13 +1402,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       else dyPx = stepPx;
 
       onUpdateImageOverlayContent(overlay.id, {
-        x: Math.max(0, Math.min(1, overlay.x + dxPx / frameRect.width)),
-        y: Math.max(0, Math.min(1, overlay.y + dyPx / frameRect.height)),
+        x: clampTo(overlay.x + dxPx / frameRect.width, placeBounds.x0, placeBounds.x1),
+        y: clampTo(overlay.y + dyPx / frameRect.height, placeBounds.y0, placeBounds.y1),
       });
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent]);
+  }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent, placeBounds]);
 
   // Same arrow-key nudging as the image overlay effect above (1px per press, 10px with Shift),
   // scoped to blur overlays for the same reason - no focus trap here, unlike a selected text
@@ -1605,6 +1483,12 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const roomAbovePx = o.y * frameRect.height;
         const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
+        const radius = o.shape === "ellipse" ? "50%" : (o.cornerRadius ?? 0) * frameRect.height;
+        // Only the picture gets blurred - export blurs the frame and nothing past its edge, so the
+        // part of a region hanging off it (a find near the edge, padded) mustn't smear the
+        // wallpaper or the black around the picture here either. Cut in the region's own box, so
+        // an unrotated one only (a rotated region's edge isn't axis-aligned).
+        const cut = o.rotation ? undefined : frameCut(o.x, o.y, o.width, o.height, 1, frameRect.width, frameRect.height);
         return (
           <div
             key={o.id}
@@ -1623,13 +1507,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               top: o.y * frameRect.height,
               width: o.width * frameRect.width,
               height: o.height * frameRect.height,
-              backdropFilter: `blur(${blurPx}px)`,
-              WebkitBackdropFilter: `blur(${blurPx}px)`,
-              borderRadius: o.shape === "ellipse" ? "50%" : (o.cornerRadius ?? 0) * frameRect.height,
+              borderRadius: radius,
               transform: o.rotation ? `rotate(${o.rotation}deg)` : undefined,
               pointerEvents: placingAnything ? "none" : "auto",
             }}
           >
+            <div
+              className="absolute inset-0 pointer-events-none"
+              data-frame-cut={o.rotation ? undefined : o.id}
+              style={{ backdropFilter: `blur(${blurPx}px)`, WebkitBackdropFilter: `blur(${blurPx}px)`, borderRadius: radius, clipPath: cut }}
+            />
             {isSelected && (
               <>
                 <ResizeHandles
@@ -1662,7 +1549,138 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           </div>
         );
       })}
-      {activeImageOverlays.map((o) => {
+      {/* Pictures and text in one pile, bottom first (overlayStack) - the order export composites
+          them in, so Bring to front / Send to back move a title past a picture and back. The
+          title being edited keeps its place in the pile too. */}
+      {stackedActiveOverlays.map((s) => {
+        if (s.kind === "text") {
+          if (s.o.id === editingSession?.id && editingOverlayData) {
+            // VideoPlayer's overlay wrapper is `pointer-events: none` by default (so clicks reach the
+            // video when there's nothing to interact with), and it's inherited - this opts the
+            // editor back in.
+            return (
+              <div key={`editing-${s.o.id}`} style={{ pointerEvents: "auto" }}>
+                <VideoTextEditor
+                  ref={textEditorRef}
+                  key={editingSession.id}
+                  keyframedId={editingOverlayData.keyframes?.length ? editingOverlayData.id : undefined}
+                  left={editingSession.x * frameRect.width}
+                  top={editingSession.y * frameRect.height}
+                  width={editingSession.width * frameRect.width}
+                  fontSize={editingSession.fontSize * frameRect.height}
+                  paddingPx={editingSession.padding * frameRect.height}
+                  paddingXPx={(editingSession.paddingX ?? editingSession.padding) * frameRect.height}
+                  strokeColor={editingOverlayData.strokeColor}
+                  strokeWidth={editingOverlayData.strokeWidth ? textStrokePx(editingOverlayData.strokeWidth, frameRect.height) : undefined}
+                  cornerStyle={editingOverlayData.cornerStyle}
+                  fontFamily={editingOverlayData.fontFamily}
+                  letterSpacing={editingOverlayData.letterSpacing}
+                  look={editingOverlayData}
+                  frameWidth={frameRect.width}
+                  frameHeight={frameRect.height}
+                  initialText={liveTextRef.current}
+                  initialColor={liveColorRef.current}
+                  initialBackgroundColor={liveBackgroundColorRef.current}
+                  initialColorRuns={liveColorRunsRef.current}
+                  initialBoldRuns={liveBoldRunsRef.current}
+                  initialItalicRuns={liveItalicRunsRef.current}
+                  initialTextAlign={liveTextAlignRef.current}
+                  onContentChange={handleNoteContentChange}
+                  onFormatChange={setLiveTextFormat}
+                  onCommit={commitEditingOverlay}
+                  onCancel={cancelEditingOverlay}
+                  onMoveEnd={handleNoteMoveEnd}
+                  onResizeEnd={handleNoteResizeEnd}
+                  onResizeWidthEnd={handleNoteWidthResizeEnd}
+                  onNudge={(dx, dy) => {
+                    // Alt+arrow keys: frame pixels on a 1080-tall frame, as the panel's nudge pad counts them.
+                    if (frameRect.height <= 0) return;
+                    const aspect = frameRect.width / frameRect.height;
+                    setEditingOverlay((prev) => (prev ? { ...prev, x: prev.x + dx / (1080 * aspect), y: prev.y + dy / 1080 } : prev));
+                  }}
+                />
+              </div>
+            );
+          }
+          const o = s.o;
+          const { x: paddingXPx, y: paddingPx } = textPaddingPx(o, frameRect.height);
+          const heightPx = o.fontSize * frameRect.height * textLineHeight(o) + paddingPx * 2;
+          // Shown in capitals (textCase) letter for letter, as the canvas and export draw it.
+          const shown = o.textCase ? { ...o, text: caseText(o.text, o.textCase) } : o;
+          const onCanvas = usesCanvasText(o);
+          const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
+          return (
+            <div
+              key={o.id}
+              onClick={() => selectTextOverlayExclusive(o.id)}
+              onContextMenu={openContextMenu("text", o.id)}
+              data-kf-overlay={o.keyframes?.length ? o.id : undefined}
+              className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
+              style={{
+                // The app turns font synthesis off (App.css); a title face with no italic or bold
+                // file of its own then ignored the Italic/Bold buttons. Export's canvas slants and
+                // thickens such a face, and so does this (the canvas inside inherits it).
+                fontSynthesis: "style weight",
+                mixBlendMode: cssBlendMode(o.blendMode),
+                left: o.x * frameRect.width,
+                top: o.y * frameRect.height,
+                width: o.width * frameRect.width,
+                font: `${o.fontSize * frameRect.height}px ${TEXT_FONT_FAMILY}`,
+                // Drawn on canvas: the box only holds the place (and the hit area) at the text's size.
+                ...(onCanvas
+                  ? {
+                      ...titleFontStyle(o.fontFamily),
+                      fontSize: o.fontSize * frameRect.height,
+                      letterSpacing: o.letterSpacing ? `${o.letterSpacing}em` : undefined,
+                      color: "transparent",
+                    }
+                  : {}),
+                lineHeight: textLineHeight(o),
+                padding: `${paddingPx}px ${paddingXPx}px`,
+                textAlign: o.textAlign ?? "left",
+                pointerEvents: placingAnything ? "none" : "auto",
+                // --reveal-fade: a title reveal's exit fade, set by RevealText.
+                opacity: o.keyframes?.length || isTextReveal(o.animation) ? `calc(${anim.opacity} * var(--kf-opacity, 1) * var(--reveal-fade, 1))` : anim.opacity,
+                // Turned about its own centre after any slide/scale, as pictures are; the canvas
+                // inside draws it level (CanvasTextOverlay) and this turns both together.
+                transform:
+                  [
+                    anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+                    anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
+                    o.rotation ? `rotate(${o.rotation}deg)` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" ") || undefined,
+                background: onCanvas ? "transparent" : textBoxBackgroundCss(o),
+                boxShadow: onCanvas ? undefined : textBoxBorderCss(o, frameRect.height),
+                borderRadius: textCornerRadiusPx(o.cornerStyle, heightPx, o.fontSize * frameRect.height),
+                // -webkit-text-stroke draws centered on the glyph outline by default, which can eat
+                // into thin strokes of the fill color on top of it - paint-order puts the stroke
+                // fully behind the fill instead, the standard trick for a clean "outlined caption"
+                // look (this is a Chromium/WebView2 app, so both properties are safe to rely on).
+                WebkitTextStroke: !onCanvas && o.strokeColor && o.strokeWidth ? `${textStrokePx(o.strokeWidth, frameRect.height)}px ${o.strokeColor}` : undefined,
+                paintOrder: !onCanvas && o.strokeColor && o.strokeWidth ? "stroke fill" : undefined,
+                // Default text has no backgroundColor and no stroke, so a plain drop-shadow keeps
+                // it legible over arbitrary (light or busy) video content instead of only working
+                // on dark footage - standard caption/title styling. Skipped once a stroke is set -
+                // the two together look muddy, and the stroke alone already solves legibility.
+                textShadow: onCanvas || o.backgroundColor || o.boxFill || (o.strokeColor && o.strokeWidth) ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
+              }}
+            >
+              {onCanvas ? (
+                <>
+                  {shown.text}
+                  <CanvasTextOverlay overlay={o} frameWidth={frameRect.width} frameHeight={frameRect.height} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
+                </>
+              ) : isTextReveal(o.animation) ? (
+                <RevealText overlay={shown} kind={o.animation} paddingPx={paddingPx} paddingXPx={paddingXPx} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
+              ) : (
+                renderFormattedSegments(shown.text, o.colorRuns ?? [], o.boldRuns ?? [], o.italicRuns ?? [], o.color)
+              )}
+            </div>
+          );
+        }
+        const o = s.o;
         const isSelected = selectedImageOverlayId === o.id;
         const radiusPx = (o.cornerRadius ?? 0) * frameRect.height;
         // .video-container (the ancestor VideoPlayer renders all of this into) clips with
@@ -1860,342 +1878,103 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         );
       })}
 
-      {activeOverlays
-        .filter((o) => o.id !== editingSession?.id)
-        .map((o) => {
-          const paddingPx = o.padding !== undefined ? o.padding * frameRect.height : 2;
-          const heightPx = o.fontSize * frameRect.height * 1.3 + paddingPx * 2;
-          const onCanvas = usesCanvasText(o);
-          const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
-          return (
-            <div
-              key={o.id}
-              onClick={() => selectTextOverlayExclusive(o.id)}
-              onContextMenu={openContextMenu("text", o.id)}
-              data-kf-overlay={o.keyframes?.length ? o.id : undefined}
-              className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
-              style={{
-                mixBlendMode: cssBlendMode(o.blendMode),
-                left: o.x * frameRect.width,
-                top: o.y * frameRect.height,
-                width: o.width * frameRect.width,
-                font: `${o.fontSize * frameRect.height}px ${TEXT_FONT_FAMILY}`,
-                // Drawn on canvas: the box only holds the place (and the hit area) at the text's size.
-                ...(onCanvas
-                  ? {
-                      ...titleFontStyle(o.fontFamily),
-                      fontSize: o.fontSize * frameRect.height,
-                      letterSpacing: o.letterSpacing ? `${o.letterSpacing}em` : undefined,
-                      color: "transparent",
-                    }
-                  : {}),
-                lineHeight: 1.3,
-                padding: paddingPx,
-                textAlign: o.textAlign ?? "left",
-                pointerEvents: placingAnything ? "none" : "auto",
-                // --reveal-fade: a title reveal's exit fade, set by RevealText.
-                opacity: o.keyframes?.length || isTextReveal(o.animation) ? `calc(${anim.opacity} * var(--kf-opacity, 1) * var(--reveal-fade, 1))` : anim.opacity,
-                // Turned about its own centre after any slide/scale, as pictures are; the canvas
-                // inside draws it level (CanvasTextOverlay) and this turns both together.
-                transform:
-                  [
-                    anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
-                    anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
-                    o.rotation ? `rotate(${o.rotation}deg)` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" ") || undefined,
-                background: onCanvas ? "transparent" : o.backgroundColor ?? "transparent",
-                borderRadius: cornerRadiusCss(o.cornerStyle, heightPx),
-                // -webkit-text-stroke draws centered on the glyph outline by default, which can eat
-                // into thin strokes of the fill color on top of it - paint-order puts the stroke
-                // fully behind the fill instead, the standard trick for a clean "outlined caption"
-                // look (this is a Chromium/WebView2 app, so both properties are safe to rely on).
-                WebkitTextStroke: !onCanvas && o.strokeColor && o.strokeWidth ? `${textStrokePx(o.strokeWidth, frameRect.height)}px ${o.strokeColor}` : undefined,
-                paintOrder: !onCanvas && o.strokeColor && o.strokeWidth ? "stroke fill" : undefined,
-                // Default text has no backgroundColor and no stroke, so a plain drop-shadow keeps
-                // it legible over arbitrary (light or busy) video content instead of only working
-                // on dark footage - standard caption/title styling. Skipped once a stroke is set -
-                // the two together look muddy, and the stroke alone already solves legibility.
-                textShadow: onCanvas || o.backgroundColor || (o.strokeColor && o.strokeWidth) ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
-              }}
-            >
-              {onCanvas ? (
-                <>
-                  {o.text}
-                  <CanvasTextOverlay overlay={o} frameWidth={frameRect.width} frameHeight={frameRect.height} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
-                </>
-              ) : isTextReveal(o.animation) ? (
-                <RevealText overlay={o} kind={o.animation} paddingPx={paddingPx} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
-              ) : (
-                renderFormattedSegments(o.text, o.colorRuns ?? [], o.boldRuns ?? [], o.italicRuns ?? [], o.color)
-              )}
-            </div>
-          );
-        })}
 
       {editingSession && editingOverlayData && (
         <>
-          {/* VideoPlayer's overlay wrapper is `pointer-events: none` by default (so clicks reach
-              the video when there's nothing to interact with) - `pointer-events` is an inherited
-              CSS property, and TextNoteEditor (reused as-is, not our code to edit) never opts back
-              into `auto` itself the way our own read-only/placement divs already do. Without this
-              wrapper every click inside the editor - the drag header, the color picker, the
-              textarea itself - silently fell through to the <video> behind it instead of reaching
-              the editor. Same reasoning applies to the style panel below. */}
-          <div style={{ pointerEvents: "auto" }}>
-{dockHost ? (
-              <VideoTextEditor
-                ref={textEditorRef}
-                key={editingSession.id}
-                left={editingSession.x * frameRect.width}
-                top={editingSession.y * frameRect.height}
-                width={editingSession.width * frameRect.width}
-                fontSize={editingSession.fontSize * frameRect.height}
-                paddingPx={editingSession.padding * frameRect.height}
-                strokeColor={editingOverlayData.strokeColor}
-                strokeWidth={editingOverlayData.strokeWidth ? textStrokePx(editingOverlayData.strokeWidth, frameRect.height) : undefined}
-                cornerStyle={editingOverlayData.cornerStyle}
-                fontFamily={editingOverlayData.fontFamily}
-                letterSpacing={editingOverlayData.letterSpacing}
-                look={editingOverlayData}
-                frameWidth={frameRect.width}
-                frameHeight={frameRect.height}
-                initialText={liveTextRef.current}
-                initialColor={liveColorRef.current}
-                initialBackgroundColor={liveBackgroundColorRef.current}
-                initialColorRuns={liveColorRunsRef.current}
-                initialBoldRuns={liveBoldRunsRef.current}
-                initialItalicRuns={liveItalicRunsRef.current}
-                initialTextAlign={liveTextAlignRef.current}
-                onContentChange={handleNoteContentChange}
-                onFormatChange={setLiveTextFormat}
-                onCommit={commitEditingOverlay}
-                onCancel={cancelEditingOverlay}
-                onMoveEnd={handleNoteMoveEnd}
-                onResizeEnd={handleNoteResizeEnd}
-                onResizeWidthEnd={handleNoteWidthResizeEnd}
-              />
-            ) : (
-                        <TextNoteEditor
-              key={editingSession.id}
-              left={editingSession.x * frameRect.width}
-              top={editingSession.y * frameRect.height}
-              width={editingSession.width * frameRect.width}
-              fontSize={editingSession.fontSize * frameRect.height}
-              initialText={liveTextRef.current}
-              initialColor={liveColorRef.current}
-              initialBackgroundColor={liveBackgroundColorRef.current}
-              initialColorRuns={liveColorRunsRef.current}
-              initialBoldRuns={liveBoldRunsRef.current}
-              initialItalicRuns={liveItalicRunsRef.current}
-              initialTextAlign={liveTextAlignRef.current}
-              onContentChange={handleNoteContentChange}
-              onCommit={commitEditingOverlay}
-              onCancel={cancelEditingOverlay}
-              onMoveEnd={handleNoteMoveEnd}
-              onResizeEnd={handleNoteResizeEnd}
-              onResizeWidthEnd={handleNoteWidthResizeEnd}
-            />
-            )}
-          </div>
-          {/* Video-only creative styling - stroke/background-shape/fade animation apply straight
-              to the store on click (each becomes its own undo step) rather than staging through
-              TextNoteEditor's session, since these are discrete one-click choices, not continuous
-              typing. Positioned a fixed offset above the editor's own header bar so the two don't
-              overlap regardless of box width. */}
-          <OverlaySettingsPanel
-            title="Text"
-            icon={<IoText size={14} />}
-            onClose={commitEditingOverlay}
-            docked={
-              <TextDockedPanel
-                look={{ ...editingOverlayData, ...(liveTextFormat ? { color: liveTextFormat.color, backgroundColor: liveTextFormat.backgroundColor } : {}) }}
-                onApplyLook={(style) => {
-                  const { color, backgroundColor, padding, ...rest } = lookPatch(style.look);
-                  // Colour and box fill are the editor's (it's what gets committed), the rest the store's.
-                  if (color) textEditorRef.current?.applyColor(color);
-                  textEditorRef.current?.setBackground(backgroundColor);
-                  setEditingOverlay((prev) => (prev ? { ...prev, padding: padding ?? legacyPaddingFraction(frameRect.height) } : prev));
-                  onUpdateTextOverlayContent(editingOverlayData.id, rest);
-                }}
-                onLook={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
-                backgroundColor={liveTextFormat ? liveTextFormat.backgroundColor : editingOverlayData.backgroundColor}
-                textColor={liveTextFormat?.color}
-                textAlign={liveTextFormat?.textAlign}
-                onTextColor={(c) => textEditorRef.current?.applyColor(c)}
-                onHighlight={(c) => textEditorRef.current?.setBackground(c)}
-                onBold={() => textEditorRef.current?.toggleBold()}
-                onItalic={() => textEditorRef.current?.toggleItalic()}
-                onAlign={(a) => textEditorRef.current?.setAlign(a)}
-                strokeColor={editingOverlayData.strokeColor}
-                strokeWidth={editingOverlayData.strokeWidth}
-                cornerStyle={editingOverlayData.cornerStyle}
-                animation={editingOverlayData.animation}
-                fontSizePx={Math.round(editingSession.fontSize * frameRect.height)}
-                paddingPx={Math.round(editingSession.padding * frameRect.height)}
-                onFontSizePx={(px) => {
-                  if (frameRect.height <= 0) return;
-                  setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
-                }}
-                onPaddingPx={(px) => {
-                  if (frameRect.height <= 0) return;
-                  setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
-                }}
-                onCornerStyle={(cornerStyle) => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle })}
-                onStroke={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
-                onAnimation={(animation) => onUpdateTextOverlayContent(editingOverlayData.id, { animation })}
-                text={editingOverlayData.text}
-                reveal={editingOverlayData.reveal}
-                onReveal={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, { reveal: { ...editingOverlayData.reveal, ...patch } })}
-                x={editingSession.x}
-                y={editingSession.y}
-                width={editingSession.width}
-                height={editingOverlayData.height}
-                startTime={editingOverlayData.startTime}
-                endTime={editingOverlayData.endTime}
-                playhead={currentOutputTime}
-                onPlace={(x, y) => setEditingOverlay((prev) => (prev ? { ...prev, x, y } : prev))}
-                keyframes={editingOverlayData.keyframes}
-                onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
-                blendMode={editingOverlayData.blendMode}
-                onBlendMode={(blendMode) => onUpdateTextOverlayContent(editingOverlayData.id, { blendMode })}
-                track={editingOverlayData.track}
-                onTrackMotion={onTrackMotion ? () => onTrackMotion("text", editingOverlayData.id) : undefined}
-                onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("text", editingOverlayData.id, edge, time) : undefined}
-                onDuplicate={() => onDuplicateTextOverlay(editingOverlayData.id)}
-                onFront={() => onBringTextOverlayToFront(editingOverlayData.id)}
-                onBack={() => onSendTextOverlayToBack(editingOverlayData.id)}
-                onDelete={() => {
-                  const id = editingOverlayData.id;
-                  cancelEditingOverlay();
-                  onDeleteTextOverlay(id);
-                }}
-              />
-            }
-            floatingStyle={{
-              position: "absolute",
-              left: editingSession.x * frameRect.width,
-              top: panelTopPx(editingSession.y * frameRect.height, editingOverlayData.height * frameRect.height),
-              pointerEvents: "auto",
-              zIndex: 21,
-            }}
-          >
-            {/* Font size - caret buttons step it in real time (matches the image panel's own
-                rotation input's up/down spinner), or click the value to type an exact number.
-                Reads/writes editingSession.fontSize (the staged, not-yet-committed value the
-                corner drag handle also uses), so this and that handle stay two ways of setting the
-                exact same in-progress number instead of racing each other, both flushing together
-                at the normal commit point. */}
-            <SteppedNumberField
-              valuePx={Math.round(editingSession.fontSize * frameRect.height)}
-              min={4}
-              max={500}
-              title="Font size - click the arrows or type a value"
-              onChangePx={(px) => {
-                if (frameRect.height <= 0) return;
-                setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
-              }}
-            />
-            <div className="w-px h-4 bg-white/15" />
-            {TEXT_STYLE_PRESETS.map((preset) => (
-              <button
-                key={preset.name}
-                type="button"
-                title={preset.name}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, preset.patch)}
-                className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-              >
-                {preset.name}
-              </button>
-            ))}
-            <div className="w-px h-4 bg-white/15" />
-            {/* Everything past this point is reached for less often than font size/style presets
-                above - tucked behind a caret instead of growing this row every time a new text
-                aesthetic ships (padding, then outline, then corners, then animations, ...). */}
-            <ToolbarOverflowMenu>
-              {/* Padding around the text inside its box - most visible once a background/pill is
-                  applied. Same staged-in-session treatment as font size above, for the same reason
-                  (one undo step per edit, not one per pixel/keystroke). Note this doesn't preview
-                  live *while* the editor is open - TextNoteEditor (reused as-is) draws its own
-                  fixed-padding chrome and has no padding prop of its own to drive - it becomes
-                  visible the moment editing ends, same as this panel's other aesthetic controls
-                  (stroke/corner/fade) already work. */}
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Padding</span>
-                <SteppedNumberField
-                  valuePx={Math.round(editingSession.padding * frameRect.height)}
-                  min={0}
-                  max={100}
-                  title="Padding - click the arrows or type a value"
-                  onChangePx={(px) => {
+          {(() => {
+            // One set of props: the full panel docked in the sidebar, or the quick bar riding on the
+            // box when the sidebar is closed (TextQuickBar).
+            const textPanel = (
+                <TextDockedPanel
+                  frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
+                  look={{ ...editingOverlayData, ...(liveTextFormat ? { color: liveTextFormat.color, backgroundColor: liveTextFormat.backgroundColor } : {}) }}
+                  onApplyLook={(style) => {
+                    const { color, backgroundColor, padding, ...rest } = lookPatch(style.look);
+                    // Colour and box fill are the editor's (it's what gets committed), the rest the store's.
+                    if (color) textEditorRef.current?.applyColor(color);
+                    textEditorRef.current?.setBackground(backgroundColor);
+                    setEditingOverlay((prev) => (prev ? { ...prev, padding: padding ?? legacyPaddingFraction(frameRect.height), paddingX: undefined } : prev));
+                    onUpdateTextOverlayContent(editingOverlayData.id, rest);
+                  }}
+                  onLook={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
+                  backgroundColor={liveTextFormat ? liveTextFormat.backgroundColor : editingOverlayData.backgroundColor}
+                  textColor={liveTextFormat?.color}
+                  textAlign={liveTextFormat?.textAlign}
+                  onTextColor={(c) => textEditorRef.current?.applyColor(c)}
+                  onHighlight={(c) => textEditorRef.current?.setBackground(c)}
+                  onBold={() => textEditorRef.current?.toggleBold()}
+                  onItalic={() => textEditorRef.current?.toggleItalic()}
+                  onAlign={(a) => textEditorRef.current?.setAlign(a)}
+                  strokeColor={editingOverlayData.strokeColor}
+                  strokeWidth={editingOverlayData.strokeWidth}
+                  cornerStyle={editingOverlayData.cornerStyle}
+                  animation={editingOverlayData.animation}
+                  fontSizePx={Math.round(editingSession.fontSize * frameRect.height)}
+                  paddingPx={Math.round(editingSession.padding * frameRect.height)}
+                  paddingXPx={Math.round((editingSession.paddingX ?? editingSession.padding) * frameRect.height)}
+                  onFontSizePx={(px) => {
                     if (frameRect.height <= 0) return;
-                    setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
+                    setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
+                  }}
+                  onPaddingPx={(edge, px) => {
+                    if (frameRect.height <= 0) return;
+                    // Setting top/bottom pins the sides at what they show now, so each moves on its own.
+                    setEditingOverlay((prev) =>
+                      prev ? (edge === "x" ? { ...prev, paddingX: px / frameRect.height } : { ...prev, padding: px / frameRect.height, paddingX: prev.paddingX ?? prev.padding }) : prev
+                    );
+                  }}
+                  onCornerStyle={(cornerStyle) => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle })}
+                  onStroke={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
+                  onAnimation={(animation) => {
+                    onUpdateTextOverlayContent(editingOverlayData.id, { animation });
+                    textEditorRef.current?.previewAnimation(animation);
+                  }}
+                  text={editingOverlayData.text}
+                  reveal={editingOverlayData.reveal}
+                  onReveal={(patch) => {
+                    onUpdateTextOverlayContent(editingOverlayData.id, { reveal: { ...editingOverlayData.reveal, ...patch } });
+                    textEditorRef.current?.previewAnimation(editingOverlayData.animation);
+                  }}
+                  x={editingSession.x}
+                  y={editingSession.y}
+                  width={editingSession.width}
+                  height={editingOverlayData.height}
+                  startTime={editingOverlayData.startTime}
+                  endTime={editingOverlayData.endTime}
+                  playhead={currentOutputTime}
+                  onPlace={(x, y) => setEditingOverlay((prev) => (prev ? { ...prev, x, y } : prev))}
+                  keyframes={editingOverlayData.keyframes}
+                  onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                  blendMode={editingOverlayData.blendMode}
+                  onBlendMode={(blendMode) => onUpdateTextOverlayContent(editingOverlayData.id, { blendMode })}
+                  track={editingOverlayData.track}
+                  onTrackMotion={onTrackMotion ? () => onTrackMotion("text", editingOverlayData.id) : undefined}
+                  onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("text", editingOverlayData.id, edge, time) : undefined}
+                  onDuplicate={() => onDuplicateTextOverlay(editingOverlayData.id)}
+                  onFront={() => onBringTextOverlayToFront(editingOverlayData.id)}
+                  onBack={() => onSendTextOverlayToBack(editingOverlayData.id)}
+                  onDelete={() => {
+                    const id = editingOverlayData.id;
+                    cancelEditingOverlay();
+                    onDeleteTextOverlay(id);
                   }}
                 />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Outline</span>
-                <div onMouseDown={(e) => e.preventDefault()} title="Outline color/width">
-                  <ColorSwatchPicker
-                    color={editingOverlayData.strokeColor ?? "#000000"}
-                    onChange={(c) => onUpdateTextOverlayContent(editingOverlayData.id, { strokeColor: c, strokeWidth: editingOverlayData.strokeWidth || 2 })}
-                    size="sm"
-                  />
-                </div>
-                <button
-                  type="button"
-                  title={editingOverlayData.strokeWidth ? "Remove outline" : "Add outline"}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() =>
-                    onUpdateTextOverlayContent(editingOverlayData.id, {
-                      strokeWidth: editingOverlayData.strokeWidth ? undefined : 2,
-                      strokeColor: editingOverlayData.strokeColor ?? "#000000",
-                    })
-                  }
-                  className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-                    editingOverlayData.strokeWidth ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-                  }`}
-                >
-                  {editingOverlayData.strokeWidth ? "On" : "Off"}
-                </button>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Corners</span>
-                {CORNER_OPTIONS.map((corner) => (
-                  <button
-                    key={corner}
-                    type="button"
-                    title={corner === "square" ? "Square corners" : corner === "rounded" ? "Rounded corners" : "Pill shape"}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle: corner })}
-                    className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
-                      (editingOverlayData.cornerStyle ?? "square") === corner ? "bg-blue-500/20 ring-1 ring-blue-400" : "hover:bg-white/10"
-                    }`}
-                  >
-                    <span
-                      className="block w-2.5 h-2.5 bg-white/80"
-                      style={{ borderRadius: corner === "pill" ? 999 : corner === "rounded" ? 3 : 0 }}
-                    />
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Animate</span>
-                <AnimationPicker text value={editingOverlayData.animation} onChange={(next) => onUpdateTextOverlayContent(editingOverlayData.id, { animation: next })} />
-              </div>
-              <button
-                type="button"
-                title="Duplicate this text overlay"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onDuplicateTextOverlay(editingOverlayData.id)}
-                className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-              >
-                Duplicate
-              </button>
-            </ToolbarOverflowMenu>
-          </OverlaySettingsPanel>
+            );
+            return (
+              <OverlaySettingsPanel title="Text" icon={<IoText size={14} />} onClose={commitEditingOverlay} docked={textPanel} bare>
+                <TextQuickBar
+                  {...(textPanel.props as TextDockedPanelProps)}
+                  boxLeftPx={editingSession.x * frameRect.width}
+                  boxTopPx={editingSession.y * frameRect.height}
+                  boxWidthPx={editingSession.width * frameRect.width}
+                  boxHeightPx={editingOverlayData.height * frameRect.height}
+                  frameWidthPx={frameRect.width}
+                  frameHeightPx={frameRect.height}
+                  onOpenSettings={openToolPanel ?? undefined}
+                />
+              </OverlaySettingsPanel>
+            );
+          })()}
         </>
       )}
 
@@ -2239,6 +2018,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             const corner = (["square", "rounded", "round"] as const).find((c) => Math.abs((o.cornerRadius ?? 0) - radiusFor(c)) < 0.001) ?? null;
             return (
               <ImageDockedPanel
+                frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
                 opacity={o.opacity}
                 corner={corner}
                 borderColor={o.borderColor}
@@ -2269,7 +2049,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 onReplace={() => void handleReplaceImage(o.id)}
                 onCrop={() => setCroppingOverlayId(o.id)}
                 asset={o.asset}
-                onAsset={(patch) => o.asset && onUpdateImageOverlayContent(o.id, { asset: { ...o.asset, ...patch } })}
+                onAsset={(patch) => onUpdateImageOverlayContent(o.id, assetPatch(o, patch))}
                 reveal={o.reveal}
                 onReveal={(reveal) => onUpdateImageOverlayContent(o.id, { reveal })}
                 mask={o.mask}
@@ -2339,7 +2119,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           {selectedImageOverlayData.asset && (
             <AssetFloatingControls
               asset={selectedImageOverlayData.asset}
-              onAsset={(patch) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { asset: { ...selectedImageOverlayData.asset!, ...patch } })}
+              onAsset={(patch) => onUpdateImageOverlayContent(selectedImageOverlayData.id, assetPatch(selectedImageOverlayData, patch))}
             />
           )}
           {!selectedImageOverlayData.asset && (["square", "rounded", "round"] as const).map((corner) => {
@@ -2522,6 +2302,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             const maxRadiusPx = Math.min(o.width * frameRect.width, o.height * frameRect.height) / 2;
             return (
               <BlurDockedPanel
+                frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
                 intensity={o.intensity}
                 shape={shape}
                 preset={preset}

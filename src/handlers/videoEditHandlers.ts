@@ -452,12 +452,9 @@ export function duplicateOverlay<T extends { id: string; x: number; y: number; c
   };
 }
 
-// Stacking order within one overlay kind's own array is just array order (later = rendered on
-// top - see VideoOverlayLayer's activeOverlays/activeImageOverlays .map() calls) - "front"/"back"
-// are therefore just "move to the end"/"move to the start" of that same array. Note text and
-// image overlays are two entirely separate render passes (all images render, then all text -
-// see VideoOverlayLayer's return), so these only ever reorder within one kind; there's no single
-// combined z-order across both yet.
+// Stacking within one overlay kind's own array is array order (later = on top); across text and
+// pictures it's `layer` first (overlayStack below). "Front"/"back" move the overlay to the end/
+// start of its array - the generics here - and past every other layer (layerInFront/layerBehind).
 export function bringOverlayToFront<T extends { id: string }>(overlays: T[], id: string): T[] {
   const index = overlays.findIndex((o) => o.id === id);
   if (index === -1 || index === overlays.length - 1) return overlays;
@@ -474,6 +471,32 @@ export function sendOverlayToBack<T extends { id: string }>(overlays: T[], id: s
   const [item] = next.splice(index, 1);
   next.unshift(item);
   return next;
+}
+
+// Text and pictures stack as one pile: by `layer`, then pictures before text, then each list's own
+// order. Unset, a picture is layer 0 and text layer 1 - text over pictures, as it always was.
+export type StackedOverlay = { kind: "image"; o: ImageOverlay } | { kind: "text"; o: TextOverlay };
+
+const layerOf = (s: StackedOverlay): number => s.o.layer ?? (s.kind === "image" ? 0 : 1);
+
+export function overlayStack(imageOverlays: ImageOverlay[], textOverlays: TextOverlay[]): StackedOverlay[] {
+  const all: StackedOverlay[] = [...imageOverlays.map((o) => ({ kind: "image" as const, o })), ...textOverlays.map((o) => ({ kind: "text" as const, o }))];
+  // Stable: equal layers keep pictures-then-text and each list's order.
+  return all.map((s, i) => ({ s, i, layer: layerOf(s) })).sort((a, b) => a.layer - b.layer || a.i - b.i).map((e) => e.s);
+}
+
+// The layer that puts an overlay above / below every other one, or null when it already is.
+export function layerInFront(imageOverlays: ImageOverlay[], textOverlays: TextOverlay[], id: string): number | null {
+  const stack = overlayStack(imageOverlays, textOverlays);
+  const top = stack[stack.length - 1];
+  if (!top || top.o.id === id) return null;
+  return layerOf(top) + 1;
+}
+
+export function layerBehind(imageOverlays: ImageOverlay[], textOverlays: TextOverlay[], id: string): number | null {
+  const stack = overlayStack(imageOverlays, textOverlays);
+  if (!stack[0] || stack[0].o.id === id) return null;
+  return layerOf(stack[0]) - 1;
 }
 
 // ---- Audio overlays ----------------------------------------------------------------------------
