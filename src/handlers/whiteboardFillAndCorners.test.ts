@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import { createDefaultWhiteboardNode, nodeHasFill, resolveFillType, resolveGradientStops, WhiteboardNode } from "../utils/whiteboardTypes";
 import {
   dashArrayFor,
+  detectShapeCorners,
   fillImageRect,
   fillPatternTile,
   hexToRgba,
   linearGradientPoints,
   nodeDropShadowCSS,
+  resolveBoxCornerRadii,
   roundedPolygonD,
   shapeOutlineFor,
   supportsCornerRadius,
@@ -59,6 +61,30 @@ describe("corner radius", () => {
 
   it("does not round a cube's outline out from under its spokes", () => {
     expect(shapeOutlineFor("cube", 100, 100, { cornerRadius: 20 }).kind).toBe("polygon");
+  });
+
+  it("detects corners with directional labels across shapes", () => {
+    expect(detectShapeCorners(node("triangle")).map((c) => c.label)).toEqual(["Top", "Bottom-right", "Bottom-left"]);
+    expect(detectShapeCorners(node("triangle", { flipVertical: true })).map((c) => c.label)).toEqual(["Bottom", "Top-right", "Top-left"]);
+    expect(detectShapeCorners(node("rectangle")).map((c) => c.label)).toEqual(["Top-left", "Top-right", "Bottom-right", "Bottom-left"]);
+    expect(detectShapeCorners(node("diamond")).map((c) => c.label)).toEqual(["Top", "Right", "Bottom", "Left"]);
+    expect(detectShapeCorners(node("hexagon")).map((c) => c.label)).toEqual(["Top-left", "Top-right", "Right", "Bottom-right", "Bottom-left", "Left"]);
+    expect(detectShapeCorners(node("polygon", { sides: 5 })).map((c) => c.label)).toEqual(["Top", "Top-right", "Bottom-right", "Bottom-left", "Top-left"]);
+    expect(detectShapeCorners(node("ellipse"))).toEqual([]);
+  });
+
+  it("rounds only the targeted corner when cornerRadii is set", () => {
+    // Round only the Top corner (index 0) of a triangle; bottom corners stay sharp.
+    const outline = shapeOutlineFor("triangle", 160, 130, { cornerRadius: 0, cornerRadii: [20, null, null] });
+    expect(outline.kind).toBe("path");
+    if (outline.kind !== "path") return;
+    expect(outline.d.match(/Q/g)?.length).toBe(1);
+    expect(outline.d).toContain("L160,130");
+    expect(outline.d).toContain("L0,130");
+  });
+
+  it("resolves per-corner box radii with fallback to cornerRadius", () => {
+    expect(resolveBoxCornerRadii({ width: 100, height: 80, cornerRadius: 10, cornerRadii: [25, null, 0, null] })).toEqual([25, 10, 0, 10]);
   });
 });
 

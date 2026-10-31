@@ -144,6 +144,7 @@ import {
   DEFAULT_SHADOW_OFFSET_X,
   DEFAULT_SHADOW_OFFSET_Y,
   DEFAULT_SHADOW_OPACITY,
+  detectShapeCorners,
   distributeNodes,
   fillPatternTile,
   nudgeEdgeBy,
@@ -2705,18 +2706,49 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           {/* Every straight-edged outline rounds (see whiteboardHandlers.ts's supportsCornerRadius);
               an image only when its mask is "rounded" - showing the slider anywhere else would be a
               control with no visible effect. */}
-          {selectedNodes.every(supportsCornerRadius) && (
-            <SliderField
-              label="Corner radius"
-              resetKey={`cr-${ids}`}
-              value={selectedNodes[0].cornerRadius ?? 0}
-              min={0}
-              max={Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2))}
-              step={1}
-              onCommit={(n) => updateNodes({ cornerRadius: n })}
-              onPreview={previewField("cornerRadius")}
-            />
-          )}
+          {selectedNodes.every(supportsCornerRadius) && (() => {
+            const maxRadius = Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2));
+            const corners = detectShapeCorners(selectedNodes[0]);
+            const buildCornerRadii = (node: WhiteboardNode, cornerIndex: number, nextRadius: number): (number | null)[] => {
+              const nodeCorners = detectShapeCorners(node);
+              const len = Math.max(nodeCorners.length, cornerIndex + 1);
+              return Array.from({ length: len }, (_, i) => (i === cornerIndex ? nextRadius : (node.cornerRadii?.[i] ?? null)));
+            };
+            return (
+              <>
+                <SliderField
+                  label="Corner radius"
+                  resetKey={`cr-${ids}`}
+                  value={selectedNodes[0].cornerRadius ?? 0}
+                  min={0}
+                  max={maxRadius}
+                  step={1}
+                  onCommit={(n) => updateNodes({ cornerRadius: n, cornerRadii: undefined })}
+                  onPreview={(n) => onPreviewNodes?.(n === null ? null : { cornerRadius: n, cornerRadii: undefined })}
+                />
+                {corners.map((corner) => {
+                  const val = selectedNodes[0].cornerRadii?.[corner.index] ?? selectedNodes[0].cornerRadius ?? 0;
+                  return (
+                    <SliderField
+                      key={`${selectedNodes[0].shapeType}-${corner.index}-${corner.label}`}
+                      label={corner.label}
+                      resetKey={`cr-${ids}-${corner.index}-${selectedNodes[0].cornerRadius ?? 0}`}
+                      value={val}
+                      min={0}
+                      max={maxRadius}
+                      step={1}
+                      onCommit={(n) => updateNodes({ cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) })}
+                      onPreview={(n) =>
+                        onPreviewNodes?.(
+                          n === null ? null : { cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) }
+                        )
+                      }
+                    />
+                  );
+                })}
+              </>
+            );
+          })()}
           {selectedNodes.every((n) => n.shapeType === "polygon") && (
             <Field label="Sides">
               <input

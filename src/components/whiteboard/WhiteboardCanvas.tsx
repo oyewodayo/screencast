@@ -73,7 +73,9 @@ import {
   outlineOptionsFor,
   resolveAmplifierGeometry,
   resolveAnchorPoint,
+  resolveBoxCornerRadii,
   resolveEdgeEndpoints,
+  roundedRectSvgD,
   SERIES_FILL_OPACITY,
   shapeOutlineFor,
   ChartLabel,
@@ -161,7 +163,9 @@ function ChartLabelText({ label, node }: { label: ChartLabel; node: WhiteboardNo
 // the border - so the stroke keeps CSS's crisp inside-the-box placement either way.
 function BoxShapeBody({ node, paint }: { node: WhiteboardNode; paint: FillPaint }) {
   const ellipse = node.shapeType === "ellipse";
-  const radius = ellipse ? "50%" : node.cornerRadius ?? 0;
+  const [tl, tr, br, bl] = resolveBoxCornerRadii(node);
+  const allEqual = tl === tr && tr === br && br === bl;
+  const radius = ellipse ? "50%" : allEqual ? tl : `${tl}px ${tr}px ${br}px ${bl}px`;
   const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
     ? hexToRgba(node.strokeColor, node.strokeOpacity)
     : node.strokeColor;
@@ -172,9 +176,14 @@ function BoxShapeBody({ node, paint }: { node: WhiteboardNode; paint: FillPaint 
   }
   const w = node.width;
   const h = node.height;
-  const r = Math.max(0, Math.min(node.cornerRadius ?? 0, w / 2, h / 2));
   const shape = (p: { fill: string; fillOpacity?: number; opacity?: number }) =>
-    ellipse ? <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} {...p} /> : <rect x={0} y={0} width={w} height={h} rx={r} ry={r} {...p} />;
+    ellipse ? (
+      <ellipse cx={w / 2} cy={h / 2} rx={w / 2} ry={h / 2} {...p} />
+    ) : allEqual ? (
+      <rect x={0} y={0} width={w} height={h} rx={tl} ry={tl} {...p} />
+    ) : (
+      <path d={roundedRectSvgD(w, h, [tl, tr, br, bl])} {...p} />
+    );
   return (
     <>
       <svg width="100%" height="100%" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ position: "absolute", inset: 0 }}>
@@ -205,7 +214,15 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
   React.useEffect(() => setFailed(false), [src]);
 
   const mask = node.imageMask ?? "rect";
-  const borderRadius = mask === "ellipse" ? "50%" : mask === "rounded" ? `${Math.max(0, node.cornerRadius ?? 0)}px` : undefined;
+  const [tl, tr, br, bl] = resolveBoxCornerRadii(node);
+  const borderRadius =
+    mask === "ellipse"
+      ? "50%"
+      : mask === "rounded"
+      ? tl === tr && tr === br && br === bl
+        ? `${tl}px`
+        : `${tl}px ${tr}px ${br}px ${bl}px`
+      : undefined;
   const crop = resolveImageCrop(node);
   const fit = node.imageFit ?? "cover";
 

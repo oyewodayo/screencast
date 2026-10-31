@@ -660,6 +660,7 @@ export interface ShapeOutlineOptions {
   // Any straight-edged "polygon" outline - see roundOutlineCorners. Rectangles round through their
   // own "rect" body instead, so this never reaches them.
   cornerRadius?: number;
+  cornerRadii?: (number | null)[];
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -2916,10 +2917,12 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
 // neighboring fillets can never overlap; that clamp is what keeps a star's needle-sharp tips and a
 // tiny triangle well-formed at any radius instead of looping back on themselves. Concave vertices
 // (a star's inner points, a cross's inside corners) round the same way.
-export function roundedPolygonD(points: [number, number][], radius: number): string {
+export function roundedPolygonD(points: [number, number][], radius: number, cornerRadii?: (number | null | undefined)[]): string {
   const n = points.length;
-  if (n < 3 || radius <= 0) return `M${points.map(([x, y]) => `${x},${y}`).join(" L")} Z`;
+  const radii = points.map((_, i) => Math.max(0, cornerRadii?.[i] ?? radius ?? 0));
+  if (n < 3 || radii.every((r) => r <= 0)) return `M${points.map(([x, y]) => `${x},${y}`).join(" L")} Z`;
   const corners = points.map((p, i) => {
+    const r = radii[i];
     const prev = points[(i - 1 + n) % n];
     const next = points[(i + 1) % n];
     const ax = prev[0] - p[0];
@@ -2930,29 +2933,143 @@ export function roundedPolygonD(points: [number, number][], radius: number): str
     const lb = Math.hypot(bx, by) || 1;
     const cos = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)));
     const half = Math.acos(cos) / 2;
-    const ideal = half > 1e-4 ? radius / Math.tan(half) : 0;
+    const ideal = r > 0 && half > 1e-4 ? r / Math.tan(half) : 0;
     const t = Math.min(ideal, la / 2, lb / 2);
     return {
       start: [p[0] + (ax / la) * t, p[1] + (ay / la) * t] as const,
       end: [p[0] + (bx / lb) * t, p[1] + (by / lb) * t] as const,
       vertex: p,
+      rounded: t > 1e-4,
     };
   });
   const f = (v: number) => +v.toFixed(2);
   let d = `M${f(corners[0].end[0])},${f(corners[0].end[1])}`;
   for (let i = 1; i <= n; i++) {
     const c = corners[i % n];
-    d += ` L${f(c.start[0])},${f(c.start[1])} Q${f(c.vertex[0])},${f(c.vertex[1])} ${f(c.end[0])},${f(c.end[1])}`;
+    if (c.rounded) {
+      d += ` L${f(c.start[0])},${f(c.start[1])} Q${f(c.vertex[0])},${f(c.vertex[1])} ${f(c.end[0])},${f(c.end[1])}`;
+    } else {
+      d += ` L${f(c.vertex[0])},${f(c.vertex[1])}`;
+    }
   }
   return `${d} Z`;
+}
+
+// Resolves a 4-corner box's [top-left, top-right, bottom-right, bottom-left] radii, clamped to half
+// the shorter side so neither CSS border-radius nor Canvas2D/SVG arc paths ever overlap.
+export function resolveBoxCornerRadii(
+  node: Pick<WhiteboardNode, "width" | "height" | "cornerRadius" | "cornerRadii">
+): [number, number, number, number] {
+  const maxR = Math.max(0, Math.min(node.width, node.height) / 2);
+  const base = node.cornerRadius ?? 0;
+  return [
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[0] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[1] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[2] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[3] ?? base)),
+  ];
+}
+
+// SVG path `d` for a w x h rectangle with independent [tl, tr, br, bl] circular corner radii -
+// used when a rectangle/equation carries a gradient, image, or pattern fill alongside per-corner
+// radii (SVG's <rect> only accepts a single uniform rx/ry).
+export function roundedRectSvgD(w: number, h: number, radii: [number, number, number, number]): string {
+  const maxR = Math.max(0, Math.min(w, h) / 2);
+  const [tl, tr, br, bl] = radii.map((r) => Math.max(0, Math.min(maxR, r)));
+  const f = (v: number) => +v.toFixed(2);
+  return [
+    `M${f(tl)},0`,
+    `L${f(w - tr)},0`,
+    tr > 0 ? `A${f(tr)},${f(tr)} 0 0,1 ${f(w)},${f(tr)}` : "",
+    `L${f(w)},${f(h - br)}`,
+    br > 0 ? `A${f(br)},${f(br)} 0 0,1 ${f(w - br)},${f(h)}` : "",
+    `L${f(bl)},${f(h)}`,
+    bl > 0 ? `A${f(bl)},${f(bl)} 0 0,1 0,${f(h - bl)}` : "",
+    `L0,${f(tl)}`,
+    tl > 0 ? `A${f(tl)},${f(tl)} 0 0,1 ${f(tl)},0` : "",
+    "Z",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+export interface DetectedShapeCorner {
+  index: number;
+  label: string;
+  point: [number, number];
+}
+
+function cornerDirectionLabel(nx: number, ny: number): string {
+  const dx = nx - 0.5;
+  const dy = ny - 0.5;
+  if (Math.hypot(dx, dy) < 0.12) return "Center";
+  if (Math.abs(dx) <= 0.12) return dy < 0 ? "Top" : "Bottom";
+  if (Math.abs(dy) <= 0.12) return dx < 0 ? "Left" : "Right";
+  const v = dy < 0 ? "Top" : "Bottom";
+  const h = dx < 0 ? "left" : "right";
+  return `${v}-${h}`;
+}
+
+// Detects the roundable corners of any shape that supports corner radius and names each vertex by
+// its position on the shape (e.g. "Top", "Bottom-right", "Bottom-left" for a triangle; "Top-left",
+// "Top-right", "Bottom-right", "Bottom-left" for a rectangle; "Top", "Right", "Bottom", "Left" for
+// a diamond; etc.), accounting for horizontal/vertical flips so labels match the on-screen corners.
+export function detectShapeCorners(node: WhiteboardNode): DetectedShapeCorner[] {
+  if (!supportsCornerRadius(node)) return [];
+  const { width: w, height: h } = node;
+  let points: [number, number][];
+  if (node.shapeType === "rectangle" || node.shapeType === "equation" || node.shapeType === "image") {
+    points = [
+      [0, 0],
+      [w, 0],
+      [w, h],
+      [0, h],
+    ];
+  } else {
+    const outline = baseShapeOutline(node.shapeType, w, h, outlineOptionsFor(node));
+    if (outline.kind !== "polygon") return [];
+    points = outline.points;
+  }
+
+  const baseLabels = points.map((p, i) => {
+    const rawNx = w > 0 ? p[0] / w : 0.5;
+    const rawNy = h > 0 ? p[1] / h : 0.5;
+    const nx = node.flipHorizontal ? 1 - rawNx : rawNx;
+    const ny = node.flipVertical ? 1 - rawNy : rawNy;
+    const dir = cornerDirectionLabel(nx, ny);
+    if (node.shapeType === "star" && i % 2 === 1) {
+      return `Inner ${dir.toLowerCase()}`;
+    }
+    return dir;
+  });
+
+  const counts = new Map<string, number>();
+  for (const lbl of baseLabels) counts.set(lbl, (counts.get(lbl) ?? 0) + 1);
+  const seen = new Map<string, number>();
+
+  return points.map((point, index) => {
+    const base = baseLabels[index];
+    if ((counts.get(base) ?? 0) > 1) {
+      const next = (seen.get(base) ?? 0) + 1;
+      seen.set(base, next);
+      return { index, label: `${base} ${next}`, point };
+    }
+    return { index, label: base, point };
+  });
 }
 
 // Only plain closed polygons round - one with inner lines/circles (cube spokes, a note's crease, a
 // table grid, benzene's ring) has strokes that land exactly on its vertices, and rounding the outline
 // out from under them would leave those strokes poking past the new edge.
-function roundOutlineCorners(shapeType: WhiteboardShapeType, outline: ShapeOutline, radius: number | undefined): ShapeOutline {
-  if (!radius || radius <= 0 || outline.kind !== "polygon" || outline.innerLines || outline.innerCircle || shapeType === "table") return outline;
-  return { kind: "path", d: roundedPolygonD(outline.points, radius) };
+function roundOutlineCorners(
+  shapeType: WhiteboardShapeType,
+  outline: ShapeOutline,
+  radius: number | undefined,
+  cornerRadii?: (number | null | undefined)[]
+): ShapeOutline {
+  const hasRadius = (radius !== undefined && radius > 0) || (cornerRadii?.some((r) => r !== null && r !== undefined && r > 0) ?? false);
+  if (!hasRadius || outline.kind !== "polygon" || outline.innerLines || outline.innerCircle || shapeType === "table") return outline;
+  return { kind: "path", d: roundedPolygonD(outline.points, radius ?? 0, cornerRadii) };
 }
 
 // Whether the style panel's Corner radius control does anything for this node - rectangles and
@@ -2978,7 +3095,9 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
   const annotations = CHART_ANNOTATION_SHAPES.has(shapeType) ? opts?.chartAnnotations ?? [] : [];
   const margins = CHART_AXIS_TITLE_SHAPES.has(shapeType) ? chartMargins(shapeType, w, h, opts ?? {}) : { left: 0, top: 0, bottom: 0, labels: [] as ChartLabel[] };
   const hasMargins = margins.left > 0 || margins.top > 0 || margins.bottom > 0;
-  if (!hasMargins && annotations.length === 0) return roundOutlineCorners(shapeType, baseShapeOutline(shapeType, w, h, opts), opts?.cornerRadius);
+  if (!hasMargins && annotations.length === 0) {
+    return roundOutlineCorners(shapeType, baseShapeOutline(shapeType, w, h, opts), opts?.cornerRadius, opts?.cornerRadii);
+  }
 
   const innerW = Math.max(1, w - margins.left);
   const innerH = Math.max(1, h - margins.top - margins.bottom);
@@ -3077,6 +3196,7 @@ export function outlineOptionsFor(node: WhiteboardNode): ShapeOutlineOptions {
     tableColWidths: node.tableColWidths,
     tableRowHeights: node.tableRowHeights,
     cornerRadius: node.cornerRadius,
+    cornerRadii: node.cornerRadii,
     axisPlacement: node.axisPlacement,
     xLabelSide: node.xLabelSide,
     yLabelSide: node.yLabelSide,
@@ -3179,11 +3299,7 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
     return path;
   }
   if (mask === "rounded") {
-    // Clamped to half the shorter side - a radius past that is geometrically meaningless and
-    // renders as a malformed path rather than a rounder box.
-    const r = Math.max(0, Math.min(node.cornerRadius ?? 0, Math.min(w, h) / 2));
-    path.roundRect(0, 0, w, h, r);
-    return path;
+    return roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii);
   }
   path.rect(0, 0, w, h);
   return path;
@@ -3519,18 +3635,27 @@ function freehandPath2D(node: WhiteboardNode): Path2D {
   return path;
 }
 
-function roundedRectPath2D(w: number, h: number, radius: number): Path2D {
+function roundedRectPath2D(w: number, h: number, radius: number, cornerRadii?: (number | null | undefined)[]): Path2D {
   const path = new Path2D();
-  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
-  if (r <= 0) {
+  const [tl, tr, br, bl] = resolveBoxCornerRadii({
+    width: w,
+    height: h,
+    cornerRadius: radius,
+    cornerRadii: cornerRadii as (number | null)[] | undefined,
+  });
+  if (tl <= 0 && tr <= 0 && br <= 0 && bl <= 0) {
     path.rect(0, 0, w, h);
     return path;
   }
-  path.moveTo(r, 0);
-  path.arcTo(w, 0, w, h, r);
-  path.arcTo(w, h, 0, h, r);
-  path.arcTo(0, h, 0, 0, r);
-  path.arcTo(0, 0, w, 0, r);
+  path.moveTo(tl, 0);
+  path.lineTo(w - tr, 0);
+  if (tr > 0) path.arcTo(w, 0, w, h, tr);
+  path.lineTo(w, h - br);
+  if (br > 0) path.arcTo(w, h, 0, h, br);
+  path.lineTo(bl, h);
+  if (bl > 0) path.arcTo(0, h, 0, 0, bl);
+  path.lineTo(0, tl);
+  if (tl > 0) path.arcTo(0, 0, w, 0, tl);
   path.closePath();
   return path;
 }
@@ -3703,7 +3828,7 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode, ima
 
   switch (outline.kind) {
     case "rect":
-      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0));
+      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii));
       return;
     case "ellipse": {
       const p = new Path2D();

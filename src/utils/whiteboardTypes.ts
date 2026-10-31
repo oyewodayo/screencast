@@ -691,6 +691,9 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // whiteboardHandlers.ts's supportsCornerRadius/roundedPolygonD - and an "image" node uses it for
   // its "rounded" mask. The toolbar's "Rounded" rectangle quick-add is just this at a nonzero default.
   cornerRadius?: number;
+  // Per-vertex corner radius overrides in the shape's own outline vertex order (see
+  // whiteboardHandlers.ts's detectShapeCorners). A null/undefined entry falls back to cornerRadius.
+  cornerRadii?: (number | null)[];
   // "polygon" only, 3-12 sides - a pentagon, heptagon, octagon etc. are all this one shapeType at
   // a different `sides`, not their own separate shapeType values (see boardTypes.ts's BoardShape
   // for the same convention). Absent on a node predating this field - resolves to 5 (pentagon).
