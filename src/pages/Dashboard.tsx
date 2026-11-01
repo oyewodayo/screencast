@@ -1988,6 +1988,7 @@ const setScreen = () => {
       // The pointer and shortcuts for the editor's Screen Style (services/input_tracker.rs).
       track_pointer: recordingPrefs.editablePointer,
       track_keys: recordingPrefs.recordShortcuts,
+      mute_notifications: recordingPrefs.muteNotificationsWhileRecording,
       // Live background behind the person in a bubble recorded into the screen (camera_effects.rs) -
       // a separately recorded webcam gets it in the editor instead, at full quality.
       camera_effect: formData.record_type === "sva" && !formData.separate_webcam_capture ? cameraEffectSpec(recordingPrefs.cameraBackground) : null,
@@ -4863,8 +4864,11 @@ const setScreen = () => {
                     of chaining into whatever's behind it (the main content pane, the tools panel)
                     once you scroll past its own content - each panel should scroll on its own. */}
                 <div
-                  className={`px-3 ${selectedFile ? "pt-0" : "pt-3"} pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 text-neutral-800 dark:text-neutral-200`}
+                  className={`px-3 ${selectedFile ? "pt-0" : "pt-3"} pb-[var(--docker-height,64px)] text-sm overflow-y-auto overscroll-contain flex-1 isolate [contain:paint] text-neutral-800 dark:text-neutral-200`}
                 >
+                {/* isolate + contain:paint: the grid cards' checkboxes are absolutely positioned (z-10, fading
+                    opacity), which WebView2 otherwise paints unclipped once scrolled out of this list - over the
+                    timeline and the bottom docker. The scroller now owns their stacking and clipping. */}
                 {/* "Now open" banner - pinned to the top of this scrolling list (not the whole
                     sidebar; the search box/tabs/Files header above it never scroll away in the
                     first place) so it's always reachable no matter how deep the currently open

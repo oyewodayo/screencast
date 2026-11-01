@@ -71,6 +71,7 @@ mod services {
     // Keeps the window from ever going "Not responding" - see the module's own comment for the
     // threading rules every command follows and the test that enforces them.
     pub mod responsiveness;
+    pub mod quiet_notifications;
     pub mod share;
     // Opt-out analytics + crash reports, compiled in only for release builds with keys.
     pub mod telemetry;
@@ -414,6 +415,8 @@ fn main() {
             // GPU screen capture); doing them now in the background means the device pickers and
             // the first recording never wait on them.
             commands::recording::warm_device_cache(app.handle());
+            // A recording that never reached its stop (crash, kill) leaves notifications muted.
+            std::thread::spawn(services::quiet_notifications::restore);
             commands::recording::prewarm_rec_completed_modal(app.handle());
             if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app.handle()) {
                 std::thread::spawn(move || {

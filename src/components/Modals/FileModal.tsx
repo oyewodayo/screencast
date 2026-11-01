@@ -11,6 +11,7 @@ import {
   IoFolderOpenOutline,
   IoPlay,
   IoAlertCircle,
+  IoPencil,
 } from 'react-icons/io5';
 import { open } from '@tauri-apps/plugin-shell';
 const appWindow = getCurrentWebviewWindow()
@@ -47,7 +48,20 @@ const InfoRow = ({ icon, label, value }: { icon: React.ReactNode; label: string;
   </div>
 );
 
-const FileModal = ({ filePath, status = "done", error }: FileModalProps) => {
+const FileModal = ({ filePath: initialPath, status = "done", error }: FileModalProps) => {
+  // Starts as the path the backend opened this window with; a rename here replaces it, so Play,
+  // Convert format and the path row all follow the file to its new name.
+  const [filePath, setFilePath] = useState(initialPath);
+  const [renaming, setRenaming] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  // The window is reused for every recording (it's hidden on close, not destroyed), so a new file
+  // arrives as a new prop and must win over a previous recording's renamed path.
+  useEffect(() => {
+    setFilePath(initialPath);
+    setRenaming(false);
+    setRenameError(null);
+  }, [initialPath]);
   const [duration, setDuration] = useState<string | null>(null);
   const [fileSize, setFileSize] = useState<string | null>(null);
   const [isLoadingInfo, setIsLoadingInfo] = useState(true);
@@ -71,6 +85,38 @@ const FileModal = ({ filePath, status = "done", error }: FileModalProps) => {
   const fileName = filePath.split(/[\\/]/).pop() || filePath;
   const dotIndex = fileName.lastIndexOf('.');
   const fileType = dotIndex > 0 ? fileName.slice(dotIndex + 1).toUpperCase() : 'Unknown';
+
+  const stem = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+
+  const startRename = () => {
+    setDraftName(stem);
+    setRenameError(null);
+    setRenaming(true);
+  };
+
+  const commitRename = async () => {
+    const newName = draftName.trim();
+    if (!newName || newName === stem || newName === fileName) {
+      setRenaming(false);
+      return;
+    }
+    try {
+      const newPath = await invoke<string>('rename_file', { oldPath: filePath, newName });
+      // Same repair the library's own rename does, so nothing linked to the file breaks.
+      try {
+        await invoke('relink_doc_path', { oldPath: filePath, newPath });
+        await invoke('relink_file_path', { oldPath: filePath, newPath });
+      } catch (e) {
+        console.error('Failed to repair links after rename:', e);
+      }
+      setFilePath(newPath);
+      setRenaming(false);
+      setRenameError(null);
+      await emit('refresh-file-list');
+    } catch (e) {
+      setRenameError(String(e));
+    }
+  };
 
   const handleOpenFile = async () => {
     await open(filePath);
@@ -140,7 +186,47 @@ const FileModal = ({ filePath, status = "done", error }: FileModalProps) => {
         <p className="text-xs text-gray-400 dark:text-neutral-500 mb-5">Your recording has been saved</p>
 
         <div className="w-full bg-gray-50 dark:bg-neutral-800 rounded-xl mb-4">
-          <InfoRow icon={<IoDocumentTextOutline className="text-base" />} label="File name" value={fileName} />
+          {renaming ? (
+            <div className="py-2 px-3 border-b border-gray-100 dark:border-neutral-800">
+              <div className="flex items-center gap-2">
+                <IoDocumentTextOutline className="text-base text-gray-400 dark:text-neutral-500 shrink-0" />
+                <input
+                  autoFocus
+                  value={draftName}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onChange={(e) => setDraftName(e.target.value)}
+                  onBlur={commitRename}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') e.currentTarget.blur();
+                    if (e.key === 'Escape') {
+                      e.stopPropagation();
+                      setRenaming(false);
+                      setRenameError(null);
+                    }
+                  }}
+                  className="flex-1 min-w-0 text-sm font-medium bg-white dark:bg-neutral-900 text-gray-800 dark:text-neutral-200 border border-blue-500 rounded-md px-2 py-1 outline-none"
+                  aria-label="File name"
+                />
+                <span className="text-sm text-gray-400 dark:text-neutral-500">{dotIndex > 0 ? fileName.slice(dotIndex) : ''}</span>
+              </div>
+              {renameError && <p className="text-[11px] text-red-500 mt-1.5 ml-6">{renameError}</p>}
+            </div>
+          ) : (
+            <button
+              className="group w-full flex items-center justify-between gap-3 py-2.5 px-3 border-b border-gray-100 dark:border-neutral-800 text-left hover:bg-gray-100/70 dark:hover:bg-neutral-700/40 rounded-t-xl transition-colors"
+              onClick={startRename}
+              title="Rename"
+            >
+              <span className="flex items-center gap-2 text-gray-400 dark:text-neutral-500 shrink-0">
+                <IoDocumentTextOutline className="text-base" />
+                <span className="text-sm">File name</span>
+              </span>
+              <span className="flex items-center gap-1.5 min-w-0">
+                <span className="text-sm font-medium text-gray-800 dark:text-neutral-200 truncate">{fileName}</span>
+                <IoPencil className="text-xs shrink-0 text-gray-400 dark:text-neutral-500 group-hover:text-blue-500 transition-colors" />
+              </span>
+            </button>
+          )}
           <InfoRow icon={<IoFilmOutline className="text-base" />} label="Type" value={fileType} />
           <InfoRow
             icon={<IoTimeOutline className="text-base" />}

@@ -6,7 +6,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 import { formatFileSize } from "../../utils/Formater";
-import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_STYLES } from "../../utils/annotationStyles";
+import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_POINTERS, ANNOTATION_STYLES, ANNOTATION_TAP_SOUNDS } from "../../utils/annotationStyles";
+import { playTapSound } from "../../utils/annotationSound";
+import { HandGraphic } from "../AnnotationPointer";
 import AnnotationPreview from "./AnnotationPreview";
 
 interface SettingsModalProps {
@@ -543,6 +545,20 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   countdown, or press Record again, to cancel.
                 </p>
 
+                <Field label="Mute notifications while recording">
+                  <input
+                    type="checkbox"
+                    checked={settings.muteNotificationsWhileRecording}
+                    onChange={(e) => update("muteNotificationsWhileRecording", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Turns off Windows notification pop-ups (WhatsApp, mail and the rest) from the moment you start
+                  until you stop, so they never appear in your video. Your notification setting is put back
+                  afterwards, even if Briefcast closes unexpectedly.
+                </p>
+
                 <Field label="Recording type">
                   <select className={fieldInputClass} value={settings.defaultRecordType} onChange={(e) => handleRecordTypeChange(e.target.value)}>
                     {RECORD_TYPE_OPTIONS.map((o) => (
@@ -874,6 +890,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                       ["Backspace", "Clear the screen"],
                       ["1 – 8", "Pick a colour"],
                       ["P  M  N  L", "Pen, Marker, Neon, Laser"],
+                      ["Ctrl+Z", "Undo the last stroke"],
+                      ["Hold Shift", "Draw a straight line"],
                     ].map(([keys, what]) => (
                       <div key={keys} className="flex items-center justify-between gap-2">
                         <span>{what}</span>
@@ -986,6 +1004,106 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                       ? "Neon and Laser already glow, so they don't use a shadow."
                       : "Keeps ink readable on busy or same-coloured backgrounds."}
                   </p>
+                </div>
+              </Section>
+
+              <Section title="Pointer and tap">
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Pointer</span>
+                      <div className="flex items-center gap-3">
+                        {settings.annotationPointer === "hand" && (
+                          <div className="relative w-6 h-9 overflow-hidden" aria-hidden>
+                            <div className="absolute left-3 top-1.5" style={{ transform: "rotate(-26deg)" }}>
+                              <HandGraphic color={settings.annotationColor} stick={false} />
+                            </div>
+                          </div>
+                        )}
+                        <Segmented value={settings.annotationPointer} options={ANNOTATION_POINTERS} onChange={(v) => update("annotationPointer", v)} />
+                      </div>
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {settings.annotationPointer === "hand"
+                        ? "A little hand on a stick that follows your cursor, in the colour you're drawing with."
+                        : settings.annotationPointer === "dot"
+                        ? "A glowing dot in the ink colour."
+                        : settings.annotationPointer === "custom"
+                        ? "Your own image - its top centre is the point."
+                        : "The system crosshair."}
+                    </p>
+                  </div>
+
+                  {settings.annotationPointer === "custom" && (
+                    <Field label="Pointer image">
+                      <div className="flex items-center gap-2">
+                        {settings.annotationPointerImage && (
+                          <img src={settings.annotationPointerImage} alt="" className="h-8 w-auto max-w-[3rem] object-contain" />
+                        )}
+                        <input
+                          type="file"
+                          accept="image/png,image/webp"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = "";
+                            if (!file) return;
+                            // Downscaled before it's stored: settings live in localStorage, and the
+                            // pointer is only ever drawn ~64px tall.
+                            const url = URL.createObjectURL(file);
+                            const img = new Image();
+                            img.onload = () => {
+                              const scale = Math.min(1, 160 / img.naturalHeight);
+                              const canvas = document.createElement("canvas");
+                              canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+                              canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+                              canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+                              update("annotationPointerImage", canvas.toDataURL("image/png"));
+                              URL.revokeObjectURL(url);
+                            };
+                            img.onerror = () => URL.revokeObjectURL(url);
+                            img.src = url;
+                          }}
+                          className="text-xs text-neutral-500 dark:text-neutral-400 file:mr-2 file:px-2.5 file:py-1 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-neutral-100 dark:file:bg-neutral-800 file:text-neutral-700 dark:file:text-neutral-200 file:cursor-pointer"
+                        />
+                      </div>
+                    </Field>
+                  )}
+
+                  <Field label="Tap ripple">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationTapRipple}
+                      onChange={(e) => update("annotationTapRipple", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">A ring spreads from the point where you click, so viewers see exactly where.</p>
+
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Tap sound</span>
+                    <Segmented
+                      value={settings.annotationTapSound}
+                      options={ANNOTATION_TAP_SOUNDS}
+                      onChange={(v) => {
+                        update("annotationTapSound", v);
+                        playTapSound(v, settings.annotationSoundVolume);
+                      }}
+                    />
+                  </div>
+
+                  <Field label="Volume">
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={settings.annotationTapSound === "off"}
+                      value={settings.annotationSoundVolume}
+                      onChange={(e) => update("annotationSoundVolume", Number(e.target.value))}
+                      onPointerUp={() => playTapSound(settings.annotationTapSound, settings.annotationSoundVolume)}
+                      className="w-32 accent-blue-500 disabled:opacity-40"
+                    />
+                  </Field>
                 </div>
               </Section>
               </>

@@ -5,7 +5,7 @@
 // small, non-sensitive UI preference data with no need for filesystem placement or the
 // asset-scope concerns that apply to actual recording/annotation files.
 
-import type { AnnotationFade, AnnotationStyle } from "./annotationStyles";
+import type { AnnotationFade, AnnotationPointer, AnnotationStyle, AnnotationTapSound } from "./annotationStyles";
 
 export interface AppSettings {
   defaultRecordType: string;
@@ -45,6 +45,14 @@ export interface AppSettings {
   // Off hides the overlay's floating toolbar so drawing looks like it comes from nowhere while
   // presenting - its keyboard shortcuts (Esc, Backspace, 1-8, P/M/N/L) still work.
   annotationShowToolbar: boolean;
+  // The cursor stand-in shown while drawing (see AnnotationPointer.tsx). "custom" uses
+  // annotationPointerImage, a downscaled PNG data URL - empty falls back to the hand.
+  annotationPointer: AnnotationPointer;
+  annotationPointerImage: string;
+  // Expanding ring where each press lands, and the synthesised tap that goes with it (volume 0-1).
+  annotationTapRipple: boolean;
+  annotationTapSound: AnnotationTapSound;
+  annotationSoundVolume: number;
   // Whether the full recording setup panel (file name/type/recording options/audio+video
   // device pickers/Screenshot/Start Recording) still appears in the bottom docker. Its fields
   // now live here in Settings as defaults regardless of this - turning it off just also stops
@@ -68,6 +76,9 @@ export interface AppSettings {
   // to switch to the window being recorded and get ready. See utils/recordingCountdown.ts.
   recordingCountdownEnabled: boolean;
   recordingCountdownSeconds: number;
+  // Windows toast pop-ups (WhatsApp, mail...) are switched off while a recording runs, so they
+  // don't end up in the video, and put back when it stops. See services/quiet_notifications.rs.
+  muteNotificationsWhileRecording: boolean;
   defaultAudioDevice: string;
   defaultVideoDevices: string[];
   defaultIncludeSystemAudio: boolean;
@@ -139,6 +150,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   annotationFade: "normal",
   annotationShadow: false,
   annotationShowToolbar: true,
+  annotationPointer: "hand",
+  annotationPointerImage: "",
+  annotationTapRipple: true,
+  annotationTapSound: "pop",
+  annotationSoundVolume: 0.5,
   // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
@@ -147,6 +163,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   notifyOnRecordingStart: false,
   recordingCountdownEnabled: false,
   recordingCountdownSeconds: 3,
+  muteNotificationsWhileRecording: true,
   defaultAudioDevice: "",
   defaultVideoDevices: [],
   defaultIncludeSystemAudio: false,

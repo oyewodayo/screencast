@@ -228,6 +228,9 @@ pub struct FormData {
     // "Record shortcuts": keyboard shortcuts (never typing) recorded for the editor's key chips.
     #[serde(default)]
     track_keys: bool,
+    // Windows toasts are switched off from start until stop - services/quiet_notifications.rs.
+    #[serde(default)]
+    mute_notifications: bool,
     // Max output width in px for screen-capture modes (sva/sa/s) - None reproduces the previous
     // hardcoded behavior exactly (MAX_RECORDING_WIDTH, 1920). The frontend's "native" option sends
     // a very large value (comfortably above any realistic display) rather than a separate sentinel/
@@ -2102,6 +2105,10 @@ pub async fn start_recording(
         paused_accumulated_ms: 0,
     });
 
+    if form_data.mute_notifications {
+        tauri::async_runtime::spawn_blocking(crate::services::quiet_notifications::mute);
+    }
+
     Ok(output)
 }
 
@@ -2521,6 +2528,9 @@ pub async fn stop_recording(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     info!("Stop recording processing");
+    // No-op unless this recording muted them. Before the file is assembled so the popups come back
+    // right at Stop rather than after a long finish.
+    tauri::async_runtime::spawn_blocking(crate::services::quiet_notifications::restore);
 
     let output_path = {
         let app_state = state.output_path.lock().await;
