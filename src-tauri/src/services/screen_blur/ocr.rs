@@ -57,6 +57,9 @@ const OCR_MIN_INTERVAL: Duration = Duration::from_millis(100);
 // playing video, an animation) - so it never pins a core. Any finding, a new window or a new file
 // snaps back to the minimum.
 const OCR_MAX_INTERVAL: Duration = Duration::from_millis(1500);
+// The next pass waits at least this many times as long as the last one took (up to DUTY_CAP).
+const DUTY_FACTOR: u32 = 3;
+const DUTY_CAP: Duration = Duration::from_secs(6);
 // Poll for frames this often right after activity, and this often when the window is quiet. WGC only
 // produces frames on change, so the quiet rate costs nothing and adds no visible delay.
 const POLL_ACTIVE: Duration = Duration::from_millis(3);
@@ -153,6 +156,8 @@ struct OcrResult {
     // Lines OCR read - zero means a blank frame (a capture's first one can be), which must not
     // count as "read" and lift a secrets file's cover.
     lines: usize,
+    // How long the pass took - the next one waits at least DUTY_FACTOR times that.
+    took: Duration,
 }
 
 // Re-read this much above and below a change: a line's text is taller than the rows that changed.
@@ -219,8 +224,7 @@ impl Capture {
         // No yellow "being captured" border on the user's window, no cursor in the frames.
         let _ = session.SetIsBorderRequired(false);
         let _ = session.SetIsCursorCaptureEnabled(false);
-        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-        let r = Self::resources(device, size, scale)?;
+        let r = Self::resources(device, size)?;
         session.StartCapture()?;
         Ok(Capture { hwnd, _item: item, pool, session, size, mip: r.0, srv: r.1, track: r.2, diff: r.3, ocr: r.4, ocr_level: r.5 })
     }
@@ -229,7 +233,6 @@ impl Capture {
     unsafe fn resources(
         device: &ID3D11Device,
         size: SizeInt32,
-        scale: f32,
     ) -> windows::core::Result<(ID3D11Texture2D, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11Texture2D, ID3D11Texture2D, u32)> {
         let (w, h) = level_size(size, 0);
         let mip = texture(device, w, h, DIFF_LEVEL + 1, false)?;
@@ -241,7 +244,6 @@ impl Capture {
         let diff = texture(device, dw, dh, 1, true)?;
         // Full resolution: at half size Windows OCR stopped reading monospace text altogether
         // (measured on a 4K .env in Notepad: it returned the tab titles and almost no lines).
-        let _ = scale;
         let ocr_level = 0;
         let (ow, oh) = level_size(size, ocr_level);
         let ocr = texture(device, ow, oh, 1, true)?;
@@ -250,8 +252,7 @@ impl Capture {
 
     unsafe fn resize(&mut self, device: &ID3D11Device, d3d: &IDirect3DDevice, size: SizeInt32) -> windows::core::Result<()> {
         self.pool.Recreate(d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
-        let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
-        let r = Self::resources(device, size, scale)?;
+        let r = Self::resources(device, size)?;
         (self.mip, self.srv, self.track, self.diff, self.ocr, self.ocr_level, self.size) = (r.0, r.1, r.2, r.3, r.4, r.5, size);
         Ok(())
     }
@@ -463,6 +464,9 @@ unsafe fn run(rules: Arc<Mutex<TextRules>>, stop: Arc<AtomicBool>, sink: Sink) -
             // slow down. Anything new: stay quick.
             let found: Vec<(i32, i32, &'static str)> = res.hits.iter().map(|h| ((h.x0 / 8.0) as i32, (h.y0 / 8.0) as i32, h.label)).collect();
             ocr_interval = if found == last_found { (ocr_interval * 3 / 2).min(OCR_MAX_INTERVAL) } else { OCR_MIN_INTERVAL };
+            // However busy the window, OCR gets at most ~1/(DUTY_FACTOR+1) of its threads' time: a
+            // pass that took 1.4s on a dense 4K window waits 4.2s before the next.
+            ocr_interval = ocr_interval.max((res.took * DUTY_FACTOR).min(DUTY_CAP));
             last_found = found;
             let fresh: Vec<Tracked> = match (snap, prev.as_ref()) {
                 (Some(then), Some(now)) => res.hits.iter().map(|h| follow(h, &then, now, now.h / 2)).collect(),
@@ -766,7 +770,7 @@ fn spawn_ocr(engine: OcrEngine, rx: Receiver<OcrRequest>, tx: Sender<OcrResult>,
                 })
                 .unwrap_or_default();
             let band = (req.y0 as f32, req.y0 as f32 + req.h as f32 * req.factor);
-            if tx.send(OcrResult { hwnd: req.hwnd, frame: req.frame, band, hits, lines: line_count }).is_err() {
+            if tx.send(OcrResult { hwnd: req.hwnd, frame: req.frame, band, hits, lines: line_count, took: started.elapsed() }).is_err() {
                 break;
             }
         }

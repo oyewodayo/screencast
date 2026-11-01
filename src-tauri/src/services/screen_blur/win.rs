@@ -34,7 +34,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    PeekMessageW, PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    KillTimer, PeekMessageW, PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, GA_ROOT, GWLP_HWNDPARENT, GWL_EXSTYLE, GW_HWNDPREV, GW_OWNER, HMENU, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, LWA_ALPHA,
     MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_NCHITTEST, WM_QUIT, WM_TIMER,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -63,6 +63,8 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const TICK_MS: u32 = 1000;
 const REDETECT_EVERY_TICKS: u32 = 3;
 const REDETECT_BACKGROUND_TICKS: u32 = 30;
+// Overlay outline updates, at most this often.
+const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 // A screen full of keys shouldn't become hundreds of windows.
 const MAX_TEXT_REGIONS: usize = 64;
 
@@ -139,6 +141,8 @@ struct WaLayout {
     divider_frac: f64,
     contact_w: i32,
     frame: (i32, i32),
+    // Whether the parts' frost colours have been sampled yet.
+    toned: bool,
 }
 
 struct Region {
@@ -184,6 +188,9 @@ struct State {
     effects_on: bool,
     gesture: Option<Gesture>,
     timer: usize,
+    // Throttles events to the overlay; `flush_timer` delivers the last one of a burst.
+    last_publish: Instant,
+    flush_timer: usize,
     ticks: u32,
     next_text_id: u64,
     wa: HashMap<isize, WaLayout>,
@@ -362,6 +369,8 @@ fn spawn_worker() -> Result<Worker, String> {
                     effects_on: effects_enabled(),
                     gesture: None,
                     timer: 0,
+                    last_publish: Instant::now(),
+                    flush_timer: 0,
                     ticks: 0,
                     next_text_id: 0,
                     wa: HashMap::new(),
@@ -419,7 +428,15 @@ unsafe fn handle(msg: &MSG) {
     if msg.hwnd.0 == 0 && msg.message == WM_WAKE {
         drain_commands();
     } else if msg.hwnd.0 == 0 && msg.message == WM_TIMER {
-        auto_tick();
+        let flush = with_state(|s| s.flush_timer != 0 && msg.wParam.0 == s.flush_timer).unwrap_or(false);
+        if flush {
+            if let Some(id) = with_state(|s| std::mem::take(&mut s.flush_timer)) {
+                let _ = KillTimer(HWND::default(), id);
+            }
+            emit_snapshot();
+        } else {
+            auto_tick();
+        }
     } else {
         let _ = TranslateMessage(msg);
         DispatchMessageW(msg);
@@ -1013,6 +1030,7 @@ fn wa_default(frame: &RECT, scale: f64) -> WaLayout {
         divider_frac: 0.45,
         contact_w: (420.0 * scale).round() as i32,
         frame: size,
+        toned: false,
     }
 }
 
@@ -1163,7 +1181,8 @@ unsafe fn apply_wa_layout(anchor: HWND, edges: Option<WhatsAppEdges>) {
     for (w, r) in moves {
         move_window(w, &r);
     }
-    if relaid || with_state(|s| s.ticks <= REDETECT_EVERY_TICKS).unwrap_or(false) {
+    let first = with_state(|s| s.wa.get_mut(&anchor.0).map(|l| !std::mem::replace(&mut l.toned, true))).flatten().unwrap_or(false);
+    if relaid || first {
         probe_tones(anchor, regions_of(anchor, |k| matches!(k, Kind::Auto(AutoPart::WhatsApp(_)))));
     }
 }
@@ -1354,7 +1373,8 @@ unsafe extern "system" fn win_event(_hook: HWINEVENTHOOK, event: u32, hwnd: HWND
 }
 
 // Refreshes the shared snapshot and tells the overlay (which draws handles for the regions in
-// draw mode) where everything is now.
+// draw mode) where everything is now - at most every PUBLISH_EVERY: while a window scrolls, blurs
+// move up to 60 times a second, and only the overlay's outlines need to hear about it.
 fn publish() {
     let snap: Option<Vec<Snapshot>> = with_state(|s| {
         s.regions
@@ -1364,13 +1384,31 @@ fn publish() {
     });
     let Some(snap) = snap else { return };
     if let Ok(mut s) = SNAPSHOT.lock() {
-        *s = snap.clone();
+        *s = snap;
     }
+    let due = with_state(|s| {
+        if s.last_publish.elapsed() >= PUBLISH_EVERY {
+            return true;
+        }
+        if s.flush_timer == 0 {
+            s.flush_timer = unsafe { SetTimer(HWND::default(), 0, PUBLISH_EVERY.as_millis() as u32, None) };
+        }
+        false
+    })
+    .unwrap_or(false);
+    if due {
+        emit_snapshot();
+    }
+}
+
+fn emit_snapshot() {
+    with_state(|s| s.last_publish = Instant::now());
+    let Some(snap) = SNAPSHOT.lock().ok().map(|s| s.clone()) else { return };
     let (Some(app), overlay) = (APP.get(), OVERLAY.load(Ordering::Relaxed)) else { return };
     if overlay == 0 {
         return;
     }
     let Ok((origin, scale)) = overlay_frame(HWND(overlay)) else { return };
     let regions: Vec<BlurRegion> = snap.iter().map(|s| to_region(origin, scale, s)).collect();
-    let _ = app.emit(CHANGED_EVENT, regions);
+    let _ = app.emit_to("annotation-overlay", CHANGED_EVENT, regions);
 }
