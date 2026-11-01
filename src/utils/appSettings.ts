@@ -53,6 +53,19 @@ export interface AppSettings {
   annotationTapRipple: boolean;
   annotationTapSound: AnnotationTapSound;
   annotationSoundVolume: number;
+  // Privacy blur (services/screen_blur.rs). Strength 0-100 on top of Windows' own backdrop blur
+  // (already unreadable at 0). The WhatsApp rule blurs its chat list by itself - "recording" only
+  // while Briefcast records, so everyday WhatsApp use isn't blurred.
+  annotationBlurStrength: number;
+  annotationAutoBlurWhatsApp: "off" | "recording" | "always";
+  // Which parts of WhatsApp that rule covers - the chat list and the open chat's name + photo by
+  // default; the messages too if asked.
+  annotationBlurWhatsAppParts: { chatList: boolean; contact: boolean; messages: boolean };
+  // Sensitive text found on screen with Windows' OCR (services/screen_blur/sensitive.rs). Same
+  // off/while recording/always choice; categories plus the user's own comma-separated keywords.
+  annotationAutoBlurText: "off" | "recording" | "always";
+  annotationBlurTextRules: { passwords: boolean; keys: boolean; financial: boolean; personal: boolean };
+  annotationBlurKeywords: string;
   // Whether the full recording setup panel (file name/type/recording options/audio+video
   // device pickers/Screenshot/Start Recording) still appears in the bottom docker. Its fields
   // now live here in Settings as defaults regardless of this - turning it off just also stops
@@ -109,6 +122,9 @@ export interface AppSettings {
   editablePointer: boolean;
   // "Record shortcuts": keyboard shortcuts (never typing) recorded for the editor's key chips.
   recordShortcuts: boolean;
+  // The window's close button: true hides Briefcast to the tray (shortcuts keep working), false
+  // quits. null = not decided yet - the first close asks (see closeGuards.ts).
+  closeToTray: boolean | null;
 }
 
 export interface CameraBackgroundPref {
@@ -155,6 +171,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   annotationTapRipple: true,
   annotationTapSound: "pop",
   annotationSoundVolume: 0.5,
+  annotationBlurStrength: 50,
+  annotationAutoBlurWhatsApp: "recording",
+  annotationBlurWhatsAppParts: { chatList: true, contact: true, messages: false },
+  annotationAutoBlurText: "recording",
+  annotationBlurTextRules: { passwords: true, keys: true, financial: true, personal: false },
+  annotationBlurKeywords: "",
   // Off by default - the bottom-right shortcut icons (see ActiveRecordingState.tsx) are the
   // primary way to start a recording now; the full panel is an opt-in for anyone who wants it.
   showRecordingDocker: false,
@@ -177,6 +199,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   windowTitleBar: false,
   editablePointer: false,
   recordShortcuts: false,
+  closeToTray: null,
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded

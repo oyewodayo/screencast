@@ -79,6 +79,7 @@ import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
+import { addCloseGuard, installCloseGuards, quitApp } from "../utils/closeGuards";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
@@ -320,6 +321,9 @@ const unbindShortcut = (accelerator: string): Promise<void> =>
 // registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
 // watches annotationEnabled below), not recording state.
 const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
+// Blurs the whole active window, or unblurs it (services/screen_blur) - from anywhere, no draw mode
+// needed. Lives and dies with the annotation tool, like the shortcut above.
+const BLUR_WINDOW_SHORTCUT = 'CommandOrControl+Alt+B';
 
 // Toggles visibility of the bottom-right recording-panel buttons (screenshot/screen-webcam-mic/
 // record) - meant for hiding them right before presenting/recording a screen that includes this
@@ -2399,33 +2403,26 @@ const setScreen = () => {
 			.catch((error) => console.error("Error checking for a recording in progress:", error));
 	}, []);
 
-	// Closing the main window quits Briefcast (main.rs), which would end a recording in progress
-	// abruptly - its parts never assembled into a file. So while recording, closing asks first, and
-	// "Stop and quit" saves the recording properly before letting the close through.
+	// Quitting Briefcast (main.rs) would end a recording in progress abruptly - its parts never
+	// assembled into a file. So while recording, quitting asks first, and "Stop and quit" saves the
+	// recording properly before letting the quit through. (Hiding to the tray never gets here.)
 	useEffect(() => {
 		if (!isRecording) return;
-		let ownClose = false;
-		const unlistenPromise = appWindow.onCloseRequested(async (event) => {
-			if (ownClose) return;
-			event.preventDefault();
+		return addCloseGuard(async () => {
 			const stopAndQuit = await ask("A recording is in progress. Stop and save it, then quit Briefcast?", {
 				title: "Recording in progress",
 				kind: "warning",
 				okLabel: "Stop and quit",
 				cancelLabel: "Keep recording",
 			});
-			if (!stopAndQuit) return;
+			if (!stopAndQuit) return false;
 			try {
 				await invoke("stop_recording");
 			} catch (error) {
 				console.error("Error stopping recording before quitting:", error);
 			}
-			ownClose = true;
-			await appWindow.close();
+			return true;
 		});
-		return () => {
-			unlistenPromise.then((unlisten) => unlisten());
-		};
 	}, [isRecording]);
 
 	// One update check per launch, delayed so it never competes with startup work (device probes,
@@ -2777,6 +2774,7 @@ const setScreen = () => {
 					await toggleAnnotationDrawMode(true);
 				}
 				await unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
+				await unbindShortcut(BLUR_WINDOW_SHORTCUT);
 				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 				if (overlay) await overlay.hide();
 				return;
@@ -2794,12 +2792,41 @@ const setScreen = () => {
 				console.error('Failed to register annotation hotkey:', err);
 				setError(`Couldn't register the annotation shortcut (${ANNOTATION_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
 			}
+			try {
+				await bindShortcut(BLUR_WINDOW_SHORTCUT, () => {
+					invoke('screen_blur_toggle_window').catch((err) => console.error('Blur window:', err));
+				});
+			} catch (err) {
+				console.error('Failed to register blur-window hotkey:', err);
+				setError(`Couldn't register the blur shortcut (${BLUR_WINDOW_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+			}
 		})();
 
 		return () => {
 			cancelled = true;
 		};
 	}, [annotationEnabled, toggleAnnotationDrawMode]);
+
+	// Privacy blur strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
+	// starts/stops (the WhatsApp rule defaults to "while recording") and whenever Settings closes -
+	// saved or cancelled, which also undoes the strength slider's unsaved live preview.
+	useEffect(() => {
+		if (showSettings) return;
+		const st = loadSettings();
+		const active = (mode: 'off' | 'recording' | 'always') => mode === 'always' || (mode === 'recording' && isRecording);
+		invoke('screen_blur_configure', {
+			config: {
+				strength: st.annotationBlurStrength,
+				autoWhatsapp: active(st.annotationAutoBlurWhatsApp),
+				whatsappParts: st.annotationBlurWhatsAppParts,
+				autoText: active(st.annotationAutoBlurText),
+				textRules: {
+					...st.annotationBlurTextRules,
+					keywords: st.annotationBlurKeywords.split(',').map((k) => k.trim()).filter(Boolean),
+				},
+			},
+		}).catch((err) => console.error('Screen blur config:', err));
+	}, [isRecording, showSettings]);
 
 	// The overlay's own Esc key / toolbar close button can't reach annotationDrawModeRef directly
 	// (different window, different JS context) - it asks via this event instead.
@@ -2873,16 +2900,18 @@ const setScreen = () => {
 		};
 	});
 
-	const handleRecordingToggleHotkey = useCallback(() => {
+	// recordTypeOverride: the tray's "Start recording" submenu picks the setup and starts in one go.
+	const handleRecordingToggleHotkey = useCallback((recordTypeOverride?: string) => {
 		const s = recordingHotkeyRef.current;
 		if (s.isRecording) {
 			void s.stopRecording();
 			return;
 		}
+		if (recordTypeOverride) setRecordType(recordTypeOverride);
 		void s.startRecording({
 			file_name: s.fileName,
 			file_ext: s.fileExt,
-			record_type: s.recordType,
+			record_type: recordTypeOverride ?? s.recordType,
 			audio_device: s.audioDevice,
 			// Deliberately skips EnhancedScreenOptions' target picker - see RECORDING_TOGGLE_SHORTCUT's
 			// own doc comment for why.
@@ -2919,6 +2948,44 @@ const setScreen = () => {
 			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
 		};
 	}, [handleRecordingToggleHotkey]);
+
+	// The screen/camera/mic toggles are what Ctrl+Shift+R records with, so they're remembered
+	// between launches rather than resetting to Settings' default - it's the same setting. "c" is
+	// only the screenshot flow's brief detour, never a recording setup to keep.
+	useEffect(() => {
+		if (!["sva", "sa", "s", "va", "v", "a"].includes(recordType)) return;
+		const settings = loadSettings();
+		if (settings.defaultRecordType !== recordType) saveSettings({ ...settings, defaultRecordType: recordType });
+	}, [recordType]);
+
+	// The tray icon's menu (services/tray.rs) - it can be used with this window hidden in the tray.
+	useEffect(() => {
+		const unlisten = listen<{ action: string; recordType?: string }>("tray-action", ({ payload }) => {
+			switch (payload.action) {
+				case "record":
+					if (!recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey(payload.recordType);
+					break;
+				case "stop":
+					if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
+					break;
+				case "screenshot":
+					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+					break;
+				case "quit":
+					void quitApp();
+					break;
+			}
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+		};
+	}, [handleRecordingToggleHotkey]);
+
+	// The tray icon gets a red dot while recording - the only sign of it with the window hidden
+	// and the recording bar tucked away (Ctrl+Shift+H).
+	useEffect(() => {
+		invoke("tray_set_recording", { recording: isRecording }).catch(() => {});
+	}, [isRecording]);
 
 	// ---- The phone app's Remote, Voice-over and Beam (phone_transfer_page.html). Phones mirror this
 	// window's state: recording (with a pause-aware elapsed snapshot the phone ticks on from, so the
@@ -3293,6 +3360,7 @@ const setScreen = () => {
 	const libraryRefreshRef = useRef<() => void>(() => {});
 	libraryRefreshRef.current = () => void handleDirectoryFiles();
 	useEffect(() => {
+		installCloseGuards();
 		installGlobalCloseGuard();
 		return onJobFinished((job) => {
 			libraryRefreshRef.current();

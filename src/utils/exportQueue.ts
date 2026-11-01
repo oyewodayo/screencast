@@ -14,7 +14,7 @@ import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { addCloseGuard } from "./closeGuards";
 
 export interface ExportJobPayload {
   // export_trimmed_video's arguments, minus jobId.
@@ -221,16 +221,7 @@ let globalGuardInstalled = false;
 export function installGlobalCloseGuard() {
   if (globalGuardInstalled) return;
   globalGuardInstalled = true;
-  const appWindow = getCurrentWebviewWindow();
-  let closing = false;
-  void appWindow.onCloseRequested(async (event) => {
-    if (closing || editorGuards > 0 || !hasActiveJobs()) return;
-    event.preventDefault();
-    if (await confirmCloseWithActiveExports()) {
-      closing = true;
-      await appWindow.close();
-    }
-  });
+  addCloseGuard(() => editorGuards > 0 || !hasActiveJobs() || confirmCloseWithActiveExports());
 }
 
 // "4:12" / "1:02:09" / "<1 min"-style countdown text.

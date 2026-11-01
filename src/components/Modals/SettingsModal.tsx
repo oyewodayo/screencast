@@ -88,6 +88,22 @@ const Segmented = <T extends string>({ value, options, onChange, disabled }: {
   </div>
 );
 
+// Whether Windows has an OCR language for sensitive-text detection - it can't work without one.
+const OcrStatus: React.FC = () => {
+  const [language, setLanguage] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    invoke<string | null>("screen_blur_ocr_language").then(setLanguage, () => setLanguage(null));
+  }, []);
+  if (language === undefined) return null;
+  return language ? (
+    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">Reads text with Windows' built-in OCR ({language}) - nothing leaves this PC.</p>
+  ) : (
+    <p className="text-xs text-amber-600 dark:text-amber-400 text-right">
+      Windows has no OCR language installed. Add one in Settings › Time &amp; language › Language (with "Optical character recognition").
+    </p>
+  );
+};
+
 // Mirrors services/telemetry.rs's TelemetrySettings. `available` is false in builds compiled
 // without analytics/crash-report keys (dev and source builds), which send nothing regardless.
 interface TelemetrySettings {
@@ -472,6 +488,25 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 </Field>
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
                   The last row of the bottom bar - date/time, CPU RAM, OS and the "Request feature / Report a bug" link.
+                </p>
+              </Section>
+            )}
+
+            {activeSection === "appearance" && (
+              <Section title="Closing the window">
+                <Field label="The close button">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.closeToTray === null ? "ask" : settings.closeToTray ? "tray" : "quit"}
+                    onChange={(e) => update("closeToTray", e.target.value === "ask" ? null : e.target.value === "tray")}
+                  >
+                    <option value="tray">Keeps Briefcast in the tray</option>
+                    <option value="quit">Quits Briefcast</option>
+                    <option value="ask">Asks the first time</option>
+                  </select>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  In the tray, Ctrl+Shift+R still starts a recording. Click the tray icon to reopen Briefcast, or right-click it to record, take a screenshot or quit.
                 </p>
               </Section>
             )}
@@ -892,6 +927,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                       ["P  M  N  L", "Pen, Marker, Neon, Laser"],
                       ["Ctrl+Z", "Undo the last stroke"],
                       ["Hold Shift", "Draw a straight line"],
+                      ["B", "Blur something private"],
+                      ["Shift+Backspace", "Remove every blur"],
                     ].map(([keys, what]) => (
                       <div key={keys} className="flex items-center justify-between gap-2">
                         <span>{what}</span>
@@ -1106,6 +1143,141 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   </Field>
                 </div>
               </Section>
+
+              <Section title="Privacy blur">
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Press B while drawing and drag over anything private. The blur stays on screen and in recordings, and you
+                  can still click and type underneath it.
+                </p>
+                <Field label="Strength">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={settings.annotationBlurStrength}
+                      onChange={(e) => {
+                        const strength = Number(e.target.value);
+                        update("annotationBlurStrength", strength);
+                        // Live: any blur already on screen changes as the slider moves.
+                        void invoke("screen_blur_configure", { config: { strength } }).catch(() => {});
+                      }}
+                      className="w-32 accent-blue-500"
+                    />
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-8 text-right">
+                      {settings.annotationBlurStrength}
+                    </span>
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
+                  Even at 0 text can't be read. Higher adds more blur and frost.
+                </p>
+
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur WhatsApp chats</span>
+                    <Segmented
+                      value={settings.annotationAutoBlurWhatsApp}
+                      options={[
+                        { id: "off", label: "Off" },
+                        { id: "recording", label: "While recording" },
+                        { id: "always", label: "Always" },
+                      ]}
+                      onChange={(v) => update("annotationAutoBlurWhatsApp", v)}
+                    />
+                  </div>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                    {settings.annotationAutoBlurWhatsApp === "off"
+                      ? "WhatsApp is never blurred automatically."
+                      : "Follows the WhatsApp window as it moves, resizes or switches chats."}
+                  </p>
+                </div>
+                {settings.annotationAutoBlurWhatsApp !== "off" && (
+                  <div className="flex items-center justify-end gap-4 text-sm text-neutral-700 dark:text-neutral-300">
+                    {(
+                      [
+                        ["chatList", "Chat list"],
+                        ["contact", "Contact name & photo"],
+                        ["messages", "Messages"],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <label key={key} className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={settings.annotationBlurWhatsAppParts[key]}
+                          onChange={(e) => update("annotationBlurWhatsAppParts", { ...settings.annotationBlurWhatsAppParts, [key]: e.target.checked })}
+                          className="w-4 h-4 accent-blue-500 cursor-pointer"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1 pt-2">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur sensitive text</span>
+                    <Segmented
+                      value={settings.annotationAutoBlurText}
+                      options={[
+                        { id: "off", label: "Off" },
+                        { id: "recording", label: "While recording" },
+                        { id: "always", label: "Always" },
+                      ]}
+                      onChange={(v) => update("annotationAutoBlurText", v)}
+                    />
+                  </div>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                    {settings.annotationAutoBlurText === "off"
+                      ? "Text on screen is never blurred automatically."
+                      : "Watches the window you're using and blurs what matches below. A safety net, not a guarantee: new text can show for a moment before it's blurred, and unusual fonts can be missed."}
+                  </p>
+                  {settings.annotationAutoBlurText !== "off" && <OcrStatus />}
+                </div>
+                {settings.annotationAutoBlurText !== "off" && (
+                  <>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm text-neutral-700 dark:text-neutral-300">
+                      {(
+                        [
+                          ["passwords", "Passwords & PINs"],
+                          ["keys", "API keys, tokens & private keys"],
+                          ["financial", "Card & bank numbers"],
+                          ["personal", "Emails & phone numbers"],
+                        ] as const
+                      ).map(([key, label]) => (
+                        <label key={key} className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={settings.annotationBlurTextRules[key]}
+                            onChange={(e) => update("annotationBlurTextRules", { ...settings.annotationBlurTextRules, [key]: e.target.checked })}
+                            className="w-4 h-4 accent-blue-500 cursor-pointer"
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                    <Field label="Also blur these words">
+                      <input
+                        type="text"
+                        value={settings.annotationBlurKeywords}
+                        onChange={(e) => update("annotationBlurKeywords", e.target.value)}
+                        placeholder="Client name, project codename…"
+                        className="w-56 px-2 py-1 rounded-md text-sm bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100 placeholder:text-neutral-400"
+                      />
+                    </Field>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2 text-right">Separate with commas. Matching ignores upper/lower case.</p>
+                  </>
+                )}
+
+                <div className="flex items-center justify-between gap-4 pt-2">
+                  <span className="text-sm text-neutral-700 dark:text-neutral-300">Blur the whole window you're using</span>
+                  <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
+                    Ctrl+Alt+B
+                  </kbd>
+                </div>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">Works anywhere. Press it again to unblur.</p>
+              </Section>
               </>
             )}
 
@@ -1224,6 +1396,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   <ShortcutRow keys="Ctrl+Shift+H" description="Show/hide the floating recording overlay (while recording)" />
                   <ShortcutRow keys="Ctrl+Shift+B" description="Show/hide the recording panel buttons - handy right before presenting" />
                   <ShortcutRow keys="Ctrl+Shift+D" description="Toggle the annotation tool's draw mode (see Annotation settings)" />
+                  <ShortcutRow keys="Ctrl+Alt+B" description="Blur the active window, or unblur it" />
                 </Section>
 
                 <Section title="File selection">

@@ -30,6 +30,16 @@ function SourceIcons({ recordType }: { recordType: string }) {
     );
 }
 
+// The same, in words - shown for the first moments of a recording, so one started blind from
+// Ctrl+Shift+R or the tray says what it's actually capturing.
+function sourceLabel(recordType: string): string {
+    const parts: string[] = [];
+    if (["sva", "sa", "s", "c"].includes(recordType)) parts.push("screen");
+    if (["sva", "va", "v"].includes(recordType)) parts.push("camera");
+    if (["sva", "sa", "va", "a"].includes(recordType)) parts.push("mic");
+    return parts.join(" + ");
+}
+
 // The live dot + timer. Red and pulsing while capturing, amber and still while paused, so the
 // state reads from across the screen without having to look at the buttons.
 function RecTimer({ time, paused, compact }: { time: string; paused: boolean; compact?: boolean }) {
@@ -89,6 +99,7 @@ const RecordingOverlayWindow = () => {
     // viewMode is purely local UI state - the backend only cares about the *events* (see
     // handleSwitchView below), not which mode is "current" at any given moment.
     const [canSwitchView, setCanSwitchView] = useState<boolean>(false);
+    const [showSourceLabel, setShowSourceLabel] = useState<boolean>(false);
     const [viewMode, setViewMode] = useState<'screen' | 'camera'>('screen');
 
     const formatTime = (seconds: number): string => {
@@ -314,6 +325,13 @@ const RecordingOverlayWindow = () => {
         return () => clearInterval(interval);
     }, [isRecording, startTime, isPaused, pauseStartedAt, pausedAccumulatedMs]);
 
+    useEffect(() => {
+        if (!isRecording) return;
+        setShowSourceLabel(true);
+        const timer = window.setTimeout(() => setShowSourceLabel(false), 4000);
+        return () => window.clearTimeout(timer);
+    }, [isRecording]);
+
     const pauseButton = (
         <button
             type="button"
@@ -372,6 +390,8 @@ const RecordingOverlayWindow = () => {
                             <span className="text-emerald-300/90" title="The screen capture was restarted - nothing recorded was lost">
                                 recovered
                             </span>
+                        ) : showSourceLabel ? (
+                            sourceLabel(recordType)
                         ) : droppedFrames > 0 ? (
                             <span className="text-amber-300/90" title="Frames dropped during capture - the encoder may be falling behind">
                                 {droppedFrames} dropped

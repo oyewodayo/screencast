@@ -13,7 +13,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { addCloseGuard } from "../utils/closeGuards";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
 import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
@@ -111,7 +111,6 @@ import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
 import { loadTitleFonts } from "../utils/titleFonts";
 import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, imageOverlayAnimates, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
-const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // An audio overlay can hang past the video's end, but must start at least this far before it.
@@ -706,40 +705,26 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // docs editor's own version, so closing from anywhere else in the app is unaffected.
   useEffect(() => {
     if (!sourcePath) return;
-    let ownClose = false; // true once *we* called appWindow.close() - let that one through untouched
-    let pendingClose: Promise<void> | null = null; // dedupes a rapid double-click on the close button
-
-    const unlistenPromise = appWindow.onCloseRequested(async (event) => {
-      if (ownClose) return;
-      event.preventDefault();
-      if (pendingClose) {
-        await pendingClose;
-        return;
+    const removeGuard = addCloseGuard(async () => {
+      if (hasActiveJobs()) {
+        // Background exports (exportQueue.ts) - cancelled if the user goes ahead.
+        if (!(await confirmCloseWithActiveExports())) return false;
+      } else if (isExportingRef.current) {
+        const shouldCancelAndClose = await ask(
+          "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
+          { title: "Export in progress", kind: "warning" }
+        );
+        if (!shouldCancelAndClose) return false; // leave the window open - nothing else to do
+        await invoke("cancel_conversion").catch(() => {}); // best-effort; proceeding to close either way
       }
-      pendingClose = (async () => {
-        if (hasActiveJobs()) {
-          // Background exports (exportQueue.ts) - cancelled if the user goes ahead.
-          if (!(await confirmCloseWithActiveExports())) return;
-        } else if (isExportingRef.current) {
-          const shouldCancelAndClose = await ask(
-            "A video export is still in progress. Closing now will cancel it, and the exported file will be incomplete.",
-            { title: "Export in progress", kind: "warning" }
-          );
-          if (!shouldCancelAndClose) return; // leave the window open - nothing else to do
-          await invoke("cancel_conversion").catch(() => {}); // best-effort; proceeding to close either way
-        }
-        await flushSave();
-        ownClose = true;
-        await appWindow.close();
-      })();
-      await pendingClose;
-      pendingClose = null; // lets a later close attempt (the user declined this one) re-prompt cleanly
+      await flushSave();
+      return true;
     });
 
     setEditorCloseGuard(true);
     return () => {
       setEditorCloseGuard(false);
-      unlistenPromise.then((unlisten) => unlisten());
+      removeGuard();
     };
   }, [sourcePath, flushSave]);
 

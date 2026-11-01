@@ -11,11 +11,10 @@
 // sync provider would tap into, so no rework is needed when that phase arrives.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { addCloseGuard } from "../utils/closeGuards";
 import * as Y from "yjs";
 import { DocComment, DocMargins, DocOrientation, DocPageSetupPatch, DocPageSize, DocVersionSummary } from "../utils/docTypes";
 import { extractPlainText } from "../utils/docYjsText";
-const appWindow = getCurrentWebviewWindow()
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // Confirmed with the user: a periodic snapshot every ~10 minutes while a doc is actively being
@@ -186,31 +185,15 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
   // Save-on-quit: this hook only exists while a doc is actually open (DocsEditor is mounted),
   // so registering here - rather than app-wide - automatically scopes the guard to "only when
   // there's something to save"; closing from DocsHome or anywhere else is unaffected.
-  useEffect(() => {
-    let ownClose = false; // true once *we* called appWindow.close() - let that one through untouched
-    let pendingClose: Promise<void> | null = null; // dedupes a rapid double-click on the close button
-
-    const unlistenPromise = appWindow.onCloseRequested(async (event) => {
-      if (ownClose) return;
-      event.preventDefault();
-      if (!pendingClose) {
-        pendingClose = flushSave()
-          .catch((err) => {
-            // A save failure must never trap the user in an unclosable app - log and quit anyway.
-            console.error("Failed to save on quit:", err);
-          })
-          .then(() => {
-            ownClose = true;
-            return appWindow.close();
-          });
-      }
-      await pendingClose;
-    });
-
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [flushSave]);
+  useEffect(
+    () =>
+      addCloseGuard(async () => {
+        // A save failure must never trap the user in an unclosable app - log and quit anyway.
+        await flushSave().catch((err) => console.error("Failed to save on quit:", err));
+        return true;
+      }),
+    [flushSave]
+  );
 
   const refreshVersions = useCallback((idOverride?: string) => {
     const id = idOverride ?? docIdRef.current;

@@ -9,10 +9,12 @@
 // still gets to fade naturally instead of vanishing instantly.
 import { useEffect, useRef, useState } from 'react';
 import { listen, emit } from '@tauri-apps/api/event';
-import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute } from 'react-icons/io5';
+import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute, IoEyeOff } from 'react-icons/io5';
 import { BsHighlighter } from 'react-icons/bs';
 import { loadSettings } from '../utils/appSettings';
 import AnnotationPointer, { AnnotationPointerHandle, resolvePointer } from './AnnotationPointer';
+import ScreenBlurLayer from './ScreenBlurLayer';
+import useScreenBlur from '../hooks/useScreenBlur';
 import { playTapSound } from '../utils/annotationSound';
 import {
   ANNOTATION_COLORS,
@@ -106,6 +108,10 @@ const AnnotationOverlayWindow = () => {
   const pointerRef = useRef<AnnotationPointerHandle>(null);
   const pressRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const pointerKind = resolvePointer(pointerCfg.kind, pointerCfg.image);
+  // "blur" swaps drawing for placing privacy blur regions (B). Regions outlive draw mode - they're
+  // native windows (services/screen_blur.rs) that stay up, click-through, until removed.
+  const [tool, setTool] = useState<'ink' | 'blur'>('ink');
+  const blur = useScreenBlur(drawModeActive);
   const dragStateRef = useRef({ dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 });
 
   // Sizes the canvas's backing store to the window's real pixel dimensions (HiDPI-sharp) - the
@@ -146,6 +152,7 @@ const AnnotationOverlayWindow = () => {
         setInk({ color: st.annotationColor, width: st.annotationWidth, style: st.annotationStyle, fade: st.annotationFade, shadow: st.annotationShadow });
         setShowToolbar(st.annotationShowToolbar);
         setPointerCfg(readPointerConfig());
+        setTool('ink');
       } else {
         // "Until I exit" strokes end with draw mode; fading ones get to finish.
         strokesRef.current = strokesRef.current.filter((st) => fadeTotalMs(st.style, st.fade) > 0);
@@ -177,14 +184,22 @@ const AnnotationOverlayWindow = () => {
       const key = e.key.toLowerCase();
       if (key === 'escape') {
         void emit('annotation-turn-off-request');
+      } else if ((key === 'backspace' || key === 'delete') && e.shiftKey) {
+        blur.clear();
       } else if (key === 'backspace' || key === 'delete') {
         handleClear();
+      } else if (key === 'b') {
+        setTool((t) => (t === 'blur' ? 'ink' : 'blur'));
       } else if (/^[1-8]$/.test(key)) {
         const color = ANNOTATION_COLORS[Number(key) - 1];
         setInk((prev) => ({ ...prev, color }));
+        setTool('ink');
       } else {
         const style = KEY_STYLES[key];
-        if (style) setInk((prev) => ({ ...prev, style }));
+        if (style) {
+          setInk((prev) => ({ ...prev, style }));
+          setTool('ink');
+        }
       }
     };
 
@@ -379,6 +394,18 @@ const AnnotationOverlayWindow = () => {
       />
 
       {drawModeActive && (
+        <ScreenBlurLayer
+          regions={blur.regions}
+          interactive={tool === 'blur'}
+          onBegin={blur.begin}
+          onTrack={blur.track}
+          onEnd={blur.end}
+          onRemove={blur.remove}
+        />
+      )}
+
+      {/* Placing blur uses a plain crosshair - the hand would sit over the very thing being hidden. */}
+      {drawModeActive && tool === 'ink' && (
         <AnnotationPointer ref={pointerRef} kind={pointerKind} color={ink.color} image={pointerCfg.image} ripple={pointerCfg.ripple} />
       )}
 
@@ -409,17 +436,48 @@ const AnnotationOverlayWindow = () => {
           {ANNOTATION_STYLES.map((st) => (
             <button
               key={st.id}
-              onClick={() => setInk((prev) => ({ ...prev, style: st.id }))}
+              onClick={() => {
+                setInk((prev) => ({ ...prev, style: st.id }));
+                setTool('ink');
+              }}
               data-tip={st.label}
               aria-label={st.label}
-              aria-pressed={ink.style === st.id}
+              aria-pressed={tool === 'ink' && ink.style === st.id}
               className={`w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
-                ink.style === st.id ? 'bg-white/20 text-white' : 'text-white/60 hover:text-white hover:bg-white/10'
+                tool === 'ink' && ink.style === st.id ? 'bg-white/20 text-white' : 'text-white/60 hover:text-white hover:bg-white/10'
               }`}
             >
               {STYLE_ICONS[st.id]}
             </button>
           ))}
+
+          <button
+            onClick={() => setTool((t) => (t === 'blur' ? 'ink' : 'blur'))}
+            data-tip="Blur - drag over anything private. You can still type underneath."
+            data-tip-kbd="B"
+            aria-label="Blur"
+            aria-pressed={tool === 'blur'}
+            className={`relative w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
+              tool === 'blur' ? 'bg-white/20 text-white' : 'text-white/60 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            <IoEyeOff size={15} />
+            {blur.count > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 rounded-full bg-sky-500 text-[9px] font-semibold leading-[14px] text-white text-center">
+                {blur.count}
+              </span>
+            )}
+          </button>
+          {tool === 'blur' && blur.count > 0 && (
+            <button
+              onClick={blur.clear}
+              data-tip="Remove every blur"
+              data-tip-kbd="Shift+Backspace"
+              className="px-2 h-7 rounded-md text-xs font-medium text-white/75 hover:text-white hover:bg-white/10 whitespace-nowrap"
+            >
+              Unblur all
+            </button>
+          )}
 
           <div className="w-px h-5 bg-white/20 mx-1" />
 
@@ -427,7 +485,10 @@ const AnnotationOverlayWindow = () => {
           {(ANNOTATION_COLORS.includes(ink.color.toLowerCase()) ? ANNOTATION_COLORS : [...ANNOTATION_COLORS, ink.color]).map((color) => (
             <button
               key={color}
-              onClick={() => setInk((prev) => ({ ...prev, color }))}
+              onClick={() => {
+                setInk((prev) => ({ ...prev, color }));
+                setTool('ink');
+              }}
               aria-label={`Color ${color}`}
               aria-pressed={ink.color.toLowerCase() === color.toLowerCase()}
               className="relative h-8 w-4 flex items-end justify-center"

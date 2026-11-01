@@ -77,6 +77,8 @@ mod services {
     pub mod telemetry;
     pub mod sidecars;
     pub mod trash;
+    // The tray icon the closed window hides to - see the module's own comment.
+    pub mod tray;
     pub mod utility;
     pub mod whisper_model;
     // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
@@ -102,6 +104,9 @@ mod services {
     // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
     #[cfg(target_os = "windows")]
     pub mod input_tracker;
+    // The annotation overlay's privacy blur - live acrylic regions you can still type through.
+    // Stubbed off Windows inside the module, so its commands register everywhere.
+    pub mod screen_blur;
     // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
     // process dies for any reason (including a force-kill), so they can't outlive it holding the
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
@@ -368,11 +373,7 @@ fn main() {
         // shortcut... it may already be in use by another app". Instead the running copy's main
         // window is brought forward - what the user launching it again actually wanted.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            services::tray::show_main(app);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -390,6 +391,7 @@ fn main() {
         .manage(services::file_watcher::FileWatcherState::default())
         .manage(services::phone_camera::PhoneCameraState::default())
         .manage(services::phone_transfer::PhoneTransferState::default())
+        .manage(services::tray::TrayState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -403,6 +405,9 @@ fn main() {
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
             }
 
+            if let Err(e) = services::tray::install(app.handle()) {
+                log::warn!("Could not create the tray icon: {}", e);
+            }
             services::telemetry::init(app.handle());
             // Only if a phone was paired before - lets a phone that still has the page open
             // reconnect without anyone opening the Transfer dialog first.
@@ -717,7 +722,17 @@ fn main() {
             services::trash::restore_from_trash,
             services::trash::delete_trash_item,
             services::trash::empty_trash,
-            services::trash::purge_expired_trash
+            services::trash::purge_expired_trash,
+            services::screen_blur::screen_blur_set,
+            services::screen_blur::screen_blur_remove,
+            services::screen_blur::screen_blur_clear,
+            services::screen_blur::screen_blur_list,
+            services::screen_blur::screen_blur_gesture_begin,
+            services::screen_blur::screen_blur_gesture_end,
+            services::screen_blur::screen_blur_configure,
+            services::screen_blur::screen_blur_toggle_window,
+            services::screen_blur::screen_blur_ocr_language,
+            services::tray::tray_set_recording
         ])
         .build(context)
         .expect("error while building tauri application")
