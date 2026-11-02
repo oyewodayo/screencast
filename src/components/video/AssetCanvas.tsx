@@ -7,6 +7,7 @@
 // same as for a picture overlay; flip and shadow are drawn here since they depend on the shape.
 import React, { useEffect, useRef } from "react";
 import { OverlayAsset, assetMarginPx, drawAssetFrame } from "../../utils/videoAssets";
+import { stickerResourceVersion } from "../../utils/stickerAssets";
 
 interface AssetCanvasProps {
   asset: OverlayAsset;
@@ -38,12 +39,15 @@ const AssetCanvas: React.FC<AssetCanvasProps> = ({ asset, widthPx, heightPx, dur
     canvas.height = Math.max(1, Math.round(cssH * dpr));
     let raf = 0;
     let lastTime = Number.NaN;
+    let lastVersion = -1;
     const draw = () => {
       raf = requestAnimationFrame(draw);
       const t = getTimeRef.current();
-      // Paused on one frame - nothing to redraw.
-      if (t === lastTime) return;
+      // Paused on one frame - nothing to redraw, unless a sticker's face or picture just came in.
+      const version = stickerResourceVersion();
+      if (t === lastTime && version === lastVersion) return;
       lastTime = t;
+      lastVersion = version;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(dpr, 0, 0, dpr, (cssW / 2) * dpr, (cssH / 2) * dpr);

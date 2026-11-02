@@ -16,6 +16,7 @@ import {
   type WatermarkLayout,
   type WatermarkSize,
 } from "../../utils/docWatermark";
+import ColorInput from "../common/ColorInput";
 
 interface DocWatermarkDialogProps {
   watermark: DocWatermark;
@@ -214,7 +215,7 @@ const DocWatermarkDialog: React.FC<DocWatermarkDialogProps> = ({ watermark: wm, 
                         WATERMARK_COLORS.some((c) => c.value === wm.color) ? "ring-1 ring-black/10" : "ring-2 ring-blue-500"
                       }`}
                     >
-                      <input type="color" value={wm.color} onChange={(e) => set({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" aria-label="Custom colour" />
+                      <ColorInput value={wm.color} onChange={(e) => set({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" aria-label="Custom colour" />
                     </label>
                   </div>
                 </div>

@@ -55,6 +55,54 @@ import { latticeRenderOnDemand } from "../components/whiteboard/LatticeGaugeWidg
 
 // ---- Node geometry ----------------------------------------------------------------------------
 
+export const DEFAULT_SHADOW_COLOR = "#000000";
+export const DEFAULT_SHADOW_BLUR = 12;
+export const DEFAULT_SHADOW_OFFSET_X = 0;
+export const DEFAULT_SHADOW_OFFSET_Y = 4;
+export const DEFAULT_SHADOW_OPACITY = 0.25;
+
+export function hexToRgba(color: string, alpha: number): string {
+  const c = color.trim();
+  if (c.startsWith("rgba")) {
+    return c.replace(/[\d.]+\)$/g, `${alpha})`);
+  }
+  if (c.startsWith("rgb")) {
+    return c.replace("rgb", "rgba").replace(")", `, ${alpha})`);
+  }
+  const clean = c.replace("#", "");
+  const num = parseInt(clean.length === 3 ? clean.split("").map((ch) => ch + ch).join("") : clean, 16);
+  if (isNaN(num)) return `rgba(0,0,0,${alpha})`;
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+export function nodeDropShadowCSS(item: {
+  shadowEnabled?: boolean;
+  shadowColor?: string;
+  shadowOpacity?: number;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+}): string | undefined {
+  if (!item.shadowEnabled) return undefined;
+  const opacity = Math.max(0, Math.min(1, item.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+  if (opacity <= 0) return undefined;
+  const color = item.shadowColor ?? DEFAULT_SHADOW_COLOR;
+  const blur = Math.max(0, item.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+  const ox = item.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+  const oy = item.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  const rgba = hexToRgba(color, opacity);
+  return `drop-shadow(${ox}px ${oy}px ${blur}px ${rgba})`;
+}
+
+export function dashArrayFor(strokeStyle?: "solid" | "dashed" | "dotted", strokeWidth: number = 2): string | undefined {
+  if (!strokeStyle || strokeStyle === "solid") return undefined;
+  if (strokeStyle === "dotted") return `${Math.max(1, strokeWidth * 0.4)},${Math.max(3, strokeWidth * 1.6 + 3)}`;
+  return "8,6";
+}
+
 export function nodeCenter(node: WhiteboardNode): { x: number; y: number } {
   return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
 }
@@ -148,6 +196,130 @@ export function nudgeEdgeBy(edge: WhiteboardEdge, dx: number, dy: number): White
     source: nudgeEndpoint(edge.source),
     target: nudgeEndpoint(edge.target),
     waypoints: edge.waypoints?.map((wp) => ({ x: wp.x + dx, y: wp.y + dy })),
+  };
+}
+
+// Mirrors an edge's free-floating endpoints and waypoints across its own bounding center along
+// the horizontal (left<->right) or vertical (top<->bottom) axis. If both endpoints are attached to
+// nodes, flipping swaps source and target.
+export function flipEdge(
+  edge: WhiteboardEdge,
+  axis: "horizontal" | "vertical",
+  nodesById: Map<string, WhiteboardNode> = new Map()
+): WhiteboardEdge {
+  if (edge.source.nodeId && edge.target.nodeId) {
+    return {
+      ...edge,
+      source: edge.target,
+      target: edge.source,
+      waypoints: edge.waypoints ? [...edge.waypoints].reverse() : undefined,
+      curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+    };
+  }
+  const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+  const pts = [source, target, ...(edge.waypoints ?? [])];
+  const minX = Math.min(...pts.map((p) => p.x));
+  const maxX = Math.max(...pts.map((p) => p.x));
+  const minY = Math.min(...pts.map((p) => p.y));
+  const maxY = Math.max(...pts.map((p) => p.y));
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const mirrorPt = (p: { x: number; y: number }) =>
+    axis === "horizontal" ? { x: 2 * cx - p.x, y: p.y } : { x: p.x, y: 2 * cy - p.y };
+  const flipEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => {
+    if (ep.nodeId) return ep;
+    const m = mirrorPt({ x: ep.x ?? 0, y: ep.y ?? 0 });
+    return { ...ep, x: m.x, y: m.y };
+  };
+  return {
+    ...edge,
+    source: flipEndpoint(edge.source),
+    target: flipEndpoint(edge.target),
+    waypoints: edge.waypoints?.map(mirrorPt),
+    curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+  };
+}
+
+// Mirrors a selection of nodes and edges across the center of their combined bounding box - the
+// on-screen "flip" of a multi-selection (or a single shape, mirrored in place). Each node toggles
+// its own flip flag and negates its rotation (a mirrored rotated shape turns the other way); each
+// edge mirrors its free endpoints and waypoints across the same center and negates curveBow. An
+// endpoint attached to a node is left alone - it follows that node to its mirrored position.
+export function flipItems(
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[],
+  axis: "horizontal" | "vertical",
+  nodesById: Map<string, WhiteboardNode>
+): { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const n of nodes) xs.push(n.x, n.x + n.width), ys.push(n.y, n.y + n.height);
+  for (const e of edges) {
+    const { source, target } = resolveEdgeEndpoints(e, nodesById);
+    for (const p of [source, target, ...(e.waypoints ?? [])]) xs.push(p.x), ys.push(p.y);
+  }
+  if (xs.length === 0) return { nodes, edges };
+  const sumX = Math.min(...xs) + Math.max(...xs);
+  const sumY = Math.min(...ys) + Math.max(...ys);
+  const horizontal = axis === "horizontal";
+  const mirrorPt = (p: { x: number; y: number }) => (horizontal ? { x: sumX - p.x, y: p.y } : { x: p.x, y: sumY - p.y });
+  const flippedNodes = nodes.map((n) => {
+    const rotation = n.rotation ? (360 - n.rotation) % 360 || undefined : undefined;
+    return horizontal
+      ? { ...n, rotation, flipHorizontal: !(n.flipHorizontal ?? false) || undefined, x: sumX - n.x - n.width }
+      : { ...n, rotation, flipVertical: !(n.flipVertical ?? false) || undefined, y: sumY - n.y - n.height };
+  });
+  const flippedEdges = edges.map((e) => {
+    const flipEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => (ep.nodeId ? ep : { ...ep, ...mirrorPt({ x: ep.x ?? 0, y: ep.y ?? 0 }) });
+    return {
+      ...e,
+      source: flipEndpoint(e.source),
+      target: flipEndpoint(e.target),
+      waypoints: e.waypoints?.map(mirrorPt),
+      curveBow: e.curveBow !== undefined ? -e.curveBow : undefined,
+    };
+  });
+  return { nodes: flippedNodes, edges: flippedEdges };
+}
+
+// Reverses a connector's direction (swapping source and target endpoints, reversing any manual
+// waypoints, and flipping curveBow so a curved connector traces the exact same arc).
+export function reverseEdgeDirection(edge: WhiteboardEdge): WhiteboardEdge {
+  return {
+    ...edge,
+    source: edge.target,
+    target: edge.source,
+    waypoints: edge.waypoints ? [...edge.waypoints].reverse() : undefined,
+    curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+    labelPosition: edge.labelPosition !== undefined ? +(1 - edge.labelPosition).toFixed(4) : undefined,
+  };
+}
+
+// Scales a free-floating edge's length around its midpoint while preserving its angle.
+export function scaleEdgeLength(edge: WhiteboardEdge, nextLength: number): WhiteboardEdge {
+  if (edge.source.nodeId || edge.target.nodeId) return edge;
+  const sx = edge.source.x ?? 0;
+  const sy = edge.source.y ?? 0;
+  const tx = edge.target.x ?? 0;
+  const ty = edge.target.y ?? 0;
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const curLen = Math.hypot(dx, dy);
+  const safeNext = Math.max(1, nextLength);
+  const mx = (sx + tx) / 2;
+  const my = (sy + ty) / 2;
+  const ux = curLen > 1e-6 ? dx / curLen : 1;
+  const uy = curLen > 1e-6 ? dy / curLen : 0;
+  const half = safeNext / 2;
+  const ratio = curLen > 1e-6 ? safeNext / curLen : 1;
+  return {
+    ...edge,
+    source: { ...edge.source, x: mx - ux * half, y: my - uy * half },
+    target: { ...edge.target, x: mx + ux * half, y: my + uy * half },
+    waypoints: edge.waypoints?.map((wp) => ({
+      x: mx + (wp.x - mx) * ratio,
+      y: my + (wp.y - my) * ratio,
+    })),
   };
 }
 
@@ -336,23 +508,80 @@ function smoothPolylineD(points: { x: number; y: number }[]): string {
   return d;
 }
 
-// Builds the SVG path `d` string for an edge between two resolved endpoints. `waypoints` (manual
-// bend points a user dragged onto the line - see WhiteboardEdge.waypoints's own doc comment) take
-// priority when present: "curved" smooths a spline through source->waypoints->target,
-// straight/orthogonal both connect them with sharp segments - orthogonal's own auto right-angle
-// routing below only runs when there are none. Otherwise: "straight" is a single segment;
-// "orthogonal" (draw.io's default connector look) inserts one or two right-angle bends depending
-// on which sides the two ends leave from; "curved" is a cubic bezier through curveControlPoints -
-// see its own doc comment for why it always actually curves, never silently degrading to a
-// straight line when neither end is anchored to a shape. `bow` (only consulted when at least one
-// end is free-floating AND there are no waypoints) defaults to DEFAULT_CURVE_BOW's fixed direction
-// when omitted; pass the edge's own WhiteboardEdge.curveBow to bow the curve the way it was
-// actually drawn instead.
-export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting, bow: number = DEFAULT_CURVE_BOW, waypoints: { x: number; y: number }[] = []): string {
+// Connects an open polyline of points, optionally rounding interior bends with radius `cornerRadius`.
+function roundedOpenPolylineD(points: { x: number; y: number }[], cornerRadius: number = 0): string {
+  if (points.length === 0) return "";
+  if (points.length < 3 || cornerRadius <= 0) {
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  }
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+    const inDx = prev.x - curr.x;
+    const inDy = prev.y - curr.y;
+    const outDx = next.x - curr.x;
+    const outDy = next.y - curr.y;
+    const inLen = Math.hypot(inDx, inDy);
+    const outLen = Math.hypot(outDx, outDy);
+    const r = Math.min(cornerRadius, inLen / 2, outLen / 2);
+    if (r < 0.5) {
+      d += ` L ${curr.x} ${curr.y}`;
+    } else {
+      const sx = curr.x + (inDx / inLen) * r;
+      const sy = curr.y + (inDy / inLen) * r;
+      const ex = curr.x + (outDx / outLen) * r;
+      const ey = curr.y + (outDy / outLen) * r;
+      d += ` L ${sx} ${sy} Q ${curr.x} ${curr.y} ${ex} ${ey}`;
+    }
+  }
+  const last = points[points.length - 1];
+  d += ` L ${last.x} ${last.y}`;
+  return d;
+}
+
+function orthogonalPolylinePoints(source: ResolvedPoint, target: ResolvedPoint): { x: number; y: number }[] {
+  if (!source.side && !target.side) {
+    if (Math.abs(source.x - target.x) < 0.5 || Math.abs(source.y - target.y) < 0.5) {
+      return [{ x: source.x, y: source.y }, { x: target.x, y: target.y }];
+    }
+    if (Math.abs(target.x - source.x) >= Math.abs(target.y - source.y)) {
+      const midX = (source.x + target.x) / 2;
+      return [{ x: source.x, y: source.y }, { x: midX, y: source.y }, { x: midX, y: target.y }, { x: target.x, y: target.y }];
+    }
+    const midY = (source.y + target.y) / 2;
+    return [{ x: source.x, y: source.y }, { x: source.x, y: midY }, { x: target.x, y: midY }, { x: target.x, y: target.y }];
+  }
+  const sourceHorizontal = source.side ? source.side === "left" || source.side === "right" : Math.abs(target.x - source.x) >= Math.abs(target.y - source.y);
+  const targetHorizontal = target.side ? target.side === "left" || target.side === "right" : sourceHorizontal;
+
+  if (sourceHorizontal && targetHorizontal) {
+    const midX = (source.x + target.x) / 2;
+    return [{ x: source.x, y: source.y }, { x: midX, y: source.y }, { x: midX, y: target.y }, { x: target.x, y: target.y }];
+  }
+  if (!sourceHorizontal && !targetHorizontal) {
+    const midY = (source.y + target.y) / 2;
+    return [{ x: source.x, y: source.y }, { x: source.x, y: midY }, { x: target.x, y: midY }, { x: target.x, y: target.y }];
+  }
+  if (sourceHorizontal) {
+    return [{ x: source.x, y: source.y }, { x: target.x, y: source.y }, { x: target.x, y: target.y }];
+  }
+  return [{ x: source.x, y: source.y }, { x: source.x, y: target.y }, { x: target.x, y: target.y }];
+}
+
+export function buildEdgePath(
+  source: ResolvedPoint,
+  target: ResolvedPoint,
+  routing: EdgeRouting,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = [],
+  cornerRadius: number = 0
+): string {
   if (waypoints.length > 0) {
     const points = [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }];
     if (routing === "curved") return smoothPolylineD(points);
-    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+    return roundedOpenPolylineD(points, cornerRadius);
   }
 
   if (routing === "curved") {
@@ -360,38 +589,69 @@ export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, rout
     return `M ${source.x} ${source.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${target.x} ${target.y}`;
   }
 
-  if (routing === "straight" || !source.side || !target.side) {
+  if (routing === "straight") {
     return `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
   }
-  const sourceHorizontal = source.side === "left" || source.side === "right";
-  const targetHorizontal = target.side === "left" || target.side === "right";
 
-  if (sourceHorizontal && targetHorizontal) {
-    const midX = (source.x + target.x) / 2;
-    return `M ${source.x} ${source.y} L ${midX} ${source.y} L ${midX} ${target.y} L ${target.x} ${target.y}`;
-  }
-  if (!sourceHorizontal && !targetHorizontal) {
-    const midY = (source.y + target.y) / 2;
-    return `M ${source.x} ${source.y} L ${source.x} ${midY} L ${target.x} ${midY} L ${target.x} ${target.y}`;
-  }
-  // Mixed: one leaves horizontally, the other vertically - a single bend at the corner that keeps
-  // each end perpendicular to the side it left from.
-  if (sourceHorizontal) {
-    return `M ${source.x} ${source.y} L ${target.x} ${source.y} L ${target.x} ${target.y}`;
-  }
-  return `M ${source.x} ${source.y} L ${source.x} ${target.y} L ${target.x} ${target.y}`;
+  return roundedOpenPolylineD(orthogonalPolylinePoints(source, target), cornerRadius);
 }
 
-// The path's final segment direction, in degrees (SVG marker-friendly: 0 = pointing +x) - what an
-// arrowhead marker's orient should follow so it points the way the line is actually arriving,
-// rather than the straight source->target direction (wrong for an orthogonal/curved path's last
-// leg). "curved" uses the exact same cubic-bezier control points buildEdgePath drew the curve
-// through (see curveControlPoints) to find each end's real tangent direction - using the straight
-// source->target direction instead (as this used to) is only correct when the curve doesn't
-// actually bow away from that line, which free-floating ends now deliberately do. "orthogonal"
-// leaves/arrives along the anchored side's own normal; only "straight" (or an orthogonal edge with
-// neither end anchored, which buildEdgePath already renders as a plain line) falls back to the
-// literal source->target direction.
+// Computes the (x, y) point at fraction `t` (0 = source, 0.5 = midpoint, 1 = target) along the
+// edge's rendered path - used to position the connector's text label.
+export function edgePointAtFraction(
+  source: ResolvedPoint,
+  target: ResolvedPoint,
+  routing: EdgeRouting,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = [],
+  t: number = 0.5
+): { x: number; y: number } {
+  const clampedT = Math.max(0, Math.min(1, Number.isFinite(t) ? t : 0.5));
+  if (routing === "curved" && waypoints.length === 0) {
+    const { c1, c2 } = curveControlPoints(source, target, bow);
+    const u = 1 - clampedT;
+    const x =
+      u * u * u * source.x +
+      3 * u * u * clampedT * c1.x +
+      3 * u * clampedT * clampedT * c2.x +
+      clampedT * clampedT * clampedT * target.x;
+    const y =
+      u * u * u * source.y +
+      3 * u * u * clampedT * c1.y +
+      3 * u * clampedT * clampedT * c2.y +
+      clampedT * clampedT * clampedT * target.y;
+    return { x, y };
+  }
+  const poly =
+    waypoints.length > 0
+      ? [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }]
+      : routing === "orthogonal"
+        ? orthogonalPolylinePoints(source, target)
+        : [{ x: source.x, y: source.y }, { x: target.x, y: target.y }];
+  if (poly.length < 2) return { x: source.x, y: source.y };
+  const segLengths: number[] = [];
+  let total = 0;
+  for (let i = 0; i < poly.length - 1; i++) {
+    const len = Math.hypot(poly[i + 1].x - poly[i].x, poly[i + 1].y - poly[i].y);
+    segLengths.push(len);
+    total += len;
+  }
+  if (total <= 1e-6) return { x: source.x, y: source.y };
+  let targetDist = clampedT * total;
+  for (let i = 0; i < segLengths.length; i++) {
+    const segLen = segLengths[i];
+    if (targetDist <= segLen || i === segLengths.length - 1) {
+      const f = segLen > 1e-6 ? targetDist / segLen : 0;
+      return {
+        x: poly[i].x + (poly[i + 1].x - poly[i].x) * f,
+        y: poly[i].y + (poly[i + 1].y - poly[i].y) * f,
+      };
+    }
+    targetDist -= segLen;
+  }
+  return { x: target.x, y: target.y };
+}
+
 export function edgeEndAngleDeg(
   source: { x: number; y: number },
   target: { x: number; y: number },
@@ -402,9 +662,6 @@ export function edgeEndAngleDeg(
   waypoints: { x: number; y: number }[] = []
 ): { startDeg: number; endDeg: number } {
   if (waypoints.length > 0) {
-    // Approximates each end's tangent as the direction from its nearest waypoint - exact for the
-    // straight/orthogonal (sharp-segment) case, a reasonable stand-in for "curved" (the true
-    // tangent at a quadratic spline's very end point is this same direction anyway).
     const nearStart = waypoints[0];
     const nearEnd = waypoints[waypoints.length - 1];
     const startDeg = (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
@@ -417,14 +674,24 @@ export function edgeEndAngleDeg(
     const startDeg = (Math.atan2(source.y - c1.y, source.x - c1.x) * 180) / Math.PI;
     return { startDeg, endDeg };
   }
-  if (routing === "orthogonal" && (sourceSide || targetSide)) {
-    const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
-    // A marker-end arrow points in the direction of travel AT arrival, i.e. the side's outward
-    // normal reversed (arriving INTO the shape) - so target uses sideDeg+180, while a marker-start
-    // arrow (pointing back out along departure) uses the source side's own outward angle directly.
-    const endDeg = targetSide ? sideDeg(targetSide) + 180 : (Math.atan2(target.y - source.y, target.x - source.x) * 180) / Math.PI;
-    const startDeg = sourceSide ? sideDeg(sourceSide) : (Math.atan2(source.y - target.y, source.x - target.x) * 180) / Math.PI;
-    return { startDeg, endDeg };
+  if (routing === "orthogonal") {
+    if (sourceSide || targetSide) {
+      const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
+      const poly = orthogonalPolylinePoints({ ...source, side: sourceSide }, { ...target, side: targetSide });
+      const nearStart = poly[1] ?? target;
+      const nearEnd = poly[poly.length - 2] ?? source;
+      const endDeg = targetSide ? sideDeg(targetSide) + 180 : (Math.atan2(target.y - nearEnd.y, target.x - nearEnd.x) * 180) / Math.PI;
+      const startDeg = sourceSide ? sideDeg(sourceSide) : (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
+      return { startDeg, endDeg };
+    }
+    const poly = orthogonalPolylinePoints({ ...source, side: null }, { ...target, side: null });
+    if (poly.length >= 2) {
+      const nearStart = poly[1];
+      const nearEnd = poly[poly.length - 2];
+      const startDeg = (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
+      const endDeg = (Math.atan2(target.y - nearEnd.y, target.x - nearEnd.x) * 180) / Math.PI;
+      return { startDeg, endDeg };
+    }
   }
   const dx = target.x - source.x;
   const dy = target.y - source.y;
@@ -619,6 +886,7 @@ export interface ShapeOutlineOptions {
   // Any straight-edged "polygon" outline - see roundOutlineCorners. Rectangles round through their
   // own "rect" body instead, so this never reaches them.
   cornerRadius?: number;
+  cornerRadii?: (number | null)[];
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -2875,10 +3143,12 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
 // neighboring fillets can never overlap; that clamp is what keeps a star's needle-sharp tips and a
 // tiny triangle well-formed at any radius instead of looping back on themselves. Concave vertices
 // (a star's inner points, a cross's inside corners) round the same way.
-export function roundedPolygonD(points: [number, number][], radius: number): string {
+export function roundedPolygonD(points: [number, number][], radius: number, cornerRadii?: (number | null | undefined)[]): string {
   const n = points.length;
-  if (n < 3 || radius <= 0) return `M${points.map(([x, y]) => `${x},${y}`).join(" L")} Z`;
+  const radii = points.map((_, i) => Math.max(0, cornerRadii?.[i] ?? radius ?? 0));
+  if (n < 3 || radii.every((r) => r <= 0)) return `M${points.map(([x, y]) => `${x},${y}`).join(" L")} Z`;
   const corners = points.map((p, i) => {
+    const r = radii[i];
     const prev = points[(i - 1 + n) % n];
     const next = points[(i + 1) % n];
     const ax = prev[0] - p[0];
@@ -2889,29 +3159,143 @@ export function roundedPolygonD(points: [number, number][], radius: number): str
     const lb = Math.hypot(bx, by) || 1;
     const cos = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)));
     const half = Math.acos(cos) / 2;
-    const ideal = half > 1e-4 ? radius / Math.tan(half) : 0;
+    const ideal = r > 0 && half > 1e-4 ? r / Math.tan(half) : 0;
     const t = Math.min(ideal, la / 2, lb / 2);
     return {
       start: [p[0] + (ax / la) * t, p[1] + (ay / la) * t] as const,
       end: [p[0] + (bx / lb) * t, p[1] + (by / lb) * t] as const,
       vertex: p,
+      rounded: t > 1e-4,
     };
   });
   const f = (v: number) => +v.toFixed(2);
   let d = `M${f(corners[0].end[0])},${f(corners[0].end[1])}`;
   for (let i = 1; i <= n; i++) {
     const c = corners[i % n];
-    d += ` L${f(c.start[0])},${f(c.start[1])} Q${f(c.vertex[0])},${f(c.vertex[1])} ${f(c.end[0])},${f(c.end[1])}`;
+    if (c.rounded) {
+      d += ` L${f(c.start[0])},${f(c.start[1])} Q${f(c.vertex[0])},${f(c.vertex[1])} ${f(c.end[0])},${f(c.end[1])}`;
+    } else {
+      d += ` L${f(c.vertex[0])},${f(c.vertex[1])}`;
+    }
   }
   return `${d} Z`;
+}
+
+// Resolves a 4-corner box's [top-left, top-right, bottom-right, bottom-left] radii, clamped to half
+// the shorter side so neither CSS border-radius nor Canvas2D/SVG arc paths ever overlap.
+export function resolveBoxCornerRadii(
+  node: Pick<WhiteboardNode, "width" | "height" | "cornerRadius" | "cornerRadii">
+): [number, number, number, number] {
+  const maxR = Math.max(0, Math.min(node.width, node.height) / 2);
+  const base = node.cornerRadius ?? 0;
+  return [
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[0] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[1] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[2] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[3] ?? base)),
+  ];
+}
+
+// SVG path `d` for a w x h rectangle with independent [tl, tr, br, bl] circular corner radii -
+// used when a rectangle/equation carries a gradient, image, or pattern fill alongside per-corner
+// radii (SVG's <rect> only accepts a single uniform rx/ry).
+export function roundedRectSvgD(w: number, h: number, radii: [number, number, number, number]): string {
+  const maxR = Math.max(0, Math.min(w, h) / 2);
+  const [tl, tr, br, bl] = radii.map((r) => Math.max(0, Math.min(maxR, r)));
+  const f = (v: number) => +v.toFixed(2);
+  return [
+    `M${f(tl)},0`,
+    `L${f(w - tr)},0`,
+    tr > 0 ? `A${f(tr)},${f(tr)} 0 0,1 ${f(w)},${f(tr)}` : "",
+    `L${f(w)},${f(h - br)}`,
+    br > 0 ? `A${f(br)},${f(br)} 0 0,1 ${f(w - br)},${f(h)}` : "",
+    `L${f(bl)},${f(h)}`,
+    bl > 0 ? `A${f(bl)},${f(bl)} 0 0,1 0,${f(h - bl)}` : "",
+    `L0,${f(tl)}`,
+    tl > 0 ? `A${f(tl)},${f(tl)} 0 0,1 ${f(tl)},0` : "",
+    "Z",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+export interface DetectedShapeCorner {
+  index: number;
+  label: string;
+  point: [number, number];
+}
+
+function cornerDirectionLabel(nx: number, ny: number): string {
+  const dx = nx - 0.5;
+  const dy = ny - 0.5;
+  if (Math.hypot(dx, dy) < 0.12) return "Center";
+  if (Math.abs(dx) <= 0.12) return dy < 0 ? "Top" : "Bottom";
+  if (Math.abs(dy) <= 0.12) return dx < 0 ? "Left" : "Right";
+  const v = dy < 0 ? "Top" : "Bottom";
+  const h = dx < 0 ? "left" : "right";
+  return `${v}-${h}`;
+}
+
+// Detects the roundable corners of any shape that supports corner radius and names each vertex by
+// its position on the shape (e.g. "Top", "Bottom-right", "Bottom-left" for a triangle; "Top-left",
+// "Top-right", "Bottom-right", "Bottom-left" for a rectangle; "Top", "Right", "Bottom", "Left" for
+// a diamond; etc.), accounting for horizontal/vertical flips so labels match the on-screen corners.
+export function detectShapeCorners(node: WhiteboardNode): DetectedShapeCorner[] {
+  if (!supportsCornerRadius(node)) return [];
+  const { width: w, height: h } = node;
+  let points: [number, number][];
+  if (node.shapeType === "rectangle" || node.shapeType === "equation" || node.shapeType === "image") {
+    points = [
+      [0, 0],
+      [w, 0],
+      [w, h],
+      [0, h],
+    ];
+  } else {
+    const outline = baseShapeOutline(node.shapeType, w, h, outlineOptionsFor(node));
+    if (outline.kind !== "polygon") return [];
+    points = outline.points;
+  }
+
+  const baseLabels = points.map((p, i) => {
+    const rawNx = w > 0 ? p[0] / w : 0.5;
+    const rawNy = h > 0 ? p[1] / h : 0.5;
+    const nx = node.flipHorizontal ? 1 - rawNx : rawNx;
+    const ny = node.flipVertical ? 1 - rawNy : rawNy;
+    const dir = cornerDirectionLabel(nx, ny);
+    if (node.shapeType === "star" && i % 2 === 1) {
+      return `Inner ${dir.toLowerCase()}`;
+    }
+    return dir;
+  });
+
+  const counts = new Map<string, number>();
+  for (const lbl of baseLabels) counts.set(lbl, (counts.get(lbl) ?? 0) + 1);
+  const seen = new Map<string, number>();
+
+  return points.map((point, index) => {
+    const base = baseLabels[index];
+    if ((counts.get(base) ?? 0) > 1) {
+      const next = (seen.get(base) ?? 0) + 1;
+      seen.set(base, next);
+      return { index, label: `${base} ${next}`, point };
+    }
+    return { index, label: base, point };
+  });
 }
 
 // Only plain closed polygons round - one with inner lines/circles (cube spokes, a note's crease, a
 // table grid, benzene's ring) has strokes that land exactly on its vertices, and rounding the outline
 // out from under them would leave those strokes poking past the new edge.
-function roundOutlineCorners(shapeType: WhiteboardShapeType, outline: ShapeOutline, radius: number | undefined): ShapeOutline {
-  if (!radius || radius <= 0 || outline.kind !== "polygon" || outline.innerLines || outline.innerCircle || shapeType === "table") return outline;
-  return { kind: "path", d: roundedPolygonD(outline.points, radius) };
+function roundOutlineCorners(
+  shapeType: WhiteboardShapeType,
+  outline: ShapeOutline,
+  radius: number | undefined,
+  cornerRadii?: (number | null | undefined)[]
+): ShapeOutline {
+  const hasRadius = (radius !== undefined && radius > 0) || (cornerRadii?.some((r) => r !== null && r !== undefined && r > 0) ?? false);
+  if (!hasRadius || outline.kind !== "polygon" || outline.innerLines || outline.innerCircle || shapeType === "table") return outline;
+  return { kind: "path", d: roundedPolygonD(outline.points, radius ?? 0, cornerRadii) };
 }
 
 // Whether the style panel's Corner radius control does anything for this node - rectangles and
@@ -2937,7 +3321,9 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
   const annotations = CHART_ANNOTATION_SHAPES.has(shapeType) ? opts?.chartAnnotations ?? [] : [];
   const margins = CHART_AXIS_TITLE_SHAPES.has(shapeType) ? chartMargins(shapeType, w, h, opts ?? {}) : { left: 0, top: 0, bottom: 0, labels: [] as ChartLabel[] };
   const hasMargins = margins.left > 0 || margins.top > 0 || margins.bottom > 0;
-  if (!hasMargins && annotations.length === 0) return roundOutlineCorners(shapeType, baseShapeOutline(shapeType, w, h, opts), opts?.cornerRadius);
+  if (!hasMargins && annotations.length === 0) {
+    return roundOutlineCorners(shapeType, baseShapeOutline(shapeType, w, h, opts), opts?.cornerRadius, opts?.cornerRadii);
+  }
 
   const innerW = Math.max(1, w - margins.left);
   const innerH = Math.max(1, h - margins.top - margins.bottom);
@@ -3036,6 +3422,7 @@ export function outlineOptionsFor(node: WhiteboardNode): ShapeOutlineOptions {
     tableColWidths: node.tableColWidths,
     tableRowHeights: node.tableRowHeights,
     cornerRadius: node.cornerRadius,
+    cornerRadii: node.cornerRadii,
     axisPlacement: node.axisPlacement,
     xLabelSide: node.xLabelSide,
     yLabelSide: node.yLabelSide,
@@ -3138,11 +3525,7 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
     return path;
   }
   if (mask === "rounded") {
-    // Clamped to half the shorter side - a radius past that is geometrically meaningless and
-    // renders as a malformed path rather than a rounder box.
-    const r = Math.max(0, Math.min(node.cornerRadius ?? 0, Math.min(w, h) / 2));
-    path.roundRect(0, 0, w, h, r);
-    return path;
+    return roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii);
   }
   path.rect(0, 0, w, h);
   return path;
@@ -3397,14 +3780,25 @@ export function applyCommand(page: WhiteboardPage, command: WhiteboardCommand): 
       return { ...page, edges: page.edges.filter((e) => e.id !== command.item.id) };
     case "edit-edge":
       return { ...page, edges: page.edges.map((e) => (e.id === command.after.id ? command.after : e)) };
+    case "batch-edit-edges": {
+      const afterById = new Map(command.after.map((e) => [e.id, e]));
+      return { ...page, edges: page.edges.map((e) => afterById.get(e.id) ?? e) };
+    }
     case "reorder-nodes":
       return { ...page, nodes: command.after };
+    case "reorder-items":
+      return { ...page, nodes: command.afterNodes, edges: command.afterEdges };
     case "paste-items":
       return { ...page, nodes: [...page.nodes, ...command.nodes], edges: [...page.edges, ...command.edges] };
     case "delete-items": {
       const nodeIds = new Set(command.nodes.map((n) => n.id));
       const edgeIds = new Set(command.edges.map((e) => e.id));
       return { ...page, nodes: page.nodes.filter((n) => !nodeIds.has(n.id)), edges: page.edges.filter((e) => !edgeIds.has(e.id)) };
+    }
+    case "batch-edit-items": {
+      const nodesById = new Map(command.afterNodes.map((n) => [n.id, n]));
+      const edgesById = new Map(command.afterEdges.map((e) => [e.id, e]));
+      return { ...page, nodes: page.nodes.map((n) => nodesById.get(n.id) ?? n), edges: page.edges.map((e) => edgesById.get(e.id) ?? e) };
     }
   }
 }
@@ -3434,8 +3828,18 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
       return { type: "add-edge", item: command.item };
     case "edit-edge":
       return { type: "edit-edge", before: command.after, after: command.before };
+    case "batch-edit-edges":
+      return { type: "batch-edit-edges", before: command.after, after: command.before };
     case "reorder-nodes":
       return { type: "reorder-nodes", before: command.after, after: command.before };
+    case "reorder-items":
+      return {
+        type: "reorder-items",
+        beforeNodes: command.afterNodes,
+        afterNodes: command.beforeNodes,
+        beforeEdges: command.afterEdges,
+        afterEdges: command.beforeEdges,
+      };
     // Exact mirror of each other - no special-casing needed in useWhiteboardStore's undo()/redo()
     // the way "delete-node" needs (see undoDeleteNode's own doc comment): both directions of a
     // paste/un-paste are already fully expressible as one one of these two command types.
@@ -3443,7 +3847,94 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
       return { type: "delete-items", nodes: command.nodes, edges: command.edges };
     case "delete-items":
       return { type: "paste-items", nodes: command.nodes, edges: command.edges };
+    case "batch-edit-items":
+      return { type: "batch-edit-items", beforeNodes: command.afterNodes, afterNodes: command.beforeNodes, beforeEdges: command.afterEdges, afterEdges: command.beforeEdges };
   }
+}
+
+// Resolves a unified layer rank (0 .. N+E-1, higher = further in front) across all nodes and edges
+// on a page. Items without an explicit `zIndex` default to nodes in `page.nodes` order followed by
+// edges in `page.edges` order, so freshly drawn lines sit above shapes until explicitly reordered.
+export function resolvePageLayerOrder(page: { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] }): Map<string, number> {
+  const entries: { id: string; z: number; fallback: number }[] = [];
+  let maxExplicitZ = -1;
+  page.nodes.forEach((n) => {
+    if (typeof n.zIndex === "number" && Number.isFinite(n.zIndex)) maxExplicitZ = Math.max(maxExplicitZ, n.zIndex);
+  });
+  page.edges.forEach((e) => {
+    if (typeof e.zIndex === "number" && Number.isFinite(e.zIndex)) maxExplicitZ = Math.max(maxExplicitZ, e.zIndex);
+  });
+  const baseUnset = maxExplicitZ >= 0 ? maxExplicitZ + 1 : 0;
+  page.nodes.forEach((n, i) => {
+    const fallback = i;
+    const z = typeof n.zIndex === "number" && Number.isFinite(n.zIndex) ? n.zIndex : baseUnset + fallback;
+    entries.push({ id: n.id, z, fallback });
+  });
+  page.edges.forEach((e, i) => {
+    const fallback = page.nodes.length + i;
+    const z = typeof e.zIndex === "number" && Number.isFinite(e.zIndex) ? e.zIndex : baseUnset + fallback;
+    entries.push({ id: e.id, z, fallback });
+  });
+  entries.sort((a, b) => (a.z !== b.z ? a.z - b.z : a.fallback - b.fallback));
+  const map = new Map<string, number>();
+  entries.forEach((entry, rank) => map.set(entry.id, rank));
+  return map;
+}
+
+export type LayerReorderAction = "front" | "back" | "forward" | "backward";
+
+// Reorders any selection of nodes and/or edges in the unified page layer stack ("front" = top of
+// stack, "back" = bottom of stack, "forward" = one step up, "backward" = one step down), assigning
+// contiguous `zIndex` values and updating array order to match.
+export function reorderPageItems(
+  page: { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] },
+  selectedIds: ReadonlySet<string>,
+  action: LayerReorderAction
+): { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } {
+  if (selectedIds.size === 0) return { nodes: page.nodes, edges: page.edges };
+  const ranks = resolvePageLayerOrder(page);
+  type TaggedItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
+  const unified: TaggedItem[] = [
+    ...page.nodes.map((item): TaggedItem => ({ kind: "node", item })),
+    ...page.edges.map((item): TaggedItem => ({ kind: "edge", item })),
+  ].sort((a, b) => (ranks.get(a.item.id) ?? 0) - (ranks.get(b.item.id) ?? 0));
+
+  if (action === "front") {
+    const rest = unified.filter((x) => !selectedIds.has(x.item.id));
+    const sel = unified.filter((x) => selectedIds.has(x.item.id));
+    unified.splice(0, unified.length, ...rest, ...sel);
+  } else if (action === "back") {
+    const sel = unified.filter((x) => selectedIds.has(x.item.id));
+    const rest = unified.filter((x) => !selectedIds.has(x.item.id));
+    unified.splice(0, unified.length, ...sel, ...rest);
+  } else if (action === "forward") {
+    for (let i = unified.length - 2; i >= 0; i--) {
+      if (selectedIds.has(unified[i].item.id) && !selectedIds.has(unified[i + 1].item.id)) {
+        const tmp = unified[i];
+        unified[i] = unified[i + 1];
+        unified[i + 1] = tmp;
+      }
+    }
+  } else if (action === "backward") {
+    for (let i = 1; i < unified.length; i++) {
+      if (selectedIds.has(unified[i].item.id) && !selectedIds.has(unified[i - 1].item.id)) {
+        const tmp = unified[i];
+        unified[i] = unified[i - 1];
+        unified[i - 1] = tmp;
+      }
+    }
+  }
+
+  const nextNodes: WhiteboardNode[] = [];
+  const nextEdges: WhiteboardEdge[] = [];
+  unified.forEach((entry, zIndex) => {
+    if (entry.kind === "node") {
+      nextNodes.push({ ...entry.item, zIndex });
+    } else {
+      nextEdges.push({ ...entry.item, zIndex });
+    }
+  });
+  return { nodes: nextNodes, edges: nextEdges };
 }
 
 // Re-adds a deleted node's cascade-deleted edges too, in one shot - invertCommand alone can't
@@ -3478,18 +3969,27 @@ function freehandPath2D(node: WhiteboardNode): Path2D {
   return path;
 }
 
-function roundedRectPath2D(w: number, h: number, radius: number): Path2D {
+function roundedRectPath2D(w: number, h: number, radius: number, cornerRadii?: (number | null | undefined)[]): Path2D {
   const path = new Path2D();
-  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
-  if (r <= 0) {
+  const [tl, tr, br, bl] = resolveBoxCornerRadii({
+    width: w,
+    height: h,
+    cornerRadius: radius,
+    cornerRadii: cornerRadii as (number | null)[] | undefined,
+  });
+  if (tl <= 0 && tr <= 0 && br <= 0 && bl <= 0) {
     path.rect(0, 0, w, h);
     return path;
   }
-  path.moveTo(r, 0);
-  path.arcTo(w, 0, w, h, r);
-  path.arcTo(w, h, 0, h, r);
-  path.arcTo(0, h, 0, 0, r);
-  path.arcTo(0, 0, w, 0, r);
+  path.moveTo(tl, 0);
+  path.lineTo(w - tr, 0);
+  if (tr > 0) path.arcTo(w, 0, w, h, tr);
+  path.lineTo(w, h - br);
+  if (br > 0) path.arcTo(w, h, 0, h, br);
+  path.lineTo(bl, h);
+  if (bl > 0) path.arcTo(0, h, 0, 0, bl);
+  path.lineTo(0, tl);
+  if (tl > 0) path.arcTo(0, 0, w, 0, tl);
   path.closePath();
   return path;
 }
@@ -3548,13 +4048,28 @@ export function fillImageSrc(node: WhiteboardNode, imageSrcFor?: ImageSrcResolve
   return imageSrcFor({ ...node, assetFileName: node.fillImageAsset });
 }
 
-// Where an image fill's bitmap lands inside the node's w x h box for each fit mode.
-export function fillImageRect(fit: WhiteboardNode["fillImageFit"], w: number, h: number, iw: number, ih: number): { x: number; y: number; w: number; h: number } {
-  if (fit === "fill" || iw <= 0 || ih <= 0) return { x: 0, y: 0, w, h };
-  const scale = fit === "contain" ? Math.min(w / iw, h / ih) : Math.max(w / iw, h / ih);
-  const dw = iw * scale;
-  const dh = ih * scale;
-  return { x: (w - dw) / 2, y: (h - dh) / 2, w: dw, h: dh };
+// Where an image fill's bitmap lands inside the node's w x h box for each fit mode, plus optional
+// pan offsets (fractions of w/h) and zoom scale multiplier.
+export function fillImageRect(
+  fit: WhiteboardNode["fillImageFit"],
+  w: number,
+  h: number,
+  iw: number,
+  ih: number,
+  offsetX = 0,
+  offsetY = 0,
+  scale = 1
+): { x: number; y: number; w: number; h: number } {
+  const s = Math.max(0.1, scale);
+  if (fit === "fill" || iw <= 0 || ih <= 0) {
+    const dw = w * s;
+    const dh = h * s;
+    return { x: (w - dw) / 2 + offsetX * w, y: (h - dh) / 2 + offsetY * h, w: dw, h: dh };
+  }
+  const baseScale = fit === "contain" ? Math.min(w / iw, h / ih) : Math.max(w / iw, h / ih);
+  const dw = iw * baseScale * s;
+  const dh = ih * baseScale * s;
+  return { x: (w - dw) / 2 + offsetX * w, y: (h - dh) / 2 + offsetY * h, w: dw, h: dh };
 }
 
 // Paints a node's interior - solid, gradient, or image - then its pattern overlay, clipped to
@@ -3597,7 +4112,16 @@ function paintNodeFill(ctx: CanvasRenderingContext2D, node: WhiteboardNode, path
           ctx.fillStyle = node.fillColor;
           ctx.fillRect(0, 0, w, h);
         }
-        const r = fillImageRect(node.fillImageFit, w, h, img.naturalWidth, img.naturalHeight);
+        const r = fillImageRect(
+          node.fillImageFit,
+          w,
+          h,
+          img.naturalWidth,
+          img.naturalHeight,
+          node.fillImageOffsetX ?? 0,
+          node.fillImageOffsetY ?? 0,
+          node.fillImageScale ?? 1
+        );
         ctx.drawImage(img, r.x, r.y, r.w, r.h);
       } else if (node.fillColor) {
         ctx.fillStyle = node.fillColor;
@@ -3644,14 +4168,25 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode, ima
     paintNodeFill(ctx, node, path, imageSrcFor);
     if (node.strokeWidth > 0) {
       ctx.lineWidth = node.strokeWidth;
-      ctx.strokeStyle = node.strokeColor;
+      const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+        ? hexToRgba(node.strokeColor, node.strokeOpacity)
+        : node.strokeColor;
+      ctx.strokeStyle = strokeColor;
+      if (node.strokeStyle === "dashed") {
+        ctx.setLineDash([8, 6]);
+      } else if (node.strokeStyle === "dotted") {
+        ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+      } else {
+        ctx.setLineDash([]);
+      }
       ctx.stroke(path);
+      ctx.setLineDash([]);
     }
   };
 
   switch (outline.kind) {
     case "rect":
-      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0));
+      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii));
       return;
     case "ellipse": {
       const p = new Path2D();
@@ -4044,13 +4579,35 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     if (node.flipHorizontal || node.flipVertical) ctx.scale(node.flipHorizontal ? -1 : 1, node.flipVertical ? -1 : 1);
     ctx.translate(-node.width / 2, -node.height / 2);
   }
+  if (node.opacity !== undefined && node.opacity < 1) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, node.opacity));
+  }
+  if (node.shadowEnabled) {
+    const shadowColor = node.shadowColor ?? DEFAULT_SHADOW_COLOR;
+    const shadowOpacity = Math.max(0, Math.min(1, node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+    ctx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+    ctx.shadowBlur = Math.max(0, node.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+    ctx.shadowOffsetX = node.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+    ctx.shadowOffsetY = node.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  }
   if (node.shapeType === "freehand") {
     const path = freehandPath2D(node);
     ctx.lineWidth = node.strokeWidth;
-    ctx.strokeStyle = node.strokeColor;
+    const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+      ? hexToRgba(node.strokeColor, node.strokeOpacity)
+      : node.strokeColor;
+    ctx.strokeStyle = strokeColor;
+    if (node.strokeStyle === "dashed") {
+      ctx.setLineDash([8, 6]);
+    } else if (node.strokeStyle === "dotted") {
+      ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+    } else {
+      ctx.setLineDash([]);
+    }
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
     ctx.stroke(path);
+    ctx.setLineDash([]);
     // A "Freehand Arrow" (see whiteboardTypes.ts's WhiteboardNode.endArrowType doc comment) caps
     // one or both ends with a marker, angled off the stroke's own final two points (a close-enough
     // stand-in for the smoothed curve's true end tangent - freehandPath2D's own last segment is a
@@ -4203,10 +4760,29 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   const { source, target } = resolveEdgeEndpoints(edge, nodesById);
   const bow = edge.curveBow ?? DEFAULT_CURVE_BOW;
   const waypoints = edge.waypoints ?? [];
-  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow, waypoints));
+  const cornerRadius = edge.cornerRadius ?? 0;
+  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow, waypoints, cornerRadius));
+
+  ctx.save();
+  if (edge.opacity !== undefined && edge.opacity < 1) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, edge.opacity));
+  }
+  if (edge.shadowEnabled) {
+    const shadowColor = edge.shadowColor ?? DEFAULT_SHADOW_COLOR;
+    const shadowOpacity = Math.max(0, Math.min(1, edge.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+    ctx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+    ctx.shadowBlur = Math.max(0, edge.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+    ctx.shadowOffsetX = edge.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+    ctx.shadowOffsetY = edge.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  }
+
+  const strokeAlpha = Math.max(0, Math.min(1, edge.strokeOpacity ?? 1));
+  const strokeColor = strokeAlpha < 1 ? hexToRgba(edge.strokeColor, strokeAlpha) : edge.strokeColor;
+
   ctx.lineWidth = edge.strokeWidth;
-  ctx.strokeStyle = edge.strokeColor;
-  ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : "butt";
+  ctx.strokeStyle = strokeColor;
+  ctx.lineJoin = "round";
+  ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : edge.strokeCap ?? "butt";
   const pattern = DASH_PATTERNS[edge.strokeStyle];
   ctx.setLineDash(edge.strokeStyle === "dotted" ? pattern.map((n) => n * (edge.strokeWidth / 2 || 1)) : pattern);
   ctx.stroke(path);
@@ -4214,8 +4790,27 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   ctx.lineCap = "butt";
 
   const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side, bow, waypoints);
-  drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, edge.strokeColor, edge.strokeWidth);
-  drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, edge.strokeColor, edge.strokeWidth);
+  drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, strokeColor, edge.strokeWidth);
+  drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, strokeColor, edge.strokeWidth);
+
+  if (edge.label) {
+    const labelPt = edgePointAtFraction(source, target, edge.routing, bow, waypoints, edge.labelPosition ?? 0.5);
+    const fontSize = edge.labelFontSize ?? 13;
+    const weight = edge.labelBold ? "bold " : "";
+    const style = edge.labelItalic ? "italic " : "";
+    ctx.font = `${style}${weight}${fontSize}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    if (edge.labelShowBackground ?? true) {
+      ctx.strokeStyle = edge.labelBackgroundColor ?? "#f7f7f8";
+      ctx.lineWidth = 4;
+      ctx.lineJoin = "round";
+      ctx.strokeText(edge.label, labelPt.x, labelPt.y);
+    }
+    ctx.fillStyle = edge.labelColor ?? "#374151";
+    ctx.fillText(edge.label, labelPt.x, labelPt.y);
+  }
+  ctx.restore();
 }
 
 // Flattens one page onto an offscreen canvas sized to its content bounds (see computeContentBounds)
@@ -4270,10 +4865,19 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
   }
 
   const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
-  for (const edge of page.edges) renderEdge(ctx, edge, nodesById);
-  // Sequential awaits, not Promise.all - every node shares this one ctx (save/translate/restore),
+  const layerOrder = resolvePageLayerOrder(page);
+  type RenderableItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
+  const orderedItems: RenderableItem[] = [
+    ...page.nodes.map((item): RenderableItem => ({ kind: "node", item })),
+    ...page.edges.map((item): RenderableItem => ({ kind: "edge", item })),
+  ].sort((a, b) => (layerOrder.get(a.item.id) ?? 0) - (layerOrder.get(b.item.id) ?? 0));
+
+  // Sequential awaits, not Promise.all - every item shares this one ctx (save/translate/restore),
   // so two renderNode calls running concurrently would interleave their transform stacks.
-  for (const node of page.nodes) await renderNode(ctx, node, imageSrcFor);
+  for (const entry of orderedItems) {
+    if (entry.kind === "node") await renderNode(ctx, entry.item, imageSrcFor);
+    else renderEdge(ctx, entry.item, nodesById);
+  }
 
   return canvas;
 }

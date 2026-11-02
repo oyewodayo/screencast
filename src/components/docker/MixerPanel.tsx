@@ -42,7 +42,45 @@ export interface MixerChannel {
   meterIds: string[];
   // e.g. "3 pieces".
   detail?: string;
+  // Music ducking: how far it's pulled down under the voice right now (0..1 gain), and the most it
+  // goes (dB) - the strip's ducking meter.
+  ducking?: { read: () => number; levelDb: number };
 }
+
+// A ducked strip's live gain reduction: the bar grows as the music gives way to a voice and falls
+// back as it returns - the ducking you've been hearing, seen.
+const DuckMeter: React.FC<{ read: () => number; levelDb: number }> = ({ read, levelDb }) => {
+  const barRef = useRef<HTMLSpanElement>(null);
+  const [db, setDb] = useState(0);
+  const readRef = useRef(read);
+  readRef.current = read;
+  useEffect(() => {
+    let raf = 0;
+    let lastText = 0;
+    const tick = (now: number) => {
+      raf = requestAnimationFrame(tick);
+      const g = Math.max(1e-6, Math.min(1, readRef.current()));
+      const reduction = -20 * Math.log10(g);
+      if (barRef.current) barRef.current.style.width = `${Math.min(100, (reduction / Math.max(1, -levelDb)) * 100).toFixed(1)}%`;
+      if (now - lastText > 150) {
+        lastText = now;
+        setDb(reduction);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [levelDb]);
+  const active = db > 0.3;
+  return (
+    <div className="flex items-center gap-2 text-[10px]" title={`Dips up to ${Math.round(-levelDb)} dB while someone speaks`}>
+      <span className={`w-14 shrink-0 transition-colors ${active ? "text-amber-200" : "text-white/40"}`}>{active ? "Ducking" : "Ducks"}</span>
+      <span className="relative flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+        <span ref={barRef} className="absolute right-0 inset-y-0 rounded-full bg-gradient-to-l from-amber-300 to-amber-500/60" style={{ width: 0 }} />
+      </span>
+      <span className={`w-11 shrink-0 text-right tabular-nums ${active ? "text-amber-200" : "text-white/40"}`}>{active ? `−${db.toFixed(1)}` : "0.0"} dB</span>
+    </div>
+  );
+};
 
 interface MixerPanelProps {
   anchor: { left: number; top: number };
@@ -217,6 +255,7 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
                   </button>
                 </div>
                 <Meter ids={ch.meterIds} />
+                {ch.ducking && <DuckMeter read={ch.ducking.read} levelDb={ch.ducking.levelDb} />}
                 <label className="flex items-center gap-2 text-[11px]">
                   <KnobSlider min={0} max={1} step={0.005} value={ch.volume} onChange={(v) => onVolume(ch.key, v)} resetTo={1} title="Level - double-click for 0 dB" />
                   <span className="w-11 shrink-0 text-right tabular-nums text-white/60">{levelLabel(ch.volume)} dB</span>

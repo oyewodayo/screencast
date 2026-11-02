@@ -107,6 +107,17 @@ const DocIndent = Extension.create<IndentOptions>({
           },
         },
       },
+      {
+        types: ["bulletList", "orderedList"],
+        attributes: {
+          indentLeft: {
+            default: null,
+            parseHTML: (element) => cssLengthToIn(element.style.paddingLeft),
+            renderHTML: (attributes) =>
+              typeof attributes.indentLeft === "number" && attributes.indentLeft > 0 ? { style: `padding-left: ${attributes.indentLeft}in` } : {},
+          },
+        },
+      },
     ];
   },
   // Google Docs' own bindings.

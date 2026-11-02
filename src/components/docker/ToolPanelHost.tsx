@@ -16,6 +16,11 @@ export const ToolPanelHostContext = createContext<HTMLElement | null>(null);
 
 export const useToolPanelHost = (): HTMLElement | null => useContext(ToolPanelHostContext);
 
+// Opens the sidebar on its Tools tab - for a floating control's "All settings", which then docks
+// its full panel there. Null where there's no sidebar to open.
+export const ToolPanelOpenContext = createContext<(() => void) | null>(null);
+export const useOpenToolPanel = (): (() => void) | null => useContext(ToolPanelOpenContext);
+
 // Shown in a docked/floating clip panel's header while a multi-selection is what it edits.
 export const SelectionCountBadge: React.FC<{ count?: number }> = ({ count }) =>
   count && count > 1 ? (

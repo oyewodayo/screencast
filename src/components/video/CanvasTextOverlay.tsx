@@ -6,7 +6,7 @@
 // overlay's own positioned box (which keeps handling selection, animation and keyframes), drawn at
 // the screen's pixel density so it stays crisp. A reveal redraws every animation frame from
 // `getTime` until it settles; a still title redraws only when it changes or its face loads.
-import React, { useEffect, useRef } from "react";
+import React, { useLayoutEffect, useRef } from "react";
 import type { TextOverlay } from "../../utils/videoEditTypes";
 import { drawTextOverlay } from "../../utils/videoOverlayRender";
 import { isTextReveal, textRevealState } from "../../utils/textReveal";
@@ -26,7 +26,8 @@ const CanvasTextOverlay: React.FC<CanvasTextOverlayProps> = ({ overlay, frameWid
   const getTimeRef = useRef(getTime);
   getTimeRef.current = getTime;
 
-  useEffect(() => {
+  // Drawn before paint, so a title being resized never shows a frame out of step with its box.
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;

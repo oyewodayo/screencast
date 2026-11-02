@@ -4,12 +4,14 @@ version = 4
 
 [[package]]
 name = "Briefcast"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
+ "blur-track",
  "chrono",
+ "composition-effects",
  "futures-util",
  "hound",
  "image",
@@ -602,6 +604,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blur-track"
+version = "0.1.0"
+
+[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -828,6 +834,14 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "composition-effects"
+version = "0.1.0"
+dependencies = [
+ "windows 0.57.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]

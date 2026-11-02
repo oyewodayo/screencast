@@ -3,7 +3,7 @@
 // (top-right), and the Edit button with the page navigator beneath it (bottom-right). The markup tools themselves live in the vertical dock
 // (AnnotationToolbar) that the Edit button reveals.
 import React, { useEffect, useState } from "react";
-import { IoAdd, IoRemove, IoPencil, IoClose, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoScanOutline, IoChatbubblesOutline } from "react-icons/io5";
+import { IoAdd, IoRemove, IoPencil, IoClose, IoCheckmarkCircle, IoCloudUploadOutline, IoAlertCircleOutline, IoScanOutline, IoChatbubblesOutline, IoSearchOutline } from "react-icons/io5";
 import { IoIosArrowBack, IoIosArrowForward } from "react-icons/io";
 
 const PillButton: React.FC<{
@@ -131,12 +131,29 @@ export const ZoomControl: React.FC<{
   fitMode: boolean;
   onZoomChange: (zoom: number) => void;
   onFit: () => void;
-}> = ({ zoom, minZoom, maxZoom, fitMode, onZoomChange, onFit }) => (
+  magnifierActive?: boolean;
+  onToggleMagnifier?: () => void;
+}> = ({ zoom, minZoom, maxZoom, fitMode, onZoomChange, onFit, magnifierActive, onToggleMagnifier }) => (
   <div className="flex flex-col items-center gap-0.5 p-0.5 rounded-full bg-white/80 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_4px_16px_rgba(0,0,0,0.08)] ring-1 ring-black/[0.05] dark:ring-white/[0.08]">
     <PillButton compact title="Fit to screen" kbd="Ctrl+0" tipSide="left" active={fitMode} onClick={onFit}>
       <IoScanOutline size={13} />
     </PillButton>
     <div className="w-3.5 h-px bg-black/[0.08] dark:bg-white/[0.1]" />
+    {onToggleMagnifier && (
+      <>
+        <PillButton
+          compact
+          title={magnifierActive ? "Close magnifying lens" : "Magnifying lens"}
+          kbd="M"
+          tipSide="left"
+          active={magnifierActive}
+          onClick={onToggleMagnifier}
+        >
+          <IoSearchOutline size={13} />
+        </PillButton>
+        <div className="w-3.5 h-px bg-black/[0.08] dark:bg-white/[0.1]" />
+      </>
+    )}
     <PillButton compact title="Zoom in" kbd="Ctrl+=" tipSide="left" disabled={zoom >= maxZoom} onClick={() => onZoomChange(Math.min(maxZoom, Math.round((zoom + 0.25) * 100) / 100))}>
       <IoAdd size={14} />
     </PillButton>

@@ -5,11 +5,14 @@ import { fillWindow } from "../../utils/reframeTrack";
 import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { IoLayersOutline } from "react-icons/io5";
+import { beatStarts as stageBeatStarts, sceneDuration, setBeatHold, setSceneDuration } from "../../utils/stage/stageEditing";
+import type { StageScene } from "../../utils/stage/stageTypes";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { BsCursor } from "react-icons/bs";
-import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary } from "react-icons/md";
+import { MdBlurOn, MdClosedCaptionOff, MdFlip, MdGraphicEq, MdOutlineNoiseControlOff, MdPictureInPictureAlt, MdViewQuilt, MdFlashOn, MdTune, MdVideoLibrary, MdOutlineSettingsVoice } from "react-icons/md";
 import {
   IoArrowUndo,
   IoArrowRedo,
@@ -60,7 +63,9 @@ import ElementsGallery from "../video/ElementsGallery";
 import SplitScreenPanel from "../video/SplitScreenPanel";
 import HighlightIntroPanel from "../video/HighlightIntroPanel";
 import ShortsStudio from "../shorts/ShortsStudio";
-import { assetEntry, makeAsset } from "../../utils/videoAssets";
+import { OverlayAsset, assetEntry } from "../../utils/videoAssets";
+import { isStickerKind, loadStickerResources } from "../../utils/stickerAssets";
+import { placeStickerSet, stickerBox } from "../../utils/stickerSets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import MusicLibraryPanel from "./MusicLibraryPanel";
 import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
@@ -71,7 +76,8 @@ import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
 import AudioChipContextMenu, { AudioSaveFormat } from "./AudioChipContextMenu";
 import AutomationLine from "./AutomationLine";
 import { claimPlayback, readPreviewHead, registerPlayback } from "../../utils/previewHead";
-import { describeProgress, etaTracker, listenJobProgress } from "../../utils/jobProgress";
+import { registerTimelineTransport } from "../../utils/timelineTransport";
+import { describeProgress, etaTracker, listenJobProgress, useJobProgress } from "../../utils/jobProgress";
 import { startBleedRemoval } from "../../utils/bleed/bleedJob";
 import type { BleedStrength } from "../../utils/bleed/bleedJob";
 import { cleanedTrackPath, cleanupKey, isCleaned } from "../../utils/audioTrackCleanup";
@@ -124,6 +130,9 @@ const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.wi
 import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
+import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
+import DuckShade from "./DuckShade";
+import SoundProPopover from "./SoundProPopover";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
 import { subscribeVideoFrames, wantVideoFrames, type FrameWant } from "../../utils/videoFrameCache";
@@ -683,6 +692,9 @@ interface VideoTimelineDockerProps {
   getExactOutputTime?: () => number | null;
   // The player's source time right now, frame-accurate - null while it can't be trusted (mid-switch).
   getPlayerTime?: () => number | null;
+  // Pauses the player if it is playing - a no-op otherwise, so the end-of-sequence stop can never
+  // start playback instead (a toggle did, whenever the <video> was momentarily paused mid-switch).
+  onPausePlayer?: () => void;
   // Reports the ACTIVE clip's own color/Ken Burns effect fields upward, so VideoPlayer (mounted
   // as a sibling subtree by Dashboard) can drive live CSS filter/transform on the <video> element
   // without needing to know about clips at all - same "report state this component already tracks
@@ -722,6 +734,9 @@ interface VideoTimelineDockerProps {
   // Adjustment layers (AdjustmentLayersLayer.tsx draws them and their settings).
   selectedAdjustmentId?: string | null;
   onSelectAdjustment?: (id: string | null) => void;
+  // Stage scenes (motion graphics) - selected one edited in StageLayer's panel.
+  selectedSceneId?: string | null;
+  onSelectScene?: (id: string | null) => void;
   isPlacingBlur?: boolean;
   onToggleArmPlaceBlur?: () => void;
 
@@ -774,6 +789,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onOutputTimeChange,
   getExactOutputTime,
   getPlayerTime,
+  onPausePlayer,
   onActiveClipChange,
   onReframePreviewChange,
   noiseReductionStatus = "idle",
@@ -790,6 +806,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   onSelectBlurOverlay,
   selectedAdjustmentId = null,
   onSelectAdjustment,
+  selectedSceneId,
+  onSelectScene,
   isPlacingBlur = false,
   onToggleArmPlaceBlur,
   selectedPipOverlayId = null,
@@ -1367,6 +1385,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
   // The mixer (MixerPanel), and the strip it opens with its effects showing.
   const [mixerAnchor, setMixerAnchor] = useState<{ left: number; top: number } | null>(null);
+  // "Make it sound pro" (SoundProPopover).
+  const [soundProAnchor, setSoundProAnchor] = useState<{ left: number; top: number } | null>(null);
+  const soundProInput = useMemo(
+    () => ({
+      clips: editStore.clips,
+      audioOverlays: editStore.audioOverlays,
+      videoAudioMuted: editStore.videoAudioMuted,
+      videoAudioFx: editStore.videoAudioFx,
+      master: editStore.master,
+      loudnessLufs: exportLoudness,
+    }),
+    [editStore.clips, editStore.audioOverlays, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.master, exportLoudness]
+  );
+  // "Make it sound pro" waits on a cleaned voice track rendering - the first still going, and how far.
+  const soundProCleaningTrack = soundProAnchor ? editStore.audioOverlays.find((o) => !o.muted && cleanupStatus(o) === "calibrating") ?? null : null;
+  const soundProCleaningProgress = useJobProgress(soundProCleaningTrack ? { conversionOf: soundProCleaningTrack.src } : null, !!soundProCleaningTrack);
   const [mixerFocus, setMixerFocus] = useState<string | null>(null);
   const mixerButtonRef = useRef<HTMLButtonElement>(null);
   const mixerSession = useMixerSession();
@@ -1485,7 +1519,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     editStore.clips.length > 0 || isProject ? editStore.playbackClips : duration > 0 ? [{ id: "__pending__", sourcePath: file.path, start: 0, end: duration }] : [];
   // A project with audio and no pictures: the audio is the timeline. Its blank clips drive playback
   // and Save but never show on the video lane, which keeps offering to add pictures.
-  const isAudioOnly = isProject && editStore.clips.length === 0 && editStore.audioOverlays.length > 0;
+  // A project with no clips but sound or scenes plays (and saves) over its blank canvas.
+  const isAudioOnly = isProject && editStore.clips.length === 0 && (editStore.audioOverlays.length > 0 || editStore.scenes.length > 0);
 
   // Applies the in-progress resize (if any) so every position derived below - block widths, tick
   // marks, the playhead, other handles - stays visually consistent with the live drag instead of
@@ -1889,6 +1924,79 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     onSelectAdjustment?.(id);
     if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
   };
+  // ---- Stage scene lane: move a scene, stretch its last beat, drag a beat's boundary. -------------
+  // A scenes-only project's canvas grows with its scenes, so they move freely there; over clips a
+  // scene stays inside the video, as overlays do.
+  const scenesFree = editStore.clips.length === 0;
+  const [sceneDrag, setSceneDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
+  const [sceneEdgeDrag, setSceneEdgeDrag] = useState<null | { id: string; beat: number | "end"; startClientX: number; startValue: number; liveValue: number }>(null);
+  const renderScenes: StageScene[] = editStore.scenes.map((sc) => {
+    if (sceneDrag && sc.id === sceneDrag.id) return { ...sc, startTime: sceneDrag.liveStartTime };
+    if (sceneEdgeDrag && sc.id === sceneEdgeDrag.id)
+      return sceneEdgeDrag.beat === "end" ? setSceneDuration(sc, sceneEdgeDrag.liveValue) : setBeatHold(sc, sceneEdgeDrag.beat, sceneEdgeDrag.liveValue);
+    return sc;
+  });
+  const beginSceneDrag = (sc: StageScene) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setSceneDrag({ id: sc.id, startClientX: e.clientX, startTime: sc.startTime, duration: sceneDuration(sc), isDragging: false, liveStartTime: sc.startTime });
+  };
+  const handleSceneDragMove = (e: React.PointerEvent) => {
+    if (!sceneDrag) return;
+    e.stopPropagation();
+    const moved = Math.abs(e.clientX - sceneDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
+    // Its start or its end snaps - to the other scenes' edges too, so scenes butt end to end exactly.
+    const edges = editStore.scenes.filter((x) => x.id !== sceneDrag.id).flatMap((x) => [x.startTime, x.startTime + sceneDuration(x)]);
+    const targets = [...overlaySnapTargets, ...edges];
+    const free = sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec;
+    const startTo = snapToTargets(free, targets, pxPerSec);
+    const endTo = snapToTargets(free + sceneDrag.duration, targets, pxPerSec);
+    const startPull = startTo !== free ? Math.abs(startTo - free) : Infinity;
+    const endPull = endTo !== free + sceneDrag.duration ? Math.abs(endTo - (free + sceneDrag.duration)) : Infinity;
+    const raw = startPull === Infinity && endPull === Infinity ? free : startPull <= endPull ? startTo : endTo - sceneDrag.duration;
+    const liveStartTime = Math.max(0, scenesFree ? raw : Math.min(raw, totalOutputDuration - sceneDrag.duration));
+    setSceneDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
+  };
+  const endSceneDrag = () => {
+    if (!sceneDrag) return;
+    const { id, isDragging, liveStartTime, duration } = sceneDrag;
+    setSceneDrag(null);
+    if (isDragging) editStore.moveSceneTime(id, liveStartTime);
+    onSelectScene?.(id);
+    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime + Math.min(duration, 1.5) * 0.9);
+  };
+  // A beat boundary (`beat` = the beat whose end it is) or the scene's end, dragged: that beat holds
+  // longer or shorter; everything after it moves with it.
+  const beginSceneEdgeDrag = (sc: StageScene, beat: number | "end") => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    onSelectScene?.(sc.id);
+    const startValue = beat === "end" ? sceneDuration(sc) : sc.beats[beat].hold;
+    setSceneEdgeDrag({ id: sc.id, beat, startClientX: e.clientX, startValue, liveValue: startValue });
+  };
+  const handleSceneEdgeDragMove = (e: React.PointerEvent) => {
+    if (!sceneEdgeDrag) return;
+    e.stopPropagation();
+    const liveValue = Math.max(0.1, sceneEdgeDrag.startValue + (e.clientX - sceneEdgeDrag.startClientX) / pxPerSec);
+    setSceneEdgeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
+  };
+  const endSceneEdgeDrag = () => {
+    if (!sceneEdgeDrag) return;
+    const { id, beat, liveValue } = sceneEdgeDrag;
+    setSceneEdgeDrag(null);
+    editStore.updateScene(id, (sc) => (beat === "end" ? setSceneDuration(sc, liveValue) : setBeatHold(sc, beat, liveValue)));
+  };
+  const addScene = async () => {
+    // Laid out for the frame it will be seen in: the video's, or a fresh project's own.
+    let frame = videoPixelSize;
+    if (!frame && isProject) frame = await invoke<{ width: number; height: number }>("read_video_project", { projectPath: file.path }).catch(() => null);
+    const total = totalOutputDuration;
+    const startTime = editStore.clips.length > 0 ? Math.max(0, Math.min(currentOutputTime, total - 1)) : Math.max(0, currentOutputTime);
+    const id = editStore.addScene(startTime, frame ?? { width: 1920, height: 1080 });
+    onSelectScene?.(id);
+    seekToOutputTime(startTime + 1.4);
+  };
+
   const addAdjustmentLayer = () => {
     const total = totalOutputDuration;
     if (total <= 0) return;
@@ -2145,7 +2253,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     return y;
   };
   // The lanes run as far as the longest audio overhang, so all of it stays on screen to work with.
-  const laneEndTime = renderAudioOverlays.reduce((end, o) => Math.max(end, o.endTime), totalOutputDuration);
+  const laneEndTime = Math.max(
+    renderAudioOverlays.reduce((end, o) => Math.max(end, o.endTime), totalOutputDuration),
+    editStore.scenes.reduce((end, sc) => Math.max(end, sc.startTime + sceneDuration(sc)), 0)
+  );
   // Zoomed all the way out, the whole timeline fits on screen - however long it is (a day of audio
   // is a fraction of a pixel a second). Never tighter than MIN_PX_PER_SEC for a short one.
   const minPxPerSec = Math.min(MIN_PX_PER_SEC, (viewWidth * 0.95) / Math.max(1, laneEndTime));
@@ -2309,6 +2420,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     lastAppliedTimeRef.current = sourceTime;
     onSeek(renderClips[index].sourcePath, sourceTime);
   };
+  // The player's scrub bar reads and seeks the edit through here (timelineTransport.ts) - always
+  // against the latest clips, and the active clip as of this very frame.
+  const transportRef = useRef<{ seekToOutputTime: (t: number) => void; outputTimeNow: () => number | null }>({ seekToOutputTime: () => {}, outputTimeNow: () => null });
+  transportRef.current = {
+    seekToOutputTime: (t: number) => renderClips.length > 0 && seekToOutputTime(t),
+    outputTimeNow: () => {
+      const index = activeClipIndexRef.current;
+      const clip = renderClips[index];
+      const t = getPlayerTime?.();
+      if (!clip || t == null) return null;
+      return outputStarts[index] + sourceToOutputOffset(clip, Math.max(clip.start, Math.min(clip.end, t)));
+    },
+  };
+  useEffect(
+    () =>
+      registerTimelineTransport({
+        getTime: () => transportRef.current.outputTimeNow(),
+        seek: (t) => transportRef.current.seekToOutputTime(t),
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   const handleScrubPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return; // right-click opens menus, it doesn't move the playhead
@@ -2841,8 +2974,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         volume: overlay.muted ? 0 : overlay.volume,
         outputFormat: format,
         outputPath: chosen,
-        fadeIn: overlay.fadeInSec ?? null,
-        fadeOut: overlay.fadeOutSec ?? null,
+        // Its fades as heard - its own, and the edge fades its cuts get (audioJoins.ts).
+        fadeIn: pieceFades.get(overlay.id)?.fadeIn || null,
+        fadeOut: pieceFades.get(overlay.id)?.fadeOut || null,
         fx: fxForExport(overlay.fx),
       });
       const done = `Saved ${name}`;
@@ -3191,12 +3325,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // Playback running out of one clip carries on into the next - even if the <video> paused
       // itself on reaching the end of its file. A scrub past the end while paused stays paused.
       advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
-    } else if (isPlaying && !stopRequestedRef.current && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
+    } else if (isPlaying && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
       // Finished the last clip in playback order - stop there rather than playing on into the
       // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
-      // cut for a reason). Play again restarts from clip 0 (handleTransportPlayClick).
-      stopRequestedRef.current = true;
-      onTogglePlay();
+      // cut for a reason). Play again restarts from clip 0 (the isPlaying effect below).
+      stopAtEnd();
     }
   }, [currentTime, editStore.clips]);
   function advanceToClip(index: number, resume: boolean) {
@@ -3218,16 +3351,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
     if (t < clip.end - FRAME_BOUNDARY_SEC) return;
     if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
-    else if (!stopRequestedRef.current) {
-      // The end of the last clip - stop there (see the effect above). Once: isPlaying only turns
-      // false a render later, and a second toggle would start it again.
-      stopRequestedRef.current = true;
-      onTogglePlay();
-    }
+    else stopAtEnd(); // the end of the last clip - stop there (see the effect above)
   };
+  // A definite pause, safe to repeat every frame until it lands. Without onPausePlayer it falls back
+  // to a toggle - once, since isPlaying only turns false a render later and a second toggle would
+  // start it again.
+  function stopAtEnd() {
+    if (onPausePlayer) return onPausePlayer();
+    if (stopRequestedRef.current) return;
+    stopRequestedRef.current = true;
+    onTogglePlay();
+  }
   useEffect(() => {
     if (isPlaying) stopRequestedRef.current = false;
-    if (!isPlaying || !getPlayerTime) return;
+    if (!isPlaying) return;
+    // Play pressed while sitting at the end of the last clip - from the player's own button, k, or
+    // anywhere else that isn't handleTransportPlayClick - starts over from clip 0 instead of being
+    // stopped again on the very next frame.
+    const lastIndex = baseClips.length - 1;
+    const last = baseClips[lastIndex];
+    const t = getPlayerTime?.() ?? currentTime;
+    if (last && activeClipIndexRef.current >= lastIndex && t >= last.end - SEEK_TOLERANCE_SEC) advanceToClip(0, true);
+    if (!getPlayerTime) return;
     let raf = 0;
     const tick = () => {
       boundaryCheckRef.current();
@@ -3510,16 +3655,26 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const anyDucked = editStore.audioOverlays.some(isDucked);
   const anyAutomated = editStore.audioOverlays.some(hasAutomation);
   const speechRangesRef = useRef<TimeRange[]>([]);
+  // The same, to draw (DuckShade) - and each ducked channel's duck gain right now, as the sync below
+  // last set it (the mixer's ducking meter reads this).
+  const [speechRanges, setSpeechRanges] = useState<TimeRange[]>([]);
+  const duckNowRef = useRef(new Map<string, number>());
   useEffect(() => {
     if (!anyDucked) return;
     let cancelled = false;
     computeSpeechTimeline({ clips: editStore.clips, videoAudioMuted: editStore.videoAudioMuted, audioOverlays: editStore.audioOverlays }).then((r) => {
-      if (!cancelled) speechRangesRef.current = r;
+      if (cancelled) return;
+      speechRangesRef.current = r;
+      setSpeechRanges(r);
     });
     return () => {
       cancelled = true;
     };
   }, [anyDucked, editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays]);
+
+  // Every piece's fades as played: its own, plus a crossfade where pieces of one track overlap and a
+  // click-proof edge fade where one is cut mid-sound (audioJoins.ts) - the export's, exactly.
+  const pieceFades = useMemo(() => joinFades(editStore.audioOverlays), [editStore.audioOverlays]);
 
   // A library song missing from disk (app data cleared, project opened on another machine) is
   // fetched again - checked once per overlay per session, which is just a file-exists test.
@@ -3541,6 +3696,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   syncAudioOverlaysRef.current = () => {
     const now = (isPlaying ? getExactOutputTime?.() : null) ?? currentOutputTime;
     const activeIds = new Set(overlaysActiveAt(editStore.audioOverlays, now).map((o) => o.id));
+    const duckNow = new Map<string, number>();
+    duckNowRef.current = duckNow;
     editStore.audioOverlays.forEach((o) => {
       const audio = audioElementsRef.current.get(o.id);
       if (!audio) return;
@@ -3565,12 +3722,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       }
       if (!isPlaying && !audio.paused) audio.pause();
 
-      const fadeIn = o.fadeInSec ?? 0;
-      const fadeOut = o.fadeOutSec ?? 0;
-      let envelope = 1;
-      if (fadeIn > 0) envelope = Math.min(envelope, (now - o.startTime) / fadeIn);
-      if (fadeOut > 0) envelope = Math.min(envelope, (o.endTime - now) / fadeOut);
+      const envelope = fadeLevel(pieceFades.get(o.id) ?? NO_FADES, now - o.startTime, o.endTime - o.startTime);
       const duck = isDucked(o) ? duckGainAt(speechRangesRef.current, now, o.duckLevel ?? DEFAULT_DUCK_LEVEL) : 1;
+      if (isDucked(o)) duckNow.set(audioChannelKey(o), Math.min(duckNow.get(audioChannelKey(o)) ?? 1, duck));
       const session = getMixerSession();
       const soloOff = silencedBySolo(session, audioChannelKey(o));
       const automated = hasAutomation(o);
@@ -3608,8 +3762,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       endTime: o.endTime,
       trimStart: o.trimStart,
       volume: o.volume,
-      fadeInSec: o.fadeInSec,
-      fadeOutSec: o.fadeOutSec,
+      fades: pieceFades.get(o.id),
       gain: o.gain,
       fx: o.fx,
       silenced: !!o.muted || silencedBySolo(getMixerSession(), audioChannelKey(o)),
@@ -3664,6 +3817,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         fx: first.fx,
         meterIds: pieces.flatMap((p) => [`audio:${p.id}`, `audition:${p.id}`]),
         detail: pieces.length > 1 ? `${pieces.length} pieces` : undefined,
+        ducking: pieces.some(isDucked) ? { read: () => duckNowRef.current.get(key) ?? 1, levelDb: 20 * Math.log10(pieces.find(isDucked)?.duckLevel ?? DEFAULT_DUCK_LEVEL) } : undefined,
       });
     }
     for (const p of editStore.pipOverlays) {
@@ -4239,10 +4393,32 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdTune size={15} />
           </button>
+          <button
+            type="button"
+            data-sound-pro-button
+            title="Make it sound pro - clean voice, music under it, the right loudness, in one click"
+            onClick={(e) => {
+              if (soundProAnchor) return setSoundProAnchor(null);
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSoundProAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${soundProAnchor ? "bg-neutral-700 text-amber-300" : "text-neutral-300 hover:bg-neutral-700 hover:text-amber-200"}`}
+          >
+            <MdOutlineSettingsVoice size={16} />
+          </button>
           </div>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            title="Add a scene - motion graphics that animate from beat to beat: titles, lists, live numbers, diagrams"
+            onClick={() => void addScene()}
+            className={`flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium transition-colors ${selectedSceneId ? "text-white bg-teal-500/40" : "text-teal-200 bg-teal-500/15 hover:bg-teal-500/25"}`}
+          >
+            <IoLayersOutline size={13} />
+            Scene
+          </button>
           <button
             type="button"
             title="Make it a Short - your best moments as vertical clips with captions"
@@ -4536,7 +4712,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               otherwise the clips' own width plus space for the "+" after the last clip. */}
           <div
             ref={trackContentRef}
-            style={isProject && baseClips.length === 0 && !isAudioOnly ? { width: "100%", minWidth: 320 } : { width: Math.max(totalWidth, laneEndTime * pxPerSec) + ADD_BUTTON_ROOM_PX }}
+            // A blank-canvas project's track is never narrower than the panel: a short scene alone
+            // mustn't squeeze the drop prompt into a column.
+            style={isProject && baseClips.length === 0 && !isAudioOnly ? { width: "100%", minWidth: 320 } : { width: Math.max(totalWidth, laneEndTime * pxPerSec) + ADD_BUTTON_ROOM_PX, minWidth: isProject && editStore.clips.length === 0 ? viewWidth : undefined }}
             className="relative"
           >
             {/* Ruler - represents the *assembled* (playback-order) timeline, not raw source time */}
@@ -4617,7 +4795,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     isAudioOnly ? "justify-start" : "justify-center"
                   }`}
                 >
-                  <span className={`flex items-center gap-2 ${isAudioOnly ? "sticky left-3 pl-3" : ""}`}>
+                  <span className={`flex items-center gap-2 whitespace-nowrap ${isAudioOnly ? "sticky left-3 pl-3" : ""}`}>
                     {isAudioOnly ? "Plays over a blank screen - drop images or videos here, or" : "Drop images or videos here, or"}
                     <button
                       type="button"
@@ -4626,6 +4804,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       className="flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 text-white hover:bg-teal-500"
                     >
                       <IoAddCircleOutline size={12} /> Add media
+                    </button>
+                    or
+                    <button
+                      type="button"
+                      title="Start from scratch - a scene of titles, lists, numbers or diagrams that animate from beat to beat"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={() => void addScene()}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded bg-white/10 text-teal-100 hover:bg-white/20"
+                    >
+                      <IoLayersOutline size={12} /> Add scene
                     </button>
                   </span>
                 </div>
@@ -5018,6 +5206,88 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
+            {/* Stage scene lane - teal. Scenes that overlap stack in rows. Each block shows its beats
+                as a strip along its foot, as long as each holds; the boundary between two beats drags
+                (how long the first holds), as does the scene's end. */}
+            {(() => {
+              const ROW = 32;
+              const rowEnds: number[] = [];
+              const rowOf = new Map<string, number>();
+              for (const sc of [...renderScenes].sort((a, b) => a.startTime - b.startTime)) {
+                const end = sc.startTime + sceneDuration(sc);
+                let r = rowEnds.findIndex((e) => e <= sc.startTime + 1e-6);
+                if (r < 0) r = rowEnds.push(end) - 1;
+                else rowEnds[r] = end;
+                rowOf.set(sc.id, r);
+              }
+              return (
+                <div className={`relative border-t border-neutral-800 ${renderScenes.length === 0 ? "hidden" : ""}`} style={{ height: Math.max(1, rowEnds.length) * ROW }}>
+                  {renderScenes.map((sc) => {
+                    const left = sc.startTime * pxPerSec;
+                    const duration = sceneDuration(sc);
+                    const width = Math.max(1, duration * pxPerSec);
+                    const top = (rowOf.get(sc.id) ?? 0) * ROW + 3;
+                    const isSelected = selectedSceneId === sc.id;
+                    const starts = stageBeatStarts(sc);
+                    const local = currentOutputTime - sc.startTime;
+                    const title = sc.name ?? (sc.elements.find((el) => el.kind === "text")?.props.text ?? "Scene");
+                    return (
+                      <React.Fragment key={sc.id}>
+                        <div
+                          onPointerDown={beginSceneDrag(sc)}
+                          onPointerMove={handleSceneDragMove}
+                          onPointerUp={endSceneDrag}
+                          onPointerCancel={endSceneDrag}
+                          title={`${title} - ${sc.beats.length} beat${sc.beats.length === 1 ? "" : "s"}, ${duration.toFixed(1)}s. Drag to move it.`}
+                          className={`absolute rounded-md overflow-hidden border flex flex-col cursor-grab active:cursor-grabbing transition-colors ${
+                            isSelected ? "border-white bg-teal-700/80 shadow-[0_0_0_1px_rgba(255,255,255,0.35)]" : "border-teal-500/70 bg-teal-950/70 hover:bg-teal-900/70"
+                          }`}
+                          style={{ left, width, top, height: ROW - 6 }}
+                        >
+                          <span className="flex-1 min-h-0 flex items-center gap-1 px-1.5 text-[11px] text-white">
+                            <IoLayersOutline size={11} className="shrink-0 text-teal-200" />
+                            <span className="truncate">{title}</span>
+                          </span>
+                          {/* The beats, each as long as it holds; the one under the playhead lit. */}
+                          <span className="flex gap-px h-[4px] mx-px mb-px">
+                            {sc.beats.map((b, i) => {
+                              const on = local >= starts[i] && local < starts[i] + b.hold;
+                              return <span key={b.id} className={`rounded-[1px] ${on ? "bg-white" : isSelected ? "bg-teal-200/70" : "bg-teal-400/50"}`} style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }} />;
+                            })}
+                          </span>
+                        </div>
+                        {starts.slice(1).map((at, i) => (
+                          <div
+                            key={sc.beats[i + 1].id}
+                            onPointerDown={beginSceneEdgeDrag(sc, i)}
+                            onPointerMove={handleSceneEdgeDragMove}
+                            onPointerUp={endSceneEdgeDrag}
+                            onPointerCancel={endSceneEdgeDrag}
+                            title={`Beat ${i + 2} begins here - drag to change how long beat ${i + 1} holds`}
+                            className="group absolute w-2 -ml-1 cursor-ew-resize z-10 flex justify-center"
+                            style={{ left: left + at * pxPerSec, top, height: ROW - 6 }}
+                          >
+                            <span className="w-px h-full bg-white/0 group-hover:bg-white/60" />
+                          </div>
+                        ))}
+                        <div
+                          onPointerDown={beginSceneEdgeDrag(sc, "end")}
+                          onPointerMove={handleSceneEdgeDragMove}
+                          onPointerUp={endSceneEdgeDrag}
+                          onPointerCancel={endSceneEdgeDrag}
+                          title="Drag to change how long the last beat holds"
+                          className="group absolute w-2.5 -ml-2 cursor-ew-resize z-10 flex items-center justify-center"
+                          style={{ left: left + width, top, height: ROW - 6 }}
+                        >
+                          <span className={`w-[3px] h-3 rounded-full ${isSelected ? "bg-white" : "bg-teal-300/70"} group-hover:bg-white`} />
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
             {/* Adjustment-layer lane - violet; the chip names what the layer does. */}
             <div className={`h-8 relative border-t border-neutral-800 ${renderAdjustmentLayers.length === 0 ? "hidden" : ""}`}>
               {renderAdjustmentLayers.map((layer) => {
@@ -5216,6 +5486,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   >
                     {/* The cleaned file's waveform once it's in - the noise floor visibly drops. */}
                     <AudioChipWaveform overlay={{ ...overlay, src: playedSrc(overlay) }} widthPx={width} heightPx={height - 4} visible={[drawWindow.from - left, drawWindow.to - left]} />
+                    {/* Where it dips under the voice (music ducking). */}
+                    {isDucked(overlay) && speechRanges.length > 0 && (
+                      <DuckShade
+                        ranges={speechRanges}
+                        startTime={overlay.startTime}
+                        endTime={overlay.endTime}
+                        level={overlay.duckLevel ?? DEFAULT_DUCK_LEVEL}
+                        pxPerSec={pxPerSec}
+                        widthPx={width}
+                        heightPx={height - 4}
+                        visible={[drawWindow.from - left, drawWindow.to - left]}
+                      />
+                    )}
                     {/* Where playback bleed was found and taken out. */}
                     {overlay.bleed?.regions.map(([a, b], i) => (
                       <div
@@ -5459,6 +5742,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           );
         })()}
 
+      {soundProAnchor && editStore.editState && (
+        <SoundProPopover
+          anchor={soundProAnchor}
+          input={soundProInput}
+          apply={editStore.applySoundPro}
+          cleaning={{ pending: !!soundProCleaningTrack || noiseReductionStatus === "calibrating", progress: soundProCleaningProgress }}
+          undo={editStore.undo}
+          redo={editStore.redo}
+          undoTopLabel={editStore.undoTopLabel}
+          redoTopLabel={editStore.redoTopLabel}
+          onLoudnessChange={setExportLoudness}
+          isPlaying={isPlaying}
+          onTogglePlay={onTogglePlay}
+          onClose={() => setSoundProAnchor(null)}
+        />
+      )}
       {mixerAnchor && (
         <MixerPanel
           anchor={mixerAnchor}
@@ -5600,9 +5899,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         <ElementsGallery
           anchor={elementsAnchor}
           onClose={() => setElementsAnchor(null)}
-          onPick={(kind) => {
+          onPick={(asset: OverlayAsset) => {
+            const kind = asset.kind;
             const entry = assetEntry(kind);
             const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
+            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
+            const endTime = Math.min(total, startTime + length);
+            setElementsAnchor(null);
+            if (isStickerKind(kind)) {
+              // Sized to its words in its own face - wait for the face before measuring.
+              void loadStickerResources(asset).then(() => {
+                const box = stickerBox(asset, entry.frameHeight ?? 0.2, frameAspect);
+                const id = editStore.addImageOverlay("", Math.max(0.02, 0.5 - box.width / 2), Math.max(0.02, 0.5 - box.height / 2), box.width, box.height, startTime, endTime, asset);
+                onSelectImageOverlay?.(id);
+              });
+              return;
+            }
             // Wide elements (underlines, bars) by width; everything else about a third of the frame tall.
             let height = entry.aspect >= 3 ? 0.5 / entry.aspect * frameAspect : 0.32;
             let width = (height * entry.aspect) / frameAspect;
@@ -5614,13 +5928,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               width = 1;
               height = 1;
             }
-            const length = kind === "countdown" ? 3 : kind === "progress" ? 5 : kind === "reveal" ? 2.6 : entry.fullFrame ? 6 : 4;
-            const total = totalOutputDuration > 0 ? totalOutputDuration : length;
-            const startTime = Math.max(0, Math.min(currentOutputTime, total - Math.min(length, total)));
-            const endTime = Math.min(total, startTime + length);
-            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, makeAsset(kind));
+            const id = editStore.addImageOverlay("", 0.5 - width / 2, 0.5 - height / 2, width, height, startTime, endTime, asset);
             onSelectImageOverlay?.(id);
+          }}
+          onPickSet={(set) => {
+            const frameAspect = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9;
+            const total = totalOutputDuration > 0 ? totalOutputDuration : set.length;
+            const start = Math.max(0, Math.min(currentOutputTime, total - Math.min(set.length, total)));
             setElementsAnchor(null);
+            void Promise.all(set.pieces.map((p) => loadStickerResources(p.asset))).then(() => {
+              editStore.addImageOverlays(placeStickerSet(set, frameAspect, start, total));
+            });
           }}
         />
       )}
@@ -5716,6 +6034,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 setSelectedAudioOverlayId(editStore.duplicateAudioOverlay(overlay.id));
                 setAudioPopoverAnchor(null);
               }}
+              onRepeatToFill={(fadeOutSec) => editStore.repeatAudioOverlayToFill(overlay.id, totalOutputDuration, fadeOutSec)}
               videoEnd={totalOutputDuration}
               timelinePlaying={isPlaying}
               onPreviewStart={() => {

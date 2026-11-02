@@ -12,6 +12,7 @@ import Slider from "../docker/Slider";
 import NumberStepper from "../docker/NumberStepper";
 import { CaptionPosition, CaptionSettings } from "../../utils/videoEditTypes";
 import { CAPTION_PRESETS, CAPTION_PRESET_ORDER, CaptionLine, captionBoxStyle, captionWordStyle } from "../../utils/captions";
+import ColorInput from "../common/ColorInput";
 
 const EMPHASIS_SWATCHES = ["#d07cff", "#facc15", "#4ade80", "#38bdf8", "#f87171", "#ffffff", "#111827"];
 const POSITIONS: { value: CaptionPosition; label: string }[] = [
@@ -153,7 +154,7 @@ export const CaptionStyleControls: React.FC<{
             />
           ))}
           <label title="Custom colour" className="relative w-5 h-5 rounded-full ring-1 ring-white/20 overflow-hidden cursor-pointer bg-[conic-gradient(red,yellow,lime,cyan,blue,magenta,red)]">
-            <input type="color" value={settings.emphasisColor} onChange={(e) => onUpdate({ emphasisColor: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+            <ColorInput value={settings.emphasisColor} onChange={(e) => onUpdate({ emphasisColor: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
           </label>
         </div>
       )}

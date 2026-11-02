@@ -22,6 +22,9 @@ import {
   duplicateOverlay,
   duplicateTimedOverlay,
   insertClip,
+  layerBehind,
+  layerInFront,
+  overlayStack,
   moveOverlayTime,
   overlaysActiveAt,
   removeSilentRanges,
@@ -39,7 +42,7 @@ import {
   updateClip,
   updateOverlay,
 } from "./videoEditHandlers";
-import { AudioOverlay, Clip, PipOverlay, TextOverlay } from "../utils/videoEditTypes";
+import { AudioOverlay, Clip, ImageOverlay, PipOverlay, TextOverlay } from "../utils/videoEditTypes";
 
 function makeClip(overrides: Partial<Clip> = {}): Clip {
   return { id: "clip-1", sourcePath: "video.mp4", start: 0, end: 10, ...overrides };
@@ -458,6 +461,39 @@ describe("duplicateOverlay / bringOverlayToFront / sendOverlayToBack", () => {
     const overlays = [makeTextOverlay({ id: "a" }), makeTextOverlay({ id: "b" })];
     expect(bringOverlayToFront(overlays, "b")).toBe(overlays);
     expect(sendOverlayToBack(overlays, "a")).toBe(overlays);
+  });
+});
+
+describe("overlayStack / layerInFront / layerBehind", () => {
+  const image = (id: string, layer?: number) => ({ id, layer }) as ImageOverlay;
+  const text = (id: string, layer?: number) => makeTextOverlay({ id, layer });
+  const order = (images: ImageOverlay[], texts: TextOverlay[]) => overlayStack(images, texts).map((s) => s.o.id);
+
+  it("puts text over pictures when no layer is set", () => {
+    expect(order([image("p1"), image("p2")], [text("t1")])).toEqual(["p1", "p2", "t1"]);
+  });
+
+  it("stacks text and pictures together by layer", () => {
+    expect(order([image("p1", 2)], [text("t1"), text("t2", -1)])).toEqual(["t2", "t1", "p1"]);
+  });
+
+  it("brings a picture over the text and sends text under a picture", () => {
+    const images = [image("p1")];
+    const texts = [text("t1")];
+    expect(layerInFront(images, texts, "p1")).toBe(2);
+    expect(order([image("p1", 2)], texts)).toEqual(["t1", "p1"]);
+    expect(layerBehind(images, texts, "t1")).toBe(-1);
+    expect(order(images, [text("t1", -1)])).toEqual(["t1", "p1"]);
+  });
+
+  it("is null when already on top / at the bottom", () => {
+    expect(layerInFront([image("p1")], [text("t1")], "t1")).toBeNull();
+    expect(layerBehind([image("p1")], [text("t1")], "p1")).toBeNull();
+  });
+
+  it("gives a new overlay the layer over everything", () => {
+    expect(layerInFront([image("p1", 4)], [text("t1")], "")).toBe(5);
+    expect(layerInFront([], [], "")).toBeNull();
   });
 });
 

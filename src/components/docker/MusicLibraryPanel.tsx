@@ -11,7 +11,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoAdd, IoBookmark, IoBookmarkOutline, IoCheckmark, IoClose, IoCloudOfflineOutline, IoDownloadOutline, IoFolderOpenOutline, IoMusicalNotes, IoPause, IoPlay, IoRefreshOutline, IoSearchOutline } from "react-icons/io5";
+import { IoAdd, IoBookmark, IoBookmarkOutline, IoCheckmark, IoClose, IoCloudOfflineOutline, IoDownloadOutline, IoFolderOpenOutline, IoMusicalNotes, IoPause, IoPlay, IoRefreshOutline, IoSearchOutline, IoSparkles } from "react-icons/io5";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import {
   canDownloadLibraryTracks,
@@ -34,6 +34,7 @@ import {
 } from "../../utils/musicLibrary";
 import { DOCKED_PANEL_CLASS, useDockSnap, useFloatingDismiss, useToolPanelHost } from "./ToolPanelHost";
 import { BUILTIN_SFX_TRACKS, isBuiltinSfxId } from "../../utils/builtinSfx";
+import AiVoicePanel from "./AiVoicePanel";
 import VoiceRecorder from "./VoiceRecorder";
 
 export interface TrackBeats {
@@ -354,6 +355,14 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
   const [tab, setTab] = useState<"music" | "sfx">("music");
   // The Record tab is open (the library's own tab is kept for coming back to).
   const [recordOpen, setRecordOpen] = useState(false);
+  // The AI voice tab (AiVoicePanel), the same way.
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const tabStripRef = useRef<HTMLDivElement>(null);
+  // Keep the chosen tab in view when the strip is narrower than its tabs.
+  useEffect(() => {
+    const on = tabStripRef.current?.querySelector<HTMLElement>("[data-tab-on]");
+    on?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [tab, recordOpen, voiceOpen]);
   const [filter, setFilter] = useState<Filter>("foryou");
   const [query, setQuery] = useState("");
   const [saved, setSaved] = useState<string[]>(readSavedTracks);
@@ -749,7 +758,14 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
 
       <div className="flex items-center gap-2">
         <IoMusicalNotes size={14} className="text-teal-300 shrink-0" />
-        <div className="flex p-0.5 rounded-md bg-white/5 text-[11px]">
+        <div
+          ref={tabStripRef}
+          // Tabs scroll sideways rather than wrapping onto two lines; the wheel scrolls them too.
+          onWheel={(e) => {
+            if (e.deltaY !== 0 && e.currentTarget.scrollWidth > e.currentTarget.clientWidth) e.currentTarget.scrollLeft += e.deltaY;
+          }}
+          className="flex min-w-0 p-0.5 rounded-md bg-white/5 text-[11px] whitespace-nowrap overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&>button]:shrink-0"
+        >
           {(["music", "sfx"] as const).map((k) => (
             <button
               key={k}
@@ -757,9 +773,11 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
               onClick={() => {
                 setTab(k);
                 setRecordOpen(false);
+                setVoiceOpen(false);
                 setExpandedId(null);
               }}
-              className={`px-2 py-0.5 rounded ${tab === k && !recordOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
+              data-tab-on={tab === k && !recordOpen && !voiceOpen ? "" : undefined}
+              className={`px-2 py-0.5 rounded ${tab === k && !recordOpen && !voiceOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
             >
               {k === "music" ? "Music" : "Sound effects"}
             </button>
@@ -768,13 +786,29 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
             type="button"
             onClick={() => {
               setRecordOpen(true);
+              setVoiceOpen(false);
               audioRef.current?.pause();
             }}
             title="Record a voice-over (or anything) straight onto the timeline"
+            data-tab-on={recordOpen ? "" : undefined}
             className={`flex items-center gap-1 px-2 py-0.5 rounded ${recordOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
           >
             <span className={`h-1.5 w-1.5 rounded-full ${recordOpen ? "bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.9)]" : "bg-red-500/70"}`} />
             Record
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setVoiceOpen(true);
+              setRecordOpen(false);
+              audioRef.current?.pause();
+            }}
+            title="Turn a script into a natural-sounding voice-over - made on this PC"
+            data-tab-on={voiceOpen ? "" : undefined}
+            className={`flex items-center gap-1 px-2 py-0.5 rounded ${voiceOpen ? "bg-white/15 text-white" : "text-white/55 hover:text-white"}`}
+          >
+            <IoSparkles size={11} className={voiceOpen ? "text-teal-300" : "text-teal-300/70"} />
+            AI voice
           </button>
         </div>
         <span className="flex-1" />
@@ -783,7 +817,9 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
         </button>
       </div>
 
-      {recordOpen ? (
+      {voiceOpen ? (
+        <AiVoicePanel placeAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} />
+      ) : recordOpen ? (
         <VoiceRecorder recordAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} />
       ) : (
       <>

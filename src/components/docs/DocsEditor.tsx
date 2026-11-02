@@ -9,12 +9,14 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { Extension } from "@tiptap/core";
+import { NodeSelection } from "@tiptap/pm/state";
 import { useEditor, EditorContent } from "@tiptap/react";
 import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
 import Placeholder from "@tiptap/extension-placeholder";
-import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoClose, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
-import { MdArrowDropDown, MdDescription, MdFileDownload, MdInsertLink, MdIosShare, MdMailOutline, MdPrint } from "react-icons/md";
+import { IoArrowBack, IoChatbubbleOutline, IoHelpCircleOutline, IoCloudDoneOutline, IoOptionsOutline, IoSearch, IoTimeOutline, IoWarningOutline } from "react-icons/io5";
+import LinksControl from "../links/LinksControl";
+import { MdArrowDropDown, MdDescription, MdFileDownload, MdIosShare, MdMailOutline, MdPrint } from "react-icons/md";
 import { TbBooks, TbListTree, TbTypography } from "react-icons/tb";
 import DocHelpPanel from "./DocHelpPanel";
 import DocStyleDialog from "./DocStyleDialog";
@@ -24,6 +26,12 @@ import DocPageChromeOverlay from "./DocPageChromeOverlay";
 import useDocPageChrome from "../../hooks/useDocPageChrome";
 import DocWatermarkDialog from "./DocWatermarkDialog";
 import DocWatermarkOverlay from "./DocWatermarkOverlay";
+import DocLetterheadOverlay from "./DocLetterheadOverlay";
+import DocLetterheadDialog, { type LetterheadApplyOptions } from "./DocLetterheadDialog";
+import useDocLetterhead from "../../hooks/useDocLetterhead";
+import { firstPageTop, letterheadMargins, letterheadPngBytes, letterheadUrl, stationeryPrintCss, writeLetterhead, type DocLetterhead } from "../../utils/docLetterhead";
+import { saveLetterhead } from "../../utils/letterheadLibrary";
+import { TbFileCertificate } from "react-icons/tb";
 import useDocWatermark from "../../hooks/useDocWatermark";
 import { hasWatermark, printWatermarkCss, svgDataUrl, watermarkPngBytes, watermarkSvg, writeWatermark, type DocWatermark } from "../../utils/docWatermark";
 import { hasPageChrome, printChromeCss, todayLabel, writePageChrome, type ChromeBand, type DocPageChrome } from "../../utils/docPageChrome";
@@ -40,8 +48,8 @@ import { addFontFilesToDocument } from "../../utils/docFonts";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry, type DocMargins } from "../../utils/docTypes";
-import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
-import { createSlashCommandExtension } from "../../utils/docSlashCommand";
+import { createDocImagePasteExtension, saveImageBytes, uploadImageFromPath } from "../../utils/docImagePaste";
+import { createSlashCommandExtension, OPEN_SIGNATURE_EVENT } from "../../utils/docSlashCommand";
 import DocFindReplace from "../../utils/docFindReplace";
 import DocDictation from "../../utils/docDictationExtension";
 import DocPaint from "../../utils/docPaintExtension";
@@ -55,6 +63,8 @@ import DocOutlinePanel from "./DocOutlinePanel";
 import DocCitePicker, { type CitePickerMode } from "./DocCitePicker";
 import DocCrossRefPicker, { type CrossRefPickerMode } from "./DocCrossRefPicker";
 import DocFindReplaceBar from "./DocFindReplaceBar";
+import DocSignatureStudio, { type SignatureResult } from "./DocSignatureStudio";
+import DocSignaturePlacer, { type PendingSignature } from "./DocSignaturePlacer";
 import DocCommentsSidebar from "./DocCommentsSidebar";
 import DocPageSetupPopover from "./DocPageSetupPopover";
 import DocToolbar, { Dropdown, menuItemClass } from "./DocToolbar";
@@ -295,6 +305,8 @@ async function buildStandaloneHtml(
     dark ? "a{color:#93c5fd!important}th{background:rgba(255,255,255,.08)!important}blockquote{color:#d4d4d4!important}pre{background:rgba(255,255,255,.08)!important}" : "",
     "@media print{body{margin:0 auto;padding:0;max-width:none}}",
     "h1,h2,h3,h4{line-height:1.25;margin:1.4em 0 .5em}",
+    // Free pictures (docImageLayout.ts) are placed from the paragraph they're anchored to.
+    'body{isolation:isolate}:has(>img[data-layout="front"]),:has(>img[data-layout="behind"]){position:relative}',
     "p{margin:0 0 .9em}img{max-width:100%;height:auto}",
     "table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #d0d0d0;padding:6px 10px;vertical-align:top;text-align:left}th{background:#f3f3f3}",
     "blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid #d0d0d0;color:#555}",
@@ -392,12 +404,11 @@ const headerIconClass = (active = false) =>
       : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.06] dark:hover:bg-white/10"
   }`;
 
-const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, onOpenLinkedFile }) => {
+const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
   const store = useDocsEditStore(docId);
   const [linkOpen, setLinkOpen] = useState(false);
-  const [headerMenu, setHeaderMenu] = useState<"export" | "pageSetup" | "linkFile" | null>(null);
+  const [headerMenu, setHeaderMenu] = useState<"export" | "pageSetup" | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [fileFilter, setFileFilter] = useState("");
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [showFindReplace, setShowFindReplace] = useState(false);
   const [showComments, setShowComments] = useState(false);
@@ -415,6 +426,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // The header/footer panel, and which band to focus in it (a double-clicked margin).
   const [chromeEditor, setChromeEditor] = useState<{ focus: ChromeBand | null } | null>(null);
   const watermark = useDocWatermark(store.ydoc);
+  const letterhead = useDocLetterhead(store.ydoc);
+  const [showLetterhead, setShowLetterhead] = useState(false);
   const [showWatermark, setShowWatermark] = useState(false);
   const toggleOutline = useCallback(() => {
     setShowOutline((v) => {
@@ -443,7 +456,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     setShowHelp((v) => !v);
   }, []);
 
-  const menuProps = (id: "export" | "pageSetup" | "linkFile") => ({
+  const menuProps = (id: "export" | "pageSetup") => ({
     open: headerMenu === id,
     onOpenChange: (next: boolean) => setHeaderMenu((cur) => (next ? id : cur === id ? null : cur)),
   });
@@ -552,6 +565,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     const svg = watermarkSvg(watermark, pageWidthPx(page), pageHeightPx(page));
     return svg ? svgDataUrl(svg) : "";
   }, [watermark, page]);
+  // The letterhead's two sheets as image URLs (screen overlay and @page backgrounds), and page 1's
+  // own top margin when the letterhead needs more room there than on later pages.
+  const letterheadUrls = useMemo(() => ({ first: letterheadUrl(letterhead?.first ?? null), rest: letterheadUrl(letterhead?.rest ?? null) }), [letterhead]);
+  const firstTop = firstPageTop(letterhead, margins);
+  const paginationMargins = useMemo(() => ({ ...margins, firstTop }), [margins, firstTop]);
+  // The sheet in inches and its margins - where print places sheet-sized @page backgrounds.
+  const printSheet = { widthIn: pageDimensionsIn(page).width, heightIn: pageDimensionsIn(page).height, top: margins.top, left: margins.left };
   const [rulerUnit, setRulerUnit] = useRulerUnit();
   const [rulerVisible, setRulerVisible] = useState(readRulerVisible);
   const toggleRuler = useCallback(() => {
@@ -589,8 +609,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   // wouldn't notice on its own).
   useEffect(() => {
     if (!editor) return;
-    editor.commands.setPaginationLayout(page, margins, layout.columns);
-  }, [editor, page, margins, layout.columns]);
+    editor.commands.setPaginationLayout(page, paginationMargins, layout.columns);
+  }, [editor, page, paginationMargins, layout.columns]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -675,6 +695,32 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     [editor, store]
   );
 
+  // Signing: the studio makes the signature, it's saved into this doc's assets, then the placer
+  // lets it be dropped anywhere on the page.
+  const [signing, setSigning] = useState<"studio" | PendingSignature | null>(null);
+  const handleSignaturePlace = useCallback(
+    async (sig: SignatureResult) => {
+      try {
+        const bytes = Array.from(new Uint8Array(await sig.blob.arrayBuffer()));
+        const src = await saveImageBytes(docId, bytes, "png");
+        setSigning({ src, width: sig.width, height: sig.height, signer: sig.signer });
+      } catch (err) {
+        console.error("Failed to save signature:", err);
+        setSigning(null);
+      }
+    },
+    [docId]
+  );
+
+  // "/signature" in the slash menu.
+  useEffect(() => {
+    if (!editor) return;
+    const dom = editor.view.dom;
+    const open = () => setSigning("studio");
+    dom.addEventListener(OPEN_SIGNATURE_EVENT, open);
+    return () => dom.removeEventListener(OPEN_SIGNATURE_EVENT, open);
+  }, [editor]);
+
   // Toolbar-driven counterpart to docImagePaste.ts's paste/drop handling.
   const handleInsertImage = useCallback(async () => {
     if (!editor) return;
@@ -712,6 +758,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           orientation: store.orientation,
           pageColor: store.pageColor,
           pageChrome,
+          letterhead: letterhead
+            ? {
+                first: await letterheadPngBytes(letterhead.first, letterhead.widthPx, letterhead.heightPx),
+                rest: letterhead.rest ? (letterhead.rest === letterhead.first ? "same" : await letterheadPngBytes(letterhead.rest, letterhead.widthPx, letterhead.heightPx)) : null,
+                widthPx: pageWidthPx(page),
+                heightPx: pageHeightPx(page),
+                firstTopIn: firstTop,
+              }
+            : null,
           watermark: hasWatermark(watermark)
             ? { png: await watermarkPngBytes(watermark, pageWidthPx(page), pageHeightPx(page)), widthPx: pageWidthPx(page), heightPx: pageHeightPx(page), skipFirstPage: watermark.skipFirstPage }
             : null,
@@ -801,6 +856,33 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
     },
     [store]
   );
+  // Putting the document on a letterhead: its sheets into the Y.Doc, the page set to its size and
+  // text-safe margins (the old margins kept, to come back when it's removed).
+  const applyLetterhead = useCallback(
+    async (lh: DocLetterhead, opts: LetterheadApplyOptions) => {
+      if (!store.ydoc) return;
+      const previous = letterhead?.previousMargins ?? margins;
+      writeLetterhead(store.ydoc, { ...lh, previousMargins: previous });
+      const portrait = lh.widthPx <= lh.heightPx;
+      const [a, b] = portrait ? [lh.widthPx, lh.heightPx] : [lh.heightPx, lh.widthPx];
+      const size = Math.abs(a - 793.7) < 8 && Math.abs(b - 1122.5) < 10 ? "a4" : Math.abs(a - 816) < 8 && Math.abs(b - 1344) < 10 ? "legal" : Math.abs(a - 816) < 8 && Math.abs(b - 1056) < 10 ? "letter" : null;
+      await store.setPageSetup({
+        margins: letterheadMargins(lh, margins),
+        ...(size ? { pageSize: size, orientation: portrait ? "portrait" : "landscape" } : {}),
+      });
+      if (opts.saveToLibrary) await saveLetterhead({ ...lh, previousMargins: null }, opts.thumb, opts.makeDefault);
+      setShowLetterhead(false);
+    },
+    [store, letterhead, margins]
+  );
+  const removeLetterhead = useCallback(async () => {
+    if (!store.ydoc) return;
+    const previous = letterhead?.previousMargins;
+    writeLetterhead(store.ydoc, null);
+    if (previous) await store.setPageSetup({ margins: previous });
+    setShowLetterhead(false);
+  }, [store, letterhead]);
+
   const updateWatermark = useCallback((next: DocWatermark) => store.ydoc && writeWatermark(store.ydoc, next), [store.ydoc]);
   // More menu: "Page numbers…" switches them on (bottom centre by default) and opens the panel on
   // them; "Header & footer…" just opens it.
@@ -843,12 +925,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
   }, [editor, editor?.state.doc]);
 
   const openComments = store.comments.filter((c) => !c.resolved_at).length;
-  const linkedFile = useMemo(() => libraryFiles.find((f) => f.path === store.linkedTo), [libraryFiles, store.linkedTo]);
-  const filteredLibraryFiles = useMemo(() => {
-    const q = fileFilter.trim().toLowerCase();
-    if (!q) return libraryFiles;
-    return libraryFiles.filter((f) => f.name.toLowerCase().includes(q));
-  }, [libraryFiles, fileFilter]);
 
   const statusNotice: Notice | null = dictation.message ? { text: dictation.message } : notice;
   const showRuler = rulerVisible && !store.loading && !store.loadError;
@@ -926,9 +1002,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           the last page to full height. */}
       <style>{`
         @page { size: ${cssPageSize(page)}; margin: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in;${pageColor ? ` background: ${pageColor};` : ""} }
-        ${printWatermarkCss(watermark, watermarkUrl)}
+        ${letterhead ? stationeryPrintCss(watermark, watermarkUrl, letterhead, letterheadUrls, firstTop, printSheet) : printWatermarkCss(watermark, watermarkUrl, printSheet)}
         ${printChromeCss(pageChrome, { title: store.title, date: todayLabel(), fontFamily: textFont, color: pageDark ? "#d4d4d4" : "#5f6368", pagesHint: pageCount })}
-        .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
+        .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${firstTop ?? margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0; min-height: 0; }
         }
@@ -976,29 +1052,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
               <span className="shrink-0" data-tip={`${charCount.toLocaleString()} characters`}>
                 · {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
                 {pageCount > 1 && ` · ${pageCount} pages`}
-              </span>
-            )}
-            {linkedFile && (
-              <span className="inline-flex items-center gap-1 min-w-0">
-                ·
-                <button
-                  type="button"
-                  data-tip="Open linked recording"
-                  onClick={() => onOpenLinkedFile?.(linkedFile.path, linkedFile.name)}
-                  className="inline-flex items-center gap-1 min-w-0 hover:text-blue-600 dark:hover:text-blue-400"
-                >
-                  <MdInsertLink size={14} className="shrink-0" />
-                  <span className="truncate max-w-[14rem]">{linkedFile.name}</span>
-                </button>
-                <button
-                  type="button"
-                  data-tip="Unlink recording"
-                  aria-label="Unlink recording"
-                  onClick={() => void store.unlinkDoc()}
-                  className="p-0.5 rounded hover:bg-black/[0.06] dark:hover:bg-white/10 hover:text-red-500"
-                >
-                  <IoClose size={12} />
-                </button>
               </span>
             )}
             {statusNotice && (
@@ -1067,45 +1120,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
             </span>
           )}
         </button>
-        {!store.linkedTo && (
-          <Dropdown
-            {...menuProps("linkFile")}
-            label="Link to a recording"
-            align="right"
-            keepSelection={false}
-            trigger={<MdInsertLink size={20} />}
-            triggerClassName={headerIconClass(headerMenu === "linkFile")}
-            panelClassName="w-64 p-1.5"
-          >
-            <input
-              autoFocus
-              value={fileFilter}
-              onChange={(e) => setFileFilter(e.target.value)}
-              placeholder="Filter recordings…"
-              className="w-full mb-1 px-2 py-1.5 text-sm rounded-md border border-neutral-300 dark:border-neutral-600 bg-transparent outline-none focus:border-blue-500 text-neutral-800 dark:text-neutral-100"
-            />
-            <div className="max-h-60 overflow-y-auto">
-              {filteredLibraryFiles.length === 0 ? (
-                <p className="px-2 py-1.5 text-xs text-neutral-400 dark:text-neutral-500">No matching files</p>
-              ) : (
-                filteredLibraryFiles.map((f) => (
-                  <button
-                    key={f.path}
-                    type="button"
-                    onClick={() => {
-                      void store.linkDoc(f.path);
-                      setHeaderMenu(null);
-                      setFileFilter("");
-                    }}
-                    className={`${menuItemClass} rounded-md truncate`}
-                  >
-                    <span className="truncate">{f.name}</span>
-                  </button>
-                ))
-              )}
-            </div>
-          </Dropdown>
-        )}
+        <LinksControl self={{ kind: "doc", id: docId }} title={store.title || "Untitled note"} variant="header" />
+        <button
+          type="button"
+          onClick={() => setShowLetterhead(true)}
+          data-tip={letterhead ? `Letterhead: ${letterhead.name}` : "Letterhead - write on your company stationery"}
+          aria-label="Letterhead"
+          className={headerIconClass(!!letterhead)}
+        >
+          <TbFileCertificate size={19} strokeWidth={1.75} />
+        </button>
         <Dropdown
           {...menuProps("pageSetup")}
           label="Page setup"
@@ -1195,11 +1219,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
           linkOpen={linkOpen}
           onLinkOpenChange={setLinkOpen}
           onInsertImage={() => void handleInsertImage()}
+          onSign={() => {
+            // A selected picture's toolbar would sit over the page while placing.
+            if (editor.state.selection instanceof NodeSelection) editor.commands.setTextSelection(editor.state.selection.to);
+            setSigning("studio");
+          }}
           onAddComment={(text) => void submitComment(text)}
           rulerVisible={rulerVisible}
           onToggleRuler={toggleRuler}
           onOpenHeaderFooter={openHeaderFooter}
           onOpenWatermark={() => setShowWatermark(true)}
+          onOpenLetterhead={() => setShowLetterhead(true)}
           onOpenPicker={openPicker}
           docFonts={docFonts}
           onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
@@ -1280,6 +1310,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
                       {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
                           flips the editor's text, heading and link colours. */}
                       <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                      {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
                       <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
                       <DocPageChromeOverlay
                         chrome={pageChrome}
@@ -1367,6 +1398,18 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack, libraryFiles, on
         />
       )}
 
+      {signing === "studio" && <DocSignatureStudio onPlace={(sig) => void handleSignaturePlace(sig)} onClose={() => setSigning(null)} />}
+      {editor && signing && signing !== "studio" && <DocSignaturePlacer editor={editor} signature={signing} onDone={() => setSigning(null)} />}
+
+      {showLetterhead && store.ydoc && (
+        <DocLetterheadDialog
+          current={letterhead}
+          sheet={{ widthPx: pageWidthPx(page), heightPx: pageHeightPx(page) }}
+          onApply={(lh, opts) => void applyLetterhead(lh, opts)}
+          onRemove={() => void removeLetterhead()}
+          onClose={() => setShowLetterhead(false)}
+        />
+      )}
       {showWatermark && store.ydoc && <DocWatermarkDialog watermark={watermark} onChange={updateWatermark} onClose={() => setShowWatermark(false)} />}
 
       {chromeEditor && store.ydoc && (

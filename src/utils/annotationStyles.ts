@@ -10,6 +10,25 @@ import { getStroke } from "perfect-freehand";
 export type AnnotationStyle = "pen" | "marker" | "neon" | "laser";
 export type AnnotationFade = "quick" | "normal" | "slow" | "never";
 
+// What follows the cursor while drawing. "hand" is the signature one - a glove on a stick, tinted
+// to the current ink colour; "custom" is the user's own PNG (appSettings.annotationPointerImage).
+export type AnnotationPointer = "hand" | "dot" | "system" | "custom";
+export type AnnotationTapSound = "off" | "tick" | "pop" | "wood";
+
+export const ANNOTATION_POINTERS: { id: AnnotationPointer; label: string }[] = [
+  { id: "hand", label: "Hand" },
+  { id: "dot", label: "Dot" },
+  { id: "system", label: "Crosshair" },
+  { id: "custom", label: "Custom" },
+];
+
+export const ANNOTATION_TAP_SOUNDS: { id: AnnotationTapSound; label: string }[] = [
+  { id: "off", label: "Off" },
+  { id: "tick", label: "Tick" },
+  { id: "pop", label: "Pop" },
+  { id: "wood", label: "Wood" },
+];
+
 export const ANNOTATION_COLORS = ["#ef4444", "#f97316", "#facc15", "#22c55e", "#3b82f6", "#a855f7", "#ffffff", "#111111"];
 
 export const ANNOTATION_STYLES: { id: AnnotationStyle; label: string; hint: string }[] = [

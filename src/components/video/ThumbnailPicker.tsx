@@ -46,6 +46,7 @@ import {
   shownTextOf,
   textBoxStyle,
 } from "../../utils/thumbnailLayers";
+import ColorInput from "../common/ColorInput";
 
 export interface ScrubSpriteMeta {
   url: string;
@@ -143,8 +144,7 @@ const SwatchRow: React.FC<{ value: string | null; onChange: (c: string | null) =
       />
     ))}
     <label title="Custom colour" className="relative w-5 h-5 rounded-full ring-1 ring-white/20 overflow-hidden cursor-pointer bg-[conic-gradient(red,yellow,lime,cyan,blue,magenta,red)]">
-      <input
-        type="color"
+      <ColorInput
         value={value && value.startsWith("#") ? value : "#ffffff"}
         onChange={(e) => onChange(e.target.value)}
         className="absolute inset-0 opacity-0 cursor-pointer"

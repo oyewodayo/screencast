@@ -15,11 +15,13 @@ interface RevealTextProps {
   overlay: TextOverlay;
   kind: TextReveal;
   paddingPx: number;
+  // Left/right padding when it differs from paddingPx (TextOverlay.paddingX).
+  paddingXPx?: number;
   // Seconds into the overlay's life right now.
   getTime: () => number;
 }
 
-const RevealText: React.FC<RevealTextProps> = ({ overlay, kind, paddingPx, getTime }) => {
+const RevealText: React.FC<RevealTextProps> = ({ overlay, kind, paddingPx, paddingXPx, getTime }) => {
   const duration = overlay.endTime - overlay.startTime;
   const settings = overlay.reveal;
   const [t, setT] = useState(() => getTime());
@@ -74,8 +76,8 @@ const RevealText: React.FC<RevealTextProps> = ({ overlay, kind, paddingPx, getTi
         <span
           className="absolute pointer-events-none"
           style={{
-            left: paddingPx,
-            right: paddingPx,
+            left: paddingXPx ?? paddingPx,
+            right: paddingXPx ?? paddingPx,
             top: "calc(100% + 0.08em)",
             height: "0.09em",
             background: settings.underline,

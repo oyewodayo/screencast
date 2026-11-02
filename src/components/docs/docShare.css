@@ -1,0 +1,24 @@
+/* components/docs/docShare.css
+ *
+ * The Share dialog's "Send to a device" tiles (DocShareDialog.tsx): while a file is on its way the
+ * device's circle sends out the house cast-arc ripple.
+ */
+.doc-share-pulse {
+  border: 2px solid rgba(26, 115, 232, 0.55);
+  animation: doc-share-arc 1.2s ease-out infinite;
+}
+@keyframes doc-share-arc {
+  from {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .doc-share-pulse {
+    animation: none;
+  }
+}

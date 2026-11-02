@@ -19,6 +19,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { AudioFx } from "./audioFx";
 import { dbToGain, gainDbAt, hasAutomation, type GainPoint } from "./audioAutomation";
+import { fadeLevel, NO_FADES, type PieceFades } from "./audioJoins";
 import { resumeMixer, setElementGain, syncElementFx } from "./mixerGraph";
 import { claimPlayback, registerPlayback, setPreviewHead } from "./previewHead";
 
@@ -30,8 +31,8 @@ export interface AuditionPiece {
   endTime: number;
   trimStart: number;
   volume: number;
-  fadeInSec?: number;
-  fadeOutSec?: number;
+  // Its fades as played - its own and its joins' (audioJoins.ts).
+  fades?: PieceFades;
   gain?: GainPoint[];
   fx?: AudioFx;
   // Muted, or silenced by another strip's solo.
@@ -246,11 +247,7 @@ export class Audition {
       }
       // Its level: volume, fades in and out, mute/solo - and its volume line, smoothly once it's
       // routed (folded into the volume, up to unity, until then).
-      const fadeIn = piece.fadeInSec ?? 0;
-      const fadeOut = piece.fadeOutSec ?? 0;
-      let envelope = 1;
-      if (fadeIn > 0) envelope = Math.min(envelope, local / fadeIn);
-      if (fadeOut > 0) envelope = Math.min(envelope, (length - local) / fadeOut);
+      const envelope = fadeLevel(piece.fades ?? NO_FADES, local, length);
       const base = piece.silenced ? 0 : piece.volume * Math.max(0, Math.min(1, envelope));
       const gainAt = hasAutomation(piece) ? (t: number) => dbToGain(gainDbAt(piece.gain, t)) : null;
       if (setElementGain(el, gainAt) || !gainAt) el.volume = Math.max(0, Math.min(1, base));

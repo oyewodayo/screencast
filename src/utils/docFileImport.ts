@@ -26,7 +26,7 @@ export function isOpenableDocument(fileName: string): boolean {
   return OPENABLE_DOC_EXTENSIONS.includes(fileName.split(".").pop()?.toLowerCase() ?? "");
 }
 
-const OPENED_KEY = "briefcast.openedDocumentFiles.v1";
+const OPENED_KEY = "briefcast.openedDocumentFiles.v2";
 
 interface OpenedRecord {
   docId: string;

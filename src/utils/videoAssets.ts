@@ -12,6 +12,8 @@
 // dividing LOOP_PERIOD_SEC, which is what lets export send one loop's worth of frames for an
 // element of any length (see assetFrameKey).
 
+import { STICKER_COLORS, StickerFill, StickerIcon, drawSticker, isStickerKind, loadStickerResources } from "./stickerAssets";
+
 export type AssetKind =
   // shapes
   | "rectangle"
@@ -68,7 +70,27 @@ export type AssetKind =
   | "polaroid"
   | "lightleak"
   | "grain"
-  | "twinkle";
+  | "twinkle"
+  // stickers (stickerAssets.ts)
+  | "chip"
+  | "name-tag"
+  | "stat"
+  | "card"
+  | "place"
+  | "disc"
+  | "title"
+  | "milestone"
+  | "icon"
+  | "emoji"
+  | "quote"
+  | "profile"
+  | "rating"
+  | "meter"
+  | "checklist"
+  | "price"
+  | "message"
+  | "versus"
+  | "date";
 
 export type AssetEntrance = "none" | "pop" | "draw" | "zoom" | "spin" | "drop" | "wipe" | "glitch" | "flip";
 export type AssetLoop = "none" | "pulse" | "float" | "spin" | "wiggle" | "glow" | "shimmer" | "hue";
@@ -96,13 +118,26 @@ export interface OverlayAsset {
   countFrom?: number;
   countTo?: number;
   countPace?: CountPace;
+  // Stickers (stickerAssets.ts): the style switches - Solid / Outline / No background, a border,
+  // the 3D edge (on unless false) - an icon or a picture (a file path) where the icon goes, a
+  // third line of words (corner tag / kicker / pill) and a third colour for inner pieces. `color2`
+  // is a sticker's edge and its words on light surfaces.
+  fill?: StickerFill;
+  border?: boolean;
+  lip?: boolean;
+  icon?: StickerIcon;
+  image?: string;
+  tag?: string;
+  accent?: string;
+  // A chat bubble's side: the other person's on the left (the default), yours on the right.
+  side?: "left" | "right";
 }
 
 // How an element changes over its life once it has entered - decides how many distinct frames
 // export has to render (assetFrameKey).
 type AssetMotion = "static" | "periodic" | "timed";
 
-export type AssetCategory = "Shapes" | "Callouts" | "Animated" | "Overlays";
+export type AssetCategory = "Stickers" | "Shapes" | "Callouts" | "Animated" | "Overlays";
 
 export interface AssetCatalogEntry {
   kind: AssetKind;
@@ -122,6 +157,8 @@ export interface AssetCatalogEntry {
   // A cheaper identity for a settled frame than "every frame in the loop" - frames with the same
   // key look the same (a blinking dot is on or off, a clock shows a whole second).
   idleKey?: (asset: OverlayAsset, t: number, duration: number) => string;
+  // How tall it's added, as a fraction of the frame's height (default: a third of it).
+  frameHeight?: number;
 }
 
 const fx = (entrance: AssetEntrance, loop: AssetLoop = "none", exit = true) => ({ entrance, loop, exit });
@@ -129,7 +166,164 @@ const fx = (entrance: AssetEntrance, loop: AssetLoop = "none", exit = true) => (
 // REC-style blinking: on for the first half of every 1.2s.
 const blinkOn = (t: number) => t % 1.2 < 0.7;
 
+const sticker = { lip: true, fill: "solid" as const, color2: STICKER_COLORS.navy, ...fx("pop") };
+
 export const ASSET_CATALOG: AssetCatalogEntry[] = [
+  { kind: "chip", label: "Label", category: "Stickers", aspect: 3, motion: "static", frameHeight: 0.07, text: ["Label"], defaults: { ...sticker, color: STICKER_COLORS.amber, icon: "users", text: "Trained" } },
+  {
+    kind: "name-tag",
+    label: "Name tag",
+    category: "Stickers",
+    aspect: 3.2,
+    motion: "static",
+    frameHeight: 0.2,
+    text: ["Name", "Title"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.blue, text: "Daniel Adeyemi", subtext: "CEO, Brightpath Academy", tag: "NEW" },
+  },
+  {
+    kind: "stat",
+    label: "Stat counter",
+    category: "Stickers",
+    aspect: 2,
+    motion: "static",
+    // Counting up: every frame differs until the figure lands.
+    settleSec: 2.4,
+    frameHeight: 0.24,
+    text: ["Line", "After the number"],
+    defaults: { ...sticker, color: STICKER_COLORS.blue, text: "people in our network", subtext: "+", countFrom: 0, countTo: 200000 },
+  },
+  { kind: "card", label: "Info card", category: "Stickers", aspect: 2.6, motion: "static", frameHeight: 0.15, text: ["Headline", "Line under"], defaults: { ...sticker, color: STICKER_COLORS.blue, icon: "doc", tag: "Use your", text: "transcript", subtext: "" } },
+  {
+    kind: "place",
+    label: "Place card",
+    category: "Stickers",
+    aspect: 2.1,
+    motion: "static",
+    frameHeight: 0.17,
+    text: ["Name", "Location"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.blue, text: "Oxford Open University of London", subtext: "England" },
+  },
+  { kind: "disc", label: "Icon disc", category: "Stickers", aspect: 1, motion: "static", frameHeight: 0.14, defaults: { ...sticker, color: STICKER_COLORS.amber, accent: STICKER_COLORS.plum, icon: "cap", tag: "NEW" } },
+  {
+    kind: "title",
+    label: "Title",
+    category: "Stickers",
+    aspect: 3,
+    motion: "static",
+    frameHeight: 0.3,
+    text: ["Headline", "Byline"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.amber, icon: "cap", tag: "Introducing", text: "Degrees", subtext: "by Brightpath Academy" },
+  },
+  {
+    kind: "milestone",
+    label: "Milestone",
+    category: "Stickers",
+    aspect: 2.4,
+    motion: "static",
+    frameHeight: 0.26,
+    text: ["Figure", "Word"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.amber, text: "5", subtext: "years", tag: "Anniversary" },
+  },
+  { kind: "icon", label: "Icon", category: "Stickers", aspect: 1, motion: "static", frameHeight: 0.14, defaults: { ...sticker, fill: "none", color: STICKER_COLORS.amber, icon: "star" } },
+  { kind: "emoji", label: "Emoji", category: "Stickers", aspect: 1, motion: "static", frameHeight: 0.16, text: ["Emoji"], defaults: { ...sticker, fill: "none", lip: false, color: STICKER_COLORS.white, text: "\u{1F525}" } },
+  {
+    kind: "quote",
+    label: "Quote",
+    category: "Stickers",
+    aspect: 2.2,
+    motion: "static",
+    frameHeight: 0.3,
+    text: ["Quote", "Name"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.blue, text: "This changed how our whole team works. We ship twice as fast now.", subtext: "Ada Okafor", tag: "Head of Product" },
+  },
+  {
+    kind: "profile",
+    label: "Profile",
+    category: "Stickers",
+    aspect: 3.4,
+    motion: "static",
+    frameHeight: 0.13,
+    text: ["Name", "Handle"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.blue, icon: "check", text: "Your Name", subtext: "@yourhandle", tag: "Follow" },
+  },
+  {
+    kind: "rating",
+    label: "Rating",
+    category: "Stickers",
+    aspect: 2.6,
+    motion: "static",
+    // The stars fill in after the entrance.
+    settleSec: 2,
+    frameHeight: 0.15,
+    text: ["Line"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.amber, text: "from 2,400 reviews", countTo: 4.9 },
+  },
+  {
+    kind: "meter",
+    label: "Meter",
+    category: "Stickers",
+    aspect: 4,
+    motion: "static",
+    settleSec: 2.2,
+    frameHeight: 0.12,
+    text: ["Label"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.teal, text: "Course completed", countTo: 78 },
+  },
+  {
+    kind: "checklist",
+    label: "Checklist",
+    category: "Stickers",
+    aspect: 1.7,
+    motion: "static",
+    // Up to six items ticking in one after another.
+    settleSec: 3.2,
+    frameHeight: 0.3,
+    text: ["Items (; between)"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.teal, tag: "You'll learn", text: "Plan your shoot; Record in one take; Edit in minutes" },
+  },
+  {
+    kind: "price",
+    label: "Price",
+    category: "Stickers",
+    aspect: 1.7,
+    motion: "static",
+    frameHeight: 0.2,
+    text: ["Price", "Per"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.red, tag: "$99", text: "$49", subtext: "/month" },
+  },
+  {
+    kind: "message",
+    label: "Chat bubble",
+    category: "Stickers",
+    aspect: 2.6,
+    motion: "static",
+    // Typing dots, then the words.
+    settleSec: 1.8,
+    frameHeight: 0.16,
+    text: ["Message"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.blue, tag: "Sam", text: "Wait, you made this in Briefcast?!" },
+  },
+  {
+    kind: "versus",
+    label: "Versus",
+    category: "Stickers",
+    aspect: 3.6,
+    motion: "static",
+    frameHeight: 0.12,
+    text: ["Left", "Right"],
+    defaults: { ...sticker, color: STICKER_COLORS.blue, accent: STICKER_COLORS.amber, text: "Before", subtext: "After" },
+  },
+  {
+    kind: "date",
+    label: "Date",
+    category: "Stickers",
+    aspect: 3,
+    motion: "static",
+    frameHeight: 0.17,
+    text: ["Event", "Time & place"],
+    defaults: { ...sticker, color: STICKER_COLORS.white, accent: STICKER_COLORS.red, tag: "Mar 14", text: "Launch livestream", subtext: "7 PM WAT · Online" },
+  },
+
   { kind: "rectangle", label: "Rectangle", category: "Shapes", aspect: 1.6, motion: "static", defaults: { color: "#3b82f6", color2: "#8b5cf6", ...fx("pop") } },
   { kind: "rounded", label: "Rounded", category: "Shapes", aspect: 1.6, motion: "static", defaults: { color: "#f43f5e", color2: "#f59e0b", ...fx("pop") } },
   { kind: "circle", label: "Circle", category: "Shapes", aspect: 1, motion: "static", defaults: { color: "#22d3ee", color2: "#3b82f6", ...fx("pop") } },
@@ -226,7 +420,7 @@ const GRAIN_FRAMES = 8;
 const GRAIN_FPS = 12;
 const grainFrame = (t: number) => Math.floor(t * GRAIN_FPS) % GRAIN_FRAMES;
 
-export const ASSET_CATEGORIES: AssetCategory[] = ["Shapes", "Callouts", "Animated", "Overlays"];
+export const ASSET_CATEGORIES: AssetCategory[] = ["Stickers", "Shapes", "Callouts", "Animated", "Overlays"];
 
 export const assetEntry = (kind: AssetKind): AssetCatalogEntry => ASSET_CATALOG.find((e) => e.kind === kind) ?? ASSET_CATALOG[0];
 
@@ -573,6 +767,13 @@ function drawCursorArrow(ctx: CanvasRenderingContext2D, x: number, y: number, si
 // Draws one element, already transformed so its box is centred on 0,0. `reveal` is how far a
 // "draw" entrance has got (1 = fully drawn).
 function drawElement(ctx: CanvasRenderingContext2D, asset: OverlayAsset, w: number, h: number, t: number, duration: number, reveal: number): void {
+  if (isStickerKind(asset.kind)) {
+    ctx.save();
+    ctx.translate(-w / 2, -h / 2);
+    drawSticker(ctx, asset, w, h, t, entranceSeconds(asset, duration));
+    ctx.restore();
+    return;
+  }
   const unit = Math.min(w, h);
   const kind = asset.kind;
   ctx.lineCap = "round";
@@ -1841,20 +2042,20 @@ export function drawAssetFrame(ctx: CanvasRenderingContext2D, asset: OverlayAsse
 // Which distinct picture frame k (of `total`) is - equal keys mean identical frames, so export
 // only renders and ships each key once. Entering/leaving frames are always unique; after that a
 // still element is one frame, a looping one repeats every LOOP_PERIOD_SEC, and a timed one
-// (progress, countdown) is different every frame.
-export function assetFrameKey(asset: OverlayAsset, k: number, total: number, duration: number): string {
+// (progress, countdown) is different every frame. `fps`: the rate frames are drawn at.
+export function assetFrameKey(asset: OverlayAsset, k: number, total: number, duration: number, fps = ASSET_FPS): string {
   const entry = assetEntry(asset.kind);
-  const e = Math.ceil(entranceSeconds(asset, duration) * ASSET_FPS);
+  const e = Math.ceil(entranceSeconds(asset, duration) * fps);
   const x = asset.exit ? e : 0;
-  const settled = Math.max(e, Math.ceil((entry.settleSec ?? 0) * ASSET_FPS));
+  const settled = Math.max(e, Math.ceil((entry.settleSec ?? 0) * fps));
   if (k < settled || k >= total - x) return `f${k}`;
   // A glitch's tear reads pixels from the canvas, so it can't be keyed - but it only runs while entering.
-  if (entry.idleKey && asset.loop === "none") return `i${entry.idleKey(asset, k / ASSET_FPS, duration)}`;
+  if (entry.idleKey && asset.loop === "none") return `i${entry.idleKey(asset, k / fps, duration)}`;
   const motion = entry.motion;
   const loops = asset.loop !== "none" || motion === "periodic";
   if (motion === "timed") return `f${k}`;
   if (!loops) return "still";
-  return `p${k % Math.round(LOOP_PERIOD_SEC * ASSET_FPS)}`;
+  return `p${k % Math.round(LOOP_PERIOD_SEC * fps)}`;
 }
 
 export interface RenderedAssetFrames {
@@ -1871,7 +2072,9 @@ export interface RenderedAssetFrames {
 export async function renderAssetFrames(
   overlay: { asset?: OverlayAsset; x: number; y: number; width: number; height: number; opacity: number; rotation?: number; flipHorizontal?: boolean; flipVertical?: boolean; shadow?: boolean; startTime: number; endTime: number },
   framePixelWidth: number,
-  framePixelHeight: number
+  framePixelHeight: number,
+  // The export's overlay rate (get_export_frame_rate).
+  fps = ASSET_FPS
 ): Promise<RenderedAssetFrames | null> {
   const asset = overlay.asset;
   if (!asset) return null;
@@ -1896,19 +2099,21 @@ export async function renderAssetFrames(
   const ctx = canvas.getContext("2d", { willReadFrequently: asset.entrance === "glitch" });
   if (!ctx) return null;
 
-  const total = Math.max(1, Math.ceil(duration * ASSET_FPS));
+  // A sticker's face and picture have to be in before the first frame is drawn.
+  if (isStickerKind(asset.kind)) await loadStickerResources(asset);
+  const total = Math.max(1, Math.ceil(duration * fps));
   const keyIndex = new Map<string, number>();
   const unique: string[] = [];
   const sequence: number[] = [];
   for (let k = 0; k < total; k++) {
-    const key = assetFrameKey(asset, k, total, duration);
+    const key = assetFrameKey(asset, k, total, duration, fps);
     let idx = keyIndex.get(key);
     if (idx === undefined) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, cw, ch);
       ctx.translate(cw / 2, ch / 2);
       ctx.globalAlpha = overlay.opacity;
-      drawAssetFrame(ctx, asset, w, h, k / ASSET_FPS, duration, {
+      drawAssetFrame(ctx, asset, w, h, k / fps, duration, {
         rotationDeg: overlay.rotation,
         flipHorizontal: overlay.flipHorizontal,
         flipVertical: overlay.flipVertical,

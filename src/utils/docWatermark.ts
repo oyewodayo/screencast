@@ -164,9 +164,23 @@ export function svgDataUrl(svg: string): string {
 
 // The @page background for print. Comes after the page's own @page rule (DocsEditor.tsx), whose
 // background shorthand carries the page colour; this rule only adds the image on top of it.
-export function printWatermarkCss(wm: DocWatermark, dataUrl: string): string {
+//
+// Chromium lays an @page background out against the page's text area (inside the margins) while
+// still painting the whole sheet, so a sheet-sized image is placed by giving it the sheet's own
+// size and shifting it out by the margins - percentages would shrink it into the text area.
+export interface SheetGeometry {
+  widthIn: number;
+  heightIn: number;
+  top: number;
+  left: number;
+}
+
+export const sheetBackground = (g: SheetGeometry, top = g.top) =>
+  `background-size: ${g.widthIn}in ${g.heightIn}in; background-position: ${-g.left}in ${-top}in; background-repeat: no-repeat;`;
+
+export function printWatermarkCss(wm: DocWatermark, dataUrl: string, sheet: SheetGeometry): string {
   if (!dataUrl) return "";
-  const rule = `@page { background-image: url("${dataUrl}"); background-position: center; background-size: 100% 100%; background-repeat: no-repeat; }`;
+  const rule = `@page { background-image: url("${dataUrl}"); ${sheetBackground(sheet)} }`;
   return wm.skipFirstPage ? `${rule}\n@page :first { background-image: none; }` : rule;
 }
 

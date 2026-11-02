@@ -14,7 +14,7 @@ import { DOC_DRAG_MIME, DocFolder, DocSummary, flattenFolderTree } from "../../u
 import { getPinnedDocIds, toggleDocPin, forgetDocPin } from "../../utils/docLibraryHistory";
 import { openDocumentFile } from "../../utils/docFileImport";
 import { extractPlainText } from "../../utils/docYjsText";
-import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
+import { DOC_TEMPLATES, DOC_TEMPLATE_CATEGORIES, DocTemplate, cachedTemplatePreview, createDocFromTemplate, templatePreview } from "../../utils/docTemplates";
 import { loadDocPreview, type DocPreviewData } from "../../utils/docPreview";
 import DocTemplateVariantPicker from "./DocTemplateVariantPicker";
 import DocFolderSidebar from "./DocFolderSidebar";
@@ -22,6 +22,8 @@ import DocPagePreview from "./DocPagePreview";
 import DocTemplateCard from "./DocTemplateCard";
 import FileInfoModal from "../Modals/FileInfoModal";
 import DocPdfImportDialog from "./DocPdfImportDialog";
+import { defaultLetterhead, type SavedLetterhead } from "../../utils/letterheadLibrary";
+import { letterheadMargins, writeLetterhead } from "../../utils/docLetterhead";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -79,6 +81,41 @@ const DocCardThumbnail: React.FC<{ doc: DocSummary }> = ({ doc }) => {
   );
 };
 
+// Building a template's preview (a schema parse, then typesetting it) is the slowest part of
+// opening Docs, so cards show their skeleton first and fill in after the screen has painted - one
+// card per task, so no single long task holds up a click.
+const previewQueue: (() => void)[] = [];
+let previewQueueRunning = false;
+function runPreviewQueue() {
+  const next = previewQueue.shift();
+  if (!next) {
+    previewQueueRunning = false;
+    return;
+  }
+  next();
+  setTimeout(runPreviewQueue, 0);
+}
+function queueTemplatePreview(task: () => void): () => void {
+  previewQueue.push(task);
+  if (!previewQueueRunning) {
+    previewQueueRunning = true;
+    // After the next paint: rAF runs before it, the timeout after.
+    requestAnimationFrame(() => setTimeout(runPreviewQueue, 0));
+  }
+  return () => {
+    const i = previewQueue.indexOf(task);
+    if (i >= 0) previewQueue.splice(i, 1);
+  };
+}
+
+const TemplatePreview: React.FC<{ template: DocTemplate }> = ({ template }) => {
+  const [preview, setPreview] = useState<DocPreviewData | null>(() => cachedTemplatePreview(template));
+  useEffect(() => {
+    if (preview) return;
+    return queueTemplatePreview(() => setPreview(templatePreview(template)));
+  }, [template, preview]);
+  return <DocPagePreview preview={preview} />;
+};
 
 const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
@@ -334,6 +371,37 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
+
+  // The letterhead marked "Use for new documents" (DocLetterheadDialog.tsx): its own card in the
+  // new-document row, so a company letter is one click away.
+  const [homeLetterhead, setHomeLetterhead] = useState<SavedLetterhead | null>(null);
+  useEffect(() => {
+    void defaultLetterhead().then(setHomeLetterhead);
+  }, []);
+  const [creatingOnLetterhead, setCreatingOnLetterhead] = useState(false);
+  const handleCreateOnLetterhead = useCallback(async () => {
+    if (!homeLetterhead) return;
+    setCreatingOnLetterhead(true);
+    setError(null);
+    try {
+      const id = crypto.randomUUID();
+      const lh = homeLetterhead.letterhead;
+      const defaults = { top: 1, right: 1, bottom: 1, left: 1 };
+      const ydoc = new Y.Doc();
+      writeLetterhead(ydoc, { ...lh, previousMargins: defaults });
+      const title = `Untitled document ${(docs?.length ?? 0) + 1}`;
+      await invoke("create_doc", { id, title, bytes: Array.from(Y.encodeStateAsUpdate(ydoc)), folderId: selectedFolderId });
+      const portrait = lh.widthPx <= lh.heightPx;
+      const a4 = Math.abs(Math.min(lh.widthPx, lh.heightPx) - 793.7) < 8;
+      await invoke("set_doc_page_setup", { id, pageSize: a4 ? "a4" : "letter", orientation: portrait ? "portrait" : "landscape", margins: letterheadMargins(lh, defaults), pageColor: null });
+      onOpenDoc(id);
+    } catch (err) {
+      console.error("Failed to create a document on the letterhead:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreatingOnLetterhead(false);
+    }
+  }, [homeLetterhead, docs, selectedFolderId, onOpenDoc]);
 
   const handleCreate = useCallback(async () => {
     setIsCreating(true);
@@ -658,13 +726,27 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           </div>
 
           {(() => {
-            const isBusy = isCreating || creatingTemplateId !== null;
+            const isBusy = isCreating || creatingTemplateId !== null || creatingOnLetterhead;
             const blankCard = (
-              <DocTemplateCard name="Blank document" disabled={isBusy} isBusy={isCreating} onClick={() => void handleCreate()}>
-                <div className="aspect-[8.5/11] bg-white dark:bg-neutral-900 flex items-center justify-center">
-                  <IoAdd size={56} className="text-blue-500" />
-                </div>
-              </DocTemplateCard>
+              <>
+                <DocTemplateCard name="Blank document" disabled={isBusy} isBusy={isCreating} onClick={() => void handleCreate()}>
+                  <div className="aspect-[8.5/11] bg-white dark:bg-neutral-900 flex items-center justify-center">
+                    <IoAdd size={56} className="text-blue-500" />
+                  </div>
+                </DocTemplateCard>
+                {homeLetterhead && (
+                  <DocTemplateCard name={homeLetterhead.name} description="On your letterhead" disabled={isBusy} isBusy={creatingOnLetterhead} onClick={() => void handleCreateOnLetterhead()}>
+                    <div className="relative aspect-[8.5/11] bg-white">
+                      {homeLetterhead.thumb && <img src={homeLetterhead.thumb} alt="" className="absolute inset-0 w-full h-full object-cover" draggable={false} />}
+                      <span className="absolute inset-0 flex items-center justify-center">
+                        <span className="w-11 h-11 rounded-full bg-blue-600/90 text-white flex items-center justify-center shadow-lg">
+                          <IoAdd size={26} />
+                        </span>
+                      </span>
+                    </div>
+                  </DocTemplateCard>
+                )}
+              </>
             );
             const templateCard = (template: DocTemplate) => (
               <DocTemplateCard
@@ -676,7 +758,7 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
                 isBusy={creatingTemplateId === template.id}
                 onClick={() => void handleCreateFromTemplate(template)}
               >
-                <DocPagePreview preview={templatePreview(template)} />
+                <TemplatePreview template={template} />
               </DocTemplateCard>
             );
             const gridClass = "grid gap-4 grid-cols-[repeat(auto-fill,minmax(128px,1fr))]";

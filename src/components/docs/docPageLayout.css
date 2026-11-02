@@ -12,18 +12,22 @@
 .doc-page-gap {
   position: relative;
   background: var(--doc-canvas, #f9fbfd);
+  user-select: none;
+  pointer-events: none;
 }
 
 /* Gap and tail are children of .ProseMirror, so the editor's 1rem between-blocks rule
-   (docSchemaExtensions.ts) would add space above them; the gap's -1rem bottom margin also cancels
-   that same rule on the block right after it, so the next page's text starts exactly at its top
-   margin. */
+   (docSchemaExtensions.ts) would add space above them; the gap's bottom margin (--gap-mb,
+   defaulting to -1rem) cancels the top margin of the block right after it, so the next page's
+   text starts flush at its top margin regardless of custom spaceBefore. */
 .ProseMirror > .doc-page-gap {
   margin-top: 0 !important;
-  margin-bottom: -1rem !important;
+  margin-bottom: var(--gap-mb, -1rem) !important;
 }
 .ProseMirror > .doc-page-tail {
   margin-top: 0 !important;
+  user-select: none;
+  pointer-events: none;
 }
 
 .doc-page-gap-end,

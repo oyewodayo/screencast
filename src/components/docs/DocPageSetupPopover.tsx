@@ -18,6 +18,7 @@ import {
   pageDimensionsIn,
 } from "../../utils/docPageGeometry";
 import type { RulerUnit } from "./DocRuler";
+import ColorInput from "../common/ColorInput";
 
 interface DocPageSetupPopoverProps {
   pageSize: DocPageSize | null;
@@ -89,7 +90,7 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
   const [draftMargins, setDraftMargins] = useState(() => marginDrafts(margins ?? DEFAULT_MARGINS));
   const [draftColumns, setDraftColumns] = useState<1 | 2>(columns);
   const [draftGap, setDraftGap] = useState(() => toUnit(columnGap));
-  const customColorRef = useRef<HTMLInputElement>(null);
+  const customColorRef = useRef<HTMLButtonElement>(null);
 
   // Re-syncs the draft if the popover is reopened after the doc's own page setup changed
   // elsewhere (e.g. a ruler drag or a version restore) while it was closed.
@@ -264,9 +265,8 @@ const DocPageSetupPopover: React.FC<DocPageSetupPopoverProps> = ({
                 >
                   Custom colour…
                 </button>
-                <input
+                <ColorInput
                   ref={customColorRef}
-                  type="color"
                   value={shownColor}
                   onChange={(e) => setDraftColor(normalizePageColor(e.target.value))}
                   aria-label="Custom page color"

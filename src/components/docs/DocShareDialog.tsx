@@ -5,9 +5,10 @@
 // (share_staging_path in services/share.rs) under the document's own title, then handed on:
 //   Email - straight into the desktop mail client with the file attached (Simple MAPI), or into
 //           Gmail / Outlook / Yahoo / the default mail app with the file on the clipboard to paste.
-//   Share - the Windows share sheet (every share target installed on the PC), or a chat app opened
-//           with the file on the clipboard, or the file / its formatted contents copied to paste
-//           anywhere.
+//   Share - straight to a paired phone or tablet (services/phoneTransfer.ts - the same pairing as
+//           the Phones hub), the Windows share sheet (every share target installed on the PC), a
+//           chat app opened with the file on the clipboard, or the file / its formatted contents
+//           copied to paste anywhere.
 // Each format is exported at most once per opening of the dialog; the document can't change while
 // it's open.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -16,6 +17,17 @@ import { IoClose } from "react-icons/io5";
 import { MdAttachFile, MdCheckCircle, MdContentCopy, MdContentPaste, MdErrorOutline, MdFileDownload, MdIosShare, MdMailOutline } from "react-icons/md";
 import { FaDiscord, FaSlack, FaTelegramPlane, FaWhatsapp, FaYahoo } from "react-icons/fa";
 import { SiGmail, SiMicrosoftoutlook, SiMicrosoftteams } from "react-icons/si";
+import { MdAdd, MdOutlinePhoneIphone, MdOutlineTabletMac } from "react-icons/md";
+import {
+  initPhoneTransfer,
+  openPhoneReceive,
+  refreshPhoneDevices,
+  sendToPhone,
+  subscribePhoneTransfer,
+  type PhoneDevice,
+  type TransferStatus,
+} from "../../services/phoneTransfer";
+import "./docShare.css";
 
 export type ShareFormat = "pdf" | "docx" | "html" | "md" | "txt";
 export type ShareMode = "email" | "share";
@@ -115,6 +127,54 @@ const tileClass =
   "group flex flex-col items-center gap-1.5 rounded-xl px-2 py-3 text-xs text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/60 disabled:opacity-50 disabled:pointer-events-none transition-colors";
 const secondaryButton =
   "inline-flex items-center gap-2 h-9 px-3.5 rounded-full text-sm font-medium border border-neutral-300 dark:border-neutral-600 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/60 disabled:opacity-50 disabled:pointer-events-none transition-colors";
+
+// ------------------------------------------------------------------------------------------------
+// Send to a device: every paired phone/tablet as a tile. A send fills a ring round the tile as the
+// file goes across and settles into a tick when the device has it; an offline device queues it
+// until it's back.
+
+const DeviceTile: React.FC<{ device: PhoneDevice; transfer: TransferStatus | null; disabled: boolean; onSend: () => void }> = ({ device, transfer, disabled, onSend }) => {
+  const Icon = device.platform === "ipad" ? MdOutlineTabletMac : MdOutlinePhoneIphone;
+  const progress = transfer ? (transfer.state === "done" ? 1 : transfer.size ? transfer.sent / transfer.size : 0) : 0;
+  const active = !!transfer && (transfer.state === "sending" || transfer.state === "offered");
+  const done = transfer?.state === "done";
+  const queued = transfer?.state === "queued";
+  const R = 21;
+  const C = 2 * Math.PI * R;
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onSend}
+      className={tileClass}
+      title={device.online ? `Send to ${device.name}` : `${device.name} is offline - it gets the file when it's back`}
+    >
+      <span className="relative h-11 w-11 inline-flex items-center justify-center">
+        <span className={`absolute inset-0 rounded-full ${device.online ? "bg-[#e8f0fe] text-[#1a73e8] dark:bg-blue-500/20 dark:text-blue-200" : "bg-neutral-100 text-neutral-400 dark:bg-neutral-700 dark:text-neutral-400"}`} />
+        {active && <span className="absolute inset-0 rounded-full doc-share-pulse" />}
+        <svg className="absolute inset-0 -rotate-90" viewBox="0 0 46 46" aria-hidden>
+          {(active || done || queued) && (
+            <circle
+              cx="23"
+              cy="23"
+              r={R}
+              fill="none"
+              stroke={done ? "#16a34a" : queued ? "#a3a3a3" : "#1a73e8"}
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeDasharray={C}
+              strokeDashoffset={C * (1 - (queued ? 1 : Math.max(0.04, progress)))}
+              style={{ transition: "stroke-dashoffset 200ms linear" }}
+            />
+          )}
+        </svg>
+        {done ? <MdCheckCircle size={22} className="relative text-green-600" /> : <Icon size={22} className="relative" />}
+        <span className={`absolute right-0.5 bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-neutral-800 ${device.online ? "bg-green-500" : "bg-neutral-300 dark:bg-neutral-500"}`} />
+      </span>
+      <span className="max-w-full truncate">{device.name}</span>
+    </button>
+  );
+};
 
 const DocShareDialog: React.FC<DocShareDialogProps> = ({ title, pageCount, wordCount, initialMode, writeExport, getClipboardContent, onSaveCopy, onClose }) => {
   const [mode, setMode] = useState<ShareMode>(initialMode);
@@ -254,6 +314,36 @@ const DocShareDialog: React.FC<DocShareDialogProps> = ({ title, pageCount, wordC
     run(async (path) => {
       const installed = caps?.apps.includes(app.scheme) ?? false;
       return copyAndOpen(path, installed ? app.app : app.web, `In ${app.name}, open a chat and press Ctrl+V to send it.`);
+    });
+
+  // Paired devices, live (online state, transfer progress).
+  const [devices, setDevices] = useState<PhoneDevice[]>([]);
+  const [transfers, setTransfers] = useState<Record<string, TransferStatus>>({});
+  const [sentTo, setSentTo] = useState<Record<string, string>>({}); // device id -> this dialog's offer id
+  useEffect(() => {
+    initPhoneTransfer();
+    void refreshPhoneDevices();
+    return subscribePhoneTransfer((st) => {
+      setDevices(st.devices);
+      setTransfers(st.transfers);
+    });
+  }, []);
+  // The status line follows the transfer through to "delivered".
+  useEffect(() => {
+    for (const [deviceId, offer] of Object.entries(sentTo)) {
+      const t = transfers[offer];
+      const d = devices.find((x) => x.id === deviceId);
+      if (t?.state === "done") setStatus({ tone: "ok", text: `${t.name} is on ${d?.name ?? "the device"}.` });
+      else if (t?.state === "interrupted") setStatus({ tone: "error", text: `Sending to ${d?.name ?? "the device"} was interrupted - try again.` });
+    }
+  }, [transfers, sentTo, devices]);
+  const sendToDevice = (device: PhoneDevice) =>
+    run(async (path) => {
+      const [status] = await sendToPhone(device.id, [{ path, name: fileName }]);
+      if (status) setSentTo((m) => ({ ...m, [device.id]: status.offer_id }));
+      return status?.state === "queued"
+        ? { tone: "ok", text: `${device.name} is offline - it will get ${fileName} as soon as it's back.` }
+        : { tone: "busy", text: `Sending ${fileName} to ${device.name}…` };
     });
 
   const copyFile = () =>
@@ -441,6 +531,28 @@ const DocShareDialog: React.FC<DocShareDialogProps> = ({ title, pageCount, wordC
                 </span>
               </button>
             )}
+            <div>
+              <span className={fieldLabel}>Send to a device</span>
+              <div className="grid grid-cols-5 gap-1">
+                {devices.map((d) => (
+                  <DeviceTile key={d.id} device={d} transfer={sentTo[d.id] ? (transfers[sentTo[d.id]] ?? null) : null} disabled={busy} onSend={() => void sendToDevice(d)} />
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    openPhoneReceive();
+                  }}
+                  className={tileClass}
+                  title="Pair a phone or tablet with Briefcast"
+                >
+                  <span className="h-11 w-11 inline-flex items-center justify-center rounded-full border-2 border-dashed border-neutral-300 dark:border-neutral-600 text-neutral-500">
+                    <MdAdd size={22} />
+                  </span>
+                  <span>{devices.length ? "Add device" : "Pair a phone"}</span>
+                </button>
+              </div>
+            </div>
             <div>
               <span className={fieldLabel}>Send in a chat</span>
               <div className="grid grid-cols-5 gap-1">

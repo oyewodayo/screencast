@@ -76,7 +76,7 @@ interface ConversionProgress {
 // sidecar next to the video (save_video_chapters/load_video_chapters, video_edits.rs), the same
 // write-tmp-then-rename convention as the timeline editor's own `.edits.json`, just a separate,
 // much smaller file so having chapters never implies the file has been opened in the full editor.
-interface Chapter {
+export interface Chapter {
   id: string;
   time: number;
   label: string;
@@ -144,12 +144,26 @@ interface KeyboardHandlerActions {
 // user-adjustable amount): that control is for jumping past whole sections, this one is for
 // frame-accurate scrubbing while trimming/reviewing a recording.
 const ARROW_SEEK_SECONDS = 5;
+export interface EditTimeline {
+  duration: number;
+  // null while it can't be read (the player is switching clips) - the bar then holds still.
+  getTime: () => number | null;
+  seek: (time: number) => void;
+  // The edit's own chapters, in its time - shown and edited in place of the file's while editing.
+  chapters: Chapter[];
+  onChaptersChange: (next: Chapter[]) => void;
+}
 interface VideoPlayerProps {
   src?: string;
   title?: string;
   // "Edit video" in the settings menu - opens (or closes) the editor for what's playing.
   onEditVideo?: () => void;
   isEditingVideo?: boolean;
+  // While the timeline editor drives playback: the edit's own time, so the scrub bar and the time
+  // readout show where you are in the edit (0:12 / 0:35) instead of inside whichever clip's file is
+  // loaded - a photo's preview proxy runs for ten minutes, so its bar barely moved. Seeks go back
+  // through the timeline, which knows which clip a time falls in.
+  editTimeline?: EditTimeline | null;
   autoPlay?: boolean;
   // Real filesystem path behind `src` (which is already a browser-loadable asset:// URL) -
   // needed only to invoke get_playable_preview if native playback fails. Without it, a decode
@@ -250,7 +264,9 @@ export interface VideoPlayerHandle {
   // `seekTime` may be a function, read once the new source is ready - a gapless handoff
   // (ClipHandoffLayer) passes where its standby has got to by then. Resolves once the player has
   // landed on that frame (or the load failed).
-  loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string) => Promise<void>;
+  // `play`: start playing once there (playback running on into the next clip) - by default it keeps
+  // whatever the player was doing, so a seek into another clip while paused stays paused.
+  loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string, play?: boolean) => Promise<void>;
   // Imperatively overrides the crop transform for as long as a crop drag is in progress (pass
   // null once it ends) - ClipCropOverlay (Dashboard) calls this on every pointer move so the
   // actual video pixels track the drag in real time instead of only jumping to the new crop once
@@ -316,7 +332,19 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo, editTimeline = null }, ref) => {
+  // While loadSource is switching files: whether to play once there. Play/pause pressed meanwhile
+  // (togglePauseAndPlay) changes it - the timeline's Play-from-the-end seeks and then plays.
+  const loadPlayIntentRef = useRef<boolean | null>(null);
+  const editTimelineRef = useRef(editTimeline);
+  editTimelineRef.current = editTimeline;
+  // Skips move through the edit while it drives playback, not past the end of one clip's file.
+  const skipBy = (seconds: number): void => {
+    const edit = editTimelineRef.current;
+    const t = edit?.getTime();
+    if (edit && t != null) edit.seek(Math.max(0, Math.min(edit.duration, t + seconds)));
+    else if (!edit) skipTime(videoRef.current, seconds);
+  };
   const contentInsetRef = useRef(contentInset);
   contentInsetRef.current = contentInset;
   // Refs
@@ -523,9 +551,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     play: () => {
       if (videoRef.current?.paused) togglePauseAndPlay();
     },
-    loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string) => {
+    loadSource: (src: string, seekTime: number | (() => number), sourcePath?: string, play?: boolean) => {
       const video = videoRef.current;
       if (!video) return Promise.resolve();
+      loadPlayIntentRef.current = play ?? !video.paused;
       let settle: () => void = () => {};
       const done = new Promise<void>((resolve) => {
         const timer = window.setTimeout(resolve, 6000);
@@ -541,7 +570,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
           if (onReady && video.getAttribute("src") === url && isPictureless(video)) return onReady(video);
           video.addEventListener("seeked", settle, { once: true });
           video.currentTime = typeof seekTime === "function" ? seekTime() : seekTime;
-          video.play().catch(() => {});
+          if (loadPlayIntentRef.current) video.play().catch(() => {});
+          loadPlayIntentRef.current = null;
         };
         const onFailed = () => {
           video.removeEventListener("loadedmetadata", onLoaded);
@@ -640,7 +670,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Chapter markers - loaded from/persisted to the `.chapters.json` sidecar (see the Chapter
   // interface's own comment). Empty until loaded, same "nothing yet, not an error" shape as
   // captionsUrl above.
-  const [chapters, setChapters] = useState<Chapter[]>([]);
+  const [fileChapters, setChapters] = useState<Chapter[]>([]);
+  // While the timeline editor drives playback, the chapters are the edit's (editTimeline).
+  const chapters = editTimeline?.chapters ?? fileChapters;
   const [showChaptersMenu, setShowChaptersMenu] = useState<boolean>(false);
   const [isDetectingChapters, setIsDetectingChapters] = useState<boolean>(false);
   // Which chapter (if any) the cursor is currently near while hovering the timeline - drives the
@@ -1021,7 +1053,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
     wrap.style.backgroundImage = `url("${scrubSprite.url}")`;
     wrap.style.backgroundSize = `${scrubSprite.columns * 100}% ${scrubSprite.rows * 100}%`;
-  }, [scrubSprite]);
+  }, [scrubSprite, !!editTimeline]);
 
   // Draws the decoded peaks onto the timeline's own waveform canvas - same devicePixelRatio-aware
   // canvas technique as VideoTimelineDocker's ClipWaveform/AudioChipWaveform (bars centered
@@ -1347,6 +1379,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const video = videoRef.current;
     if (!video) return;
 
+    if (loadPlayIntentRef.current !== null) loadPlayIntentRef.current = video.paused;
     if (video.paused) {
       video.play();
       setIsPlaying(true);
@@ -1379,6 +1412,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     }
     const FRAME_STEP_SECONDS = 1 / 30;
+    const edit = editTimelineRef.current;
+    if (edit) {
+      // Through the edit, so a step at a cut lands on the next clip's first frame, not past its file.
+      const t = edit.getTime();
+      if (t != null) edit.seek(Math.max(0, Math.min(edit.duration - FRAME_STEP_SECONDS / 2, t + direction * FRAME_STEP_SECONDS)));
+      return;
+    }
     video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + direction * FRAME_STEP_SECONDS));
   };
 
@@ -1392,49 +1432,47 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // of edits (e.g. detectChaptersFromSilence adding several at once) writes the sidecar once with
   // the final state instead of once per intermediate state.
   const persistChapters = (next: Chapter[]): void => {
+    if (editTimelineRef.current) return editTimelineRef.current.onChaptersChange(next);
     if (!filePath) return;
     invoke('save_video_chapters', { videoPath: filePath, json: JSON.stringify(next) }).catch((err) =>
       console.error('Failed to save chapters:', err)
     );
   };
 
-  const addChapterAtCurrentTime = (): void => {
-    const video = videoRef.current;
-    if (!video || !Number.isFinite(video.duration)) return;
-    const time = video.currentTime;
-    const next = [...chapters, { id: crypto.randomUUID(), time, label: formatChapterTime(time) }].sort(
-      (a, b) => a.time - b.time
-    );
-    setChapters(next);
+  // The edit's chapters live in the edit (persistChapters hands them over); the file's are local.
+  const commitChapters = (next: Chapter[]): void => {
+    if (!editTimelineRef.current) setChapters(next);
     persistChapters(next);
   };
 
+  const addChapterAtCurrentTime = (): void => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+    const time = editTimelineRef.current ? editTimelineRef.current.getTime() : video.currentTime;
+    if (time == null) return;
+    commitChapters([...chapters, { id: crypto.randomUUID(), time, label: formatChapterTime(time) }].sort((a, b) => a.time - b.time));
+  };
+
   const renameChapter = (id: string, label: string): void => {
-    setChapters((prev) => {
-      const next = prev.map((c) => (c.id === id ? { ...c, label } : c));
-      persistChapters(next);
-      return next;
-    });
+    commitChapters(chapters.map((c) => (c.id === id ? { ...c, label } : c)));
   };
 
   const deleteChapter = (id: string): void => {
-    setChapters((prev) => {
-      const next = prev.filter((c) => c.id !== id);
-      persistChapters(next);
-      return next;
-    });
+    commitChapters(chapters.filter((c) => c.id !== id));
   };
 
   const clearChapters = (): void => {
-    setChapters([]);
-    persistChapters([]);
+    commitChapters([]);
   };
 
   const seekToChapter = (time: number): void => {
+    if (editTimelineRef.current) return editTimelineRef.current.seek(time);
     const video = videoRef.current;
     if (!video) return;
     video.currentTime = time;
   };
+  // Where playback is, in the chapters' time.
+  const chapterClock = editTimeline ? (editTimeline.getTime() ?? playbackClock) : playbackClock;
 
   // Overwrites this video's gallery/sidebar poster (get_video_thumbnail's cache, conversion.rs)
   // with whatever frame is on screen right now. That command emits video-thumbnail-updated once
@@ -1548,7 +1586,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Merges with, rather than replacing, any chapters already placed by hand: existing ones within
   // MERGE_TOLERANCE_SEC of a suggestion are left alone instead of duplicated.
   const detectChaptersFromSilence = async (): Promise<void> => {
-    if (!filePath) return;
+    // The file's silences are in its own time - the edit's chapters come from its own panel.
+    if (!filePath || editTimelineRef.current) return;
     const video = videoRef.current;
     const duration = video?.duration;
     setIsDetectingChapters(true);
@@ -1713,12 +1752,12 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
   const seekBackward = (): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
-    skipTime(videoRef.current, -ARROW_SEEK_SECONDS);
+    skipBy(-ARROW_SEEK_SECONDS);
   };
 
   const seekForward = (): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
-    skipTime(videoRef.current, ARROW_SEEK_SECONDS);
+    skipBy(ARROW_SEEK_SECONDS);
   };
 
   const playbackSpeedNormal = (): void => {
@@ -2046,7 +2085,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const handleForwardSkipTime = (e: MouseEvent<HTMLButtonElement>): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const seconds = parseInt(e.currentTarget.innerText);
-    skipTime(videoRef.current, seconds);
+    skipBy(seconds);
     setCurrentSkipTime(seconds);
     setShowSkipTime(false);
   };
@@ -2054,7 +2093,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const handleBackwardSkipTime = (e: MouseEvent<HTMLButtonElement>): void => {
     if (mediaType !== 'video' && mediaType !== 'audio') return;
     const seconds = parseInt(e.currentTarget.innerText);
-    skipTime(videoRef.current, -seconds);
+    skipBy(-seconds);
     setCurrentSkipTime(seconds);
     setShowSkipTime(false);
   };
@@ -2066,9 +2105,23 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const timeline = timelineContainerRef.current;
     const video = videoRef.current;
     if (timeline) timeline.style.setProperty('--progress-position', fraction.toString());
-    if (video && Number.isFinite(video.duration)) {
+    const edit = editTimelineRef.current;
+    if (edit) setCurrentTimeElement(formatDuration(fraction * edit.duration));
+    else if (video && Number.isFinite(video.duration)) {
       setCurrentTimeElement(formatDuration(fraction * video.duration));
     }
+  };
+  // The edit's position on the bar and in the readout (see editTimeline). Returns false when the
+  // time can't be read right now.
+  const showEditTime = (): boolean => {
+    const edit = editTimelineRef.current;
+    const t = edit?.getTime();
+    if (!edit || t == null) return false;
+    const fraction = edit.duration > 0 ? Math.max(0, Math.min(1, t / edit.duration)) : 0;
+    timelineContainerRef.current?.style.setProperty('--progress-position', fraction.toString());
+    setCurrentTimeElement(formatDuration(fraction * edit.duration));
+    setTotalTimeElement(formatDuration(edit.duration));
+    return true;
   };
 
   const seekToClientX = (clientX: number, throttle: boolean): void => {
@@ -2079,6 +2132,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const fraction = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
 
     updateTimelineVisual(fraction);
+
+    const edit = editTimelineRef.current;
+    if (edit) {
+      // Every clip change is a source switch, so even mid-drag this is one seek per frame at most.
+      pendingSeekFractionRef.current = fraction;
+      if (dragRafRef.current === null) {
+        dragRafRef.current = requestAnimationFrame(() => {
+          dragRafRef.current = null;
+          const f = pendingSeekFractionRef.current;
+          pendingSeekFractionRef.current = null;
+          if (f !== null) editTimelineRef.current?.seek(f * edit.duration);
+        });
+      }
+      return;
+    }
 
     // While actively dragging, coalesce to one actual seek per animation frame instead of one
     // per mousemove (which can fire far faster than the decoder can usefully keep up with) -
@@ -2138,14 +2206,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const rect = timeline.getBoundingClientRect();
     const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     timeline.style.setProperty('--preview-position', fraction.toString());
-    const hoverTime = fraction * video.duration;
+    const hoverTime = fraction * (editTimelineRef.current?.duration ?? video.duration);
 
     // Shows the chapter tooltip whenever the cursor is merely *near* a marker, not just exactly
     // on its (very thin, hard to precisely hover) tick - tolerance scales with the video's own
     // length so a 3-hour recording doesn't make every marker impossible to trigger at typical
     // pixel-per-second zoom, floored at 1s so short videos don't make it trigger too eagerly.
     if (chapters.length > 0) {
-      const HOVER_TOLERANCE_SEC = Math.max(1, video.duration * 0.01);
+      const HOVER_TOLERANCE_SEC = Math.max(1, (editTimelineRef.current?.duration ?? video.duration) * 0.01);
       const nearest = chapters.find((c) => Math.abs(c.time - hoverTime) <= HOVER_TOLERANCE_SEC) ?? null;
       setHoveredChapter((prev) => (prev?.id === nearest?.id ? prev : nearest));
     } else if (hoveredChapter) {
@@ -2281,6 +2349,11 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       return;
     }
     if (videoRef.current && !videoRef.current.paused) {
+      if (editTimelineRef.current) {
+        showEditTime();
+        animationFrameRef.current = requestAnimationFrame(updateTimeline);
+        return;
+      }
       const progress: TimelineProgress | null = updateTimelineProgress(
         videoRef.current, 
         timelineContainerRef.current
@@ -2294,6 +2367,41 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       animationFrameRef.current = requestAnimationFrame(updateTimeline);
     }
   };
+
+  // The edit's time while paused, too: a seek or clip switch lands without the playback loop above
+  // running. Retries a few frames while the time can't be read yet (mid-switch).
+  const editDuration = editTimeline?.duration;
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (editDuration == null) {
+      // Back to the file's own time (the timeline editor closed).
+      const progress = updateTimelineProgress(video, timelineContainerRef.current);
+      if (progress && Number.isFinite(video.duration)) {
+        setCurrentTimeElement(progress.currentTime);
+        setTotalTimeElement(progress.totalTime);
+      }
+      return;
+    }
+    let raf = 0;
+    let tries = 0;
+    const refresh = () => {
+      cancelAnimationFrame(raf);
+      tries = 0;
+      const attempt = () => {
+        if (!showEditTime() && ++tries < 30) raf = requestAnimationFrame(attempt);
+      };
+      attempt();
+    };
+    refresh();
+    const events = ['seeked', 'loadeddata', 'timeupdate'] as const;
+    events.forEach((e) => video.addEventListener(e, refresh));
+    return () => {
+      cancelAnimationFrame(raf);
+      events.forEach((e) => video.removeEventListener(e, refresh));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editDuration]);
 
   // Effects
   useEffect(() => {
@@ -2563,11 +2671,16 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					>
 						<div className="timeline">
 						{mediaType === 'audio' && <canvas ref={waveformCanvasRef} className="audio-waveform-canvas" />}
+						{/* Nothing to show: no thumbnails yet (or ever, for a photo), or they'd be of the
+						    loaded clip's file rather than the edit the bar now spans - an empty frame used
+						    to float over the picture instead. */}
+						{(mediaType === 'audio' || (scrubSprite && !editTimeline)) && (
 						<div className="preview-img-wrap" ref={previewWrapRef}>
 							{mediaType === 'audio' && audioHoverTimeLabel && (
 								<span className="audio-hover-time">{audioHoverTimeLabel}</span>
 							)}
 						</div>
+						)}
 						<div className="thumb-indicator"></div>
 						{hoveredChapter && videoRef.current && Number.isFinite(videoRef.current.duration) && (
 							<div
@@ -2582,7 +2695,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						{videoRef.current && Number.isFinite(videoRef.current.duration) && (() => {
 							// At most one tick per 0.75% of the bar - closer ones would merge into a
 							// solid white strip over the progress.
-							const duration = videoRef.current!.duration;
+							const duration = editTimeline?.duration ?? videoRef.current!.duration;
 							let lastPct = -Infinity;
 							return chapters.map((chapter) => {
 								const pct = (chapter.time / duration) * 100;
@@ -2728,7 +2841,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							</button>
 
 							{showChaptersMenu && (() => {
-								const now = videoRef.current?.currentTime ?? 0;
+								const now = editTimeline ? chapterClock : videoRef.current?.currentTime ?? 0;
 								const activeChapterId = [...chapters].reverse().find((c) => c.time <= now + 0.05)?.id;
 								return (
 									<div
@@ -2781,6 +2894,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 											</span>
 											<span className="settings-row-value tabular-nums">{currentTimeElement}</span>
 										</button>
+										{!editTimeline && (
 										<button
 											className="settings-row"
 											onClick={() => void detectChaptersFromSilence()}
@@ -2792,6 +2906,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 											</span>
 											<span className="settings-row-value">Auto</span>
 										</button>
+										)}
 									</div>
 								);
 							})()}
@@ -2946,7 +3061,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						onError={handleVideoError}
 						onLoadedMetadata={() => {
 							if (videoRef.current) {
-							setTotalTimeElement(formatDuration(videoRef.current.duration));
+							if (!editTimelineRef.current) setTotalTimeElement(formatDuration(videoRef.current.duration));
 							// The position as it was when this file opened (initialTimeRef), not whatever a
 							// later render's prop says - those can already reflect early timeupdate ticks.
 							const resumeAt = initialTimeRef.current;
@@ -3020,8 +3135,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						createPortal(
 							<PlayerChaptersPanel
 								chapters={chapters}
-								activeChapterId={[...chapters].reverse().find((c) => c.time <= playbackClock + 0.05)?.id}
-								currentTime={playbackClock}
+								activeChapterId={[...chapters].reverse().find((c) => c.time <= chapterClock + 0.05)?.id}
+								currentTime={chapterClock}
 								isDetecting={isDetectingChapters}
 								onSeek={seekToChapter}
 								onRename={renameChapter}

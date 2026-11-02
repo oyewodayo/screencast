@@ -11,12 +11,13 @@
 // video timeline/tools below), with dockerMode forced to "file-tools" so the tools are already
 // open rather than needing the "show tools for this file" click. See Dashboard.tsx's
 // VideoEditorScreen for the two states that model that.
-import React, { useEffect, useMemo, useState } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { IoCutOutline, IoFilmOutline, IoFolderOpenOutline, IoImagesOutline, IoPlay, IoSearchOutline, IoTimeOutline } from "react-icons/io5";
 import { formatFileSize, truncateFileName } from "../../utils/Formater";
 import { thumbnailLimiter } from "../../utils/concurrencyLimiter";
 import { isVideoProjectPath } from "../../utils/videoEditTypes";
+import { useBatchedRecord } from "../../hooks/useBatchedRecord";
 
 export interface VideoEditorFile {
   name: string;
@@ -48,6 +49,34 @@ interface VideoEditorHomeProps {
 // WhiteboardHome's own search box.
 const SEARCH_VISIBLE_THRESHOLD = 6;
 
+// Memoized so a thumbnail arriving re-renders its own tile, not the whole library grid.
+const VideoTile = memo(function VideoTile({ video, thumbUrl, onOpen }: { video: VideoEditorFile; thumbUrl: string | undefined; onOpen: (video: VideoEditorFile) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(video)}
+      title={`Edit ${video.name}`}
+      className="group text-left rounded-lg overflow-hidden bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm hover:shadow transition-all outline-none focus-visible:border-blue-500"
+    >
+      <div className="relative aspect-video bg-neutral-100 dark:bg-neutral-950 flex items-center justify-center overflow-hidden">
+        {thumbUrl ? (
+          <img src={thumbUrl} alt="" className="w-full h-full object-cover" draggable={false} decoding="async" />
+        ) : (
+          <IoFilmOutline size={28} className="text-neutral-300 dark:text-neutral-700" />
+        )}
+        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/35 transition-colors">
+          <IoPlay size={26} className="text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow" />
+        </div>
+      </div>
+      <div className="px-3 py-2">
+        <p className="text-sm font-medium text-gray-800 dark:text-neutral-100 truncate">{truncateFileName(video.name, 30)}</p>
+        {/* A project file is a few hundred bytes of JSON - its size says nothing about the video. */}
+        <p className="text-xs text-neutral-400 dark:text-neutral-500">{isVideoProjectPath(video.path) ? "Project" : formatFileSize(video.size)}</p>
+      </div>
+    </button>
+  );
+});
+
 const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
   videos,
   recentPaths,
@@ -57,7 +86,11 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
   onCreateVideo,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
-  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
+  const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
+  // Dashboard passes a new arrow every render - this keeps the memoized tiles from re-rendering.
+  const onOpenVideoRef = useRef(onOpenVideo);
+  onOpenVideoRef.current = onOpenVideo;
+  const openVideo = useCallback((video: VideoEditorFile) => onOpenVideoRef.current(video), []);
 
   const recentVideos = useMemo(() => {
     const byPath = new Map(videos.map((video) => [video.path, video]));
@@ -89,8 +122,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
       .forEach((file) => {
         thumbnailLimiter(() => resolveThumbnailUrl(file))
           .then((url) => {
-            if (cancelled) return;
-            setThumbUrls((prev) => (prev[file.path] ? prev : { ...prev, [file.path]: url }));
+            if (!cancelled) putThumbUrl(file.path, url);
           })
           .catch((err) => console.error(`Failed to resolve thumbnail for ${file.path}:`, err));
       });
@@ -109,7 +141,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
       const file = visibleFiles.find((f) => f.path === event.payload);
       if (!file) return;
       resolveThumbnailUrl(file, true)
-        .then((url) => setThumbUrls((prev) => ({ ...prev, [file.path]: url })))
+        .then((url) => putThumbUrl(file.path, url, true))
         .catch((err) => console.error(`Failed to refresh thumbnail for ${file.path}:`, err));
     });
     return () => {
@@ -118,29 +150,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({
   }, [visibleFiles, resolveThumbnailUrl]);
 
   const renderTile = (video: VideoEditorFile): React.ReactNode => (
-    <button
-      key={video.path}
-      type="button"
-      onClick={() => onOpenVideo(video)}
-      title={`Edit ${video.name}`}
-      className="group text-left rounded-lg overflow-hidden bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 shadow-sm hover:shadow transition-all outline-none focus-visible:border-blue-500"
-    >
-      <div className="relative aspect-video bg-neutral-100 dark:bg-neutral-950 flex items-center justify-center overflow-hidden">
-        {thumbUrls[video.path] ? (
-          <img src={thumbUrls[video.path]} alt="" className="w-full h-full object-cover" draggable={false} />
-        ) : (
-          <IoFilmOutline size={28} className="text-neutral-300 dark:text-neutral-700" />
-        )}
-        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/35 transition-colors">
-          <IoPlay size={26} className="text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow" />
-        </div>
-      </div>
-      <div className="px-3 py-2">
-        <p className="text-sm font-medium text-gray-800 dark:text-neutral-100 truncate">{truncateFileName(video.name, 30)}</p>
-        {/* A project file is a few hundred bytes of JSON - its size says nothing about the video. */}
-        <p className="text-xs text-neutral-400 dark:text-neutral-500">{isVideoProjectPath(video.path) ? "Project" : formatFileSize(video.size)}</p>
-      </div>
-    </button>
+    <VideoTile key={video.path} video={video} thumbUrl={thumbUrls[video.path]} onOpen={openVideo} />
   );
 
   return (

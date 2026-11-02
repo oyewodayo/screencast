@@ -30,6 +30,11 @@ import {
   VerticalPositionAlign,
   VerticalPositionRelativeFrom,
   TextWrappingType,
+  TextWrappingSide,
+  LineRuleType,
+  type IFloating,
+  type ITableCellBorders,
+  VerticalAlign,
   IBordersOptions,
   type ICommentOptions,
   ImageRun,
@@ -92,6 +97,40 @@ function indentFor(node: JSONContent, base?: { left: number }) {
   };
 }
 
+// A CSS border ("1.5pt solid #1f2937", as docBlockFormat.ts / docTableCellShading.ts store them)
+// as a Word border. "none" (or nothing) = an explicit no-border, so Word's own defaults don't creep in.
+function wordBorder(css: unknown): { style: (typeof BorderStyle)[keyof typeof BorderStyle]; size: number; color: string; space?: number } | undefined {
+  if (typeof css !== "string" || !css.trim()) return undefined;
+  if (css.trim() === "none") return { style: BorderStyle.NONE, size: 0, color: "auto" };
+  const m = css.match(/([\d.]+)(pt|px)\s+(solid|dashed|dotted|double)\s+(#[0-9a-fA-F]{6})/);
+  if (!m) return undefined;
+  const pt = m[2] === "px" ? Number(m[1]) * 0.75 : Number(m[1]);
+  const style = m[3] === "dashed" ? BorderStyle.DASHED : m[3] === "dotted" ? BorderStyle.DOTTED : m[3] === "double" ? BorderStyle.DOUBLE : BorderStyle.SINGLE;
+  // Word measures borders in eighths of a point.
+  return { style, size: Math.max(2, Math.round(pt * 8)), color: m[4].slice(1).toUpperCase() };
+}
+
+// Paragraph spacing, line spacing, borders and shading (docBlockFormat.ts, docLineSpacingExtension.ts)
+// in Word's terms - so a document imported from Word (or styled here) keeps its rhythm, rules and
+// shaded blocks when exported back.
+function paragraphFormatFor(node: JSONContent, inherited?: IBordersOptions) {
+  const a = node.attrs ?? {};
+  const before = typeof a.spaceBefore === "number" ? Math.round(a.spaceBefore * 20) : undefined;
+  const after = typeof a.spaceAfter === "number" ? Math.round(a.spaceAfter * 20) : undefined;
+  const line = typeof a.lineSpacing === "number" ? Math.round(a.lineSpacing * 240) : undefined;
+  const border: Record<string, unknown> = { ...(inherited ?? {}) };
+  for (const side of ["top", "bottom", "left", "right"] as const) {
+    const b = wordBorder(a[`border${side[0].toUpperCase()}${side.slice(1)}`]);
+    if (b) border[side] = { ...b, space: side === "left" || side === "right" ? 4 : 1 };
+  }
+  const shading = typeof a.shading === "string" && /^#[0-9a-fA-F]{6}$/.test(a.shading) ? { fill: a.shading.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined;
+  return {
+    ...(before !== undefined || after !== undefined || line !== undefined ? { spacing: { ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}), ...(line !== undefined ? { line } : {}) } } : {}),
+    ...(Object.keys(border).length ? { border: border as IBordersOptions } : {}),
+    ...(shading ? { shading } : {}),
+  };
+}
+
 // docx's ImageRun only accepts these four raster types (confirmed from the library's own
 // RegularImageOptions type) - notably NOT "jpeg" or "webp", unlike the MIME-derived extensions
 // docImagePaste.ts/docxImport.ts can produce. A webp image saved earlier via paste/import simply
@@ -126,7 +165,49 @@ function resolveImagePath(src: string): string | null {
 const DEFAULT_IMAGE_WIDTH = 400;
 const DEFAULT_IMAGE_HEIGHT = 300;
 
-async function buildImageRun(src: string, width?: number | null, height?: number | null): Promise<ImageRun | null> {
+const EMU_PER_PX = 9525; // 914400 EMU per inch / 96 px
+
+// A picture's layout (docImageLayout.ts) as Word's own wrap setting - so it opens in Word looking
+// as it does here: in line; "Top and bottom" aligned left/centre/right; "Square" at a margin; or
+// free "In front of text" / "Behind text" at its offset from its paragraph.
+function floatingFor(attrs: Record<string, unknown>): IFloating | undefined {
+  const layout = attrs.layout as string | undefined;
+  const gap = 12 * 12700; // 12pt from the text, as the editor draws it
+  switch (layout) {
+    case "block": {
+      const align = attrs.align === "left" ? HorizontalPositionAlign.LEFT : attrs.align === "right" ? HorizontalPositionAlign.RIGHT : HorizontalPositionAlign.CENTER;
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, align },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: 0 },
+        wrap: { type: TextWrappingType.TOP_AND_BOTTOM, margins: { distT: 4 * 12700, distB: 4 * 12700 } },
+        margins: { top: 4 * 12700, bottom: 4 * 12700 },
+      };
+    }
+    case "wrapLeft":
+    case "wrapRight":
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, align: layout === "wrapLeft" ? HorizontalPositionAlign.LEFT : HorizontalPositionAlign.RIGHT },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: 0 },
+        wrap: { type: TextWrappingType.SQUARE, side: TextWrappingSide.BOTH_SIDES, margins: { distL: gap, distR: gap, distT: 2 * 12700, distB: 6 * 12700 } },
+        margins: { left: gap, right: gap, top: 2 * 12700, bottom: 6 * 12700 },
+      };
+    case "front":
+    case "behind":
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, offset: Math.round(Number(attrs.x ?? 0) * EMU_PER_PX) },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: Math.round(Number(attrs.y ?? 0) * EMU_PER_PX) },
+        wrap: { type: TextWrappingType.NONE },
+        allowOverlap: true,
+        behindDocument: layout === "behind",
+        zIndex: layout === "behind" ? 0 : 251658240,
+      };
+    default:
+      return undefined;
+  }
+}
+
+async function buildImageRun(attrs: Record<string, unknown> | undefined): Promise<ImageRun | null> {
+  const src = (attrs?.src as string) ?? "";
   const path = resolveImagePath(src);
   if (!path) return null;
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
@@ -137,10 +218,17 @@ async function buildImageRun(src: string, width?: number | null, height?: number
   }
   try {
     const bytes = await invoke<ArrayBuffer>("read_file_bytes", { path });
+    const width = (attrs?.width as number | null | undefined) ?? DEFAULT_IMAGE_WIDTH;
+    const height = (attrs?.height as number | null | undefined) ?? DEFAULT_IMAGE_HEIGHT;
+    const rotation = Number(attrs?.rotation ?? 0);
+    const alt = (attrs?.alt as string | null | undefined) ?? null;
+    const floating = floatingFor(attrs ?? {});
     return new ImageRun({
       type,
       data: new Uint8Array(bytes),
-      transformation: { width: width ?? DEFAULT_IMAGE_WIDTH, height: height ?? DEFAULT_IMAGE_HEIGHT },
+      transformation: { width, height, ...(rotation ? { rotation } : {}) },
+      ...(floating ? { floating } : {}),
+      ...(alt ? { altText: { name: attrs?.kind === "signature" ? "Signature" : "Picture", description: alt, title: alt } } : {}),
     });
   } catch (err) {
     console.error("Failed to embed image in docx export:", err);
@@ -187,6 +275,10 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
     ...(wordFontFor(fontFamily) ? { font: wordFontFor(fontFamily) } : {}),
     // docx's own run size is in half-points (OOXML convention), not points.
     ...(fontSizePt ? { size: fontSizePt * 2 } : {}),
+    // Character spacing in twips; All caps / Small caps as Word's own run properties.
+    ...(typeof textStyle?.attrs?.letterSpacing === "number" && textStyle.attrs.letterSpacing ? { characterSpacing: Math.round(textStyle.attrs.letterSpacing * 20) } : {}),
+    ...(textStyle?.attrs?.caps ? { allCaps: true } : {}),
+    ...(textStyle?.attrs?.smallCaps ? { smallCaps: true } : {}),
     ...(highlightColor ? { shading: { fill: highlightColor.replace("#", "") } } : {}),
     // No first-class inline-code concept in docx - approximated as monospace + light shading.
     // Placed last so it wins over any fontFamily/highlight above - code's own monospace+shading
@@ -273,8 +365,7 @@ async function renderInline(content: JSONContent[] | undefined, ctx: InlineConte
     } else if (node.type === "hardBreak") {
       runs.push(new TextRun({ text: "", break: 1 }));
     } else if (node.type === "image") {
-      const src = (node.attrs?.src as string) ?? "";
-      const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
+      const image = await buildImageRun(node.attrs);
       if (image) runs.push(image);
     } else if (node.type === "citation") {
       const refIds = (node.attrs?.refIds as string[] | undefined) ?? [];
@@ -440,8 +531,16 @@ class DocxBuilder {
     }
     if (children.length === 0) children.push(new Paragraph({}));
     const background = cell.attrs?.background as string | null | undefined;
+    const edges = typeof cell.attrs?.borders === "string" ? (cell.attrs.borders as string).split("|") : null;
+    const borders =
+      edges && edges.length === 4
+        ? { top: wordBorder(edges[0]), right: wordBorder(edges[1]), bottom: wordBorder(edges[2]), left: wordBorder(edges[3]) }
+        : undefined;
+    const va = cell.attrs?.verticalAlign as string | null | undefined;
     return new TableCell({
       children,
+      ...(borders ? { borders: borders as ITableCellBorders } : {}),
+      ...(va ? { verticalAlign: va === "middle" ? VerticalAlign.CENTER : va === "bottom" ? VerticalAlign.BOTTOM : VerticalAlign.TOP } : {}),
       width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE },
       columnSpan: (cell.attrs?.colspan as number | undefined) ?? undefined,
       shading: background ? { fill: background.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined,
@@ -525,6 +624,7 @@ class DocxBuilder {
             alignment: alignmentFor(node),
             indent: indentFor(node, indent),
             border,
+            ...paragraphFormatFor(node, border),
           }),
         ];
       case "heading": {
@@ -537,6 +637,7 @@ class DocxBuilder {
             alignment: alignmentFor(node),
             indent: indentFor(node, indent),
             border,
+            ...paragraphFormatFor(node, border),
           }),
         ];
       }
@@ -572,7 +673,7 @@ class DocxBuilder {
       }
       case "image": {
         const src = (node.attrs?.src as string) ?? "";
-        const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
+        const image = await buildImageRun({ ...node.attrs, src });
         return image ? [new Paragraph({ children: [image] })] : [];
       }
       case "table": {
@@ -724,8 +825,24 @@ class DocxBuilder {
     const chrome = options.pageChrome ?? null;
     const wm = options.watermark?.png ? options.watermark : null;
     const chromeHas = (band: ChromeBand) => !!chrome && bandHasContent(chrome, band);
-    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean) => {
+    const lh = options.letterhead?.first ? options.letterhead : null;
+    const sheetRun = (png: Uint8Array, w: number, h: number) =>
+      new ImageRun({
+        type: "png",
+        data: png,
+        transformation: { width: w, height: h },
+        floating: {
+          horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: 0 },
+          verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: 0 },
+          behindDocument: true,
+          allowOverlap: true,
+          wrap: { type: TextWrappingType.NONE },
+        },
+      });
+    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean, letterheadPng: Uint8Array | null = null) => {
       const children: (TextRun | ImageRun)[] = [];
+      // The letterhead sheet rides in the header behind everything, as Word letterheads are built.
+      if (letterheadPng && lh) children.push(sheetRun(letterheadPng, lh.widthPx, lh.heightPx));
       if (withText && chrome) {
         const style = { size: chrome.fontSize * 2, color: "5F6368" };
         CHROME_SLOTS.forEach((slot, i) => {
@@ -764,14 +881,25 @@ class DocxBuilder {
     };
     const textOnFirst = !chrome?.differentFirstPage;
     const markOnFirst = !wm?.skipFirstPage;
-    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage);
+    const lhRest = lh ? (lh.rest === "same" ? lh.first : lh.rest) : null;
+    // Page 1's deeper top margin: an exact-height spacer in its header carries the header down to
+    // where the text starts - Word starts the body below the header when the header runs deeper.
+    const HEADER_DIST_IN = 0.5;
+    const spacerTwips = lh?.firstTopIn ? Math.round((lh.firstTopIn - HEADER_DIST_IN) * 1440) : 0;
+    const lhNeedsFirst = !!lh && (lh.rest !== "same" || spacerTwips > 0);
+    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage) || lhNeedsFirst;
     const parts = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
       const text = chromeHas(band);
       const mark = band === "header" && !!wm;
-      if (!text && !mark) return undefined;
-      const part = (withText: boolean, withMark: boolean) => new Part({ children: [bandParagraph(band, withText, withMark)] }) as InstanceType<T>;
-      const main = part(text, mark);
-      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst) } : { default: main };
+      const sheet = band === "header" && !!lh;
+      if (!text && !mark && !sheet) return undefined;
+      const part = (withText: boolean, withMark: boolean, png: Uint8Array | null, spacer = 0) => {
+        const children: Paragraph[] = [bandParagraph(band, withText, withMark, png)];
+        if (spacer > 240) children.push(new Paragraph({ spacing: { line: spacer, lineRule: LineRuleType.EXACT, before: 0, after: 0 }, children: [] }));
+        return new Part({ children }) as InstanceType<T>;
+      };
+      const main = part(text, mark, sheet ? lhRest : null);
+      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst, sheet ? lh!.first : null, sheet ? spacerTwips : 0) } : { default: main };
     };
 
     const doc = new Document({
@@ -821,6 +949,9 @@ export interface DocxExportOptions {
   pageChrome?: DocPageChrome | null;
   // The watermark (docWatermark.ts), already drawn as a PNG of the whole sheet (CSS px size).
   watermark?: { png: Uint8Array | null; widthPx: number; heightPx: number; skipFirstPage: boolean } | null;
+  // The letterhead (docLetterhead.ts): page 1's sheet and the later pages' ("same" = page 1's, null
+  // = plain paper) as page-sized PNGs, and page 1's own top margin when it's deeper.
+  letterhead?: { first: Uint8Array | null; rest: Uint8Array | "same" | null; widthPx: number; heightPx: number; firstTopIn: number | null } | null;
   margins?: DocMargins | null;
 }
 

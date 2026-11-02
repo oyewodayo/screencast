@@ -20,9 +20,14 @@ mod commands {
     pub mod file_info;
     pub mod motion_tracking;
     pub mod object_find;
+    pub mod face_find;
     pub mod music_library;
+    // The AI voice's commands - see services/tts.rs.
+    pub mod tts;
     pub mod native_playback;
     pub mod snip;
+    pub mod screen_color;
+    pub mod stage_render;
     pub mod recording;
     pub mod system_info;
     pub mod window_capture;
@@ -39,6 +44,7 @@ mod services {
     pub mod citations;
     pub mod docs;
     pub mod docs_search;
+    pub mod links;
     pub mod file_watcher;
     pub mod google_share;
     pub mod image_annotations;
@@ -65,13 +71,20 @@ mod services {
     // Keeps the window from ever going "Not responding" - see the module's own comment for the
     // threading rules every command follows and the test that enforces them.
     pub mod responsiveness;
+    pub mod quiet_notifications;
     pub mod share;
     // Opt-out analytics + crash reports, compiled in only for release builds with keys.
     pub mod telemetry;
     pub mod sidecars;
     pub mod trash;
+    // The tray icon the closed window hides to - see the module's own comment.
+    pub mod tray;
     pub mod utility;
     pub mod whisper_model;
+    // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
+    pub mod tts;
+    pub mod tts_text;
+    pub mod tts_vocab;
     pub mod video_edits;
     pub mod mindmaps;
     pub mod whiteboards;
@@ -91,6 +104,9 @@ mod services {
     // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
     #[cfg(target_os = "windows")]
     pub mod input_tracker;
+    // The annotation overlay's privacy blur - live acrylic regions you can still type through.
+    // Stubbed off Windows inside the module, so its commands register everywhere.
+    pub mod screen_blur;
     // Windows Job Object wrapper that kills recording ffmpeg children the instant this app's own
     // process dies for any reason (including a force-kill), so they can't outlive it holding the
     // camera/mic open - see the module's own doc comment for the orphan this fixes.
@@ -357,11 +373,7 @@ fn main() {
         // shortcut... it may already be in use by another app". Instead the running copy's main
         // window is brought forward - what the user launching it again actually wanted.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            services::tray::show_main(app);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -379,6 +391,7 @@ fn main() {
         .manage(services::file_watcher::FileWatcherState::default())
         .manage(services::phone_camera::PhoneCameraState::default())
         .manage(services::phone_transfer::PhoneTransferState::default())
+        .manage(services::tray::TrayState::default())
         .setup(|app| {
             // Start watching the Briefcast folder for external changes right away, so the sidebar
             // stays live without needing a restart or a manual refresh click - see
@@ -392,6 +405,9 @@ fn main() {
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
             }
 
+            if let Err(e) = services::tray::install(app.handle()) {
+                log::warn!("Could not create the tray icon: {}", e);
+            }
             services::telemetry::init(app.handle());
             // Only if a phone was paired before - lets a phone that still has the page open
             // reconnect without anyone opening the Transfer dialog first.
@@ -404,6 +420,8 @@ fn main() {
             // GPU screen capture); doing them now in the background means the device pickers and
             // the first recording never wait on them.
             commands::recording::warm_device_cache(app.handle());
+            // A recording that never reached its stop (crash, kill) leaves notifications muted.
+            std::thread::spawn(services::quiet_notifications::restore);
             commands::recording::prewarm_rec_completed_modal(app.handle());
             if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app.handle()) {
                 std::thread::spawn(move || {
@@ -517,10 +535,21 @@ fn main() {
             commands::conversion::transcribe_doc_audio,
             commands::conversion::convert_audio,
             commands::conversion::export_trimmed_video,
+            commands::conversion::get_export_frame_rate,
+            commands::stage_render::stage_render_open,
+            commands::stage_render::stage_render_frame,
+            commands::stage_render::stage_render_finish,
+            commands::stage_render::stage_render_discard,
             commands::background_removal::background_removal_status,
             commands::recording::load_bubble_sidecar,
             commands::object_find::find_objects,
             commands::object_find::cancel_find_objects,
+            commands::face_find::face_matching_status,
+            commands::face_find::download_face_matching,
+            commands::face_find::cancel_face_matching_download,
+            commands::face_find::outline_kind_at,
+            commands::face_find::prepare_face_matching,
+            commands::face_find::find_person,
             commands::camera_effects::camera_effect_start,
             commands::camera_effects::camera_effect_status,
             commands::camera_effects::camera_effect_preview,
@@ -549,6 +578,13 @@ fn main() {
             commands::audio_tracks::download_separation_engine,
             commands::audio_tracks::cancel_separation_engine_download,
             commands::audio_tracks::cancel_voice_music_separation,
+            commands::tts::tts_status,
+            commands::tts::download_tts,
+            commands::tts::cancel_tts_download,
+            commands::tts::tts_synthesize,
+            commands::tts::cancel_tts,
+            commands::tts::tts_preview,
+            commands::tts::tts_release,
             commands::music_library::get_music_catalog,
             commands::music_library::get_music_track_file,
             commands::music_library::restore_music_track,
@@ -563,6 +599,7 @@ fn main() {
             commands::native_playback::get_next_audio_chunk,
             commands::native_playback::seek_native_playback,
             commands::native_playback::stop_native_playback,
+            commands::screen_color::sample_screen_at_cursor,
             commands::snip::snip_begin,
             commands::snip::snip_info,
             commands::snip::snip_frame,
@@ -633,6 +670,10 @@ fn main() {
             services::docs::link_doc_to_file,
             services::docs::unlink_doc,
             services::docs::find_docs_linked_to,
+            services::links::list_links,
+            services::links::add_link,
+            services::links::remove_link,
+            services::links::relink_file_path,
             services::docs::relink_doc_path,
             services::docs::export_doc,
             services::docs::export_doc_binary,
@@ -681,7 +722,17 @@ fn main() {
             services::trash::restore_from_trash,
             services::trash::delete_trash_item,
             services::trash::empty_trash,
-            services::trash::purge_expired_trash
+            services::trash::purge_expired_trash,
+            services::screen_blur::screen_blur_set,
+            services::screen_blur::screen_blur_remove,
+            services::screen_blur::screen_blur_clear,
+            services::screen_blur::screen_blur_list,
+            services::screen_blur::screen_blur_gesture_begin,
+            services::screen_blur::screen_blur_gesture_end,
+            services::screen_blur::screen_blur_configure,
+            services::screen_blur::screen_blur_toggle_window,
+            services::screen_blur::screen_blur_ocr_language,
+            services::tray::tray_set_recording
         ])
         .build(context)
         .expect("error while building tauri application")

@@ -9,6 +9,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { IoImageOutline } from "react-icons/io5";
 import { BACKGROUND_SWATCHES, BLUR_DEFAULT, type CutoutBackground } from "../../utils/cutoutBackground";
 import { IMAGE_CLIP_EXTENSIONS } from "../../utils/videoEditTypes";
+import ColorInput from "../common/ColorInput";
 
 interface Props {
   value: CutoutBackground | undefined;
@@ -98,7 +99,7 @@ const CutoutBackgroundPicker: React.FC<Props> = ({ value, onChange, allowNone })
             />
           ))}
           <label title="Any colour" className="relative w-5 h-5 rounded-full overflow-hidden ring-1 ring-white/20 hover:ring-white/50 cursor-pointer" style={{ background: "conic-gradient(red, yellow, lime, aqua, blue, magenta, red)" }}>
-            <input type="color" value={value.color} onChange={(e) => onChange({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+            <ColorInput value={value.color} onChange={(e) => onChange({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
           </label>
         </div>
       )}

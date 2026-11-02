@@ -56,7 +56,7 @@ import {
   MdBrandingWatermark,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbFileCertificate, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbSignature, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import { CELL_SHADES } from "../../utils/docTableCellShading";
 import DocColorPicker from "./DocColorPicker";
@@ -579,6 +579,8 @@ export interface DocToolbarProps {
   linkOpen: boolean;
   onLinkOpenChange: (open: boolean) => void;
   onInsertImage: () => void;
+  // Opens the signature studio (DocSignatureStudio.tsx).
+  onSign: () => void;
   onAddComment: (text: string) => void;
   rulerVisible: boolean;
   onToggleRuler: () => void;
@@ -595,6 +597,7 @@ export interface DocToolbarProps {
   // the watermark.
   onOpenHeaderFooter: (focus: "header" | "pageNumbers") => void;
   onOpenWatermark: () => void;
+  onOpenLetterhead: () => void;
 }
 
 const DocToolbar: React.FC<DocToolbarProps> = ({
@@ -603,6 +606,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   linkOpen,
   onLinkOpenChange,
   onInsertImage,
+  onSign,
   onAddComment,
   rulerVisible,
   onToggleRuler,
@@ -613,6 +617,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   typeset,
   onOpenHeaderFooter,
   onOpenWatermark,
+  onOpenLetterhead,
 }) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
@@ -1059,6 +1064,9 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           <ToolButton label="Insert image" onClick={onInsertImage}>
             <MdImage size={19} />
           </ToolButton>
+          <ToolButton label="Sign - draw, type or upload a signature" onClick={onSign}>
+            <TbSignature size={19} strokeWidth={1.75} />
+          </ToolButton>
           <Dropdown {...bind("table")} label="Insert table" trigger={<TbTable size={19} strokeWidth={1.75} />}>
             <TableGridPicker
               onPick={(rows, cols) => {
@@ -1287,6 +1295,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
             {menuAction("Show ruler", MdStraighten, onToggleRuler, { active: rulerVisible })}
           </MenuSection>
           <MenuSection title="Page">
+            {menuAction("Letterhead…", TbFileCertificate, onOpenLetterhead)}
             {menuAction("Header & footer…", TbLayoutNavbar, () => onOpenHeaderFooter("header"))}
             {menuAction("Page numbers…", TbNumbers, () => onOpenHeaderFooter("pageNumbers"))}
             {menuAction("Watermark…", MdBrandingWatermark, onOpenWatermark)}
@@ -1320,6 +1329,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           </MenuSection>
           <MenuSection title="Insert" className="@4xl:hidden">
             {menuAction("Image", MdImage, onInsertImage)}
+            {menuAction("Signature…", TbSignature, onSign)}
             {menuAction("Table (3 × 3)", TbTable, () => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run())}
             {equationItems}
             {menuAction("Citation…", TbQuote, () => openPickerAtCursor("cite"))}

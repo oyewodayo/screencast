@@ -32,6 +32,9 @@ interface SidebarFileIconProps {
   resolveThumbnailUrl?: (file: { name: string; path: string }) => Promise<string>;
   fallbackIcon: React.ReactNode;
   fallbackClassName: string;
+  // Grid view: a full-width 16:9 tile instead of the 20px row icon. Same lazy/limited resolve;
+  // `isImage` just means "has a thumbnail to resolve" (the grid also passes videos).
+  large?: boolean;
 }
 
 const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
@@ -41,6 +44,7 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
   resolveThumbnailUrl,
   fallbackIcon,
   fallbackClassName,
+  large = false,
 }) => {
   const tileRef = useRef<HTMLDivElement>(null);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -79,12 +83,16 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
   return (
     <div
       ref={tileRef}
-      className="shrink-0 w-5 h-5 rounded-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center"
+      className={
+        large
+          ? "w-full aspect-video rounded-lg overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ring-1 ring-black/5 dark:ring-white/5"
+          : "shrink-0 w-5 h-5 rounded-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center"
+      }
     >
       {thumbUrl ? (
         <img src={thumbUrl} alt="" draggable={false} loading="lazy" className="w-full h-full object-cover" />
       ) : (
-        <span className={fallbackClassName}>{fallbackIcon}</span>
+        <span className={`${fallbackClassName} ${large ? "scale-[1.8]" : ""}`}>{fallbackIcon}</span>
       )}
     </div>
   );

@@ -17,14 +17,16 @@
 // range since the last-clicked tile. All three drive the SAME selectedFilePaths Set Dashboard.tsx
 // already threads through the sidebar's bulk action bar, so a gallery selection and a sidebar
 // selection are one and the same thing, not two parallel selection models.
-import React, { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { IoChevronForward, IoClose, IoEllipsisVertical, IoFolderOutline, IoPlay, IoTrashOutline, IoVideocam, IoPhonePortraitOutline } from "react-icons/io5";
 import { openPhoneTransfer } from "../services/phoneTransfer";
 import { formatFileSize, truncateFileName } from "../utils/Formater";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
 import { useGallerySort } from "./GallerySort";
+import { useBatchedRecord } from "../hooks/useBatchedRecord";
+import InlineRenameInput from "./InlineRenameInput";
+import FloatingContextMenu from "./FloatingContextMenu";
 import { isVideoProjectPath } from "../utils/videoEditTypes";
 
 interface GalleryFile {
@@ -51,10 +53,8 @@ interface VideoFolderGalleryProps {
   // Dashboard.tsx - one rename in flight at a time, shared with the sidebar list, rather than a
   // second parallel rename state living only here.
   renamingFile: string | null;
-  renameValue: string;
-  onRenameValueChange: (value: string) => void;
   onStartRename: (file: GalleryFile) => void;
-  onCommitRename: (file: GalleryFile) => void;
+  onCommitRename: (file: GalleryFile, newName: string) => void;
   onCancelRename: () => void;
   // Lifted multi-selection - see this file's own doc comment above. `selectedFilePaths` spans
   // every folder/category (it's Dashboard.tsx's one shared selection set), not just this one, so
@@ -73,6 +73,10 @@ interface VideoFolderGalleryProps {
 
 const STATUS_RESET_MS = 1500;
 
+// Off-screen tiles skip layout and paint entirely; "auto" remembers each tile's real size once
+// it has rendered, so the scrollbar doesn't jump.
+const TILE_STYLE: React.CSSProperties = { contentVisibility: "auto", containIntrinsicSize: "auto 220px" };
+
 const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   files: unsortedFiles,
   folderLabel,
@@ -82,8 +86,6 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   onShowInfo,
   onConvertFile,
   renamingFile,
-  renameValue,
-  onRenameValueChange,
   onStartRename,
   onCommitRename,
   onCancelRename,
@@ -97,7 +99,8 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   onBulkDelete,
 }) => {
   const { sorted: files, control: sortControl } = useGallerySort(unsortedFiles, "video");
-  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
+  // Batched - one grid render per ~32ms of resolved thumbnails, not one per thumbnail.
+  const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
   const [contextMenu, setContextMenu] = useState<{ file: GalleryFile; x: number; y: number } | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -107,7 +110,6 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   const lastClickedIndexRef = useRef<number | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
     const pending = files.filter((file) => !thumbUrls[file.path]);
 
     // Routed through the shared thumbnailLimiter (concurrencyLimiter.ts), the same one
@@ -117,16 +119,9 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
     // that made this necessary).
     pending.forEach((file) => {
       thumbnailLimiter(() => resolveThumbnailUrl(file))
-        .then((url) => {
-          if (cancelled) return;
-          setThumbUrls((prev) => (prev[file.path] ? prev : { ...prev, [file.path]: url }));
-        })
+        .then((url) => putThumbUrl(file.path, url))
         .catch((err) => console.error(`Failed to resolve thumbnail for ${file.path}:`, err));
     });
-
-    return () => {
-      cancelled = true;
-    };
     // Only re-run when the folder's file list itself changes - thumbUrls updates every time a
     // thumbnail resolves, and including it here would re-trigger this effect on every single one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,23 +136,13 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
       const file = files.find((f) => f.path === event.payload);
       if (!file) return;
       resolveThumbnailUrl(file, true)
-        .then((url) => setThumbUrls((prev) => ({ ...prev, [file.path]: url })))
+        .then((url) => putThumbUrl(file.path, url, true))
         .catch((err) => console.error(`Failed to refresh thumbnail for ${file.path}:`, err));
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, [files, resolveThumbnailUrl]);
-
-  // Closes the context menu on any click/tap outside it - same pattern VideoOverlayLayer.tsx's
-  // own right-click menu uses, including the pointerdown (not click) listener so a press that
-  // opens a *different* tile's menu doesn't get eaten by this one closing first.
-  useEffect(() => {
-    if (!contextMenu) return;
-    const close = () => setContextMenu(null);
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [contextMenu]);
 
   useEffect(() => () => {
     if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
@@ -182,6 +167,106 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   const openMenuFor = (file: GalleryFile, x: number, y: number) => {
     setContextMenu({ file, x, y });
   };
+
+  // The tile handlers read Dashboard's callbacks through this ref, so the memoized grid below
+  // doesn't depend on them: they're fresh arrows on every Dashboard render, and the dashboard
+  // re-renders constantly for reasons unrelated to this folder.
+  const latest = useRef({ onSelectRange, onToggleFileSelected, onSelectOnly, onOpenVideo, onCommitRename, onCancelRename });
+  latest.current = { onSelectRange, onToggleFileSelected, onSelectOnly, onOpenVideo, onCommitRename, onCancelRename };
+
+  // Rebuilt only when something a tile shows changes - not on every parent render, which used to
+  // re-diff every tile each time and made the page feel sticky.
+  const tiles = useMemo(
+    () =>
+      files.map((file, index) => (
+        <div
+          key={file.path}
+          role="button"
+          tabIndex={0}
+          onClick={(e) => {
+            if (e.shiftKey && lastClickedIndexRef.current !== null) {
+              const [from, to] = [lastClickedIndexRef.current, index].sort((a, b) => a - b);
+              latest.current.onSelectRange(files.slice(from, to + 1).map((f) => f.path));
+            } else if (e.ctrlKey || e.metaKey) {
+              latest.current.onToggleFileSelected(file.path);
+              lastClickedIndexRef.current = index;
+            } else {
+              latest.current.onSelectOnly(file.path);
+              lastClickedIndexRef.current = index;
+            }
+          }}
+          onDoubleClick={() => latest.current.onOpenVideo(file)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") latest.current.onOpenVideo(file);
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            openMenuFor(file, e.clientX, e.clientY);
+          }}
+          title={renamingFile === file.path ? undefined : file.name}
+          style={TILE_STYLE}
+          className={`group relative flex flex-col rounded-md overflow-hidden border bg-white dark:bg-neutral-900 text-left cursor-pointer transition-colors ${
+            selectedFilePaths.has(file.path)
+              ? "border-blue-400 dark:border-blue-500 ring-1 ring-blue-400 dark:ring-blue-500"
+              : "border-gray-200 dark:border-neutral-800 hover:border-blue-300 dark:hover:border-blue-600"
+          }`}
+        >
+          <button
+            type="button"
+            title="More actions"
+            onClick={(e) => {
+              e.stopPropagation();
+              const rect = e.currentTarget.getBoundingClientRect();
+              openMenuFor(file, rect.right, rect.bottom);
+            }}
+            className="absolute top-1 right-1 z-10 p-1 rounded opacity-0 group-hover:opacity-100 bg-black/40 text-white hover:bg-black/60 transition-opacity"
+          >
+            <IoEllipsisVertical size={13} />
+          </button>
+          {/* aspect-video (16:9), not the image gallery's aspect-square - video source material
+              is almost always widescreen, and cropping a poster frame to a square would cut off
+              real content in a way it wouldn't for a typically-portrait or already-square photo. */}
+          <div className="aspect-video w-full bg-gray-100 dark:bg-neutral-800 flex items-center justify-center overflow-hidden relative">
+            {thumbUrls[file.path] ? (
+              <img
+                src={thumbUrls[file.path]}
+                alt={file.name}
+                loading="lazy"
+                decoding="async"
+                draggable={false}
+                className="w-full h-full object-contain"
+              />
+            ) : (
+              <IoVideocam size={22} className="text-gray-300 dark:text-neutral-700" />
+            )}
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="w-8 h-8 rounded-full bg-black/50 flex items-center justify-center opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all">
+                <IoPlay size={14} className="text-white translate-x-[1px]" />
+              </div>
+            </div>
+          </div>
+          {renamingFile === file.path ? (
+            <InlineRenameInput
+              fileName={file.name}
+              onCommit={(value) => latest.current.onCommitRename(file, value)}
+              onCancel={() => latest.current.onCancelRename()}
+              className="mx-1 my-1 min-w-0 border border-blue-400 rounded px-1 text-[11px] bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
+            />
+          ) : (
+            <div className="flex items-center justify-between gap-1 px-1.5 py-1">
+              <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate min-w-0">
+                {truncateFileName(file.name)}
+              </span>
+              <span className="text-[10px] text-gray-400 dark:text-neutral-500 shrink-0 whitespace-nowrap">
+                {formatFileSize(file.size)}
+              </span>
+            </div>
+          )}
+        </div>
+      )),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [files, thumbUrls, selectedFilePaths, renamingFile]
+  );
 
   const selectedInFolder = files.filter((file) => selectedFilePaths.has(file.path));
 
@@ -220,97 +305,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
           if (e.target === e.currentTarget) onClearSelection();
         }}
       >
-        {files.map((file, index) => (
-          <div
-            key={file.path}
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              if (e.shiftKey && lastClickedIndexRef.current !== null) {
-                const [from, to] = [lastClickedIndexRef.current, index].sort((a, b) => a - b);
-                onSelectRange(files.slice(from, to + 1).map((f) => f.path));
-              } else if (e.ctrlKey || e.metaKey) {
-                onToggleFileSelected(file.path);
-                lastClickedIndexRef.current = index;
-              } else {
-                onSelectOnly(file.path);
-                lastClickedIndexRef.current = index;
-              }
-            }}
-            onDoubleClick={() => onOpenVideo(file)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") onOpenVideo(file);
-            }}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              openMenuFor(file, e.clientX, e.clientY);
-            }}
-            title={file.name}
-            className={`group relative flex flex-col rounded-md overflow-hidden border bg-white dark:bg-neutral-900 text-left cursor-pointer transition-colors ${
-              selectedFilePaths.has(file.path)
-                ? "border-blue-400 dark:border-blue-500 ring-1 ring-blue-400 dark:ring-blue-500"
-                : "border-gray-200 dark:border-neutral-800 hover:border-blue-300 dark:hover:border-blue-600"
-            }`}
-          >
-            <button
-              type="button"
-              title="More actions"
-              onClick={(e) => {
-                e.stopPropagation();
-                const rect = e.currentTarget.getBoundingClientRect();
-                openMenuFor(file, rect.right, rect.bottom);
-              }}
-              className="absolute top-1 right-1 z-10 p-1 rounded opacity-0 group-hover:opacity-100 bg-black/40 text-white hover:bg-black/60 transition-opacity"
-            >
-              <IoEllipsisVertical size={13} />
-            </button>
-            {/* aspect-video (16:9), not the image gallery's aspect-square - video source material
-                is almost always widescreen, and cropping a poster frame to a square would cut off
-                real content in a way it wouldn't for a typically-portrait or already-square photo. */}
-            <div className="aspect-video w-full bg-gray-100 dark:bg-neutral-800 flex items-center justify-center overflow-hidden relative">
-              {thumbUrls[file.path] ? (
-                <img
-                  src={thumbUrls[file.path]}
-                  alt={file.name}
-                  loading="lazy"
-                  draggable={false}
-                  className="w-full h-full object-contain"
-                />
-              ) : (
-                <IoVideocam size={22} className="text-gray-300 dark:text-neutral-700" />
-              )}
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <div className="w-8 h-8 rounded-full bg-black/50 flex items-center justify-center opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all">
-                  <IoPlay size={14} className="text-white translate-x-[1px]" />
-                </div>
-              </div>
-            </div>
-            {renamingFile === file.path ? (
-              <input
-                autoFocus
-                value={renameValue}
-                onClick={(e) => e.stopPropagation()}
-                onChange={(e) => onRenameValueChange(e.target.value)}
-                onBlur={() => onCommitRename(file)}
-                onKeyDown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter") onCommitRename(file);
-                  if (e.key === "Escape") onCancelRename();
-                }}
-                className="mx-1 my-1 min-w-0 border border-blue-400 rounded px-1 text-[11px] bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-              />
-            ) : (
-              <div className="flex items-center justify-between gap-1 px-1.5 py-1">
-                <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate min-w-0">
-                  {truncateFileName(file.name)}
-                </span>
-                <span className="text-[10px] text-gray-400 dark:text-neutral-500 shrink-0 whitespace-nowrap">
-                  {formatFileSize(file.size)}
-                </span>
-              </div>
-            )}
-          </div>
-        ))}
+        {tiles}
       </div>
 
       {/* Selection panel - fixed (not just sticky-within-scroll) so it stays in view regardless
@@ -396,116 +391,115 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
         </>
       )}
 
-      {contextMenu &&
-        createPortal(
-          <div
-            onPointerDown={(e) => e.stopPropagation()}
-            style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 9999 }}
-            className="w-40 py-1 rounded-md bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 shadow-lg text-sm"
+      {contextMenu && (
+        <FloatingContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          className="w-40 py-1 rounded-md bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 shadow-lg text-sm"
+        >
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onOpenVideo(contextMenu.file);
+              setContextMenu(null);
+            }}
           >
+            Open
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              void handleCopyPath(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Copy path
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onStartRename(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onConvertFile(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Convert
+          </button>
+          {!isVideoProjectPath(contextMenu.file.path) && (
             <button
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
               onClick={() => {
-                onOpenVideo(contextMenu.file);
+                onSetThumbnail(contextMenu.file);
                 setContextMenu(null);
               }}
             >
-              Open
+              Set thumbnail…
             </button>
+          )}
+          {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) - for the whole selection when
+              this tile is part of one, the same rule as the sidebar's own file menu. */}
+          <button
+            type="button"
+            className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
+              onOpenMoveCopy(target, { left: rect.right + 4, top: rect.top });
+              setContextMenu(null);
+            }}
+          >
+            <span className="flex-1 text-left">Move or copy to…</span>
+            <IoChevronForward size={11} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+          </button>
+          {!isVideoProjectPath(contextMenu.file.path) && (
             <button
               type="button"
               className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
               onClick={() => {
-                void handleCopyPath(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Copy path
-            </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-              onClick={() => {
-                onStartRename(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Rename
-            </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-              onClick={() => {
-                onConvertFile(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Convert
-            </button>
-            {!isVideoProjectPath(contextMenu.file.path) && (
-              <button
-                type="button"
-                className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-                onClick={() => {
-                  onSetThumbnail(contextMenu.file);
-                  setContextMenu(null);
-                }}
-              >
-                Set thumbnail…
-              </button>
-            )}
-            {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) - for the whole selection when
-                this tile is part of one, the same rule as the sidebar's own file menu. */}
-            <button
-              type="button"
-              className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-              onClick={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
                 const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
-                onOpenMoveCopy(target, { left: rect.right + 4, top: rect.top });
+                openPhoneTransfer(target.filter((f) => !isVideoProjectPath(f.path)));
                 setContextMenu(null);
               }}
             >
-              <span className="flex-1 text-left">Move or copy to…</span>
-              <IoChevronForward size={11} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+              Transfer to phone
             </button>
-            {!isVideoProjectPath(contextMenu.file.path) && (
-              <button
-                type="button"
-                className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-                onClick={() => {
-                  const target = selectedFilePaths.has(contextMenu.file.path) && selectedInFolder.length > 1 ? selectedInFolder : [contextMenu.file];
-                  openPhoneTransfer(target.filter((f) => !isVideoProjectPath(f.path)));
-                  setContextMenu(null);
-                }}
-              >
-                Transfer to phone
-              </button>
-            )}
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
-              onClick={() => {
-                onShowInfo(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Info
-            </button>
-            <button
-              type="button"
-              className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 text-red-600 dark:text-red-400"
-              onClick={() => {
-                onDeleteFile(contextMenu.file);
-                setContextMenu(null);
-              }}
-            >
-              Delete
-            </button>
-          </div>,
-          document.body
-        )}
+          )}
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onShowInfo(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Info
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 text-red-600 dark:text-red-400"
+            onClick={() => {
+              onDeleteFile(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Delete
+          </button>
+        </FloatingContextMenu>
+      )}
     </div>
   );
 };

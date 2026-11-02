@@ -37,6 +37,31 @@ const DocTextOverrides = Extension.create({
             parseHTML: (el: HTMLElement) => (el.style.fontStyle === "normal" ? "normal" : null),
             renderHTML: (attrs: Record<string, unknown>) => (attrs.fontStyle === "normal" ? { style: "font-style: normal" } : {}),
           },
+          tabAlign: {
+            default: null,
+            parseHTML: (el: HTMLElement) => (el.style.float === "right" ? "right" : null),
+            renderHTML: (attrs: Record<string, unknown>) => (attrs.tabAlign === "right" ? { style: "float: right" } : {}),
+          },
+          // Word's character spacing (expanded/condensed), in pt.
+          letterSpacing: {
+            default: null,
+            parseHTML: (el: HTMLElement) => {
+              const v = parseFloat(el.style.letterSpacing);
+              return Number.isFinite(v) && v !== 0 ? v : null;
+            },
+            renderHTML: (attrs: Record<string, unknown>) => (typeof attrs.letterSpacing === "number" && attrs.letterSpacing ? { style: `letter-spacing: ${attrs.letterSpacing}pt` } : {}),
+          },
+          // Word's All caps / Small caps: the text keeps its own letters (search, export), drawn as capitals.
+          caps: {
+            default: null,
+            parseHTML: (el: HTMLElement) => (el.style.textTransform === "uppercase" ? true : null),
+            renderHTML: (attrs: Record<string, unknown>) => (attrs.caps ? { style: "text-transform: uppercase" } : {}),
+          },
+          smallCaps: {
+            default: null,
+            parseHTML: (el: HTMLElement) => (el.style.fontVariant === "small-caps" || el.style.fontVariantCaps === "small-caps" ? true : null),
+            renderHTML: (attrs: Record<string, unknown>) => (attrs.smallCaps ? { style: "font-variant: small-caps" } : {}),
+          },
         },
       },
     ];
