@@ -185,7 +185,9 @@ export const PairingPanel = ({
             )}
 
             <div className="flex gap-6">
-                <div className="shrink-0">
+                {/* p-0.5: the card's ring-2 is drawn outside its box, and the scrolling panel around this
+                    clips anything outside its own edges - without the room its top edge was cut off. */}
+                <div className="shrink-0 p-0.5">
                     {qr ? (
                         <div
                             className={`w-[212px] h-[212px] p-2 rounded-xl bg-white ring-2 [&>svg]:w-full [&>svg]:h-full ${
