@@ -119,10 +119,15 @@ export interface DocxImageMeta {
   x: number; // px from the anchor paragraph's left (front/behind)
   y: number; // px from the anchor paragraph's top
   rotation: number; // degrees, clockwise
+  // Placed relative to the page itself (Word's "relative to Page/Margin" vertically): the exact
+  // spot on its page, px from the sheet's top-left. The editor settles x/y from it once the pages
+  // are laid out (DocImageView.tsx), since only then is the anchor paragraph's page known.
+  pageX: number | null;
+  pageY: number | null;
   alt: string | null;
 }
 
-interface RawRPr {
+export interface RawRPr {
   rStyle?: string;
   fontFamily?: string;
   fontTheme?: string;
@@ -137,7 +142,7 @@ interface RawRPr {
   highlight?: string;
 }
 
-interface RawPPr {
+export interface RawPPr {
   pStyle?: string;
   spaceBeforePt?: number | null;
   spaceAfterPt?: number | null;
@@ -154,12 +159,20 @@ interface RawPPr {
   shading?: string;
   pageBreakBefore?: boolean;
   hasRightTab?: boolean;
+  tabs?: TabStop[];
   numId?: string;
   ilvl?: string;
   rPr?: RawRPr;
 }
 
-interface RawStyleDef {
+// A tab stop: position in twips from the text's left edge, alignment ("clear" removes an
+// inherited stop at that position).
+export interface TabStop {
+  pos: number;
+  val: string;
+}
+
+export interface RawStyleDef {
   styleId: string;
   type: string;
   name: string;
@@ -169,13 +182,13 @@ interface RawStyleDef {
   rPr: RawRPr;
 }
 
-interface ThemeData {
+export interface ThemeData {
   colors: Record<string, string>;
   majorFont: string | null;
   minorFont: string | null;
 }
 
-interface NumLevelDef {
+export interface NumLevelDef {
   numFmt: string;
   lvlText: string;
   leftTwips: number | null;
@@ -184,17 +197,17 @@ interface NumLevelDef {
 }
 
 const HEX6 = /^[0-9a-fA-F]{6}$/;
-const EMU_PER_PX = 9525; // 914400 EMU/inch / 96 CSS px/inch
-const TWIPS_PER_IN = 1440;
+export const EMU_PER_PX = 9525; // 914400 EMU/inch / 96 CSS px/inch
+export const TWIPS_PER_IN = 1440;
 const TWIPS_PER_PT = 20;
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
-function localTag(el: Element): string {
+export function localTag(el: Element): string {
   return el.localName || el.tagName.replace(/^.*:/, "");
 }
 
-function elementChildren(parent: Element | null | undefined): Element[] {
+export function elementChildren(parent: Element | null | undefined): Element[] {
   if (!parent || !parent.childNodes) return [];
   const out: Element[] = [];
   for (let i = 0; i < parent.childNodes.length; i++) {
@@ -204,7 +217,7 @@ function elementChildren(parent: Element | null | undefined): Element[] {
   return out;
 }
 
-function attr(el: Element | null | undefined, name: string): string | null {
+export function attr(el: Element | null | undefined, name: string): string | null {
   if (!el) return null;
   if (el.hasAttribute(name)) return el.getAttribute(name);
   const bare = name.replace(/^.*:/, "");
@@ -212,7 +225,7 @@ function attr(el: Element | null | undefined, name: string): string | null {
   return null;
 }
 
-function directChild(parent: Element | null | undefined, localName: string): Element | null {
+export function directChild(parent: Element | null | undefined, localName: string): Element | null {
   if (!parent || !parent.childNodes) return null;
   const prefixed = `w:${localName}`;
   for (let i = 0; i < parent.childNodes.length; i++) {
@@ -224,7 +237,7 @@ function directChild(parent: Element | null | undefined, localName: string): Ele
   return null;
 }
 
-function directChildren(parent: Element | null | undefined, localName: string): Element[] {
+export function directChildren(parent: Element | null | undefined, localName: string): Element[] {
   if (!parent || !parent.childNodes) return [];
   const prefixed = `w:${localName}`;
   const out: Element[] = [];
@@ -311,7 +324,7 @@ function parseThemeXml(xmlText: string | null, parser: XmlDOMParser): ThemeData 
   return theme;
 }
 
-function resolveColorAttr(el: Element | null, theme: ThemeData, attrName = "w:val"): string | undefined {
+export function resolveColorAttr(el: Element | null, theme: ThemeData, attrName = "w:val"): string | undefined {
   if (!el) return undefined;
   const val = attr(el, attrName);
   if (val && HEX6.test(val)) return `#${val.toLowerCase()}`;
@@ -331,7 +344,7 @@ function resolveThemeFont(themeAttr: string | null | undefined, theme: ThemeData
   return undefined;
 }
 
-function extractRPr(rPr: Element | null, theme: ThemeData): RawRPr {
+export function extractRPr(rPr: Element | null, theme: ThemeData): RawRPr {
   if (!rPr) return {};
   const out: RawRPr = {};
 
@@ -415,7 +428,7 @@ const HIGHLIGHT_COLORS: Record<string, string> = {
 
 // A border element (w:top/w:left/... in pBdr, tcBorders, tblBorders) as CSS; "none" when it's
 // explicitly off; undefined when absent.
-function borderCss(el: Element | null, theme: ThemeData): string | undefined {
+export function borderCss(el: Element | null, theme: ThemeData): string | undefined {
   if (!el) return undefined;
   const val = attr(el, "w:val");
   const sz = parseInt(attr(el, "w:sz") ?? "4", 10);
@@ -427,7 +440,7 @@ function borderCss(el: Element | null, theme: ThemeData): string | undefined {
   return `${style === "double" ? Math.max(pt, 2.25) : pt}pt ${style} ${color}`;
 }
 
-function mergeRPr(base: RawRPr, over: RawRPr | undefined): RawRPr {
+export function mergeRPr(base: RawRPr, over: RawRPr | undefined): RawRPr {
   if (!over) return { ...base };
   return {
     rStyle: over.rStyle ?? base.rStyle,
@@ -444,7 +457,7 @@ function mergeRPr(base: RawRPr, over: RawRPr | undefined): RawRPr {
   };
 }
 
-function extractPPr(pPr: Element | null, theme: ThemeData): RawPPr {
+export function extractPPr(pPr: Element | null, theme: ThemeData): RawPPr {
   if (!pPr) return {};
   const out: RawPPr = {};
 
@@ -544,6 +557,9 @@ function extractPPr(pPr: Element | null, theme: ThemeData): RawPPr {
     if (tabEls.some((t) => attr(t, "w:val") === "right")) {
       out.hasRightTab = true;
     }
+    out.tabs = tabEls
+      .map((t) => ({ pos: parseInt(attr(t, "w:pos") ?? "", 10), val: attr(t, "w:val") ?? "left" }))
+      .filter((t) => Number.isFinite(t.pos));
   }
 
   const numPr = directChild(pPr, "numPr");
@@ -562,7 +578,7 @@ function extractPPr(pPr: Element | null, theme: ThemeData): RawPPr {
   return out;
 }
 
-function mergePPr(base: RawPPr, over: RawPPr | undefined): RawPPr {
+export function mergePPr(base: RawPPr, over: RawPPr | undefined): RawPPr {
   if (!over) return { ...base, rPr: base.rPr ? { ...base.rPr } : undefined };
   return {
     pStyle: over.pStyle ?? base.pStyle,
@@ -581,6 +597,10 @@ function mergePPr(base: RawPPr, over: RawPPr | undefined): RawPPr {
     shading: over.shading !== undefined ? over.shading : base.shading,
     pageBreakBefore: over.pageBreakBefore ?? base.pageBreakBefore,
     hasRightTab: over.hasRightTab ?? base.hasRightTab,
+    // Tab stops accumulate down the style chain; "clear" removes an inherited one.
+    tabs: over.tabs
+      ? [...(base.tabs ?? []).filter((b) => !over.tabs!.some((o) => o.pos === b.pos)), ...over.tabs.filter((o) => o.val !== "clear")].sort((a, b) => a.pos - b.pos)
+      : base.tabs,
     numId: over.numId ?? base.numId,
     ilvl: over.ilvl ?? base.ilvl,
     rPr: mergeRPr(base.rPr ?? {}, over.rPr),
@@ -714,7 +734,7 @@ function parsePageSetup(docXml: Document, theme: ThemeData): DocxPageSetup | nul
 
 // Pictures in document order - the same order mammoth emits its <img> elements - with Word's wrap
 // setting mapped onto the editor's picture layouts (docImageLayout.ts).
-function parseImages(docXml: Document, content: { widthPx: number; marginLeftPx: number; marginTopPx: number }): DocxImageMeta[] {
+function parseImages(docXml: Document, content: { widthPx: number; marginLeftPx: number; marginTopPx: number; heightPx: number; marginBottomPx: number }): DocxImageMeta[] {
   const out: DocxImageMeta[] = [];
   const drawings = docXml.getElementsByTagName("w:drawing");
   const first = (el: Element | null | undefined, name: string): Element | null =>
@@ -739,7 +759,7 @@ function parseImages(docXml: Document, content: { widthPx: number; marginLeftPx:
     const xfrm = (drawing.getElementsByTagName("a:xfrm")[0] as Element | undefined) ?? null;
     const rot = parseInt(attr(xfrm, "rot") ?? "0", 10) / 60000;
     const rotation = Number.isFinite(rot) && rot ? Math.round((((rot + 180) % 360) - 180) * 10) / 10 : 0;
-    const meta: DocxImageMeta = { width, height, layout: "inline", align: "center", x: 0, y: 0, rotation, alt };
+    const meta: DocxImageMeta = { width, height, layout: "inline", align: "center", x: 0, y: 0, rotation, pageX: null, pageY: null, alt };
     if (anchor) {
       const posH = first(anchor, "positionH");
       const posV = first(anchor, "positionV");
@@ -765,7 +785,16 @@ function parseImages(docXml: Document, content: { widthPx: number; marginLeftPx:
       if (wrap === "wrapTopAndBottom") Object.assign(meta, { layout: "block", align });
       else if (wrap === "wrapSquare" || wrap === "wrapTight" || wrap === "wrapThrough")
         Object.assign(meta, { layout: align === "center" ? "block" : align === "right" ? "wrapRight" : "wrapLeft", align });
-      else Object.assign(meta, { layout: behind ? "behind" : "front", align, x: Math.round(x), y: Math.round(y) });
+      else {
+        Object.assign(meta, { layout: behind ? "behind" : "front", align, x: Math.round(x), y: Math.round(y) });
+        const pageY =
+          vRel === "page" ? vOffset : vRel === "margin" ? content.marginTopPx + vOffset : vRel === "topMargin" ? vOffset : vRel === "bottomMargin" ? content.heightPx - content.marginBottomPx + vOffset : null;
+        if (pageY !== null) {
+          const vAlignPage = vAlign && vRel === "page" ? (vAlign === "center" ? (content.heightPx - height) / 2 : vAlign === "bottom" ? content.heightPx - height : 0) : null;
+          meta.pageY = Math.round(vAlignPage ?? pageY);
+          meta.pageX = Math.round(content.marginLeftPx + x);
+        }
+      }
     }
     out.push(meta);
   }
@@ -886,107 +915,136 @@ function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: 
   };
 }
 
+// The document's styles, theme and numbering, resolved into the lookups every reader of a .docx
+// part needs: a paragraph style's merged pPr/rPr (basedOn chain + docDefaults) and a character
+// style's rPr. Shared by resolveDocxMetadata (the body) and docxLetterhead.ts (headers/footers).
+export interface DocxStyleContext {
+  parser: XmlDOMParser;
+  theme: ThemeData;
+  resolveNumLevel: (numId: string, ilvl: string) => NumLevelDef | null;
+  docDefaultRPr: RawRPr;
+  docDefaultPPr: RawPPr;
+  styles: Map<string, RawStyleDef>;
+  tableStyleBorders: Map<string, { borders: Element | null; basedOn?: string }>;
+  resolveParagraphStyleChain: (styleId: string | null | undefined) => { pPr: RawPPr; rPr: RawRPr; isHeading: boolean };
+  resolveCharacterStyleChain: (styleId: string | undefined) => RawRPr;
+}
+
+export async function loadStyleContext(zip: JSZip): Promise<DocxStyleContext> {
+  const stylesXmlText = (await zip.file("word/styles.xml")?.async("string")) ?? null;
+  const themeXmlText = (await zip.file("word/theme/theme1.xml")?.async("string")) ?? null;
+  const numberingXmlText = (await zip.file("word/numbering.xml")?.async("string")) ?? null;
+
+  const parser = new XmlDOMParser();
+  const theme = parseThemeXml(themeXmlText, parser);
+  const resolveNumLevel = parseNumberingXml(numberingXmlText, parser, theme);
+
+  let docDefaultRPr: RawRPr = { fontSizePt: 11 };
+  let docDefaultPPr: RawPPr = { spaceBeforePt: 0, spaceAfterPt: 0, lineTwips: 240, lineRule: "auto" };
+  const styles = new Map<string, RawStyleDef>();
+  // Table styles' borders (w:style w:type="table" > w:tblPr > w:tblBorders), by style id.
+  const tableStyleBorders = new Map<string, { borders: Element | null; basedOn?: string }>();
+  let defaultParagraphStyleId: string | null = null;
+
+  if (stylesXmlText) {
+    const stylesDoc = parser.parseFromString(stylesXmlText, "text/xml");
+    const docDefaults = stylesDoc.getElementsByTagName("w:docDefaults")[0];
+    if (docDefaults) {
+      const rPrDefault = directChild(directChild(docDefaults, "rPrDefault"), "rPr");
+      const pPrDefault = directChild(directChild(docDefaults, "pPrDefault"), "pPr");
+      docDefaultRPr = mergeRPr(docDefaultRPr, extractRPr(rPrDefault, theme));
+      docDefaultPPr = mergePPr(docDefaultPPr, extractPPr(pPrDefault, theme));
+    }
+
+    const styleEls = stylesDoc.getElementsByTagName("w:style");
+    for (let i = 0; i < styleEls.length; i++) {
+      const s = styleEls[i];
+      const styleId = attr(s, "w:styleId");
+      if (!styleId) continue;
+      const type = attr(s, "w:type") ?? "paragraph";
+      const name = attr(directChild(s, "name"), "w:val") ?? styleId;
+      const basedOn = attr(directChild(s, "basedOn"), "w:val") ?? undefined;
+      const isDefault = attr(s, "w:default") === "1" || attr(s, "w:default") === "true";
+      if (isDefault && type === "paragraph") defaultParagraphStyleId = styleId;
+      if (type === "table") tableStyleBorders.set(styleId, { borders: directChild(directChild(s, "tblPr"), "tblBorders"), basedOn });
+      styles.set(styleId, {
+        styleId,
+        type,
+        name,
+        basedOn,
+        isDefault,
+        pPr: extractPPr(directChild(s, "pPr"), theme),
+        rPr: extractRPr(directChild(s, "rPr"), theme),
+      });
+    }
+  }
+
+  const resolveParagraphStyleChain = (styleId: string | null | undefined): { pPr: RawPPr; rPr: RawRPr; isHeading: boolean } => {
+    const chain: RawStyleDef[] = [];
+    const seen = new Set<string>();
+    let cur = styleId ?? defaultParagraphStyleId;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const def = styles.get(cur);
+      if (!def) break;
+      chain.unshift(def);
+      cur = def.basedOn ?? null;
+    }
+    let pPr: RawPPr = { ...docDefaultPPr };
+    let rPr: RawRPr = { ...docDefaultRPr };
+    let isHeading = false;
+    for (const def of chain) {
+      pPr = mergePPr(pPr, def.pPr);
+      rPr = mergeRPr(rPr, def.rPr);
+      if (isHeadingStyle(def.styleId, def.name)) isHeading = true;
+    }
+    return { pPr, rPr, isHeading };
+  };
+
+  const resolveCharacterStyleChain = (styleId: string | undefined): RawRPr => {
+    if (!styleId) return {};
+    const chain: RawStyleDef[] = [];
+    const seen = new Set<string>();
+    let cur: string | undefined = styleId;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const def = styles.get(cur);
+      if (!def) break;
+      chain.unshift(def);
+      cur = def.basedOn;
+    }
+    let rPr: RawRPr = {};
+    for (const def of chain) {
+      rPr = mergeRPr(rPr, def.rPr);
+    }
+    return rPr;
+  };
+
+  return { parser, theme, resolveNumLevel, docDefaultRPr, docDefaultPPr, styles, tableStyleBorders, resolveParagraphStyleChain, resolveCharacterStyleChain };
+}
+
 export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocumentMetadata> {
   try {
     const zip = await JSZip.loadAsync(bytes);
     const docXmlText = await zip.file("word/document.xml")?.async("string");
     if (!docXmlText) return { paragraphs: [], pageSetup: null, imageSizes: [], tables: [], images: [], pageChrome: null };
 
-    const stylesXmlText = (await zip.file("word/styles.xml")?.async("string")) ?? null;
-    const themeXmlText = (await zip.file("word/theme/theme1.xml")?.async("string")) ?? null;
-    const numberingXmlText = (await zip.file("word/numbering.xml")?.async("string")) ?? null;
-
-    const parser = new XmlDOMParser();
-    const theme = parseThemeXml(themeXmlText, parser);
-    const resolveNumLevel = parseNumberingXml(numberingXmlText, parser, theme);
-
-    let docDefaultRPr: RawRPr = { fontSizePt: 11 };
-    let docDefaultPPr: RawPPr = { spaceBeforePt: 0, spaceAfterPt: 0, lineTwips: 240, lineRule: "auto" };
-    const styles = new Map<string, RawStyleDef>();
-    // Table styles' borders (w:style w:type="table" > w:tblPr > w:tblBorders), by style id.
-    const tableStyleBorders = new Map<string, { borders: Element | null; basedOn?: string }>();
-    let defaultParagraphStyleId: string | null = null;
-
-    if (stylesXmlText) {
-      const stylesDoc = parser.parseFromString(stylesXmlText, "text/xml");
-      const docDefaults = stylesDoc.getElementsByTagName("w:docDefaults")[0];
-      if (docDefaults) {
-        const rPrDefault = directChild(directChild(docDefaults, "rPrDefault"), "rPr");
-        const pPrDefault = directChild(directChild(docDefaults, "pPrDefault"), "pPr");
-        docDefaultRPr = mergeRPr(docDefaultRPr, extractRPr(rPrDefault, theme));
-        docDefaultPPr = mergePPr(docDefaultPPr, extractPPr(pPrDefault, theme));
-      }
-
-      const styleEls = stylesDoc.getElementsByTagName("w:style");
-      for (let i = 0; i < styleEls.length; i++) {
-        const s = styleEls[i];
-        const styleId = attr(s, "w:styleId");
-        if (!styleId) continue;
-        const type = attr(s, "w:type") ?? "paragraph";
-        const name = attr(directChild(s, "name"), "w:val") ?? styleId;
-        const basedOn = attr(directChild(s, "basedOn"), "w:val") ?? undefined;
-        const isDefault = attr(s, "w:default") === "1" || attr(s, "w:default") === "true";
-        if (isDefault && type === "paragraph") defaultParagraphStyleId = styleId;
-        if (type === "table") tableStyleBorders.set(styleId, { borders: directChild(directChild(s, "tblPr"), "tblBorders"), basedOn });
-        styles.set(styleId, {
-          styleId,
-          type,
-          name,
-          basedOn,
-          isDefault,
-          pPr: extractPPr(directChild(s, "pPr"), theme),
-          rPr: extractRPr(directChild(s, "rPr"), theme),
-        });
-      }
-    }
-
-    const resolveParagraphStyleChain = (styleId: string | null | undefined): { pPr: RawPPr; rPr: RawRPr; isHeading: boolean } => {
-      const chain: RawStyleDef[] = [];
-      const seen = new Set<string>();
-      let cur = styleId ?? defaultParagraphStyleId;
-      while (cur && !seen.has(cur)) {
-        seen.add(cur);
-        const def = styles.get(cur);
-        if (!def) break;
-        chain.unshift(def);
-        cur = def.basedOn ?? null;
-      }
-      let pPr: RawPPr = { ...docDefaultPPr };
-      let rPr: RawRPr = { ...docDefaultRPr };
-      let isHeading = false;
-      for (const def of chain) {
-        pPr = mergePPr(pPr, def.pPr);
-        rPr = mergeRPr(rPr, def.rPr);
-        if (isHeadingStyle(def.styleId, def.name)) isHeading = true;
-      }
-      return { pPr, rPr, isHeading };
-    };
-
-    const resolveCharacterStyleChain = (styleId: string | undefined): RawRPr => {
-      if (!styleId) return {};
-      const chain: RawStyleDef[] = [];
-      const seen = new Set<string>();
-      let cur: string | undefined = styleId;
-      while (cur && !seen.has(cur)) {
-        seen.add(cur);
-        const def = styles.get(cur);
-        if (!def) break;
-        chain.unshift(def);
-        cur = def.basedOn;
-      }
-      let rPr: RawRPr = {};
-      for (const def of chain) {
-        rPr = mergeRPr(rPr, def.rPr);
-      }
-      return rPr;
-    };
+    const ctx = await loadStyleContext(zip);
+    const { parser, theme, resolveNumLevel, docDefaultRPr, tableStyleBorders, resolveParagraphStyleChain, resolveCharacterStyleChain } = ctx;
 
     const docXml = parser.parseFromString(docXmlText, "text/xml");
     const pageSetup = parsePageSetup(docXml, theme);
     const pgSz = directChild(docXml.getElementsByTagName("w:sectPr")[docXml.getElementsByTagName("w:sectPr").length - 1] ?? null, "pgSz");
     const pageWidthPx = (parseInt(attr(pgSz, "w:w") ?? "12240", 10) / TWIPS_PER_IN) * 96;
     const margins = pageSetup?.margins ?? { top: 1, right: 1, bottom: 1, left: 1 };
-    const images = parseImages(docXml, { widthPx: pageWidthPx - (margins.left + margins.right) * 96, marginLeftPx: margins.left * 96, marginTopPx: margins.top * 96 });
+    const pageHeightPx = (parseInt(attr(pgSz, "w:h") ?? "15840", 10) / TWIPS_PER_IN) * 96;
+    const images = parseImages(docXml, {
+      widthPx: pageWidthPx - (margins.left + margins.right) * 96,
+      marginLeftPx: margins.left * 96,
+      marginTopPx: margins.top * 96,
+      heightPx: pageHeightPx,
+      marginBottomPx: margins.bottom * 96,
+    });
     const imageSizes = images.map((im) => (im.width && im.height ? { width: im.width, height: im.height } : null));
     const styleBorders = (styleId: string | null): Element | null => {
       const seen = new Set<string>();

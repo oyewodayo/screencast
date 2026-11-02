@@ -10,6 +10,7 @@ import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_POINTERS, ANNOTATION_ST
 import { playTapSound } from "../../utils/annotationSound";
 import { HandGraphic } from "../AnnotationPointer";
 import AnnotationPreview from "./AnnotationPreview";
+import ColorInput from "../common/ColorInput";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -973,8 +974,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                         }`}
                         data-tip="Custom color"
                       >
-                        <input
-                          type="color"
+                        <ColorInput
                           value={settings.annotationColor}
                           onChange={(e) => update("annotationColor", e.target.value)}
                           className="absolute inset-0 opacity-0 cursor-pointer"
@@ -1353,16 +1353,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   </select>
                 </Field>
                 <Field label="Pen color">
-                  <input
-                    type="color"
+                  <ColorInput
                     value={settings.pdfDefaultPenColor}
                     onChange={(e) => update("pdfDefaultPenColor", e.target.value)}
                     className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
                   />
                 </Field>
                 <Field label="Highlighter color">
-                  <input
-                    type="color"
+                  <ColorInput
                     value={settings.pdfDefaultHighlighterColor}
                     onChange={(e) => update("pdfDefaultHighlighterColor", e.target.value)}
                     className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"

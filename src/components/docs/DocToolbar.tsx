@@ -56,7 +56,7 @@ import {
   MdBrandingWatermark,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbSignature, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbFileCertificate, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbSignature, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import { CELL_SHADES } from "../../utils/docTableCellShading";
 import DocColorPicker from "./DocColorPicker";
@@ -597,6 +597,7 @@ export interface DocToolbarProps {
   // the watermark.
   onOpenHeaderFooter: (focus: "header" | "pageNumbers") => void;
   onOpenWatermark: () => void;
+  onOpenLetterhead: () => void;
 }
 
 const DocToolbar: React.FC<DocToolbarProps> = ({
@@ -616,6 +617,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   typeset,
   onOpenHeaderFooter,
   onOpenWatermark,
+  onOpenLetterhead,
 }) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
@@ -1293,6 +1295,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
             {menuAction("Show ruler", MdStraighten, onToggleRuler, { active: rulerVisible })}
           </MenuSection>
           <MenuSection title="Page">
+            {menuAction("Letterhead…", TbFileCertificate, onOpenLetterhead)}
             {menuAction("Header & footer…", TbLayoutNavbar, () => onOpenHeaderFooter("header"))}
             {menuAction("Page numbers…", TbNumbers, () => onOpenHeaderFooter("pageNumbers"))}
             {menuAction("Watermark…", MdBrandingWatermark, onOpenWatermark)}

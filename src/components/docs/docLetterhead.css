@@ -1,0 +1,110 @@
+/* components/docs/docLetterhead.css
+ *
+ * The Letterhead panel (DocLetterheadDialog.tsx): the preview sheet and its draggable text-safe
+ * guides.
+ */
+
+.doc-lh-backdrop {
+  animation: doc-lh-fade 160ms ease-out;
+}
+.doc-lh-dialog {
+  animation: doc-lh-rise 220ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+@keyframes doc-lh-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes doc-lh-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+}
+
+.doc-lh-sheet {
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12), 0 8px 24px rgba(15, 23, 42, 0.1);
+}
+
+/* A guide: a dashed rule across the sheet with a wide grab zone and its measurement. */
+.doc-lh-guide {
+  position: absolute;
+  left: -10px;
+  right: -10px;
+  height: 14px;
+  margin-top: -7px;
+  cursor: ns-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.doc-lh-guide::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 6.5px;
+  border-top: 1.5px dashed #ec4899;
+}
+.doc-lh-guide::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: #ec4899;
+  box-shadow: 0 0 0 2px #fff, 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.doc-lh-guide:hover::before {
+  border-top-style: solid;
+}
+.doc-lh-guide-label {
+  position: absolute;
+  left: 12px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: #ec4899;
+  color: #fff;
+  font: 600 10px/15px ui-sans-serif, system-ui, sans-serif;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 140ms ease;
+  pointer-events: none;
+}
+.doc-lh-sheet:hover .doc-lh-guide-label,
+.doc-lh-guide:active .doc-lh-guide-label {
+  opacity: 1;
+}
+
+.doc-lh-input {
+  width: 100%;
+  height: 2.25rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: 0.5rem;
+  border: 1px solid #e5e5e5;
+  background: #fafafa;
+  font-size: 13px;
+  outline: none;
+}
+textarea.doc-lh-input {
+  height: auto;
+}
+.doc-lh-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+}
+.dark .doc-lh-input {
+  border-color: #404040;
+  background: #171717;
+  color: #f5f5f5;
+}
+
+.doc-lh-busy {
+  animation: doc-lh-pulse 1.2s ease-in-out infinite;
+}
+@keyframes doc-lh-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}

@@ -42,6 +42,7 @@ import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbHexagon, TbLin
 import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardShape, BoardText } from "../../utils/boardTypes";
 import { BOARD_FONT_GROUPS, BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
 import { growTextItemToFitContent } from "../../handlers/boardHandlers";
+import ColorInput from "../common/ColorInput";
 
 const DEFAULT_SHADOW: BoardShadow = { blur: 16, offsetX: 0, offsetY: 6, color: "rgba(0,0,0,0.35)" };
 
@@ -221,7 +222,7 @@ const SliderField: React.FC<{ label: string; value: number; display: string; min
 const ColorField: React.FC<{ label: string; value: string; onChange: (v: string) => void; dimmed?: boolean }> = ({ label, value, onChange, dimmed }) => (
   <label className="flex items-center justify-between gap-2">
     <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">{label}</span>
-    <input type="color" value={value} onChange={(e) => onChange(e.target.value)} className={`${SWATCH} ${dimmed ? "opacity-30" : ""}`} />
+    <ColorInput value={value} onChange={(e) => onChange(e.target.value)} className={`${SWATCH} ${dimmed ? "opacity-30" : ""}`} />
   </label>
 );
 
@@ -462,8 +463,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
           <div className="flex items-center gap-2">
             {/* Same "native color input can't represent no-fill" pattern the board-background/grid
                 controls (BoardEditor.tsx) already use. */}
-            <input
-              type="color"
+            <ColorInput
               value={textItems[0].backgroundColor ?? "#ffffff"}
               onChange={(e) => setTextField("backgroundColor", e.target.value)}
               className={`${SWATCH} ${textItems[0].backgroundColor === null ? "opacity-30" : ""}`}
@@ -549,8 +549,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
               />
               <label className="flex items-center justify-between gap-2">
                 <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Shadow color</span>
-                <input
-                  type="color"
+                <ColorInput
                   value={rgbaToHex(imageItems[0].shadow.color)}
                   onChange={(e) => setImageField("shadow", { ...(imageItems[0].shadow ?? DEFAULT_SHADOW), color: e.target.value })}
                   className={SWATCH}
@@ -670,8 +669,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
 
           {SHAPE_FILL_TYPES.includes(shapeItems[0].shapeType) && (
             <div className="flex items-center gap-2">
-              <input
-                type="color"
+              <ColorInput
                 value={shapeItems[0].fillColor ?? "#93c5fd"}
                 onChange={(e) => setShapeField("fillColor", e.target.value)}
                 className={`${SWATCH} ${shapeItems[0].fillColor === null ? "opacity-30" : ""}`}

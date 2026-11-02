@@ -17,6 +17,7 @@ import { MAX_FEATHER, REVEAL_STYLES, type LayerMask, type MaskReveal } from "../
 import CutoutBackgroundPicker from "./CutoutBackgroundPicker";
 import { BLUR_DEFAULT } from "../../utils/cutoutBackground";
 import { backgroundRemovalStatus, cancelBackgroundRemoval, dismissBackgroundError, removeBackground, useBackgroundJob, type BackgroundRemovalStatus } from "../../utils/backgroundRemoval";
+import ColorInput from "../common/ColorInput";
 
 export type PipOverlayPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode" | "fx" | "opacity" | "fadeIn" | "fadeOut" | "chromaKey" | "mask" | "cutout">>;
 
@@ -297,8 +298,7 @@ const PipOverlayPopover: React.FC<PipOverlayPopoverProps> = ({
           <>
             <div className="flex items-center gap-1.5 text-[11px]">
               <span className="w-10 shrink-0 text-white/60">Colour</span>
-              <input
-                type="color"
+              <ColorInput
                 value={key.color}
                 onChange={(e) => onUpdate({ chromaKey: { ...key, color: e.target.value } })}
                 title="The screen's colour"

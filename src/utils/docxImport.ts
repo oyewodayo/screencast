@@ -34,6 +34,11 @@ import {
 import { writeLayout } from "./docLayout";
 import { pageDimensionsIn, pageFormat } from "./docPageGeometry";
 import { hasPageChrome, writePageChrome } from "./docPageChrome";
+import JSZip from "jszip";
+import { renderDocxLetterhead } from "./docxLetterhead";
+import { writeLetterhead } from "./docLetterhead";
+import { fromRenderedDocx } from "./letterheadSources";
+import { flattenTextBoxes } from "./docxTextBoxes";
 
 export interface ImportedDoc {
   id: string;
@@ -78,6 +83,10 @@ export function prepareConvertedDom(
       if (meta.layout === "front" || meta.layout === "behind") {
         img.setAttribute("data-x", String(meta.x));
         img.setAttribute("data-y", String(meta.y));
+        if (meta.pageY !== null && meta.pageX !== null) {
+          img.setAttribute("data-page-x", String(meta.pageX));
+          img.setAttribute("data-page-y", String(meta.pageY));
+        }
       }
     }
   });
@@ -456,6 +465,9 @@ export async function parseDocxBytesToDoc(
     saveImage?: (image: { contentType: string; readAsArrayBuffer: () => Promise<ArrayBuffer> }) => Promise<{ src: string }>;
   }
 ): Promise<{ node: ProseMirrorNode; meta: DocxDocumentMetadata }> {
+  // Text boxes become body paragraphs (side-by-side ones a borderless table row) before mammoth
+  // and the style resolver read the document, so both see them in the same order.
+  bytes = await flattenTextBoxes(bytes);
   const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   const saver = options?.saveImage ?? (options?.docIdForImages ? (image: Parameters<typeof saveEmbeddedImage>[1]) => saveEmbeddedImage(options.docIdForImages!, image) : null);
   const mammothOpts = saver ? { convertImage: mammoth.images.imgElement(saver) } : undefined;
@@ -480,6 +492,18 @@ export async function parseDocxBytesToDoc(
   return { node, meta };
 }
 
+async function importedLetterhead(bytes: ArrayBuffer, title: string) {
+  try {
+    const zip = await JSZip.loadAsync(bytes);
+    const rendered = await renderDocxLetterhead(zip);
+    if (!rendered?.rich) return null;
+    return await fromRenderedDocx(rendered, `${title} letterhead`);
+  } catch (err) {
+    console.error("Failed to read the .docx letterhead:", err);
+    return null;
+  }
+}
+
 // `preread` - the file's bytes when the caller already has them (docFileImport.ts reads them to
 // fingerprint the file first), so the file isn't read twice.
 export async function importDocxFile(path: string, fileName: string, preread?: ArrayBuffer): Promise<ImportedDoc> {
@@ -496,7 +520,17 @@ export async function importDocxFile(path: string, fileName: string, preread?: A
     const { node, meta } = await parseDocxBytesToDoc(new Uint8Array(arrayBuffer), { docIdForImages: id });
 
     const ydoc = prosemirrorToYDoc(node, "default");
-    if (meta.pageChrome && hasPageChrome(meta.pageChrome)) writePageChrome(ydoc, meta.pageChrome);
+    // A header/footer with logos, shapes, text boxes or tables is the company letterhead: it comes
+    // across as the document's letterhead, drawn as Word draws it (docxLetterhead.ts). Its page
+    // numbers stay live in the page chrome; a plain-text header stays an editable text header.
+    const letterhead = await importedLetterhead(arrayBuffer, title);
+    let margins = meta.pageSetup?.margins ?? null;
+    if (letterhead) {
+      writeLetterhead(ydoc, letterhead);
+      if (margins) margins = { ...margins, top: letterhead.restTopIn, bottom: letterhead.bottomIn };
+    }
+    const chrome = meta.pageChrome && letterhead ? { ...meta.pageChrome, header: { left: "", center: "", right: "" }, footer: { left: "", center: "", right: "" } } : meta.pageChrome;
+    if (chrome && hasPageChrome(chrome)) writePageChrome(ydoc, chrome);
     if (meta.pageSetup && meta.pageSetup.columns === 2) {
       writeLayout(ydoc, {
         body: null,
@@ -512,7 +546,7 @@ export async function importDocxFile(path: string, fileName: string, preread?: A
         id,
         pageSize: meta.pageSetup.pageSize,
         orientation: meta.pageSetup.orientation,
-        margins: meta.pageSetup.margins,
+        margins: margins ?? meta.pageSetup.margins,
         pageColor: meta.pageSetup.pageColor,
       });
     }

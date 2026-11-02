@@ -26,6 +26,12 @@ import DocPageChromeOverlay from "./DocPageChromeOverlay";
 import useDocPageChrome from "../../hooks/useDocPageChrome";
 import DocWatermarkDialog from "./DocWatermarkDialog";
 import DocWatermarkOverlay from "./DocWatermarkOverlay";
+import DocLetterheadOverlay from "./DocLetterheadOverlay";
+import DocLetterheadDialog, { type LetterheadApplyOptions } from "./DocLetterheadDialog";
+import useDocLetterhead from "../../hooks/useDocLetterhead";
+import { firstPageTop, letterheadMargins, letterheadPngBytes, letterheadUrl, stationeryPrintCss, writeLetterhead, type DocLetterhead } from "../../utils/docLetterhead";
+import { saveLetterhead } from "../../utils/letterheadLibrary";
+import { TbFileCertificate } from "react-icons/tb";
 import useDocWatermark from "../../hooks/useDocWatermark";
 import { hasWatermark, printWatermarkCss, svgDataUrl, watermarkPngBytes, watermarkSvg, writeWatermark, type DocWatermark } from "../../utils/docWatermark";
 import { hasPageChrome, printChromeCss, todayLabel, writePageChrome, type ChromeBand, type DocPageChrome } from "../../utils/docPageChrome";
@@ -420,6 +426,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
   // The header/footer panel, and which band to focus in it (a double-clicked margin).
   const [chromeEditor, setChromeEditor] = useState<{ focus: ChromeBand | null } | null>(null);
   const watermark = useDocWatermark(store.ydoc);
+  const letterhead = useDocLetterhead(store.ydoc);
+  const [showLetterhead, setShowLetterhead] = useState(false);
   const [showWatermark, setShowWatermark] = useState(false);
   const toggleOutline = useCallback(() => {
     setShowOutline((v) => {
@@ -557,6 +565,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     const svg = watermarkSvg(watermark, pageWidthPx(page), pageHeightPx(page));
     return svg ? svgDataUrl(svg) : "";
   }, [watermark, page]);
+  // The letterhead's two sheets as image URLs (screen overlay and @page backgrounds), and page 1's
+  // own top margin when the letterhead needs more room there than on later pages.
+  const letterheadUrls = useMemo(() => ({ first: letterheadUrl(letterhead?.first ?? null), rest: letterheadUrl(letterhead?.rest ?? null) }), [letterhead]);
+  const firstTop = firstPageTop(letterhead, margins);
+  const paginationMargins = useMemo(() => ({ ...margins, firstTop }), [margins, firstTop]);
+  // The sheet in inches and its margins - where print places sheet-sized @page backgrounds.
+  const printSheet = { widthIn: pageDimensionsIn(page).width, heightIn: pageDimensionsIn(page).height, top: margins.top, left: margins.left };
   const [rulerUnit, setRulerUnit] = useRulerUnit();
   const [rulerVisible, setRulerVisible] = useState(readRulerVisible);
   const toggleRuler = useCallback(() => {
@@ -594,8 +609,8 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
   // wouldn't notice on its own).
   useEffect(() => {
     if (!editor) return;
-    editor.commands.setPaginationLayout(page, margins, layout.columns);
-  }, [editor, page, margins, layout.columns]);
+    editor.commands.setPaginationLayout(page, paginationMargins, layout.columns);
+  }, [editor, page, paginationMargins, layout.columns]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -743,6 +758,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           orientation: store.orientation,
           pageColor: store.pageColor,
           pageChrome,
+          letterhead: letterhead
+            ? {
+                first: await letterheadPngBytes(letterhead.first, letterhead.widthPx, letterhead.heightPx),
+                rest: letterhead.rest ? (letterhead.rest === letterhead.first ? "same" : await letterheadPngBytes(letterhead.rest, letterhead.widthPx, letterhead.heightPx)) : null,
+                widthPx: pageWidthPx(page),
+                heightPx: pageHeightPx(page),
+                firstTopIn: firstTop,
+              }
+            : null,
           watermark: hasWatermark(watermark)
             ? { png: await watermarkPngBytes(watermark, pageWidthPx(page), pageHeightPx(page)), widthPx: pageWidthPx(page), heightPx: pageHeightPx(page), skipFirstPage: watermark.skipFirstPage }
             : null,
@@ -832,6 +856,33 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     },
     [store]
   );
+  // Putting the document on a letterhead: its sheets into the Y.Doc, the page set to its size and
+  // text-safe margins (the old margins kept, to come back when it's removed).
+  const applyLetterhead = useCallback(
+    async (lh: DocLetterhead, opts: LetterheadApplyOptions) => {
+      if (!store.ydoc) return;
+      const previous = letterhead?.previousMargins ?? margins;
+      writeLetterhead(store.ydoc, { ...lh, previousMargins: previous });
+      const portrait = lh.widthPx <= lh.heightPx;
+      const [a, b] = portrait ? [lh.widthPx, lh.heightPx] : [lh.heightPx, lh.widthPx];
+      const size = Math.abs(a - 793.7) < 8 && Math.abs(b - 1122.5) < 10 ? "a4" : Math.abs(a - 816) < 8 && Math.abs(b - 1344) < 10 ? "legal" : Math.abs(a - 816) < 8 && Math.abs(b - 1056) < 10 ? "letter" : null;
+      await store.setPageSetup({
+        margins: letterheadMargins(lh, margins),
+        ...(size ? { pageSize: size, orientation: portrait ? "portrait" : "landscape" } : {}),
+      });
+      if (opts.saveToLibrary) await saveLetterhead({ ...lh, previousMargins: null }, opts.thumb, opts.makeDefault);
+      setShowLetterhead(false);
+    },
+    [store, letterhead, margins]
+  );
+  const removeLetterhead = useCallback(async () => {
+    if (!store.ydoc) return;
+    const previous = letterhead?.previousMargins;
+    writeLetterhead(store.ydoc, null);
+    if (previous) await store.setPageSetup({ margins: previous });
+    setShowLetterhead(false);
+  }, [store, letterhead]);
+
   const updateWatermark = useCallback((next: DocWatermark) => store.ydoc && writeWatermark(store.ydoc, next), [store.ydoc]);
   // More menu: "Page numbers…" switches them on (bottom centre by default) and opens the panel on
   // them; "Header & footer…" just opens it.
@@ -951,9 +1002,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           the last page to full height. */}
       <style>{`
         @page { size: ${cssPageSize(page)}; margin: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in;${pageColor ? ` background: ${pageColor};` : ""} }
-        ${printWatermarkCss(watermark, watermarkUrl)}
+        ${letterhead ? stationeryPrintCss(watermark, watermarkUrl, letterhead, letterheadUrls, firstTop, printSheet) : printWatermarkCss(watermark, watermarkUrl, printSheet)}
         ${printChromeCss(pageChrome, { title: store.title, date: todayLabel(), fontFamily: textFont, color: pageDark ? "#d4d4d4" : "#5f6368", pagesHint: pageCount })}
-        .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
+        .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${firstTop ?? margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0; min-height: 0; }
         }
@@ -1070,6 +1121,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           )}
         </button>
         <LinksControl self={{ kind: "doc", id: docId }} title={store.title || "Untitled note"} variant="header" />
+        <button
+          type="button"
+          onClick={() => setShowLetterhead(true)}
+          data-tip={letterhead ? `Letterhead: ${letterhead.name}` : "Letterhead - write on your company stationery"}
+          aria-label="Letterhead"
+          className={headerIconClass(!!letterhead)}
+        >
+          <TbFileCertificate size={19} strokeWidth={1.75} />
+        </button>
         <Dropdown
           {...menuProps("pageSetup")}
           label="Page setup"
@@ -1169,6 +1229,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           onToggleRuler={toggleRuler}
           onOpenHeaderFooter={openHeaderFooter}
           onOpenWatermark={() => setShowWatermark(true)}
+          onOpenLetterhead={() => setShowLetterhead(true)}
           onOpenPicker={openPicker}
           docFonts={docFonts}
           onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
@@ -1249,6 +1310,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
                       {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
                           flips the editor's text, heading and link colours. */}
                       <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                      {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
                       <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
                       <DocPageChromeOverlay
                         chrome={pageChrome}
@@ -1339,6 +1401,15 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
       {signing === "studio" && <DocSignatureStudio onPlace={(sig) => void handleSignaturePlace(sig)} onClose={() => setSigning(null)} />}
       {editor && signing && signing !== "studio" && <DocSignaturePlacer editor={editor} signature={signing} onDone={() => setSigning(null)} />}
 
+      {showLetterhead && store.ydoc && (
+        <DocLetterheadDialog
+          current={letterhead}
+          sheet={{ widthPx: pageWidthPx(page), heightPx: pageHeightPx(page) }}
+          onApply={(lh, opts) => void applyLetterhead(lh, opts)}
+          onRemove={() => void removeLetterhead()}
+          onClose={() => setShowLetterhead(false)}
+        />
+      )}
       {showWatermark && store.ydoc && <DocWatermarkDialog watermark={watermark} onChange={updateWatermark} onClose={() => setShowWatermark(false)} />}
 
       {chromeEditor && store.ydoc && (

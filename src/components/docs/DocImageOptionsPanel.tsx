@@ -6,13 +6,14 @@
 // border, rounded corners, shadow, alt text, and Replace. Every field also scrubs: drag its label
 // sideways to change the value live, as in a design tool. Changes apply as they're made - the
 // picture on the page is the preview.
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MdClose, MdLink, MdLinkOff, MdRefresh, MdRotateLeft, MdRotateRight, MdSwapHoriz } from "react-icons/md";
 import { isFreeLayout, type DocImageAttrs } from "../../utils/docImageLayout";
 import { uploadImageFromPath } from "../../utils/docImagePaste";
 import { useRulerUnit } from "./DocRuler";
+import ColorInput from "../common/ColorInput";
 
 interface Props {
   attrs: DocImageAttrs;
@@ -188,8 +189,24 @@ const DocImageOptionsPanel: React.FC<Props> = ({ attrs: a, docId, anchor, natura
     }
   };
 
-  const left = Math.min(anchor.left, window.innerWidth - 316);
-  const top = Math.min(anchor.top, window.innerHeight - 40);
+  // Kept wholly inside the window: measured after layout and lifted as far as it needs to be (it
+  // scrolls inside when it's taller than the window itself).
+  const [panelH, setPanelH] = useState(0);
+  useLayoutEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const measure = () => setPanelH(el.offsetHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+  const left = Math.max(8, Math.min(anchor.left, window.innerWidth - 316));
+  const top = Math.max(12, Math.min(anchor.top, window.innerHeight - panelH - 12));
 
   return createPortal(
     <div
@@ -303,7 +320,7 @@ const DocImageOptionsPanel: React.FC<Props> = ({ attrs: a, docId, anchor, natura
             />
           ))}
           <label className="relative w-5 h-5 rounded-full ring-1 ring-black/10 overflow-hidden cursor-pointer" style={{ background: "conic-gradient(red, yellow, lime, cyan, blue, magenta, red)" }} data-tip="Custom colour">
-            <input type="color" className="absolute inset-0 opacity-0 cursor-pointer" value={a.borderColor} onChange={(e) => onChange({ borderColor: e.target.value, borderWidth: a.borderWidth || 2 })} />
+            <ColorInput className="absolute inset-0 opacity-0 cursor-pointer" value={a.borderColor} onChange={(e) => onChange({ borderColor: e.target.value, borderWidth: a.borderWidth || 2 })} />
           </label>
         </div>
 

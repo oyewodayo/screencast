@@ -50,9 +50,13 @@ describe("watermarkSvg", () => {
 describe("printWatermarkCss", () => {
   it("is an @page background, left off the first page when asked", () => {
     const url = svgDataUrl(watermarkSvg(text, 816, 1056));
-    expect(printWatermarkCss(text, url)).toMatch(/^@page \{ background-image: url\("data:image\/svg\+xml,/);
-    expect(printWatermarkCss({ ...text, skipFirstPage: true }, url)).toContain("@page :first { background-image: none; }");
-    expect(printWatermarkCss(text, "")).toBe("");
+    const sheet = { widthIn: 8.5, heightIn: 11, top: 1, left: 1.25 };
+    expect(printWatermarkCss(text, url, sheet)).toMatch(/^@page \{ background-image: url\("data:image\/svg\+xml,/);
+    // Sized to the whole sheet and shifted out of the margins - Chromium places @page backgrounds
+    // against the text area.
+    expect(printWatermarkCss(text, url, sheet)).toContain("background-size: 8.5in 11in; background-position: -1.25in -1in;");
+    expect(printWatermarkCss({ ...text, skipFirstPage: true }, url, sheet)).toContain("@page :first { background-image: none; }");
+    expect(printWatermarkCss(text, "", sheet)).toBe("");
   });
 });
 

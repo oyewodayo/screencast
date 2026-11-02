@@ -22,6 +22,8 @@ import DocPagePreview from "./DocPagePreview";
 import DocTemplateCard from "./DocTemplateCard";
 import FileInfoModal from "../Modals/FileInfoModal";
 import DocPdfImportDialog from "./DocPdfImportDialog";
+import { defaultLetterhead, type SavedLetterhead } from "../../utils/letterheadLibrary";
+import { letterheadMargins, writeLetterhead } from "../../utils/docLetterhead";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -370,6 +372,37 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
     }
   }, []);
 
+  // The letterhead marked "Use for new documents" (DocLetterheadDialog.tsx): its own card in the
+  // new-document row, so a company letter is one click away.
+  const [homeLetterhead, setHomeLetterhead] = useState<SavedLetterhead | null>(null);
+  useEffect(() => {
+    void defaultLetterhead().then(setHomeLetterhead);
+  }, []);
+  const [creatingOnLetterhead, setCreatingOnLetterhead] = useState(false);
+  const handleCreateOnLetterhead = useCallback(async () => {
+    if (!homeLetterhead) return;
+    setCreatingOnLetterhead(true);
+    setError(null);
+    try {
+      const id = crypto.randomUUID();
+      const lh = homeLetterhead.letterhead;
+      const defaults = { top: 1, right: 1, bottom: 1, left: 1 };
+      const ydoc = new Y.Doc();
+      writeLetterhead(ydoc, { ...lh, previousMargins: defaults });
+      const title = `Untitled document ${(docs?.length ?? 0) + 1}`;
+      await invoke("create_doc", { id, title, bytes: Array.from(Y.encodeStateAsUpdate(ydoc)), folderId: selectedFolderId });
+      const portrait = lh.widthPx <= lh.heightPx;
+      const a4 = Math.abs(Math.min(lh.widthPx, lh.heightPx) - 793.7) < 8;
+      await invoke("set_doc_page_setup", { id, pageSize: a4 ? "a4" : "letter", orientation: portrait ? "portrait" : "landscape", margins: letterheadMargins(lh, defaults), pageColor: null });
+      onOpenDoc(id);
+    } catch (err) {
+      console.error("Failed to create a document on the letterhead:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreatingOnLetterhead(false);
+    }
+  }, [homeLetterhead, docs, selectedFolderId, onOpenDoc]);
+
   const handleCreate = useCallback(async () => {
     setIsCreating(true);
     setError(null);
@@ -693,13 +726,27 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           </div>
 
           {(() => {
-            const isBusy = isCreating || creatingTemplateId !== null;
+            const isBusy = isCreating || creatingTemplateId !== null || creatingOnLetterhead;
             const blankCard = (
-              <DocTemplateCard name="Blank document" disabled={isBusy} isBusy={isCreating} onClick={() => void handleCreate()}>
-                <div className="aspect-[8.5/11] bg-white dark:bg-neutral-900 flex items-center justify-center">
-                  <IoAdd size={56} className="text-blue-500" />
-                </div>
-              </DocTemplateCard>
+              <>
+                <DocTemplateCard name="Blank document" disabled={isBusy} isBusy={isCreating} onClick={() => void handleCreate()}>
+                  <div className="aspect-[8.5/11] bg-white dark:bg-neutral-900 flex items-center justify-center">
+                    <IoAdd size={56} className="text-blue-500" />
+                  </div>
+                </DocTemplateCard>
+                {homeLetterhead && (
+                  <DocTemplateCard name={homeLetterhead.name} description="On your letterhead" disabled={isBusy} isBusy={creatingOnLetterhead} onClick={() => void handleCreateOnLetterhead()}>
+                    <div className="relative aspect-[8.5/11] bg-white">
+                      {homeLetterhead.thumb && <img src={homeLetterhead.thumb} alt="" className="absolute inset-0 w-full h-full object-cover" draggable={false} />}
+                      <span className="absolute inset-0 flex items-center justify-center">
+                        <span className="w-11 h-11 rounded-full bg-blue-600/90 text-white flex items-center justify-center shadow-lg">
+                          <IoAdd size={26} />
+                        </span>
+                      </span>
+                    </div>
+                  </DocTemplateCard>
+                )}
+              </>
             );
             const templateCard = (template: DocTemplate) => (
               <DocTemplateCard

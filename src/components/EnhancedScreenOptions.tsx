@@ -12,6 +12,7 @@ import { BACKGROUND_SWATCHES } from "../utils/cutoutBackground";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { PresentationPanel, startOrStopPresentation, usePresentation } from "./PresentationControls";
 import { getPresentationState } from "../services/presentation";
+import ColorInput from "./common/ColorInput";
 
 interface ScreenOptionsProps {
     recordType: string;
@@ -826,8 +827,7 @@ const EnhancedScreenOptions = ({
                             style={!BORDER_COLORS.includes(borderColor.toLowerCase()) ? { background: borderColor, borderStyle: "solid" } : undefined}
                         >
                             {BORDER_COLORS.includes(borderColor.toLowerCase()) && <span className="text-xs text-neutral-500">+</span>}
-                            <input
-                                type="color"
+                            <ColorInput
                                 value={borderColor}
                                 onChange={(e) => updateBorder({ cameraBorderColor: e.target.value })}
                                 className="absolute inset-0 opacity-0 cursor-pointer"
@@ -905,7 +905,7 @@ const EnhancedScreenOptions = ({
                             ))}
                             <label className="relative w-7 h-7 rounded-full border border-dashed border-neutral-400 dark:border-neutral-500 flex items-center justify-center cursor-pointer overflow-hidden" title="Any colour">
                                 <span className="text-xs text-neutral-500">+</span>
-                                <input type="color" value={cameraBg.color} onChange={(e) => updateCameraBg({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+                                <ColorInput value={cameraBg.color} onChange={(e) => updateCameraBg({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
                             </label>
                         </div>
                     )}

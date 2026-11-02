@@ -18,7 +18,7 @@
 //
 // The node stays inline in every layout, so the NodeViewWrapper is a <span> - a block-level tag
 // can't legally sit inside a <p>. Block and float layouts are CSS on that span.
-import React, { useCallback, useLayoutEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { NodeViewWrapper, NodeViewProps } from "@tiptap/react";
 import { NodeSelection } from "@tiptap/pm/state";
@@ -29,6 +29,7 @@ import DocImageOptionsPanel from "./DocImageOptionsPanel";
 import { AlignIcon, LayoutIcon } from "./DocImageIcons";
 import { IMAGE_LAYOUTS, imageLookStyle, isFreeLayout, type DocImageAttrs, type ImageAlign, type ImageLayout } from "../../utils/docImageLayout";
 import { collectInkLines, commitFreeImage, pageFrame, snapBox, type Guide, type InkLine, type PageFrame } from "../../utils/docImagePlacement";
+import { PAGE_GAP_PX } from "../../utils/docPageGeometry";
 import { takeJustPlaced } from "./signatureStore";
 import "./docImages.css";
 import "./docSignature.css";
@@ -467,6 +468,38 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, deleteNode, ext
     setAttrs({ src: newSrc, width: null, height: null });
     setShowCrop(false);
   };
+
+  // ---- page-relative pictures from Word ---------------------------------------------------------
+  // A picture Word placed relative to the page knows its spot on the sheet, not on its paragraph:
+  // once the pages are laid out (pagination settles a moment after load), find the sheet its
+  // paragraph landed on and turn the spot into x/y from that paragraph - once, outside undo.
+  useEffect(() => {
+    if (!free || a.pageY == null) return;
+    const timer = window.setTimeout(() => {
+      const pos = getPos();
+      const frame = pageFrame(view);
+      const card = view.dom.closest(".doc-page-card") as HTMLElement | null;
+      if (typeof pos !== "number" || !frame || !card) return;
+      const $pos = view.state.doc.resolve(pos);
+      if ($pos.depth === 0) return;
+      const host = view.nodeDOM($pos.before($pos.depth)) as HTMLElement | null;
+      if (!host) return;
+      const pageH = parseFloat(getComputedStyle(card).minHeight) || frame.card.height;
+      const pitch = pageH + PAGE_GAP_PX;
+      const hr = host.getBoundingClientRect();
+      const originLeft = hr.left + host.clientLeft;
+      const originTop = hr.top + host.clientTop;
+      const sheet = Math.max(0, Math.floor((originTop - frame.card.top) / pitch));
+      const sheetTop = frame.card.top + sheet * pitch;
+      let tr = view.state.tr
+        .setNodeAttribute(pos, "y", Math.round(sheetTop + (a.pageY as number) - originTop))
+        .setNodeAttribute(pos, "pageY", null)
+        .setNodeAttribute(pos, "pageX", null);
+      if (a.pageX != null) tr = tr.setNodeAttribute(pos, "x", Math.round(frame.card.left + a.pageX - originLeft));
+      view.dispatch(tr.setMeta("addToHistory", false));
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [free, a.pageX, a.pageY, getPos, view]);
 
   // ---- floating toolbar position -------------------------------------------------------------
   // In a portal (fixed), so it's never clipped, never rotated with the picture, and always above

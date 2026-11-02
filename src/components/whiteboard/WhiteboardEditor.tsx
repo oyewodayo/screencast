@@ -69,6 +69,7 @@ import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarke
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
 import LinksControl from "../links/LinksControl";
+import ColorInput from "../common/ColorInput";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 
@@ -1468,7 +1469,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
                   />
                 ))}
                 <label className="relative w-5 h-5 rounded-full overflow-hidden ring-1 ring-inset ring-black/15 cursor-pointer" title="Custom color" style={{ background: "conic-gradient(red, yellow, lime, cyan, blue, magenta, red)" }}>
-                  <input type="color" value={penColor} onChange={(e) => setPenColor(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                  <ColorInput value={penColor} onChange={(e) => setPenColor(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                 </label>
               </div>
               <div className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-neutral-400">

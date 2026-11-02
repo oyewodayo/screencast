@@ -104,6 +104,7 @@ const PickerOverlay: React.FC<{ onDone: (color: string | null) => void }> = ({ o
   return (
     <div
       {...{ [TEXT_EDIT_PANEL_ATTR]: "" }}
+      data-color-pick-overlay=""
       className="fixed inset-0"
       style={{ zIndex: 2147483000, cursor: "crosshair" }}
       onMouseDown={(e) => e.preventDefault()}

@@ -20,6 +20,7 @@ import { DEFAULT_SCREEN_STYLE, SCREEN_COLOR_SWATCHES, SCREEN_GRADIENTS, paintGra
 import type { PointerStyle } from "../../utils/pointerTrack";
 import type { KeystrokeStyle } from "../../utils/keystrokes";
 import { IMAGE_CLIP_EXTENSIONS } from "../../utils/videoEditTypes";
+import ColorInput from "../common/ColorInput";
 
 interface Props {
   anchor: { left: number; top: number };
@@ -167,7 +168,7 @@ const ScreenStylePanel: React.FC<Props> = ({ anchor, screenStyle, onScreenStyle,
                   />
                 ))}
                 <label title="Any colour" className="relative w-5 h-5 rounded-full overflow-hidden ring-1 ring-white/20 hover:ring-white/50 cursor-pointer" style={{ background: "conic-gradient(red, yellow, lime, aqua, blue, magenta, red)" }}>
-                  <input type="color" value={bg.color} onChange={(e) => setBackground({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+                  <ColorInput value={bg.color} onChange={(e) => setBackground({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
                 </label>
               </div>
             )}

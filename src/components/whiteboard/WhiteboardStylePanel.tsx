@@ -160,6 +160,7 @@ import {
 } from "../../handlers/whiteboardHandlers";
 import { preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
 import { exportLatticeLoop } from "../../handlers/latticeLoopExport";
+import ColorInput from "../common/ColorInput";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
@@ -864,8 +865,7 @@ function SeriesColorList({ node, updateNodes }: { node: WhiteboardNode; updateNo
     <div className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1">
       {resolved.series.map((_, i) => (
         <div key={i} className="flex items-center gap-1.5">
-          <input
-            type="color"
+          <ColorInput
             value={resolved.colors[i]}
             onChange={(e) => setColor(i, e.target.value)}
             className="h-6 w-8 rounded-md cursor-pointer bg-transparent"
@@ -970,8 +970,7 @@ function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateN
               <option value="cross">Cross</option>
               <option value="none">No marker</option>
             </select>
-            <input
-              type="color"
+            <ColorInput
               value={a.color ?? node.strokeColor}
               onChange={(e) => update(i, { color: e.target.value })}
               className="h-6 w-8 rounded-md cursor-pointer bg-transparent"
@@ -1334,7 +1333,7 @@ function HexColorInput({ value, onChange, title }: { value: string; onChange: (c
     >
       <span className="relative shrink-0 w-5 h-5 rounded-[5px] overflow-hidden ring-1 ring-inset ring-black/10 dark:ring-white/15 bg-[conic-gradient(#d4d4d4_25%,#fff_0_50%,#d4d4d4_0_75%,#fff_0)] bg-[length:8px_8px]">
         <span className="absolute inset-0" style={{ backgroundColor: value }} />
-        <input type="color" value={value} onChange={(e) => onChange(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+        <ColorInput value={value} onChange={(e) => onChange(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
       </span>
       <input
         type="text"
@@ -2538,8 +2537,7 @@ function TableCellFields({
       </p>
       <Field label="Background">
         <div className="flex items-center gap-1.5">
-          <input
-            type="color"
+          <ColorInput
             value={anchorFill ?? node.fillColor ?? "#ffffff"}
             onChange={(e) => updateNodes(withRangeFill(node, range, e.target.value))}
             className={SWATCH_CLASS}

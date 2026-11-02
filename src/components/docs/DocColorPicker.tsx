@@ -21,6 +21,7 @@ import {
   rgbToHex,
   rgbToHsv,
 } from "../../utils/docColor";
+import { EyedropperIcon, pickColorFromScreen } from "../common/ColorInput";
 
 interface DocColorPickerProps {
   value: string | null;
@@ -175,6 +176,18 @@ const DocColorPicker: React.FC<DocColorPickerProps> = ({ value, onChange, onClea
         </div>
 
         <div className="flex items-center gap-2 mt-2.5">
+          <button
+            type="button"
+            data-tip="Pick a colour from the screen"
+            aria-label="Pick a colour from the screen"
+            onClick={async () => {
+              const picked = await pickColorFromScreen();
+              if (picked) handleHexChange(picked);
+            }}
+            className="w-7 h-7 shrink-0 rounded border border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-100"
+          >
+            <EyedropperIcon size={14} />
+          </button>
           <div className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 shrink-0" style={{ backgroundColor: currentHex }} />
           <input
             value={hexInput}
@@ -233,6 +246,21 @@ const DocColorPicker: React.FC<DocColorPickerProps> = ({ value, onChange, onClea
             className="w-5 h-5 rounded-sm border border-dashed border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-400 dark:text-neutral-500 hover:border-neutral-400 dark:hover:border-neutral-500"
           >
             +
+          </button>
+          {/* Any colour on the screen - a logo, a photo, another app. */}
+          <button
+            type="button"
+            data-tip="Pick a colour from the screen"
+            aria-label="Pick a colour from the screen"
+            onClick={async () => {
+              const picked = await pickColorFromScreen();
+              if (!picked) return;
+              setRecentColors(addRecentColor(storageKey, picked));
+              pick(picked);
+            }}
+            className="w-5 h-5 rounded-sm border border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:border-neutral-400 hover:text-neutral-700"
+          >
+            <EyedropperIcon size={12} />
           </button>
         </div>
       </div>

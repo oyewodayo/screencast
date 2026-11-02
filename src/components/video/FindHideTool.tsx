@@ -13,6 +13,7 @@ import { IoClose, IoEyeOffOutline, IoImageOutline, IoPencil } from "react-icons/
 import type { FrameRect } from "../../utils/videoFrameRect";
 import type { HideEffect, HideShape, OutlineKind } from "../../utils/objectFind";
 import { BACKGROUND_SWATCHES } from "../../utils/cutoutBackground";
+import ColorInput from "../common/ColorInput";
 
 export type FindStatus =
   | { phase: "idle" }
@@ -330,7 +331,7 @@ const FindHideTool: React.FC<Props> = ({ frameRect, status, onFind, onCancelSear
               />
             ))}
             <label className="relative w-5 h-5 rounded-full overflow-hidden ring-1 ring-white/20 cursor-pointer" style={{ background: "conic-gradient(red, yellow, lime, aqua, blue, magenta, red)" }} title="Any colour">
-              <input type="color" value={effect.color} onChange={(e) => setEffect({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
+              <ColorInput value={effect.color} onChange={(e) => setEffect({ kind: "color", color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
             </label>
           </div>
         )}

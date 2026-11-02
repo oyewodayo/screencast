@@ -1,6 +1,7 @@
 // components/pdf/ColorSwatchPicker.tsx
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import ColorInput from "../common/ColorInput";
 
 interface ColorSwatchPickerProps {
   color: string;
@@ -110,8 +111,7 @@ const ColorSwatchPicker: React.FC<ColorSwatchPickerProps> = ({ color, onChange, 
               />
             ))}
             <div className={placement === "left" ? "w-4 h-px bg-black/[0.08] dark:bg-white/[0.12]" : "w-px h-5 bg-black/[0.08] dark:bg-white/[0.12]"} />
-            <input
-              type="color"
+            <ColorInput
               title="Custom color"
               value={color}
               onMouseDown={(e) => e.preventDefault()}

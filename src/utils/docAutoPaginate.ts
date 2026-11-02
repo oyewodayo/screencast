@@ -25,7 +25,9 @@ interface PaginationState {
   pageCount: number;
   // Paper size and orientation - landscape pages are wider and shorter, so they break sooner.
   page: PageFormat;
-  margins: DocMargins;
+  // firstTop: page 1's own top margin (inches) when it differs - a letterhead's first sheet usually
+  // needs more room than the pages after it (docLetterhead.ts).
+  margins: PageMargins;
   // 2 = two-column page (docLayout.ts): the browser's own multicol layout breaks columns and pages
   // (see DocsEditor.tsx's column rules), so this plugin draws no gaps and only counts the pages.
   columns: 1 | 2;
@@ -35,10 +37,12 @@ interface PaginationState {
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     docAutoPaginate: {
-      setPaginationLayout: (page: PageFormat, margins: DocMargins, columns?: 1 | 2) => ReturnType;
+      setPaginationLayout: (page: PageFormat, margins: PageMargins, columns?: 1 | 2) => ReturnType;
     };
   }
 }
+
+export type PageMargins = DocMargins & { firstTop?: number | null };
 
 export const DocAutoPaginatePluginKey = new PluginKey<PaginationState>("docAutoPaginate");
 
@@ -180,7 +184,7 @@ function columnPageCount(view: EditorView, page: PageFormat, margins: DocMargins
   return Math.max(1, Math.round((view.dom.getBoundingClientRect().height + gap) / (content + gap)));
 }
 
-function computeDecorations(view: EditorView, page: PageFormat, margins: DocMargins, columns: 1 | 2): PaginationResult & { pageCount?: number } {
+function computeDecorations(view: EditorView, page: PageFormat, margins: PageMargins, columns: 1 | 2): PaginationResult & { pageCount?: number } {
   const { state } = view;
   if (columns === 2) {
     // A page break is a forced column break (docLayout.css); one in the left column gets a second
@@ -217,6 +221,10 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
     };
   }
   const contentHeight = pageContentHeightPx(page, margins);
+  // Page 1 is shorter by however much deeper its own top margin is.
+  const firstExtra = typeof margins.firstTop === "number" ? inToPx(margins.firstTop - margins.top) : 0;
+  let pageIndex = 0;
+  const pageHeight = () => contentHeight - (pageIndex === 0 ? firstExtra : 0);
   const containerTop = view.dom.getBoundingClientRect().top;
   const decorations: Decoration[] = [];
   const signatureParts: string[] = [];
@@ -288,7 +296,8 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
       // A manual break always starts a fresh page immediately after it, regardless of how much
       // room was left - composes with automatic breaks the same way a real page break would. The
       // new page begins at the next block's top.
-      addGap(offset + node.nodeSize, 1, pageTop + contentHeight - bottom, 16, 16);
+      addGap(offset + node.nodeSize, 1, pageTop + pageHeight() - bottom, 16, 16);
+      pageIndex++;
       pageTop = bottom;
       pageStartPending = true;
       prev = null; // nothing keeps with a block across a manual break
@@ -296,8 +305,8 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
       return;
     }
 
-    const overflowsPage = bottom - pageTop > contentHeight;
-    const tallerThanWholePage = bottom - top > contentHeight;
+    const overflowsPage = bottom - pageTop > pageHeight();
+    const tallerThanWholePage = bottom - top > pageHeight();
     // A block taller than an entire page (a huge image, a long table) has nowhere better to go -
     // it just overflows that one page rather than triggering an endless string of empty pages.
     // `top > pageTop` guards the degenerate case of a block that's *already* at the top of the
@@ -310,13 +319,15 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
         addGap(
           prev.offset,
           -1,
-          pageTop + contentHeight - prev.bottomBefore,
+          pageTop + pageHeight() - prev.bottomBefore,
           prev.marginTopPx,
           prev.top - prev.bottomBefore
         );
+        pageIndex++;
         pageTop = prev.top;
       } else {
-        addGap(offset, -1, pageTop + contentHeight - lastBottom, marginTopPx, top - lastBottom);
+        addGap(offset, -1, pageTop + pageHeight() - lastBottom, marginTopPx, top - lastBottom);
+        pageIndex++;
         pageTop = top;
       }
     }
@@ -326,7 +337,7 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
 
   // Fills the last page out to full height, so the document ends on a whole sheet the way it will
   // print rather than wherever the text stops.
-  const tail = Math.round(pageTop + contentHeight - lastBottom);
+  const tail = Math.round(pageTop + pageHeight() - lastBottom);
   if (tail > 0) {
     decorations.push(
       Decoration.widget(state.doc.content.size, () => buildTailWidget(tail), { side: 1, key: `tail:${tail}`, ignoreSelection: true })
@@ -336,7 +347,7 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: DocMarg
 
   // Layout is part of the signature: gap widgets carry the side margins, so a margin change must
   // redraw them even when every break lands in the same place.
-  const layout = `${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left}`;
+  const layout = `${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left},${margins.firstTop ?? ""}`;
   return { decorations: DecorationSet.create(state.doc, decorations), signature: `${layout}|${signatureParts.join("|")}` };
 }
 
@@ -346,7 +357,7 @@ const DocAutoPaginate = Extension.create({
   addCommands() {
     return {
       setPaginationLayout:
-        (page: PageFormat, margins: DocMargins, columns: 1 | 2 = 1) =>
+        (page: PageFormat, margins: PageMargins, columns: 1 | 2 = 1) =>
         ({ tr, dispatch }) => {
           if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { page, margins, columns }));
           return true;

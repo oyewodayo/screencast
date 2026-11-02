@@ -51,6 +51,7 @@ import { StickerFill, isStickerKind, stickerArt, stickerAspect, stickerHasSurfac
 import { EmojiPicker, IconPicker } from "./StickerPickers";
 import AssetCanvas from "./AssetCanvas";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import ColorInput from "../common/ColorInput";
 
 const keepFocus = (e: React.MouseEvent) => e.preventDefault();
 
@@ -1050,7 +1051,7 @@ export const Swatches: React.FC<{
   custom?: boolean;
   matchRgb?: boolean;
 }> = ({ colors, value, onPick, titles, custom, matchRgb }) => {
-  const pickerRef = useRef<HTMLInputElement>(null);
+  const pickerRef = useRef<HTMLButtonElement>(null);
   const same = (c: string | undefined) =>
     (c ?? null) === (value ?? null) || (!!c && !!value && (c.toLowerCase() === value.toLowerCase() || (!!matchRgb && sameRgb(c, value))));
   const isCustom = !!value && !colors.some(same);
@@ -1069,10 +1070,7 @@ export const Swatches: React.FC<{
             title="Any colour…"
             onMouseDown={keepFocus}
             onClick={() => {
-              const el = pickerRef.current;
-              if (!el) return;
-              if (typeof el.showPicker === "function") el.showPicker();
-              else el.click();
+              pickerRef.current?.click();
             }}
             className={dot(isCustom)}
             style={{ background: "conic-gradient(#ef4444, #facc15, #22c55e, #22d3ee, #3b82f6, #a855f7, #ec4899, #ef4444)" }}
@@ -1081,7 +1079,7 @@ export const Swatches: React.FC<{
           </button>
         )}
         {/* The picker the rainbow dot opens - live as it's dragged around. */}
-        {custom && <input ref={pickerRef} type="color" tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />}
+        {custom && <ColorInput ref={pickerRef} tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />}
       </div>
       {custom && (
         <div className="flex items-center gap-1.5">
@@ -1202,7 +1200,7 @@ const SHADOWS: { value: TextOverlay["shadow"]; label: string; title: string }[] 
 
 // A colour as one compact control: a dot that opens the picker (live), the eyedropper, a hex field.
 const ColorField: React.FC<{ value: string; onPick: (c: string) => void }> = ({ value, onPick }) => {
-  const pickerRef = useRef<HTMLInputElement>(null);
+  const pickerRef = useRef<HTMLButtonElement>(null);
   return (
     <div className="flex items-center gap-1.5">
       <button
@@ -1210,15 +1208,12 @@ const ColorField: React.FC<{ value: string; onPick: (c: string) => void }> = ({ 
         title="Pick a colour"
         onMouseDown={keepFocus}
         onClick={() => {
-          const el = pickerRef.current;
-          if (!el) return;
-          if (typeof el.showPicker === "function") el.showPicker();
-          else el.click();
+          pickerRef.current?.click();
         }}
         className="w-[22px] h-[22px] shrink-0 rounded-full ring-1 ring-white/25 transition-transform hover:scale-110"
         style={{ background: value }}
       />
-      <input ref={pickerRef} type="color" tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />
+      <ColorInput ref={pickerRef} tabIndex={-1} value={toHex(value)} onChange={(e) => onPick(e.target.value)} className="w-0 h-0 -ml-1.5 opacity-0 pointer-events-none" aria-hidden="true" />
       <button
           type="button"
           title="Pick a colour from the screen - the video included"

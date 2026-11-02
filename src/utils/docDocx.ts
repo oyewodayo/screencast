@@ -31,6 +31,7 @@ import {
   VerticalPositionRelativeFrom,
   TextWrappingType,
   TextWrappingSide,
+  LineRuleType,
   type IFloating,
   type ITableCellBorders,
   VerticalAlign,
@@ -824,8 +825,24 @@ class DocxBuilder {
     const chrome = options.pageChrome ?? null;
     const wm = options.watermark?.png ? options.watermark : null;
     const chromeHas = (band: ChromeBand) => !!chrome && bandHasContent(chrome, band);
-    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean) => {
+    const lh = options.letterhead?.first ? options.letterhead : null;
+    const sheetRun = (png: Uint8Array, w: number, h: number) =>
+      new ImageRun({
+        type: "png",
+        data: png,
+        transformation: { width: w, height: h },
+        floating: {
+          horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: 0 },
+          verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: 0 },
+          behindDocument: true,
+          allowOverlap: true,
+          wrap: { type: TextWrappingType.NONE },
+        },
+      });
+    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean, letterheadPng: Uint8Array | null = null) => {
       const children: (TextRun | ImageRun)[] = [];
+      // The letterhead sheet rides in the header behind everything, as Word letterheads are built.
+      if (letterheadPng && lh) children.push(sheetRun(letterheadPng, lh.widthPx, lh.heightPx));
       if (withText && chrome) {
         const style = { size: chrome.fontSize * 2, color: "5F6368" };
         CHROME_SLOTS.forEach((slot, i) => {
@@ -864,14 +881,25 @@ class DocxBuilder {
     };
     const textOnFirst = !chrome?.differentFirstPage;
     const markOnFirst = !wm?.skipFirstPage;
-    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage);
+    const lhRest = lh ? (lh.rest === "same" ? lh.first : lh.rest) : null;
+    // Page 1's deeper top margin: an exact-height spacer in its header carries the header down to
+    // where the text starts - Word starts the body below the header when the header runs deeper.
+    const HEADER_DIST_IN = 0.5;
+    const spacerTwips = lh?.firstTopIn ? Math.round((lh.firstTopIn - HEADER_DIST_IN) * 1440) : 0;
+    const lhNeedsFirst = !!lh && (lh.rest !== "same" || spacerTwips > 0);
+    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage) || lhNeedsFirst;
     const parts = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
       const text = chromeHas(band);
       const mark = band === "header" && !!wm;
-      if (!text && !mark) return undefined;
-      const part = (withText: boolean, withMark: boolean) => new Part({ children: [bandParagraph(band, withText, withMark)] }) as InstanceType<T>;
-      const main = part(text, mark);
-      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst) } : { default: main };
+      const sheet = band === "header" && !!lh;
+      if (!text && !mark && !sheet) return undefined;
+      const part = (withText: boolean, withMark: boolean, png: Uint8Array | null, spacer = 0) => {
+        const children: Paragraph[] = [bandParagraph(band, withText, withMark, png)];
+        if (spacer > 240) children.push(new Paragraph({ spacing: { line: spacer, lineRule: LineRuleType.EXACT, before: 0, after: 0 }, children: [] }));
+        return new Part({ children }) as InstanceType<T>;
+      };
+      const main = part(text, mark, sheet ? lhRest : null);
+      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst, sheet ? lh!.first : null, sheet ? spacerTwips : 0) } : { default: main };
     };
 
     const doc = new Document({
@@ -921,6 +949,9 @@ export interface DocxExportOptions {
   pageChrome?: DocPageChrome | null;
   // The watermark (docWatermark.ts), already drawn as a PNG of the whole sheet (CSS px size).
   watermark?: { png: Uint8Array | null; widthPx: number; heightPx: number; skipFirstPage: boolean } | null;
+  // The letterhead (docLetterhead.ts): page 1's sheet and the later pages' ("same" = page 1's, null
+  // = plain paper) as page-sized PNGs, and page 1's own top margin when it's deeper.
+  letterhead?: { first: Uint8Array | null; rest: Uint8Array | "same" | null; widthPx: number; heightPx: number; firstTopIn: number | null } | null;
   margins?: DocMargins | null;
 }
 

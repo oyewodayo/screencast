@@ -56,6 +56,9 @@ export interface DocImageAttrs {
   // Signatures: who signed and when (ISO), shown on hover and kept in exports' alt text.
   signer: string | null;
   signedAt: string | null;
+  // Imported page-relative spot (docxStyleResolver.ts), cleared once settled into x/y.
+  pageX: number | null;
+  pageY: number | null;
 }
 
 export const isFreeLayout = (layout: unknown): layout is "front" | "behind" => layout === "front" || layout === "behind";
@@ -156,6 +159,8 @@ export function docImageAttributeSpecs() {
     kind: { default: "image" as ImageKind, parseHTML: (el: HTMLElement) => (el.getAttribute("data-kind") === "signature" ? "signature" : "image"), renderHTML: () => ({}) },
     signer: { default: null, parseHTML: (el: HTMLElement) => el.getAttribute("data-signer"), renderHTML: () => ({}) },
     signedAt: { default: null, parseHTML: (el: HTMLElement) => el.getAttribute("data-signed-at"), renderHTML: () => ({}) },
+    pageX: { default: null, parseHTML: (el: HTMLElement) => (el.hasAttribute("data-page-x") ? num(el.getAttribute("data-page-x"), 0) : null), renderHTML: () => ({}) },
+    pageY: { default: null, parseHTML: (el: HTMLElement) => (el.hasAttribute("data-page-y") ? num(el.getAttribute("data-page-y"), 0) : null), renderHTML: () => ({}) },
   };
 }
 
