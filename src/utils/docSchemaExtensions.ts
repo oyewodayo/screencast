@@ -26,6 +26,7 @@ import Subscript from "@tiptap/extension-subscript";
 import Superscript from "@tiptap/extension-superscript";
 import { createLowlight, common } from "lowlight";
 import DocImageView from "../components/docs/DocImageView";
+import { DocImageLayout, docImageAttributeSpecs } from "./docImageLayout";
 import FontSize from "./docFontSizeExtension";
 import LineSpacing from "./docLineSpacingExtension";
 import DocIndent from "./docIndentExtension";
@@ -78,6 +79,9 @@ const DocImage = Image.extend<ImageOptions & { docId: string | null }>({
           return value ? parseInt(value, 10) : null;
         },
       },
+      // Layout (in line / break text / wrap / in front / behind), position and look - see
+      // docImageLayout.ts.
+      ...docImageAttributeSpecs(),
     };
   },
   addNodeView() {
@@ -111,6 +115,8 @@ export function getDocContentExtensions(docId?: string): AnyExtension[] {
     // inherited unchanged from the parent extension via Tiptap's extension-chain resolution, so
     // this single option flip is all that's needed to change the node's schema group.
     DocImage.configure({ inline: true, docId: docId ?? null }),
+    // Anchors free (in front of / behind text) pictures to their paragraph; arrow-key nudging.
+    DocImageLayout,
     Table.configure({ resizable: true, lastColumnResizable: false, allowTableNodeSelection: true }),
     TableRow,
     // Plain header/cell plus a `background` (cell shading) attribute - see docTableCellShading.ts.

@@ -1,0 +1,13 @@
+/* components/docs/docSignatureFonts.css
+ *
+ * Handwriting faces for typed signatures (DocSignatureStudio.tsx), bundled from Fontsource (SIL
+ * Open Font License 1.1) so they work offline. Loaded with the studio, not with the app.
+ */
+@import "@fontsource/mrs-saint-delafield/latin-400.css";
+@import "@fontsource/herr-von-muellerhoff/latin-400.css";
+@import "@fontsource/alex-brush/latin-400.css";
+@import "@fontsource/la-belle-aurore/latin-400.css";
+@import "@fontsource/sacramento/latin-400.css";
+@import "@fontsource/great-vibes/latin-400.css";
+@import "@fontsource/dancing-script/latin-400.css";
+@import "@fontsource/caveat/latin-400.css";

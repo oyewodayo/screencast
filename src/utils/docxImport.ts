@@ -25,12 +25,15 @@ import { getDocContentExtensions } from "./docSchemaExtensions";
 import { EXTENSION_BY_MIME } from "./docImagePaste";
 import {
   type DocxDocumentMetadata,
+  type DocxImageMeta,
   type DocxTableMeta,
   type ParagraphStyle,
   type RunStyle,
   resolveDocxMetadata,
 } from "./docxStyleResolver";
 import { writeLayout } from "./docLayout";
+import { pageDimensionsIn, pageFormat } from "./docPageGeometry";
+import { hasPageChrome, writePageChrome } from "./docPageChrome";
 
 export interface ImportedDoc {
   id: string;
@@ -42,7 +45,11 @@ const normalizeText = (s: string): string => s.replace(/\s+/g, " ").trim().slice
 export function prepareConvertedDom(
   body: HTMLElement,
   imageSizes: Array<{ width: number; height: number } | null>,
-  tablesMeta: DocxTableMeta[]
+  tablesMeta: DocxTableMeta[],
+  images: DocxImageMeta[] = [],
+  // The page's text width: Word lets a table run into the margins, the editor's page doesn't, so
+  // wider tables are scaled down to fit instead of growing a scrollbar or being cut off.
+  contentWidthPx: number | null = null
 ): void {
   // 1. Strip empty bookmark anchors (<a id="..."></a>) that mammoth emits for <w:bookmarkStart/>;
   // unwrap non-empty anchor bookmarks without href so they don't confuse ProseMirror mark parsing.
@@ -54,13 +61,24 @@ export function prepareConvertedDom(
     }
   });
 
-  // 2. Apply <wp:extent> pixel dimensions to embedded <img> elements in document order.
+  // 2. Apply <wp:extent> pixel dimensions to embedded <img> elements in document order, and the
+  // picture's wrap setting as the editor's layout (docImageLayout.ts reads these data attributes).
   const imgs = Array.from(body.querySelectorAll("img"));
   imgs.forEach((img, idx) => {
     const sz = imageSizes[idx];
     if (sz) {
       img.setAttribute("width", String(sz.width));
       img.setAttribute("height", String(sz.height));
+    }
+    const meta = images[idx];
+    if (meta?.rotation) img.setAttribute("data-rotation", String(meta.rotation));
+    if (meta && meta.layout !== "inline") {
+      img.setAttribute("data-layout", meta.layout);
+      img.setAttribute("data-align", meta.align);
+      if (meta.layout === "front" || meta.layout === "behind") {
+        img.setAttribute("data-x", String(meta.x));
+        img.setAttribute("data-y", String(meta.y));
+      }
     }
   });
 
@@ -88,7 +106,9 @@ export function prepareConvertedDom(
       }
     }
 
-    if (meta.rules) {
+    // A table that sets its own cell borders draws exactly those; otherwise its rule style.
+    const hasOwnBorders = meta.cells.some((row) => row.some((c) => c.borders));
+    if (meta.rules && !hasOwnBorders) {
       table.setAttribute("data-rules", meta.rules);
     }
     const rows = Array.from(table.querySelectorAll("tr"));
@@ -101,8 +121,27 @@ export function prepareConvertedDom(
         if (!cm) return;
         if (cm.background) cell.setAttribute("data-background", cm.background);
         if (cm.colwidth) cell.setAttribute("colwidth", String(cm.colwidth));
+        if (cm.verticalAlign) cell.setAttribute("data-valign", cm.verticalAlign);
+        if (cm.borders) cell.setAttribute("data-borders", [cm.borders.top, cm.borders.right, cm.borders.bottom, cm.borders.left].join("|"));
       });
     });
+
+    if (contentWidthPx && contentWidthPx > 0) {
+      // The widest row's total (cell borders and padding live inside these widths in the editor).
+      let widest = 0;
+      for (const tr of rows) {
+        let sum = 0;
+        for (const cell of Array.from(tr.children)) sum += Number(cell.getAttribute("colwidth") ?? 0) || 0;
+        widest = Math.max(widest, sum);
+      }
+      const limit = contentWidthPx - 2;
+      if (widest > limit) {
+        const k = limit / widest;
+        table.querySelectorAll("td[colwidth], th[colwidth]").forEach((cell) => {
+          cell.setAttribute("colwidth", String(Math.max(20, Math.floor(Number(cell.getAttribute("colwidth")) * k))));
+        });
+      }
+    }
   });
 
   // 4. Remove any empty <p> or <h1..h6> that might remain (e.g. if a paragraph contained only a
@@ -195,8 +234,15 @@ function buildMarksForSlice(
     isHeading && effectiveBold === false ? "normal" : (run?.fontWeight ?? null);
   const fontStyle: "normal" | null = run?.fontStyle ?? null;
   const tabAlign: "right" | null = run?.tabAlign ?? null;
+  const letterSpacing = run?.letterSpacingPt ?? null;
+  const caps = run?.caps ? true : null;
+  const smallCaps = run?.smallCaps && !run?.caps ? true : null;
 
-  if ((fontFamily || fontSize || color || fontWeight || fontStyle || tabAlign) && schema.marks.textStyle) {
+  if (run?.highlight && schema.marks.highlight && !marks.some((m) => m.type.name === "highlight")) {
+    marks.push(schema.marks.highlight.create({ color: run.highlight }));
+  }
+
+  if ((fontFamily || fontSize || color || fontWeight || fontStyle || tabAlign || letterSpacing || caps || smallCaps) && schema.marks.textStyle) {
     const existingTs = marks.find((m) => m.type.name === "textStyle");
     marks = marks.filter((m) => m.type.name !== "textStyle");
     marks.push(
@@ -208,6 +254,9 @@ function buildMarksForSlice(
         fontWeight: fontWeight ?? existingTs?.attrs?.fontWeight ?? null,
         fontStyle: fontStyle ?? existingTs?.attrs?.fontStyle ?? null,
         tabAlign: tabAlign ?? existingTs?.attrs?.tabAlign ?? null,
+        letterSpacing: letterSpacing ?? existingTs?.attrs?.letterSpacing ?? null,
+        caps: caps ?? existingTs?.attrs?.caps ?? null,
+        smallCaps: smallCaps ?? existingTs?.attrs?.smallCaps ?? null,
       })
     );
   }
@@ -309,6 +358,10 @@ export function applyParagraphStyles(
         indentRight: s.indentRightIn ?? node.attrs.indentRight,
         indentFirst: s.indentFirstIn ?? node.attrs.indentFirst,
         borderBottom: s.borderBottom ?? node.attrs.borderBottom,
+        borderTop: s.borderTop ?? node.attrs.borderTop,
+        borderLeft: s.borderLeft ?? node.attrs.borderLeft,
+        borderRight: s.borderRight ?? node.attrs.borderRight,
+        shading: s.shading ?? node.attrs.shading,
       };
       const content = applyRunsToInlineChildren(node, s, isHeading, schema);
       return node.type.create(attrs, content, node.marks);
@@ -362,7 +415,15 @@ export function applyParagraphStyles(
 
     if (node.content.childCount === 0) return node;
     const children: ProseMirrorNode[] = [];
-    node.forEach((child) => children.push(walk(child)));
+    const pageBreak = node.type.name === "doc" ? schema.nodes.pageBreak : undefined;
+    node.forEach((child) => {
+      // Word's page breaks (w:br type=page, "Page break before", next-page section breaks) become
+      // real page-break blocks in front of the top-level block whose first paragraph starts the page.
+      const first = index;
+      const walked = walk(child);
+      if (pageBreak && children.length > 0 && index > first && paragraphStyles[first]?.pageBreakBefore) children.push(pageBreak.create());
+      children.push(walked);
+    });
     return node.copy(Fragment.fromArray(children));
   };
 
@@ -391,12 +452,13 @@ export async function parseDocxBytesToDoc(
   options?: {
     docIdForImages?: string;
     schema?: Schema;
+    // Where embedded pictures go when there's no doc folder (tests): returns each picture's src.
+    saveImage?: (image: { contentType: string; readAsArrayBuffer: () => Promise<ArrayBuffer> }) => Promise<{ src: string }>;
   }
 ): Promise<{ node: ProseMirrorNode; meta: DocxDocumentMetadata }> {
   const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-  const mammothOpts = options?.docIdForImages
-    ? { convertImage: mammoth.images.imgElement((image) => saveEmbeddedImage(options.docIdForImages!, image)) }
-    : undefined;
+  const saver = options?.saveImage ?? (options?.docIdForImages ? (image: Parameters<typeof saveEmbeddedImage>[1]) => saveEmbeddedImage(options.docIdForImages!, image) : null);
+  const mammothOpts = saver ? { convertImage: mammoth.images.imgElement(saver) } : undefined;
 
   const [result, meta] = await Promise.all([
     mammoth.convertToHtml({ arrayBuffer }, mammothOpts),
@@ -408,7 +470,10 @@ export async function parseDocxBytesToDoc(
 
   const schema = options?.schema ?? getSchema(getDocContentExtensions());
   const dom = new DOMParser().parseFromString(result.value, "text/html");
-  prepareConvertedDom(dom.body, meta.imageSizes, meta.tables);
+  const contentWidthPx = meta.pageSetup
+    ? (pageDimensionsIn(pageFormat(meta.pageSetup.pageSize, meta.pageSetup.orientation)).width - meta.pageSetup.margins.left - meta.pageSetup.margins.right) * 96
+    : null;
+  prepareConvertedDom(dom.body, meta.imageSizes, meta.tables, meta.images, contentWidthPx);
 
   const parsedNode = ProseMirrorDOMParser.fromSchema(schema).parse(dom.body);
   const node = applyParagraphStyles(parsedNode, schema.marks.textStyle, meta.paragraphs);
@@ -431,6 +496,7 @@ export async function importDocxFile(path: string, fileName: string, preread?: A
     const { node, meta } = await parseDocxBytesToDoc(new Uint8Array(arrayBuffer), { docIdForImages: id });
 
     const ydoc = prosemirrorToYDoc(node, "default");
+    if (meta.pageChrome && hasPageChrome(meta.pageChrome)) writePageChrome(ydoc, meta.pageChrome);
     if (meta.pageSetup && meta.pageSetup.columns === 2) {
       writeLayout(ydoc, {
         body: null,

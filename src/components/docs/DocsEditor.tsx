@@ -9,6 +9,7 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { Extension } from "@tiptap/core";
+import { NodeSelection } from "@tiptap/pm/state";
 import { useEditor, EditorContent } from "@tiptap/react";
 import katex from "katex";
 import Collaboration from "@tiptap/extension-collaboration";
@@ -41,8 +42,8 @@ import { addFontFilesToDocument } from "../../utils/docFonts";
 import { docJsonToMarkdown } from "../../utils/docMarkdown";
 import { buildDocxBytes } from "../../utils/docDocx";
 import { LibraryFileEntry, type DocMargins } from "../../utils/docTypes";
-import { createDocImagePasteExtension, uploadImageFromPath } from "../../utils/docImagePaste";
-import { createSlashCommandExtension } from "../../utils/docSlashCommand";
+import { createDocImagePasteExtension, saveImageBytes, uploadImageFromPath } from "../../utils/docImagePaste";
+import { createSlashCommandExtension, OPEN_SIGNATURE_EVENT } from "../../utils/docSlashCommand";
 import DocFindReplace from "../../utils/docFindReplace";
 import DocDictation from "../../utils/docDictationExtension";
 import DocPaint from "../../utils/docPaintExtension";
@@ -56,6 +57,8 @@ import DocOutlinePanel from "./DocOutlinePanel";
 import DocCitePicker, { type CitePickerMode } from "./DocCitePicker";
 import DocCrossRefPicker, { type CrossRefPickerMode } from "./DocCrossRefPicker";
 import DocFindReplaceBar from "./DocFindReplaceBar";
+import DocSignatureStudio, { type SignatureResult } from "./DocSignatureStudio";
+import DocSignaturePlacer, { type PendingSignature } from "./DocSignaturePlacer";
 import DocCommentsSidebar from "./DocCommentsSidebar";
 import DocPageSetupPopover from "./DocPageSetupPopover";
 import DocToolbar, { Dropdown, menuItemClass } from "./DocToolbar";
@@ -296,6 +299,8 @@ async function buildStandaloneHtml(
     dark ? "a{color:#93c5fd!important}th{background:rgba(255,255,255,.08)!important}blockquote{color:#d4d4d4!important}pre{background:rgba(255,255,255,.08)!important}" : "",
     "@media print{body{margin:0 auto;padding:0;max-width:none}}",
     "h1,h2,h3,h4{line-height:1.25;margin:1.4em 0 .5em}",
+    // Free pictures (docImageLayout.ts) are placed from the paragraph they're anchored to.
+    'body{isolation:isolate}:has(>img[data-layout="front"]),:has(>img[data-layout="behind"]){position:relative}',
     "p{margin:0 0 .9em}img{max-width:100%;height:auto}",
     "table{border-collapse:collapse;width:100%;margin:1em 0}th,td{border:1px solid #d0d0d0;padding:6px 10px;vertical-align:top;text-align:left}th{background:#f3f3f3}",
     "blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid #d0d0d0;color:#555}",
@@ -674,6 +679,32 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     },
     [editor, store]
   );
+
+  // Signing: the studio makes the signature, it's saved into this doc's assets, then the placer
+  // lets it be dropped anywhere on the page.
+  const [signing, setSigning] = useState<"studio" | PendingSignature | null>(null);
+  const handleSignaturePlace = useCallback(
+    async (sig: SignatureResult) => {
+      try {
+        const bytes = Array.from(new Uint8Array(await sig.blob.arrayBuffer()));
+        const src = await saveImageBytes(docId, bytes, "png");
+        setSigning({ src, width: sig.width, height: sig.height, signer: sig.signer });
+      } catch (err) {
+        console.error("Failed to save signature:", err);
+        setSigning(null);
+      }
+    },
+    [docId]
+  );
+
+  // "/signature" in the slash menu.
+  useEffect(() => {
+    if (!editor) return;
+    const dom = editor.view.dom;
+    const open = () => setSigning("studio");
+    dom.addEventListener(OPEN_SIGNATURE_EVENT, open);
+    return () => dom.removeEventListener(OPEN_SIGNATURE_EVENT, open);
+  }, [editor]);
 
   // Toolbar-driven counterpart to docImagePaste.ts's paste/drop handling.
   const handleInsertImage = useCallback(async () => {
@@ -1128,6 +1159,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           linkOpen={linkOpen}
           onLinkOpenChange={setLinkOpen}
           onInsertImage={() => void handleInsertImage()}
+          onSign={() => {
+            // A selected picture's toolbar would sit over the page while placing.
+            if (editor.state.selection instanceof NodeSelection) editor.commands.setTextSelection(editor.state.selection.to);
+            setSigning("studio");
+          }}
           onAddComment={(text) => void submitComment(text)}
           rulerVisible={rulerVisible}
           onToggleRuler={toggleRuler}
@@ -1299,6 +1335,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           onClose={() => setShowStyle(false)}
         />
       )}
+
+      {signing === "studio" && <DocSignatureStudio onPlace={(sig) => void handleSignaturePlace(sig)} onClose={() => setSigning(null)} />}
+      {editor && signing && signing !== "studio" && <DocSignaturePlacer editor={editor} signature={signing} onDone={() => setSigning(null)} />}
 
       {showWatermark && store.ydoc && <DocWatermarkDialog watermark={watermark} onChange={updateWatermark} onClose={() => setShowWatermark(false)} />}
 

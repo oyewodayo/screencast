@@ -56,7 +56,7 @@ import {
   MdBrandingWatermark,
 } from "react-icons/md";
 import { BiHighlight } from "react-icons/bi";
-import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbTable, TbTableOptions } from "react-icons/tb";
+import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbSignature, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import { CELL_SHADES } from "../../utils/docTableCellShading";
 import DocColorPicker from "./DocColorPicker";
@@ -579,6 +579,8 @@ export interface DocToolbarProps {
   linkOpen: boolean;
   onLinkOpenChange: (open: boolean) => void;
   onInsertImage: () => void;
+  // Opens the signature studio (DocSignatureStudio.tsx).
+  onSign: () => void;
   onAddComment: (text: string) => void;
   rulerVisible: boolean;
   onToggleRuler: () => void;
@@ -603,6 +605,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   linkOpen,
   onLinkOpenChange,
   onInsertImage,
+  onSign,
   onAddComment,
   rulerVisible,
   onToggleRuler,
@@ -1059,6 +1062,9 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           <ToolButton label="Insert image" onClick={onInsertImage}>
             <MdImage size={19} />
           </ToolButton>
+          <ToolButton label="Sign - draw, type or upload a signature" onClick={onSign}>
+            <TbSignature size={19} strokeWidth={1.75} />
+          </ToolButton>
           <Dropdown {...bind("table")} label="Insert table" trigger={<TbTable size={19} strokeWidth={1.75} />}>
             <TableGridPicker
               onPick={(rows, cols) => {
@@ -1320,6 +1326,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           </MenuSection>
           <MenuSection title="Insert" className="@4xl:hidden">
             {menuAction("Image", MdImage, onInsertImage)}
+            {menuAction("Signature…", TbSignature, onSign)}
             {menuAction("Table (3 × 3)", TbTable, () => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run())}
             {equationItems}
             {menuAction("Citation…", TbQuote, () => openPickerAtCursor("cite"))}

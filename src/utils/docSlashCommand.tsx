@@ -24,7 +24,7 @@ import {
   MdChecklist,
   MdInfoOutline,
 } from "react-icons/md";
-import { TbListDetails, TbMath, TbMathFunction, TbQuote, TbTable, TbBooks, TbCornerDownRight, TbPhoto } from "react-icons/tb";
+import { TbListDetails, TbMath, TbMathFunction, TbQuote, TbTable, TbBooks, TbCornerDownRight, TbPhoto, TbSignature } from "react-icons/tb";
 import { OPEN_PICKER_EVENT, type OpenPickerDetail } from "./docStructureNodes";
 import SlashCommandMenu, { SlashCommandItem } from "../components/docs/SlashCommandMenu";
 import { uploadImageFromPath } from "./docImagePaste";
@@ -194,8 +194,20 @@ function buildItems(docId: string): SlashCommandItem[] {
         }
       },
     },
+    {
+      title: "Signature",
+      keywords: ["signature", "sign", "autograph", "initials"],
+      icon: TbSignature,
+      // DocsEditor hosts the signature studio; it listens for this on the editor's DOM.
+      run: (editor, range) => {
+        editor.chain().focus().deleteRange(range).run();
+        editor.view.dom.dispatchEvent(new CustomEvent(OPEN_SIGNATURE_EVENT));
+      },
+    },
   ];
 }
+
+export const OPEN_SIGNATURE_EVENT = "doc-open-signature";
 
 // The citation and cross-reference pickers open anchored at the cursor (DocsEditor.tsx hosts them).
 function openPicker(editor: import("@tiptap/core").Editor, kind: OpenPickerDetail["kind"]): void {

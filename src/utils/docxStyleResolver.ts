@@ -19,6 +19,8 @@
 import JSZip from "jszip";
 import { DOMParser as XmlDOMParser } from "@xmldom/xmldom";
 import type { DocMargins, DocOrientation, DocPageSize } from "./docTypes";
+import type { DocPageChrome } from "./docPageChrome";
+import { resolveDocxPageChrome } from "./docxHeaderFooter";
 
 export interface RunStyle {
   text: string;
@@ -32,6 +34,10 @@ export interface RunStyle {
   fontWeight: "normal" | null;
   fontStyle: "normal" | null;
   tabAlign: "right" | null;
+  letterSpacingPt: number | null; // w:spacing (character spacing): expanded > 0, condensed < 0
+  caps: boolean | null;
+  smallCaps: boolean | null;
+  highlight: string | null; // "#rrggbb" from w:highlight or run shading
 }
 
 export interface ParagraphStyle {
@@ -50,6 +56,11 @@ export interface ParagraphStyle {
   indentRightIn: number | null;
   indentFirstIn: number | null;
   borderBottom: string | null;
+  borderTop: string | null;
+  borderLeft: string | null;
+  borderRight: string | null;
+  shading: string | null; // "#rrggbb" paragraph background
+  pageBreakBefore: boolean; // a page break (w:br type=page / pageBreakBefore / next-page section) precedes this block
   bulletMarker: string | null;
   listIndentLeftIn: number | null;
   isListItem: boolean;
@@ -60,6 +71,17 @@ export interface ParagraphStyle {
 export interface DocxTableCellMeta {
   background: string | null;
   colwidth: number | null;
+  verticalAlign: "top" | "middle" | "bottom" | null;
+  // Each edge as CSS ("0.5pt solid #000000" / "none"), resolved from the cell's own borders, then
+  // the table's (outer edges vs inside lines), then the table style's. null = the editor's grid.
+  borders: CellBorders | null;
+}
+
+export interface CellBorders {
+  top: string;
+  right: string;
+  bottom: string;
+  left: string;
 }
 
 export interface DocxTableMeta {
@@ -83,6 +105,21 @@ export interface DocxDocumentMetadata {
   pageSetup: DocxPageSetup | null;
   imageSizes: Array<{ width: number; height: number } | null>;
   tables: DocxTableMeta[];
+  images: DocxImageMeta[];
+  // Running header/footer and page numbers (docxHeaderFooter.ts), null when there are none.
+  pageChrome: DocPageChrome | null;
+}
+
+// A picture's size and placement (wp:inline or wp:anchor), in document order.
+export interface DocxImageMeta {
+  width: number;
+  height: number;
+  layout: "inline" | "block" | "wrapLeft" | "wrapRight" | "front" | "behind";
+  align: "left" | "center" | "right";
+  x: number; // px from the anchor paragraph's left (front/behind)
+  y: number; // px from the anchor paragraph's top
+  rotation: number; // degrees, clockwise
+  alt: string | null;
 }
 
 interface RawRPr {
@@ -94,6 +131,10 @@ interface RawRPr {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  spacingTwips?: number;
+  caps?: boolean;
+  smallCaps?: boolean;
+  highlight?: string;
 }
 
 interface RawPPr {
@@ -107,6 +148,11 @@ interface RawPPr {
   indentRightIn?: number;
   indentFirstIn?: number;
   borderBottom?: string;
+  borderTop?: string;
+  borderLeft?: string;
+  borderRight?: string;
+  shading?: string;
+  pageBreakBefore?: boolean;
   hasRightTab?: boolean;
   numId?: string;
   ilvl?: string;
@@ -326,7 +372,59 @@ function extractRPr(rPr: Element | null, theme: ThemeData): RawRPr {
     out.underline = uVal === null || (uVal !== "none" && uVal !== "0" && uVal !== "false");
   }
 
+  const spacing = attr(directChild(rPr, "spacing"), "w:val");
+  if (spacing !== null) {
+    const twips = parseInt(spacing, 10);
+    if (Number.isFinite(twips)) out.spacingTwips = twips;
+  }
+  const caps = readBoolElement(directChild(rPr, "caps"));
+  if (caps !== undefined) out.caps = caps;
+  const smallCaps = readBoolElement(directChild(rPr, "smallCaps"));
+  if (smallCaps !== undefined) out.smallCaps = smallCaps;
+
+  // Highlighter pen (a named colour), else run shading (Google Docs' text background colour).
+  const hl = attr(directChild(rPr, "highlight"), "w:val");
+  if (hl && hl !== "none" && HIGHLIGHT_COLORS[hl]) out.highlight = HIGHLIGHT_COLORS[hl];
+  else {
+    const fill = resolveColorAttr(directChild(rPr, "shd"), theme, "w:fill");
+    if (fill && fill !== "#ffffff") out.highlight = fill;
+  }
+
   return out;
+}
+
+// w:highlight's named colours (ST_HighlightColor).
+const HIGHLIGHT_COLORS: Record<string, string> = {
+  yellow: "#ffff00",
+  green: "#00ff00",
+  cyan: "#00ffff",
+  magenta: "#ff00ff",
+  blue: "#0000ff",
+  red: "#ff0000",
+  darkBlue: "#000080",
+  darkCyan: "#008080",
+  darkGreen: "#008000",
+  darkMagenta: "#800080",
+  darkRed: "#800000",
+  darkYellow: "#808000",
+  darkGray: "#808080",
+  lightGray: "#c0c0c0",
+  black: "#000000",
+  white: "#ffffff",
+};
+
+// A border element (w:top/w:left/... in pBdr, tcBorders, tblBorders) as CSS; "none" when it's
+// explicitly off; undefined when absent.
+function borderCss(el: Element | null, theme: ThemeData): string | undefined {
+  if (!el) return undefined;
+  const val = attr(el, "w:val");
+  const sz = parseInt(attr(el, "w:sz") ?? "4", 10);
+  if (!val || val === "none" || val === "nil" || !(sz > 0)) return "none";
+  // w:sz is in eighths of a point.
+  const pt = round2(Math.max(0.5, Math.min(6, sz / 8)));
+  const color = resolveColorAttr(el, theme, "w:color") ?? "#000000";
+  const style = val === "dotted" ? "dotted" : val === "dashed" || val.startsWith("dash") ? "dashed" : val === "double" ? "double" : "solid";
+  return `${style === "double" ? Math.max(pt, 2.25) : pt}pt ${style} ${color}`;
 }
 
 function mergeRPr(base: RawRPr, over: RawRPr | undefined): RawRPr {
@@ -339,6 +437,10 @@ function mergeRPr(base: RawRPr, over: RawRPr | undefined): RawRPr {
     bold: over.bold !== undefined ? over.bold : base.bold,
     italic: over.italic !== undefined ? over.italic : base.italic,
     underline: over.underline !== undefined ? over.underline : base.underline,
+    spacingTwips: over.spacingTwips ?? base.spacingTwips,
+    caps: over.caps !== undefined ? over.caps : base.caps,
+    smallCaps: over.smallCaps !== undefined ? over.smallCaps : base.smallCaps,
+    highlight: over.highlight ?? base.highlight,
   };
 }
 
@@ -412,20 +514,29 @@ function extractPPr(pPr: Element | null, theme: ThemeData): RawPPr {
 
   const pBdr = directChild(pPr, "pBdr");
   if (pBdr) {
-    const bottom = directChild(pBdr, "bottom");
-    if (bottom) {
-      const val = attr(bottom, "w:val");
-      const sz = parseInt(attr(bottom, "w:sz") ?? "0", 10);
-      if (val && val !== "none" && val !== "nil" && sz > 0) {
-        const pt = round2(Math.max(0.5, Math.min(4, sz / 8)));
-        const color = resolveColorAttr(bottom, theme, "w:color") ?? "#000000";
-        const lineStyle = val === "dotted" ? "dotted" : val === "dashed" || val === "dashSmallGap" ? "dashed" : val === "double" ? "double" : "solid";
-        out.borderBottom = `${pt}pt ${lineStyle} ${color}`;
-      } else if (val === "none" || val === "nil") {
-        out.borderBottom = "";
-      }
-    }
+    // "" = explicitly no border (overriding a style's), so the merged result can switch one off.
+    const side = (name: string): string | undefined => {
+      const css = borderCss(directChild(pBdr, name), theme);
+      return css === undefined ? undefined : css === "none" ? "" : css;
+    };
+    const bottom = side("bottom");
+    if (bottom !== undefined) out.borderBottom = bottom;
+    const top = side("top");
+    if (top !== undefined) out.borderTop = top;
+    const left = side("left") ?? side("start");
+    if (left !== undefined) out.borderLeft = left;
+    const right = side("right") ?? side("end");
+    if (right !== undefined) out.borderRight = right;
   }
+
+  const shd = directChild(pPr, "shd");
+  if (shd) {
+    const fill = resolveColorAttr(shd, theme, "w:fill");
+    out.shading = fill && fill !== "#ffffff" ? fill : "";
+  }
+
+  const pbb = readBoolElement(directChild(pPr, "pageBreakBefore"));
+  if (pbb !== undefined) out.pageBreakBefore = pbb;
 
   const tabs = directChild(pPr, "tabs");
   if (tabs) {
@@ -464,6 +575,11 @@ function mergePPr(base: RawPPr, over: RawPPr | undefined): RawPPr {
     indentRightIn: over.indentRightIn ?? base.indentRightIn,
     indentFirstIn: over.indentFirstIn ?? base.indentFirstIn,
     borderBottom: over.borderBottom !== undefined ? over.borderBottom : base.borderBottom,
+    borderTop: over.borderTop !== undefined ? over.borderTop : base.borderTop,
+    borderLeft: over.borderLeft !== undefined ? over.borderLeft : base.borderLeft,
+    borderRight: over.borderRight !== undefined ? over.borderRight : base.borderRight,
+    shading: over.shading !== undefined ? over.shading : base.shading,
+    pageBreakBefore: over.pageBreakBefore ?? base.pageBreakBefore,
     hasRightTab: over.hasRightTab ?? base.hasRightTab,
     numId: over.numId ?? base.numId,
     ilvl: over.ilvl ?? base.ilvl,
@@ -596,28 +712,64 @@ function parsePageSetup(docXml: Document, theme: ThemeData): DocxPageSetup | nul
   return { pageSize, orientation, margins, columns, columnGapIn, pageColor };
 }
 
-function parseImageSizes(docXml: Document): Array<{ width: number; height: number } | null> {
-  const sizes: Array<{ width: number; height: number } | null> = [];
+// Pictures in document order - the same order mammoth emits its <img> elements - with Word's wrap
+// setting mapped onto the editor's picture layouts (docImageLayout.ts).
+function parseImages(docXml: Document, content: { widthPx: number; marginLeftPx: number; marginTopPx: number }): DocxImageMeta[] {
+  const out: DocxImageMeta[] = [];
   const drawings = docXml.getElementsByTagName("w:drawing");
+  const first = (el: Element | null | undefined, name: string): Element | null =>
+    (el?.getElementsByTagName(`wp:${name}`)[0] as Element | undefined) ?? (el?.getElementsByTagName(name)[0] as Element | undefined) ?? null;
+  const text = (el: Element | null, name: string): string | null => {
+    const c = first(el, name);
+    return c ? (c.textContent ?? "").trim() : null;
+  };
   for (let i = 0; i < drawings.length; i++) {
     const drawing = drawings[i];
     const hasBlip = drawing.getElementsByTagName("a:blip").length > 0 || drawing.getElementsByTagName("blip").length > 0;
     if (!hasBlip) continue;
-    const extent = drawing.getElementsByTagName("wp:extent")[0] ?? drawing.getElementsByTagName("extent")[0];
-    if (extent) {
-      const cx = parseInt(attr(extent, "cx") ?? "0", 10);
-      const cy = parseInt(attr(extent, "cy") ?? "0", 10);
-      if (cx > 0 && cy > 0) {
-        sizes.push({
-          width: Math.max(1, Math.round(cx / EMU_PER_PX)),
-          height: Math.max(1, Math.round(cy / EMU_PER_PX)),
-        });
-        continue;
-      }
+    const extent = first(drawing, "extent");
+    const cx = parseInt(attr(extent, "cx") ?? "0", 10);
+    const cy = parseInt(attr(extent, "cy") ?? "0", 10);
+    const width = cx > 0 ? Math.max(1, Math.round(cx / EMU_PER_PX)) : 0;
+    const height = cy > 0 ? Math.max(1, Math.round(cy / EMU_PER_PX)) : 0;
+    const docPr = first(drawing, "docPr");
+    const alt = attr(docPr, "descr") || attr(docPr, "title") || null;
+    const anchor = first(drawing, "anchor");
+    // a:xfrm rot is in 60000ths of a degree.
+    const xfrm = (drawing.getElementsByTagName("a:xfrm")[0] as Element | undefined) ?? null;
+    const rot = parseInt(attr(xfrm, "rot") ?? "0", 10) / 60000;
+    const rotation = Number.isFinite(rot) && rot ? Math.round((((rot + 180) % 360) - 180) * 10) / 10 : 0;
+    const meta: DocxImageMeta = { width, height, layout: "inline", align: "center", x: 0, y: 0, rotation, alt };
+    if (anchor) {
+      const posH = first(anchor, "positionH");
+      const posV = first(anchor, "positionV");
+      const hAlign = text(posH, "align");
+      const hOffset = parseInt(text(posH, "posOffset") ?? "0", 10) / EMU_PER_PX;
+      const hRel = attr(posH, "relativeFrom") ?? "column";
+      const vAlign = text(posV, "align");
+      const vOffset = parseInt(text(posV, "posOffset") ?? "0", 10) / EMU_PER_PX;
+      const vRel = attr(posV, "relativeFrom") ?? "paragraph";
+      // x from the text column's left edge.
+      let x = hRel === "page" ? hOffset - content.marginLeftPx : hRel === "leftMargin" ? hOffset - content.marginLeftPx : hOffset;
+      if (hAlign) x = hAlign === "center" ? (content.widthPx - width) / 2 : hAlign === "right" || hAlign === "outside" ? content.widthPx - width : 0;
+      // y from the anchor paragraph's top; page/margin-relative offsets are approximated as if the
+      // paragraph started at the top of the text area (exact for headers' first paragraph, the
+      // common case: letterheads, logos).
+      let y = vRel === "page" ? vOffset - content.marginTopPx : vRel === "paragraph" || vRel === "line" ? vOffset : vRel === "topMargin" ? vOffset - content.marginTopPx : vOffset;
+      if (vAlign) y = 0;
+      const third = content.widthPx / 3;
+      const centre = x + width / 2;
+      const align: "left" | "center" | "right" = hAlign === "center" ? "center" : hAlign === "right" || hAlign === "outside" ? "right" : hAlign ? "left" : centre < third ? "left" : centre > third * 2 ? "right" : "center";
+      const wrap = ["wrapNone", "wrapSquare", "wrapTight", "wrapThrough", "wrapTopAndBottom"].find((w) => first(anchor, w));
+      const behind = attr(anchor, "behindDoc") === "1" || attr(anchor, "behindDoc") === "true";
+      if (wrap === "wrapTopAndBottom") Object.assign(meta, { layout: "block", align });
+      else if (wrap === "wrapSquare" || wrap === "wrapTight" || wrap === "wrapThrough")
+        Object.assign(meta, { layout: align === "center" ? "block" : align === "right" ? "wrapRight" : "wrapLeft", align });
+      else Object.assign(meta, { layout: behind ? "behind" : "front", align, x: Math.round(x), y: Math.round(y) });
     }
-    sizes.push(null);
+    out.push(meta);
   }
-  return sizes;
+  return out;
 }
 
 function hasVisibleBorder(bdrEl: Element | null): boolean {
@@ -627,9 +779,10 @@ function hasVisibleBorder(bdrEl: Element | null): boolean {
   return Boolean(val && val !== "none" && val !== "nil" && sz > 0);
 }
 
-function parseTableMeta(tbl: Element, theme: ThemeData): DocxTableMeta {
+function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: string | null) => Element | null): DocxTableMeta {
   const tblPr = directChild(tbl, "tblPr");
-  const tblBorders = directChild(tblPr, "tblBorders");
+  // The table's own borders, else its table style's (Word's "Table Grid" keeps them there).
+  const tblBorders = directChild(tblPr, "tblBorders") ?? styleBorders(attr(directChild(tblPr, "tblStyle"), "w:val"));
 
   let topOrBottomVisible = false;
   let insideVOrSideVisible = false;
@@ -660,17 +813,37 @@ function parseTableMeta(tbl: Element, theme: ThemeData): DocxTableMeta {
   const rows = directChildren(tbl, "tr").filter((tr) => !directChild(directChild(tr, "trPr"), "del"));
   const cells: DocxTableCellMeta[][] = [];
   const colHasContent: boolean[] = [];
+  const gridCols = Math.max(1, colWidthsPx.length);
+  // An edge's CSS: the cell's own border, else the table's outer edge or inside line. No border
+  // anywhere means none - Word draws no grid a document didn't ask for.
+  const edge = (tcBorders: Element | null, own: string[], table: string): string =>
+    borderCss(own.map((n) => directChild(tcBorders, n)).find(Boolean) ?? null, theme) ?? borderCss(directChild(tblBorders, table), theme) ?? "none";
 
-  for (const tr of rows) {
+  rows.forEach((tr, rowIdx) => {
     const rowMeta: DocxTableCellMeta[] = [];
     const tcs = directChildren(tr, "tc");
+    let gridCol = 0;
     tcs.forEach((tc, colIdx) => {
       const tcPr = directChild(tc, "tcPr");
+      const span = Math.max(1, parseInt(attr(directChild(tcPr, "gridSpan"), "w:val") ?? "1", 10) || 1);
+      const firstCol = gridCol === 0;
+      gridCol += span;
+      const lastCol = gridCol >= gridCols;
       const vMerge = directChild(tcPr, "vMerge");
       // Mammoth drops vMerge continuation cells (where w:val is absent or "continue").
       if (vMerge && (attr(vMerge, "w:val") ?? "continue") !== "restart") {
         return;
       }
+      const tcBorders = directChild(tcPr, "tcBorders");
+      const lastRow = rowIdx === rows.length - 1;
+      const borders: CellBorders = {
+        top: edge(tcBorders, ["top"], rowIdx === 0 ? "top" : "insideH"),
+        bottom: edge(tcBorders, ["bottom"], lastRow ? "bottom" : "insideH"),
+        left: edge(tcBorders, ["left", "start"], firstCol ? "left" : "insideV"),
+        right: edge(tcBorders, ["right", "end"], lastCol ? "right" : "insideV"),
+      };
+      const vAlignVal = attr(directChild(tcPr, "vAlign"), "w:val");
+      const verticalAlign = vAlignVal === "center" ? "middle" : vAlignVal === "bottom" ? "bottom" : vAlignVal === "top" ? "top" : null;
       checkBorders(directChild(tcPr, "tcBorders"));
       const shd = directChild(tcPr, "shd");
       const fill = resolveColorAttr(shd, theme, "w:fill") ?? null;
@@ -683,6 +856,8 @@ function parseTableMeta(tbl: Element, theme: ThemeData): DocxTableMeta {
       rowMeta.push({
         background: fill && fill !== "#ffffff" ? fill : null,
         colwidth,
+        verticalAlign,
+        borders,
       });
       const text = (tc.textContent ?? "").trim();
       const hasImg = tc.getElementsByTagName("a:blip").length > 0 || tc.getElementsByTagName("v:imagedata").length > 0;
@@ -691,7 +866,7 @@ function parseTableMeta(tbl: Element, theme: ThemeData): DocxTableMeta {
       }
     });
     cells.push(rowMeta);
-  }
+  });
 
   let rules: "none" | "booktabs" | null = null;
   if (anyBorderSpecified) {
@@ -715,7 +890,7 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
   try {
     const zip = await JSZip.loadAsync(bytes);
     const docXmlText = await zip.file("word/document.xml")?.async("string");
-    if (!docXmlText) return { paragraphs: [], pageSetup: null, imageSizes: [], tables: [] };
+    if (!docXmlText) return { paragraphs: [], pageSetup: null, imageSizes: [], tables: [], images: [], pageChrome: null };
 
     const stylesXmlText = (await zip.file("word/styles.xml")?.async("string")) ?? null;
     const themeXmlText = (await zip.file("word/theme/theme1.xml")?.async("string")) ?? null;
@@ -728,6 +903,8 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
     let docDefaultRPr: RawRPr = { fontSizePt: 11 };
     let docDefaultPPr: RawPPr = { spaceBeforePt: 0, spaceAfterPt: 0, lineTwips: 240, lineRule: "auto" };
     const styles = new Map<string, RawStyleDef>();
+    // Table styles' borders (w:style w:type="table" > w:tblPr > w:tblBorders), by style id.
+    const tableStyleBorders = new Map<string, { borders: Element | null; basedOn?: string }>();
     let defaultParagraphStyleId: string | null = null;
 
     if (stylesXmlText) {
@@ -750,6 +927,7 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
         const basedOn = attr(directChild(s, "basedOn"), "w:val") ?? undefined;
         const isDefault = attr(s, "w:default") === "1" || attr(s, "w:default") === "true";
         if (isDefault && type === "paragraph") defaultParagraphStyleId = styleId;
+        if (type === "table") tableStyleBorders.set(styleId, { borders: directChild(directChild(s, "tblPr"), "tblBorders"), basedOn });
         styles.set(styleId, {
           styleId,
           type,
@@ -805,13 +983,31 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
 
     const docXml = parser.parseFromString(docXmlText, "text/xml");
     const pageSetup = parsePageSetup(docXml, theme);
-    const imageSizes = parseImageSizes(docXml);
+    const pgSz = directChild(docXml.getElementsByTagName("w:sectPr")[docXml.getElementsByTagName("w:sectPr").length - 1] ?? null, "pgSz");
+    const pageWidthPx = (parseInt(attr(pgSz, "w:w") ?? "12240", 10) / TWIPS_PER_IN) * 96;
+    const margins = pageSetup?.margins ?? { top: 1, right: 1, bottom: 1, left: 1 };
+    const images = parseImages(docXml, { widthPx: pageWidthPx - (margins.left + margins.right) * 96, marginLeftPx: margins.left * 96, marginTopPx: margins.top * 96 });
+    const imageSizes = images.map((im) => (im.width && im.height ? { width: im.width, height: im.height } : null));
+    const styleBorders = (styleId: string | null): Element | null => {
+      const seen = new Set<string>();
+      let cur = styleId ?? undefined;
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const def = tableStyleBorders.get(cur);
+        if (!def) return null;
+        if (def.borders) return def.borders;
+        cur = def.basedOn;
+      }
+      return null;
+    };
     const tables: DocxTableMeta[] = [];
     const paragraphs: ParagraphStyle[] = [];
 
     // Accumulates the vertical height (in pt) of empty <w:p> spacer paragraphs skipped by mammoth so
     // the next non-empty paragraph preserves the exact visual blank space from Word / Google Docs.
     let pendingEmptySpacePt = 0;
+    // A page break seen after the last emitted paragraph's text: the next emitted block starts a page.
+    let pendingPageBreak = false;
 
     const processParagraph = (p: Element, forceEmitIfEmpty: boolean) => {
       const directPPrEl = directChild(p, "pPr");
@@ -831,6 +1027,8 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
       let afterRightTab = false;
       let hasNonTextInlineContent = false;
       const rawRuns: RunStyle[] = [];
+      let breakBefore = pendingPageBreak || !!mergedPPr.pageBreakBefore;
+      let breakAfter = false;
 
       const collectRunsFromContainer = (container: Element) => {
         for (const child of elementChildren(container)) {
@@ -874,6 +1072,10 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
                 fontWeight: styleChain.isHeading && boldVal === false ? "normal" : null,
                 fontStyle: italicVal === false ? "normal" : null,
                 tabAlign: currentTabAlign,
+                letterSpacingPt: resolvedRun.spacingTwips ? round2(resolvedRun.spacingTwips / TWIPS_PER_PT) : null,
+                caps: resolvedRun.caps ?? null,
+                smallCaps: resolvedRun.smallCaps ?? null,
+                highlight: resolvedRun.highlight ?? null,
               });
               currentText = "";
             };
@@ -899,6 +1101,10 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
                 const brType = attr(rc, "w:type");
                 if (!brType || brType === "textWrapping") {
                   hasNonTextInlineContent = true;
+                } else if (brType === "page") {
+                  // Before any text: this paragraph starts the new page; after text: the next one.
+                  if (rawRuns.length === 0 && !currentText) breakBefore = true;
+                  else breakAfter = true;
                 }
               } else if (
                 rLocal === "drawing" ||
@@ -917,6 +1123,12 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
       };
 
       collectRunsFromContainer(p);
+      // A section break that starts a new page ends this paragraph's page.
+      const sectPr = directChild(directPPrEl, "sectPr");
+      if (sectPr) {
+        const sectType = attr(directChild(sectPr, "type"), "w:val");
+        if (sectType !== "continuous") breakAfter = true;
+      }
 
       const fullText = rawRuns.map((r) => r.text).join("");
       const isEmpty = fullText.length === 0 && !hasNonTextInlineContent;
@@ -932,6 +1144,13 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
       })();
 
       if (isEmpty && !forceEmitIfEmpty) {
+        // A paragraph holding only a page break: the break carries to the next block, and its
+        // empty line isn't blank space on the new page.
+        if (breakBefore || breakAfter) {
+          pendingPageBreak = true;
+          pendingEmptySpacePt = 0;
+          return;
+        }
         const emptyFontPt = pilcrowRPr.fontSizePt ?? docDefaultRPr.fontSizePt ?? 11;
         const emptyLine = lineMultiplier ?? 1.15;
         const beforePt = mergedPPr.spaceBeforePt ?? 0;
@@ -952,6 +1171,7 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
       const rawBefore = mergedPPr.spaceBeforePt ?? 0;
       const spaceBeforePt = round2(rawBefore + pendingEmptySpacePt);
       pendingEmptySpacePt = 0;
+      pendingPageBreak = breakAfter;
       const spaceAfterPt = mergedPPr.spaceAfterPt ?? 0;
 
       let listIndentLeftIn: number | null = null;
@@ -975,6 +1195,11 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
         indentRightIn: isListItem ? null : (mergedPPr.indentRightIn ?? null),
         indentFirstIn: isListItem ? null : (mergedPPr.indentFirstIn ?? null),
         borderBottom: mergedPPr.borderBottom || null,
+        borderTop: mergedPPr.borderTop || null,
+        borderLeft: mergedPPr.borderLeft || null,
+        borderRight: mergedPPr.borderRight || null,
+        shading: mergedPPr.shading || null,
+        pageBreakBefore: breakBefore,
         bulletMarker: isListItem ? mapBulletMarker(numLevel) : null,
         listIndentLeftIn,
         isListItem,
@@ -1001,7 +1226,7 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
           if (forceEmit) emittedCellFallbackP = true;
           processParagraph(el, forceEmit);
         } else if (local === "tbl") {
-          const tblMeta = parseTableMeta(el, theme);
+          const tblMeta = parseTableMeta(el, theme, styleBorders);
           tables.push(tblMeta);
           const rows = directChildren(el, "tr").filter((tr) => !directChild(directChild(tr, "trPr"), "del"));
           for (const tr of rows) {
@@ -1036,10 +1261,15 @@ export async function resolveDocxMetadata(bytes: Uint8Array): Promise<DocxDocume
       pageSetup,
       imageSizes,
       tables,
+      images,
+      pageChrome: await resolveDocxPageChrome(zip, docXml).catch((err) => {
+        console.error("Failed to read the .docx header/footer:", err);
+        return null;
+      }),
     };
   } catch (err) {
     console.error("Failed to resolve docx metadata:", err);
-    return { paragraphs: [], pageSetup: null, imageSizes: [], tables: [] };
+    return { paragraphs: [], pageSetup: null, imageSizes: [], tables: [], images: [], pageChrome: null };
   }
 }
 

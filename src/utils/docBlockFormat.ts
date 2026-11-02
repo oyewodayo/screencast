@@ -92,10 +92,7 @@ function decorationAttrs(node: PMNode): Record<string, string> | null {
   if (a.span === "all") out["data-span"] = "all";
   if (typeof a.spaceBefore === "number") style.push(`margin-top: ${a.spaceBefore}pt !important`);
   if (typeof a.spaceAfter === "number") style.push(`margin-bottom: ${a.spaceAfter}pt !important`);
-  if (typeof a.borderBottom === "string" && a.borderBottom) {
-    style.push(`border-bottom: ${a.borderBottom}`);
-    style.push(`padding-bottom: 2pt`);
-  }
+  style.push(...paragraphDecorCss(a));
   if (a.noIndent === true) out["data-no-indent"] = "";
   if (node.type.name === "bulletList" && typeof a.bulletMarker === "string" && a.bulletMarker) {
     out["data-bullet"] = a.bulletMarker;
@@ -107,6 +104,28 @@ function decorationAttrs(node: PMNode): Record<string, string> | null {
   if (style.length) out.style = style.join("; ");
   return Object.keys(out).length ? out : null;
 }
+
+// Paragraph borders and shading (imported from Word's pBdr/shd, exported back the same way), as
+// CSS. A bordered or shaded paragraph gets a little padding inside the rule, as Word draws it.
+export function paragraphDecorCss(a: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const side = (name: "Top" | "Right" | "Bottom" | "Left", pad: string) => {
+    const v = a[`border${name}`];
+    if (typeof v === "string" && v) out.push(`border-${name.toLowerCase()}: ${v}`, `padding-${name.toLowerCase()}: ${pad}`);
+  };
+  side("Top", "2pt");
+  side("Bottom", "2pt");
+  side("Left", "4pt");
+  side("Right", "4pt");
+  if (typeof a.shading === "string" && a.shading) out.push(`background-color: ${a.shading}`);
+  return out;
+}
+
+const borderAttr = (name: "borderTop" | "borderLeft" | "borderRight", data: string) => ({
+  default: null,
+  parseHTML: (el: HTMLElement) => el.getAttribute(data) || null,
+  renderHTML: (attrs: Record<string, unknown>) => (typeof attrs[name] === "string" && attrs[name] ? { [data]: attrs[name] as string } : {}),
+});
 
 const key = new PluginKey<DecorationSet>("docBlockFormat");
 
@@ -154,10 +173,23 @@ const DocBlockFormat = Extension.create({
           borderBottom: {
             default: null,
             parseHTML: (el: HTMLElement) => el.getAttribute("data-border-bottom") || null,
-            renderHTML: (attrs: Record<string, unknown>) =>
-              typeof attrs.borderBottom === "string" && attrs.borderBottom
-                ? { "data-border-bottom": attrs.borderBottom, style: `border-bottom: ${attrs.borderBottom}; padding-bottom: 2pt` }
-                : {},
+            // The whole border/shading style comes from this one attribute's renderHTML, so the
+            // sides can't be emitted in a different order and override each other.
+            renderHTML: (attrs: Record<string, unknown>) => {
+              const css = paragraphDecorCss(attrs);
+              const out: Record<string, string> = {};
+              if (typeof attrs.borderBottom === "string" && attrs.borderBottom) out["data-border-bottom"] = attrs.borderBottom;
+              if (css.length) out.style = css.join("; ");
+              return out;
+            },
+          },
+          borderTop: borderAttr("borderTop", "data-border-top"),
+          borderLeft: borderAttr("borderLeft", "data-border-left"),
+          borderRight: borderAttr("borderRight", "data-border-right"),
+          shading: {
+            default: null,
+            parseHTML: (el: HTMLElement) => el.getAttribute("data-shading") || null,
+            renderHTML: (attrs: Record<string, unknown>) => (typeof attrs.shading === "string" && attrs.shading ? { "data-shading": attrs.shading } : {}),
           },
         },
       },

@@ -35,6 +35,28 @@ function toHex(value: string | null | undefined): string | null {
   return null;
 }
 
+// Imported from Word: the cell's vertical alignment, and its four edges as CSS ("t|r|b|l") when the
+// document set its own borders (forms, letterheads) instead of the editor's grid.
+const layoutAttributes = {
+  verticalAlign: {
+    default: null,
+    parseHTML: (el: HTMLElement) => {
+      const v = el.getAttribute("data-valign") ?? el.style.verticalAlign;
+      return v === "middle" || v === "bottom" || v === "top" ? v : null;
+    },
+    renderHTML: (attrs: Record<string, unknown>) => (attrs.verticalAlign ? { "data-valign": String(attrs.verticalAlign), style: `vertical-align: ${attrs.verticalAlign}` } : {}),
+  },
+  borders: {
+    default: null,
+    parseHTML: (el: HTMLElement) => el.getAttribute("data-borders") || null,
+    renderHTML: (attrs: Record<string, unknown>) => {
+      const b = typeof attrs.borders === "string" ? attrs.borders.split("|") : null;
+      if (!b || b.length !== 4) return {};
+      return { "data-borders": attrs.borders as string, style: `border-top: ${b[0]}; border-right: ${b[1]}; border-bottom: ${b[2]}; border-left: ${b[3]}` };
+    },
+  },
+};
+
 const backgroundAttribute = {
   background: {
     default: null as string | null,
@@ -51,13 +73,13 @@ const backgroundAttribute = {
 
 export const ShadedTableCell = TableCell.extend({
   addAttributes() {
-    return { ...this.parent?.(), ...backgroundAttribute };
+    return { ...this.parent?.(), ...backgroundAttribute, ...layoutAttributes };
   },
 });
 
 export const ShadedTableHeader = TableHeader.extend({
   addAttributes() {
-    return { ...this.parent?.(), ...backgroundAttribute };
+    return { ...this.parent?.(), ...backgroundAttribute, ...layoutAttributes };
   },
 });
 
