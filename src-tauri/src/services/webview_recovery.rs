@@ -41,6 +41,12 @@ const NUDGE_DELAYS: [Duration; 2] = [Duration::from_millis(800), Duration::from_
 // can coincide with it. Only one refresh sequence runs at a time; the rest are dropped.
 static REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
 
+// A resume happened and no visible window has been refreshed since. The resume nudges only reach a
+// window that is on screen at that moment; one that was minimized (or hidden) through the wake is
+// skipped, and used to come back blank with nothing left to repair it. Set at resume, cleared once
+// a window has actually been nudged, and acted on when a window is restored or focused.
+static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
+
 fn schedule_refresh(app: &AppHandle, reason: &'static str) {
     if REFRESH_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -62,6 +68,7 @@ pub fn install(app: &AppHandle) {
     log::info!("[webview-recovery] installing for {} window(s)", app.webview_windows().len());
     for window in app.webview_windows().values() {
         watch_process_failures(app, window);
+        watch_restore(app, window);
     }
     start_resume_watch(app);
 }
@@ -80,6 +87,7 @@ fn start_resume_watch(app: &AppHandle) {
                         "[webview-recovery] system resume detected (asleep ~{}s) - refreshing webviews",
                         elapsed.as_secs()
                     );
+                    RESUME_PENDING.store(true, Ordering::SeqCst);
                     schedule_refresh(&app, "resume");
                 }
             }
@@ -95,10 +103,12 @@ fn start_resume_watch(app: &AppHandle) {
 // minimize/restore does, and NotifyParentWindowPositionChanged makes it re-sync its bounds and
 // re-present. Only for windows actually on screen - the hidden overlay windows stay as they are.
 fn nudge_all(app: &AppHandle, reason: &'static str) {
+    let mut nudged = false;
     for (label, window) in app.webview_windows() {
         if !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false) {
             continue;
         }
+        nudged = true;
         let result = window.with_webview(move |platform| unsafe {
             let controller = platform.controller();
             let mut visible = windows_core::BOOL::default();
@@ -114,6 +124,25 @@ fn nudge_all(app: &AppHandle, reason: &'static str) {
             Err(e) => log::warn!("[webview-recovery] could not refresh \"{}\": {}", label, e),
         }
     }
+    if nudged {
+        RESUME_PENDING.store(false, Ordering::SeqCst);
+    } else if RESUME_PENDING.load(Ordering::SeqCst) {
+        log::info!("[webview-recovery] no window on screen ({}) - will refresh when one is restored", reason);
+    }
+}
+
+// Restoring or focusing a window is the moment a skipped one needs its surface rebuilt: Windows
+// reports it as a resize (un-minimize) and/or focus, so either one triggers the pending refresh.
+fn watch_restore(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let app = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Focused(true) | tauri::WindowEvent::Resized(_))
+            && RESUME_PENDING.swap(false, Ordering::SeqCst)
+        {
+            log::info!("[webview-recovery] window restored after a resume - refreshing");
+            schedule_refresh(&app, "restored after resume");
+        }
+    });
 }
 
 fn kind_name(kind: COREWEBVIEW2_PROCESS_FAILED_KIND) -> &'static str {
