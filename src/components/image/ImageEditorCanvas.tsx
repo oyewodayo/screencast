@@ -58,6 +58,7 @@ import {
 import { getCachedImage, preloadImage } from "../../utils/imageObjectCache";
 import ImageAnnotationEditor from "../pdf/ImageAnnotationEditor";
 import TextAnnotationEditor from "./TextAnnotationEditor";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 export interface CropRect {
   x: number;
@@ -363,9 +364,10 @@ const ImageEditorCanvas = forwardRef<ImageEditorCanvasHandle, ImageEditorCanvasP
     renderComposedCanvas(canvas, baseImageElRef.current, baseWidth, baseHeight, adjustments, displayObjects);
   }, [objects, baseWidth, baseHeight, adjustments, liveObjects, hiddenWhileEditingId]);
 
+  const canvasRestoreTick = useCanvasRestoreTick();
   useEffect(() => {
     redraw();
-  }, [redraw]);
+  }, [redraw, canvasRestoreTick]);
 
   const clearPreview = (): void => {
     const canvas = previewCanvasRef.current;

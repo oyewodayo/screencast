@@ -10,7 +10,11 @@
 import type { JSONContent } from "@tiptap/core";
 import {
   AlignmentType,
+  BookmarkEnd,
+  BookmarkStart,
   BorderStyle,
+  ShadingType,
+  PageOrientation,
   CommentReference,
   CommentRangeEnd,
   CommentRangeStart,
@@ -19,9 +23,23 @@ import {
   Footer,
   Header,
   HeadingLevel,
+  NumberFormat,
+  PageNumber,
+  HorizontalPositionAlign,
+  HorizontalPositionRelativeFrom,
+  VerticalPositionAlign,
+  VerticalPositionRelativeFrom,
+  TextWrappingType,
+  TextWrappingSide,
+  LineRuleType,
+  type IFloating,
+  type ITableCellBorders,
+  VerticalAlign,
   IBordersOptions,
   type ICommentOptions,
   ImageRun,
+  ImportedXmlComponent,
+  InternalHyperlink,
   LevelFormat,
   Packer,
   PageBreak,
@@ -30,14 +48,23 @@ import {
   type PositiveUniversalMeasure,
   Table,
   TableCell,
+  TableOfContents,
   TableRow,
+  Tab,
+  TabStopType,
   TextRun,
   UnderlineType,
   WidthType,
 } from "docx";
 import { invoke } from "@tauri-apps/api/core";
-import type { DocComment, DocPageSize } from "./docTypes";
-import { PAGE_DIMENSIONS_IN, PAGE_MARGIN_IN } from "./docPageGeometry";
+import type { DocComment, DocMargins, DocOrientation, DocPageSize } from "./docTypes";
+import { PAGE_DIMENSIONS_IN, normalizePageColor, pageDimensionsIn, pageFormat, resolveMargins } from "./docPageGeometry";
+import { CHROME_SLOTS, bandHasContent, slotSegments, todayLabel, type ChromeBand, type DocPageChrome, type PageNumberFormat } from "./docPageChrome";
+import { latexToOmml } from "./docMathOmml";
+import { wordFontFor } from "./docFonts";
+import { captionLabel, crossRefText, type DocStructure } from "./docStructure";
+import { DEFAULT_NUMBERING } from "./docNumbering";
+import { citationSpaceBefore, formatCitation, lastCharOf, styleInfo, type Segment } from "./docCitationStyles";
 
 const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeof AlignmentType]> = {
   left: AlignmentType.LEFT,
@@ -49,6 +76,59 @@ const ALIGNMENT_BY_TEXT_ALIGN: Record<string, (typeof AlignmentType)[keyof typeo
 function alignmentFor(node: JSONContent) {
   const align = node.attrs?.textAlign as string | undefined;
   return align ? ALIGNMENT_BY_TEXT_ALIGN[align] : undefined;
+}
+
+const TWIPS_PER_IN = 1440;
+
+// docIndentExtension.ts's indents in Word's twips, added on top of any structural indent the
+// caller passes (blockquote/list nesting). Legacy indentLevel counts as 0.29in per level, the
+// same conversion the extension itself uses.
+function indentFor(node: JSONContent, base?: { left: number }) {
+  const attrs = node.attrs ?? {};
+  const leftIn = typeof attrs.indentLeft === "number" ? attrs.indentLeft : ((attrs.indentLevel as number | undefined) ?? 0) * 0.29;
+  const rightIn = typeof attrs.indentRight === "number" ? attrs.indentRight : 0;
+  const firstIn = typeof attrs.indentFirst === "number" ? attrs.indentFirst : 0;
+  const left = (base?.left ?? 0) + Math.round(leftIn * TWIPS_PER_IN);
+  if (!left && !rightIn && !firstIn) return base;
+  return {
+    left,
+    ...(rightIn ? { right: Math.round(rightIn * TWIPS_PER_IN) } : {}),
+    ...(firstIn > 0 ? { firstLine: Math.round(firstIn * TWIPS_PER_IN) } : firstIn < 0 ? { hanging: Math.round(-firstIn * TWIPS_PER_IN) } : {}),
+  };
+}
+
+// A CSS border ("1.5pt solid #1f2937", as docBlockFormat.ts / docTableCellShading.ts store them)
+// as a Word border. "none" (or nothing) = an explicit no-border, so Word's own defaults don't creep in.
+function wordBorder(css: unknown): { style: (typeof BorderStyle)[keyof typeof BorderStyle]; size: number; color: string; space?: number } | undefined {
+  if (typeof css !== "string" || !css.trim()) return undefined;
+  if (css.trim() === "none") return { style: BorderStyle.NONE, size: 0, color: "auto" };
+  const m = css.match(/([\d.]+)(pt|px)\s+(solid|dashed|dotted|double)\s+(#[0-9a-fA-F]{6})/);
+  if (!m) return undefined;
+  const pt = m[2] === "px" ? Number(m[1]) * 0.75 : Number(m[1]);
+  const style = m[3] === "dashed" ? BorderStyle.DASHED : m[3] === "dotted" ? BorderStyle.DOTTED : m[3] === "double" ? BorderStyle.DOUBLE : BorderStyle.SINGLE;
+  // Word measures borders in eighths of a point.
+  return { style, size: Math.max(2, Math.round(pt * 8)), color: m[4].slice(1).toUpperCase() };
+}
+
+// Paragraph spacing, line spacing, borders and shading (docBlockFormat.ts, docLineSpacingExtension.ts)
+// in Word's terms - so a document imported from Word (or styled here) keeps its rhythm, rules and
+// shaded blocks when exported back.
+function paragraphFormatFor(node: JSONContent, inherited?: IBordersOptions) {
+  const a = node.attrs ?? {};
+  const before = typeof a.spaceBefore === "number" ? Math.round(a.spaceBefore * 20) : undefined;
+  const after = typeof a.spaceAfter === "number" ? Math.round(a.spaceAfter * 20) : undefined;
+  const line = typeof a.lineSpacing === "number" ? Math.round(a.lineSpacing * 240) : undefined;
+  const border: Record<string, unknown> = { ...(inherited ?? {}) };
+  for (const side of ["top", "bottom", "left", "right"] as const) {
+    const b = wordBorder(a[`border${side[0].toUpperCase()}${side.slice(1)}`]);
+    if (b) border[side] = { ...b, space: side === "left" || side === "right" ? 4 : 1 };
+  }
+  const shading = typeof a.shading === "string" && /^#[0-9a-fA-F]{6}$/.test(a.shading) ? { fill: a.shading.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined;
+  return {
+    ...(before !== undefined || after !== undefined || line !== undefined ? { spacing: { ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}), ...(line !== undefined ? { line } : {}) } } : {}),
+    ...(Object.keys(border).length ? { border: border as IBordersOptions } : {}),
+    ...(shading ? { shading } : {}),
+  };
 }
 
 // docx's ImageRun only accepts these four raster types (confirmed from the library's own
@@ -85,7 +165,49 @@ function resolveImagePath(src: string): string | null {
 const DEFAULT_IMAGE_WIDTH = 400;
 const DEFAULT_IMAGE_HEIGHT = 300;
 
-async function buildImageRun(src: string, width?: number | null, height?: number | null): Promise<ImageRun | null> {
+const EMU_PER_PX = 9525; // 914400 EMU per inch / 96 px
+
+// A picture's layout (docImageLayout.ts) as Word's own wrap setting - so it opens in Word looking
+// as it does here: in line; "Top and bottom" aligned left/centre/right; "Square" at a margin; or
+// free "In front of text" / "Behind text" at its offset from its paragraph.
+function floatingFor(attrs: Record<string, unknown>): IFloating | undefined {
+  const layout = attrs.layout as string | undefined;
+  const gap = 12 * 12700; // 12pt from the text, as the editor draws it
+  switch (layout) {
+    case "block": {
+      const align = attrs.align === "left" ? HorizontalPositionAlign.LEFT : attrs.align === "right" ? HorizontalPositionAlign.RIGHT : HorizontalPositionAlign.CENTER;
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, align },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: 0 },
+        wrap: { type: TextWrappingType.TOP_AND_BOTTOM, margins: { distT: 4 * 12700, distB: 4 * 12700 } },
+        margins: { top: 4 * 12700, bottom: 4 * 12700 },
+      };
+    }
+    case "wrapLeft":
+    case "wrapRight":
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, align: layout === "wrapLeft" ? HorizontalPositionAlign.LEFT : HorizontalPositionAlign.RIGHT },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: 0 },
+        wrap: { type: TextWrappingType.SQUARE, side: TextWrappingSide.BOTH_SIDES, margins: { distL: gap, distR: gap, distT: 2 * 12700, distB: 6 * 12700 } },
+        margins: { left: gap, right: gap, top: 2 * 12700, bottom: 6 * 12700 },
+      };
+    case "front":
+    case "behind":
+      return {
+        horizontalPosition: { relative: HorizontalPositionRelativeFrom.COLUMN, offset: Math.round(Number(attrs.x ?? 0) * EMU_PER_PX) },
+        verticalPosition: { relative: VerticalPositionRelativeFrom.PARAGRAPH, offset: Math.round(Number(attrs.y ?? 0) * EMU_PER_PX) },
+        wrap: { type: TextWrappingType.NONE },
+        allowOverlap: true,
+        behindDocument: layout === "behind",
+        zIndex: layout === "behind" ? 0 : 251658240,
+      };
+    default:
+      return undefined;
+  }
+}
+
+async function buildImageRun(attrs: Record<string, unknown> | undefined): Promise<ImageRun | null> {
+  const src = (attrs?.src as string) ?? "";
   const path = resolveImagePath(src);
   if (!path) return null;
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
@@ -95,16 +217,37 @@ async function buildImageRun(src: string, width?: number | null, height?: number
     return null;
   }
   try {
-    const bytes = await invoke<number[]>("read_file_bytes", { path });
+    const bytes = await invoke<ArrayBuffer>("read_file_bytes", { path });
+    const width = (attrs?.width as number | null | undefined) ?? DEFAULT_IMAGE_WIDTH;
+    const height = (attrs?.height as number | null | undefined) ?? DEFAULT_IMAGE_HEIGHT;
+    const rotation = Number(attrs?.rotation ?? 0);
+    const alt = (attrs?.alt as string | null | undefined) ?? null;
+    const floating = floatingFor(attrs ?? {});
     return new ImageRun({
       type,
       data: new Uint8Array(bytes),
-      transformation: { width: width ?? DEFAULT_IMAGE_WIDTH, height: height ?? DEFAULT_IMAGE_HEIGHT },
+      transformation: { width, height, ...(rotation ? { rotation } : {}) },
+      ...(floating ? { floating } : {}),
+      ...(alt ? { altText: { name: attrs?.kind === "signature" ? "Signature" : "Picture", description: alt, title: alt } } : {}),
     });
   } catch (err) {
     console.error("Failed to embed image in docx export:", err);
     return null;
   }
+}
+
+// docMathOmml.ts's OMML as a run-level child. fromXmlString wraps what it parses in a nameless
+// root element; its one child is the <m:oMath> / <m:oMathPara> itself. Word reads <m:oMath>
+// directly inside a <w:p> - the `docx` library already declares the m: namespace on the document.
+function ommlChild(xml: string): ParagraphChild {
+  const wrapper = ImportedXmlComponent.fromXmlString(xml) as unknown as { root: unknown[] };
+  return wrapper.root[0] as ParagraphChild;
+}
+
+// An equation KaTeX can't parse still exports - as its LaTeX source, in the same monospace style
+// inline code gets, so it's obvious in Word what needs fixing.
+function mathFallbackRun(latex: string, display: boolean): TextRun {
+  return new TextRun({ text: display ? `$$${latex}$$` : `$${latex}$`, font: "Consolas" });
 }
 
 // Flat TextRun properties, unlike docMarkdown.ts's string-wrapping - a docx run's formatting is a
@@ -122,14 +265,20 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
   // table-cell/code shading already is: a background fill on the run.
   const highlightColor = marks?.find((m) => m.type === "highlight")?.attrs?.color as string | undefined;
   return {
-    bold: has("bold") || forceBold || undefined,
-    italics: has("italic") || undefined,
+    // A "not bold"/"not italic" override (docTextOverrides.ts) beats the heading style's own.
+    bold: textStyle?.attrs?.fontWeight === "normal" ? false : has("bold") || forceBold || undefined,
+    italics: textStyle?.attrs?.fontStyle === "normal" ? false : has("italic") || undefined,
     strike: has("strike") || undefined,
     ...(has("underline") ? { underline: { type: UnderlineType.SINGLE } } : {}),
     ...(color ? { color: color.replace("#", "") } : {}),
-    ...(fontFamily ? { font: fontFamily } : {}),
+    // A CSS stack ("STIX Two Text", Georgia, serif) -> the one real font name Word should use.
+    ...(wordFontFor(fontFamily) ? { font: wordFontFor(fontFamily) } : {}),
     // docx's own run size is in half-points (OOXML convention), not points.
     ...(fontSizePt ? { size: fontSizePt * 2 } : {}),
+    // Character spacing in twips; All caps / Small caps as Word's own run properties.
+    ...(typeof textStyle?.attrs?.letterSpacing === "number" && textStyle.attrs.letterSpacing ? { characterSpacing: Math.round(textStyle.attrs.letterSpacing * 20) } : {}),
+    ...(textStyle?.attrs?.caps ? { allCaps: true } : {}),
+    ...(textStyle?.attrs?.smallCaps ? { smallCaps: true } : {}),
     ...(highlightColor ? { shading: { fill: highlightColor.replace("#", "") } } : {}),
     // No first-class inline-code concept in docx - approximated as monospace + light shading.
     // Placed last so it wins over any fontFamily/highlight above - code's own monospace+shading
@@ -143,8 +292,40 @@ function runOptionsFromMarks(marks: JSONContent["marks"], forceBold: boolean) {
 // number, not a UUID) - passed in from DocxBuilder rather than looked up globally, since the
 // mapping (and which comments actually got referenced, for the final Comments list) is per-export
 // state, not something this standalone function should own itself.
-async function renderInline(content: JSONContent[] | undefined, commentIdFor: (uuid: string) => number, forceBold = false): Promise<ParagraphChild[]> {
+interface InlineContext {
+  commentIdFor: (uuid: string) => number;
+  structure: DocStructure | null;
+}
+
+// Bookmarks as explicit start/end markers with ids from one per-export counter. The library's own
+// Bookmark class numbers every bookmark 1 when it's built outside a Document's id context, and
+// duplicate ids are invalid OOXML - Word "repairs" such a file on open.
+class BookmarkIds {
+  private next = 1;
+  wrap(name: string, children: ParagraphChild[]): ParagraphChild[] {
+    const id = this.next++;
+    return [new BookmarkStart(name, id) as unknown as ParagraphChild, ...children, new BookmarkEnd(id) as unknown as ParagraphChild];
+  }
+}
+
+// Word bookmark names: start with a letter, letters/digits/underscore, at most 40 characters.
+function bookmarkName(id: string): string {
+  return `ref_${id.replace(/[^A-Za-z0-9]/g, "").slice(0, 32)}`;
+}
+
+// A formatted reference's segments (docCitationStyles.ts) as runs - italic journal, bold volume,
+// clickable DOI.
+function segmentRuns(segments: Segment[]): ParagraphChild[] {
+  return segments.map((seg) =>
+    seg.link
+      ? new ExternalHyperlink({ link: seg.link, children: [new TextRun({ text: seg.text, style: "Hyperlink", italics: seg.italic, bold: seg.bold })] })
+      : new TextRun({ text: seg.text, italics: seg.italic || undefined, bold: seg.bold || undefined })
+  );
+}
+
+async function renderInline(content: JSONContent[] | undefined, ctx: InlineContext, forceBold = false): Promise<ParagraphChild[]> {
   if (!content) return [];
+  const { commentIdFor, structure } = ctx;
   const runs: ParagraphChild[] = [];
   // A comment mark wraps a *range* of text, which can span several runs (e.g. commented text that's
   // also partly bold) - tracked here as "the comment range currently open", closed either when the
@@ -159,7 +340,7 @@ async function renderInline(content: JSONContent[] | undefined, commentIdFor: (u
     runs.push(new CommentReference(numericId));
     activeCommentId = null;
   };
-  for (const node of content) {
+  for (const [index, node] of content.entries()) {
     const commentId = (node.marks?.find((m) => m.type === "comment")?.attrs?.commentId as string | undefined) ?? null;
     if (commentId !== activeCommentId) {
       closeComment();
@@ -184,9 +365,25 @@ async function renderInline(content: JSONContent[] | undefined, commentIdFor: (u
     } else if (node.type === "hardBreak") {
       runs.push(new TextRun({ text: "", break: 1 }));
     } else if (node.type === "image") {
-      const src = (node.attrs?.src as string) ?? "";
-      const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
+      const image = await buildImageRun(node.attrs);
       if (image) runs.push(image);
+    } else if (node.type === "citation") {
+      const refIds = (node.attrs?.refIds as string[] | undefined) ?? [];
+      const cite = structure ? formatCitation(refIds, node.attrs?.locator as string | null, structure.lookup, structure.context) : null;
+      const space = citationSpaceBefore(lastCharOf(content[index - 1]), !!cite?.superscript);
+      if (space) runs.push(new TextRun({ text: space, ...runOptionsFromMarks(node.marks, forceBold) }));
+      runs.push(new TextRun({ text: cite?.text ?? "[?]", ...runOptionsFromMarks(node.marks, forceBold), superScript: cite?.superscript || undefined }));
+    } else if (node.type === "crossRef") {
+      const targetId = String(node.attrs?.targetId ?? "");
+      const target = structure?.targets.get(targetId);
+      const run = new TextRun({ text: target ? crossRefText(target, node.attrs?.form) : "??", ...runOptionsFromMarks(node.marks, forceBold) });
+      // A real internal link: Ctrl+click in Word jumps to the figure, table or equation.
+      runs.push(target ? new InternalHyperlink({ anchor: bookmarkName(targetId), children: [run] }) : run);
+    } else if (node.type === "mathInline") {
+      const latex = (node.attrs?.latex as string) ?? "";
+      const omml = latex ? latexToOmml(latex, false) : null;
+      if (omml) runs.push(ommlChild(omml));
+      else if (latex) runs.push(mathFallbackRun(latex, false));
     }
   }
   closeComment();
@@ -230,6 +427,20 @@ class DocxBuilder {
   private comments: DocComment[] = [];
   private commentNumericIds = new Map<string, number>();
   private nextCommentNumericId = 0;
+  // Display equations numbered so far - the same document-order count docStructure.ts assigns.
+  private equationNumber = 0;
+  private captionCounts = { figure: 0, table: 0 };
+  // Every heading gets a hidden _Toc bookmark (in document order) for the table of contents' links.
+  private headingIndex = 0;
+  private structure: DocStructure | null = null;
+  private headingPages: number[] = [];
+  private bookmarks = new BookmarkIds();
+  private get inline(): InlineContext {
+    return { commentIdFor: this.commentIdFor, structure: this.structure };
+  }
+  // Width between the margins in twips, set by build() before rendering - where a numbered
+  // equation's centre and right tab stops go.
+  private textWidthTwips = 0;
 
   // An arrow class field (auto-bound), not a plain method, so it can be passed directly as
   // renderInline's commentIdFor callback without a separate .bind(this) at every call site.
@@ -266,7 +477,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content, this.commentIdFor),
+              children: await renderInline(child.content, this.inline),
               bullet: { level },
               alignment: alignmentFor(child),
             })
@@ -292,7 +503,7 @@ class DocxBuilder {
         if (child.type === "paragraph") {
           out.push(
             new Paragraph({
-              children: await renderInline(child.content, this.commentIdFor),
+              children: await renderInline(child.content, this.inline),
               numbering: { reference: ref, level },
               alignment: alignmentFor(child),
             })
@@ -319,7 +530,22 @@ class DocxBuilder {
       children.push(...rendered);
     }
     if (children.length === 0) children.push(new Paragraph({}));
-    return new TableCell({ children, width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE } });
+    const background = cell.attrs?.background as string | null | undefined;
+    const edges = typeof cell.attrs?.borders === "string" ? (cell.attrs.borders as string).split("|") : null;
+    const borders =
+      edges && edges.length === 4
+        ? { top: wordBorder(edges[0]), right: wordBorder(edges[1]), bottom: wordBorder(edges[2]), left: wordBorder(edges[3]) }
+        : undefined;
+    const va = cell.attrs?.verticalAlign as string | null | undefined;
+    return new TableCell({
+      children,
+      ...(borders ? { borders: borders as ITableCellBorders } : {}),
+      ...(va ? { verticalAlign: va === "middle" ? VerticalAlign.CENTER : va === "bottom" ? VerticalAlign.BOTTOM : VerticalAlign.TOP } : {}),
+      width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE },
+      columnSpan: (cell.attrs?.colspan as number | undefined) ?? undefined,
+      shading: background ? { fill: background.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined,
+      margins: background ? { top: 100, bottom: 100, left: 140, right: 140 } : undefined,
+    });
   }
 
   private async renderTable(node: JSONContent): Promise<Table | null> {
@@ -345,9 +571,39 @@ class DocxBuilder {
         left: { style: BorderStyle.NONE, size: 0, color: "auto" },
         right: { style: BorderStyle.NONE, size: 0, color: "auto" },
         insideVertical: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
+        // A layout table (rules "none" - résumé sidebars, callout boxes) has no lines at all.
+        insideHorizontal:
+          node.attrs?.rules === "none" ? { style: BorderStyle.NONE, size: 0, color: "auto" } : { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
       },
     });
+  }
+
+  // ☐ / ☒ glyphs in front of each item - Word's own checkbox content controls aren't something the
+  // docx library can build, and the glyphs print and convert to PDF identically everywhere.
+  private async renderTaskList(node: JSONContent, level: number): Promise<Paragraph[]> {
+    const out: Paragraph[] = [];
+    for (const item of node.content ?? []) {
+      const checked = item.attrs?.checked === true;
+      let first = true;
+      for (const child of item.content ?? []) {
+        if (child.type === "paragraph") {
+          const runs = await renderInline(child.content, this.inline);
+          out.push(
+            new Paragraph({
+              children: first ? [new TextRun({ text: checked ? "☒ " : "☐ ", font: "Segoe UI Symbol" }), ...runs] : runs,
+              indent: { left: 360 * (level + 1), hanging: first ? 300 : 0 },
+              alignment: alignmentFor(child),
+            })
+          );
+          first = false;
+        } else if (child.type === "taskList") {
+          out.push(...(await this.renderTaskList(child, level + 1)));
+        } else {
+          for (const block of await this.renderBlock(child)) if (block instanceof Paragraph) out.push(block);
+        }
+      }
+    }
+    return out;
   }
 
   // extraParagraphProps carries context a container passes down into any Paragraph it produces -
@@ -364,21 +620,24 @@ class DocxBuilder {
       case "paragraph":
         return [
           new Paragraph({
-            children: await renderInline(node.content, this.commentIdFor, forceBold),
+            children: await renderInline(node.content, this.inline, forceBold),
             alignment: alignmentFor(node),
-            indent,
+            indent: indentFor(node, indent),
             border,
+            ...paragraphFormatFor(node, border),
           }),
         ];
       case "heading": {
         const level = (node.attrs?.level as number) ?? 1;
+        const headingRuns = await renderInline(node.content, this.inline, forceBold);
         return [
           new Paragraph({
-            children: await renderInline(node.content, this.commentIdFor, forceBold),
+            children: this.bookmarks.wrap(`_Toc_h${this.headingIndex++}`, headingRuns),
             heading: HEADING_BY_LEVEL[level],
             alignment: alignmentFor(node),
-            indent,
+            indent: indentFor(node, indent),
             border,
+            ...paragraphFormatFor(node, border),
           }),
         ];
       }
@@ -386,6 +645,8 @@ class DocxBuilder {
         return this.renderBulletList(node, 0);
       case "orderedList":
         return this.renderOrderedList(node, 0);
+      case "taskList":
+        return this.renderTaskList(node, 0);
       case "blockquote": {
         // docx has no first-class blockquote - approximated with an indent + left border, passed
         // down into whatever paragraphs its contained blocks produce.
@@ -412,19 +673,102 @@ class DocxBuilder {
       }
       case "image": {
         const src = (node.attrs?.src as string) ?? "";
-        const image = await buildImageRun(src, node.attrs?.width, node.attrs?.height);
+        const image = await buildImageRun({ ...node.attrs, src });
         return image ? [new Paragraph({ children: [image] })] : [];
       }
       case "table": {
         const table = await this.renderTable(node);
         return table ? [table] : [];
       }
+      // A numbered equation is centred with its number flush right via a centre and a right tab
+      // stop, the usual Word layout; an unnumbered one is a display-math paragraph of its own.
+      case "mathBlock": {
+        const latex = ((node.attrs?.latex as string) ?? "").trim();
+        if (!latex) return [];
+        const numbered = node.attrs?.numbered !== false;
+        const index = numbered ? this.equationNumber++ : -1;
+        const number = index < 0 ? "" : (this.structure?.equationLabels[index] ?? String(index + 1));
+        const omml = latexToOmml(latex, true);
+        const math = omml ? ommlChild(numbered ? omml : `<m:oMathPara>${omml}</m:oMathPara>`) : mathFallbackRun(latex, true);
+        if (!numbered) return [new Paragraph({ children: [math], alignment: AlignmentType.CENTER, indent, border })];
+        return [
+          new Paragraph({
+            tabStops: [
+              { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
+              { type: TabStopType.RIGHT, position: this.textWidthTwips },
+            ],
+            children: [
+              new TextRun({ children: [new Tab()] }),
+              math,
+              new TextRun({ children: [new Tab()] }),
+              // Cross-references to the equation link to its number.
+              ...(node.attrs?.id ? this.bookmarks.wrap(bookmarkName(String(node.attrs.id)), [new TextRun(`(${number})`)]) : [new TextRun(`(${number})`)]),
+            ],
+            indent,
+            border,
+          }),
+        ];
+      }
+      // "Figure 2.  Caption text" - the label is bookmarked so cross-references link to it. Figure
+      // captions are centred under the image, table captions left-aligned above the table (and
+      // kept on the table's page).
+      case "caption": {
+        const kind = node.attrs?.kind === "table" ? "table" : "figure";
+        const numbering = this.structure?.numbering ?? DEFAULT_NUMBERING;
+        const index = this.captionCounts[kind]++;
+        const label = `${this.structure?.captionLabels[kind][index] ?? captionLabel(kind, index + 1, numbering)}${numbering.captionSeparator}`;
+        const labelRun = new TextRun({ text: label, bold: numbering.boldCaptionLabel || undefined });
+        const id = node.attrs?.id as string | null | undefined;
+        return [
+          new Paragraph({
+            children: [...(id ? this.bookmarks.wrap(bookmarkName(id), [labelRun]) : [labelRun]), new TextRun("  "), ...(await renderInline(node.content, this.inline, forceBold))],
+            alignment: alignmentFor(node) ?? (kind === "table" ? AlignmentType.LEFT : AlignmentType.CENTER),
+            keepNext: kind === "table" || undefined,
+            spacing: { before: 60, after: 160 },
+            indent,
+            border,
+          }),
+        ];
+      }
+      // The reference list, formatted exactly as in Docs: a hanging label column for numbered
+      // styles, a 0.5in hanging indent for APA.
+      case "bibliography": {
+        const s = this.structure;
+        if (!s || s.bibliography.length === 0) return [];
+        const numeric = styleInfo(s.style).numeric;
+        const hang = numeric ? 567 : 720;
+        return s.bibliography.map(
+          (ref) =>
+            new Paragraph({
+              children: [...(ref.label ? [new TextRun(ref.label), new TextRun({ children: [new Tab()] })] : []), ...segmentRuns(ref.segments)],
+              indent: { left: hang, hanging: hang },
+              tabStops: numeric ? [{ type: TabStopType.LEFT, position: hang }] : undefined,
+              spacing: { after: 100 },
+            })
+        );
+      }
+      // A real Word table-of-contents field, pre-filled with the entries (and the page numbers Docs
+      // shows) so it reads correctly on open; F9 in Word refreshes it against Word's own layout.
+      case "tableOfContents": {
+        const s = this.structure;
+        const maxLevel = Number(node.attrs?.maxLevel ?? 3);
+        const entries = (s?.headings ?? [])
+          .map((h, i) => ({ h, i }))
+          .filter(({ h }) => h.text && h.level <= maxLevel)
+          .map(({ h, i }) => ({ title: h.text, level: h.level, page: this.headingPages[i], href: `_Toc_h${i}` }));
+        return [
+          new Paragraph({ children: [new TextRun({ text: "Contents", bold: true, size: 28 })], spacing: { after: 160 } }),
+          // beginDirty: false - the cached entries are current, so Word opens without asking to
+          // update fields.
+          new TableOfContents("Contents", { hyperlink: true, headingStyleRange: `1-${maxLevel}`, cachedEntries: entries, beginDirty: false }) as unknown as Paragraph,
+        ];
+      }
       // docx's own PageBreak is a Run (extends Run - see its own import), the standard idiom for
       // forcing one is a Paragraph containing nothing but it.
       case "pageBreak":
         return [new Paragraph({ children: [new PageBreak()] })];
       default:
-        return [new Paragraph({ children: await renderInline(node.content, this.commentIdFor, forceBold) })];
+        return [new Paragraph({ children: await renderInline(node.content, this.inline, forceBold) })];
     }
   }
 
@@ -436,6 +780,18 @@ class DocxBuilder {
 
   async build(json: JSONContent, title: string, options: DocxExportOptions = {}): Promise<Uint8Array> {
     this.comments = options.comments ?? [];
+    this.structure = options.structure ?? null;
+    this.headingPages = options.headingPages ?? [];
+    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
+    // the doc's own margins, not docx's unrelated defaults.
+    // `dims` is the page as laid out (swapped for landscape) - the text width comes from it; Word
+    // itself wants the portrait size plus an orientation flag, and swaps them (docx's PageSize).
+    const page = pageFormat(options.pageSize, options.orientation);
+    const dims = pageDimensionsIn(page);
+    const paper = PAGE_DIMENSIONS_IN[page.size];
+    const pageColor = normalizePageColor(options.pageColor);
+    const m = resolveMargins(options.margins);
+    this.textWidthTwips = Math.round((dims.width - m.left - m.right) * TWIPS_PER_IN);
     const children = await this.renderBlocks(json.content ?? []);
 
     // Only comments whose mark actually appears somewhere in the rendered content end up here -
@@ -457,34 +813,117 @@ class DocxBuilder {
       };
     });
 
-    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
-    // the same real 1in margin on every side, not docx's own unrelated defaults.
-    const dims = PAGE_DIMENSIONS_IN[options.pageSize ?? "letter"];
-    const width = `${dims.width}in` as PositiveUniversalMeasure;
-    const height = `${dims.height}in` as PositiveUniversalMeasure;
-    const margin = `${PAGE_MARGIN_IN}in` as PositiveUniversalMeasure;
+    const width = `${paper.width}in` as PositiveUniversalMeasure;
+    const height = `${paper.height}in` as PositiveUniversalMeasure;
+    const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
+
+    // Page furniture. Each header/footer part is one paragraph: left text, a centre tab stop, a
+    // right tab stop - the three slots. The watermark rides in the header paragraph as a page-sized
+    // picture anchored to the page centre behind the text, which is how Word itself places one.
+    // "Different first page" (titlePage) is on when either the chrome or the watermark leaves page
+    // 1 out; the first-page parts then carry whichever of the two still belongs there.
+    const chrome = options.pageChrome ?? null;
+    const wm = options.watermark?.png ? options.watermark : null;
+    const chromeHas = (band: ChromeBand) => !!chrome && bandHasContent(chrome, band);
+    const lh = options.letterhead?.first ? options.letterhead : null;
+    const sheetRun = (png: Uint8Array, w: number, h: number) =>
+      new ImageRun({
+        type: "png",
+        data: png,
+        transformation: { width: w, height: h },
+        floating: {
+          horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: 0 },
+          verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: 0 },
+          behindDocument: true,
+          allowOverlap: true,
+          wrap: { type: TextWrappingType.NONE },
+        },
+      });
+    const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean, letterheadPng: Uint8Array | null = null) => {
+      const children: (TextRun | ImageRun)[] = [];
+      // The letterhead sheet rides in the header behind everything, as Word letterheads are built.
+      if (letterheadPng && lh) children.push(sheetRun(letterheadPng, lh.widthPx, lh.heightPx));
+      if (withText && chrome) {
+        const style = { size: chrome.fontSize * 2, color: "5F6368" };
+        CHROME_SLOTS.forEach((slot, i) => {
+          if (i > 0) children.push(new TextRun({ ...style, children: [new Tab()] }));
+          for (const seg of slotSegments(chrome, band, slot)) {
+            if (seg.kind === "text") children.push(new TextRun({ ...style, text: seg.text }));
+            else if (seg.kind === "page") children.push(new TextRun({ ...style, children: [PageNumber.CURRENT] }));
+            else if (seg.kind === "pages") children.push(new TextRun({ ...style, children: [PageNumber.TOTAL_PAGES] }));
+            else children.push(new TextRun({ ...style, text: seg.kind === "title" ? title : todayLabel() }));
+          }
+        });
+      }
+      if (withWatermark && wm) {
+        children.push(
+          new ImageRun({
+            type: "png",
+            data: wm.png!,
+            transformation: { width: wm.widthPx, height: wm.heightPx },
+            floating: {
+              horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, align: HorizontalPositionAlign.CENTER },
+              verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, align: VerticalPositionAlign.CENTER },
+              behindDocument: true,
+              allowOverlap: true,
+              wrap: { type: TextWrappingType.NONE },
+            },
+          })
+        );
+      }
+      return new Paragraph({
+        tabStops: [
+          { type: TabStopType.CENTER, position: Math.round(this.textWidthTwips / 2) },
+          { type: TabStopType.RIGHT, position: this.textWidthTwips },
+        ],
+        children,
+      });
+    };
+    const textOnFirst = !chrome?.differentFirstPage;
+    const markOnFirst = !wm?.skipFirstPage;
+    const lhRest = lh ? (lh.rest === "same" ? lh.first : lh.rest) : null;
+    // Page 1's deeper top margin: an exact-height spacer in its header carries the header down to
+    // where the text starts - Word starts the body below the header when the header runs deeper.
+    const HEADER_DIST_IN = 0.5;
+    const spacerTwips = lh?.firstTopIn ? Math.round((lh.firstTopIn - HEADER_DIST_IN) * 1440) : 0;
+    const lhNeedsFirst = !!lh && (lh.rest !== "same" || spacerTwips > 0);
+    const titlePage = (chrome?.differentFirstPage && (chromeHas("header") || chromeHas("footer"))) || (!!wm && wm.skipFirstPage) || lhNeedsFirst;
+    const parts = <T extends typeof Header | typeof Footer>(Part: T, band: ChromeBand) => {
+      const text = chromeHas(band);
+      const mark = band === "header" && !!wm;
+      const sheet = band === "header" && !!lh;
+      if (!text && !mark && !sheet) return undefined;
+      const part = (withText: boolean, withMark: boolean, png: Uint8Array | null, spacer = 0) => {
+        const children: Paragraph[] = [bandParagraph(band, withText, withMark, png)];
+        if (spacer > 240) children.push(new Paragraph({ spacing: { line: spacer, lineRule: LineRuleType.EXACT, before: 0, after: 0 }, children: [] }));
+        return new Part({ children }) as InstanceType<T>;
+      };
+      const main = part(text, mark, sheet ? lhRest : null);
+      return titlePage ? { default: main, first: part(text && textOnFirst, mark && markOnFirst, sheet ? lh!.first : null, sheet ? spacerTwips : 0) } : { default: main };
+    };
 
     const doc = new Document({
       title,
       numbering: { config: this.numberingConfigs },
       comments: commentChildren.length > 0 ? { children: commentChildren } : undefined,
+      // Page colour - Word shows it because docx also writes w:displayBackgroundShape. Text left at
+      // Word's "automatic" colour turns white on a dark page by itself, as it does on screen here.
+      background: pageColor ? { color: pageColor.slice(1).toUpperCase() } : undefined,
       sections: [
         {
           properties: {
             page: {
-              size: { width, height },
-              margin: { top: margin, bottom: margin, left: margin, right: margin },
+              size: { width, height, orientation: page.orientation === "landscape" ? PageOrientation.LANDSCAPE : PageOrientation.PORTRAIT },
+              margin: { top: inch(m.top), bottom: inch(m.bottom), left: inch(m.left), right: inch(m.right) },
+              pageNumbers: chrome ? { start: chrome.pageNumber.start, formatType: WORD_NUMBER_FORMAT[chrome.pageNumber.format] } : undefined,
             },
+            titlePage: titlePage || undefined,
           },
-          // Repeats on every page in real Word, unlike the CSS position:fixed trick the live
-          // print/PDF path needs (see DocsEditor.tsx's own comment on that) - .docx's header/footer
-          // model is native page-chrome, no workaround required here.
-          headers: options.headerText
-            ? { default: new Header({ children: [new Paragraph({ children: [new TextRun(options.headerText)] })] }) }
-            : undefined,
-          footers: options.footerText
-            ? { default: new Footer({ children: [new Paragraph({ children: [new TextRun(options.footerText)] })] }) }
-            : undefined,
+          // Word's own header/footer parts, with live PAGE/NUMPAGES fields - Word numbers the pages
+          // itself, in the chosen numerals from the chosen start (pageNumbers above). A different
+          // first page is Word's "Different First Page" (titlePage) with empty first-page parts.
+          headers: parts(Header, "header"),
+          footers: parts(Footer, "footer"),
           children,
         },
       ],
@@ -499,10 +938,30 @@ class DocxBuilder {
 
 export interface DocxExportOptions {
   comments?: DocComment[];
+  // Numbers, citations and the reference list (docStructure.ts's computeStructureFromJson).
+  structure?: DocStructure | null;
+  // Page of each heading in document order, as Docs paginates it - the table of contents' numbers.
+  headingPages?: number[];
   pageSize?: DocPageSize | null;
-  headerText?: string | null;
-  footerText?: string | null;
+  orientation?: DocOrientation | null;
+  pageColor?: string | null;
+  // Header, footer and page numbers (docPageChrome.ts).
+  pageChrome?: DocPageChrome | null;
+  // The watermark (docWatermark.ts), already drawn as a PNG of the whole sheet (CSS px size).
+  watermark?: { png: Uint8Array | null; widthPx: number; heightPx: number; skipFirstPage: boolean } | null;
+  // The letterhead (docLetterhead.ts): page 1's sheet and the later pages' ("same" = page 1's, null
+  // = plain paper) as page-sized PNGs, and page 1's own top margin when it's deeper.
+  letterhead?: { first: Uint8Array | null; rest: Uint8Array | "same" | null; widthPx: number; heightPx: number; firstTopIn: number | null } | null;
+  margins?: DocMargins | null;
 }
+
+const WORD_NUMBER_FORMAT: Record<PageNumberFormat, (typeof NumberFormat)[keyof typeof NumberFormat]> = {
+  decimal: NumberFormat.DECIMAL,
+  "lower-roman": NumberFormat.LOWER_ROMAN,
+  "upper-roman": NumberFormat.UPPER_ROMAN,
+  "lower-alpha": NumberFormat.LOWER_LETTER,
+  "upper-alpha": NumberFormat.UPPER_LETTER,
+};
 
 export async function buildDocxBytes(json: JSONContent, title: string, options?: DocxExportOptions): Promise<Uint8Array> {
   return new DocxBuilder().build(json, title, options);

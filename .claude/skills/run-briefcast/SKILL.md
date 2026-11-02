@@ -166,6 +166,19 @@ for a person, useless for scripted screenshots since nothing but a human can see
   actual content needs to change between test runs, give it a new filename rather than trusting a
   reopen (or even a full `quit`+`launch`) to see the new bytes.
 
+- **Helpers in `tools/`:** `raw.cjs` (POST helper bound to the current session), `realclick.cjs
+  "<js expr returning an element>" [double]` (a genuine WebDriver pointer click at the element's
+  centre - the sidebar's file-tree rows ignore a scripted `.click()`), `open_shorts.sh` (launch, open
+  `shorts_talk_test.mp4`, open the Make it a Short studio). `launch` can also leave the session on the
+  `/snip` window - pick the handle whose URL is exactly `http://tauri.localhost/`.
+- **An occluded test window stalls media.** When the WebView2 window is behind other windows, video
+  seeks never complete, new `<video>` elements don't start, and canvases drawn from video show stale
+  frames - the editor's own player included. Screenshots still work. Don't chase playback bugs seen
+  only in that state; check `readyState`/`seeking` on the main player first.
+- **WebView2 runs only a few video decoders at once** on this machine: with ~4-5 `<video>`
+  elements of a 1080p file alive, new ones sit at `readyState` 1 forever. Share one element between
+  previews (ShortsStudio does) rather than one per thumbnail.
+
 ## Troubleshooting
 
 | Symptom | Fix |

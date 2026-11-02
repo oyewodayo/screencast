@@ -51,6 +51,7 @@ import {
   insertTableFraction,
   removeTableFraction,
   resolveTableGrid,
+  resolveNodeFill,
 } from "../../utils/whiteboardTypes";
 
 export interface WhiteboardTableProps {
@@ -684,7 +685,7 @@ const WhiteboardTable: React.FC<WhiteboardTableProps> = ({ node, selected, canva
       }}
     >
       {/* Background fill, underneath the cell text/editing layer. */}
-      <div className="absolute inset-0" style={{ backgroundColor: node.fillColor ?? "transparent" }} />
+      <div className="absolute inset-0" style={{ backgroundColor: resolveNodeFill(node) ?? "transparent" }} />
       {/* The table's own outer border, as a plain non-positioning overlay - drawn on a dedicated
           child rather than the wrapper itself (which hosts every absolutely-positioned cell/handle
           below) because a border on a positioned ancestor shifts where `top:0,left:0` lands for its

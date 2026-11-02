@@ -30,9 +30,9 @@
     font-size: 0.7rem;
     padding: 1px 2px;
   }
-  .docker-panel input[type="text"],
-  .docker-panel select,
-  .docker-panel button,
+  .docker-panel:not(.docker-recording) input[type="text"],
+  .docker-panel:not(.docker-recording) select,
+  .docker-panel:not(.docker-recording) button,
   .docker-panel .docker-checkbox-field {
     padding: 6px 8px;
     font-size: 0.75rem;
@@ -51,9 +51,9 @@
   .docker-panel .docker-field-label {
     font-size: 0.65rem;
   }
-  .docker-panel input[type="text"],
-  .docker-panel select,
-  .docker-panel button,
+  .docker-panel:not(.docker-recording) input[type="text"],
+  .docker-panel:not(.docker-recording) select,
+  .docker-panel:not(.docker-recording) button,
   .docker-panel .docker-checkbox-field {
     padding: 4px 6px;
     font-size: 0.7rem;
@@ -64,5 +64,31 @@
   .docker-panel .docker-video-devices {
     min-width: 100px;
     max-height: 52px;
+  }
+}
+
+/* RecordingDocker (.docker-recording) sizes its own chips; as the panel narrows it drops the
+ * record-type and action labels to icons and tightens the chips, rather than wrapping onto more
+ * rows. */
+@container (max-width: 1100px) {
+  .docker-recording .docker-type-label {
+    display: none;
+  }
+}
+
+@container (max-width: 760px) {
+  .docker-recording {
+    padding: 8px !important;
+  }
+  .docker-recording .docker-chip {
+    height: 34px;
+  }
+  .docker-recording .docker-chip-caption,
+  .docker-recording .docker-action-label,
+  .docker-recording .docker-divider {
+    display: none;
+  }
+  .docker-recording .docker-name-input {
+    width: 8rem;
   }
 }

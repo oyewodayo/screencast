@@ -1,8 +1,11 @@
 // components/pdf/ImageAnnotationEditor.tsx
 import React, { useRef } from "react";
 
-const HANDLE_SIZE = 10;
-const ROTATE_HANDLE_OFFSET = 24; // device px above the top edge
+const HANDLE_SIZE = 12; // the visible dot
+// The grabbable area around each dot - much bigger than the dot itself, so a fingertip or a
+// slightly-off mouse press still lands on it.
+const HANDLE_HIT_SIZE = 32;
+const ROTATE_HANDLE_OFFSET = 28; // device px above the top edge
 const MIN_DIAGONAL_DEVICE_PX = 24;
 const ROTATE_SNAP_RADIANS = Math.PI / 12; // 15°, applied while Shift is held
 
@@ -89,14 +92,18 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       wrapper.style.top = `${startTop + (moveEvent.clientY - startClientY)}px`;
     };
     const handleUp = (upEvent: PointerEvent): void => {
-      handle.releasePointerCapture(upEvent.pointerId);
+      if (handle.hasPointerCapture(upEvent.pointerId)) handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
       onMoveEnd(parseFloat(wrapper.style.left), parseFloat(wrapper.style.top));
     };
 
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    // A touch the browser takes over (or any cancelled pointer) ends the gesture where it is,
+    // instead of leaving these listeners attached and the box stuck mid-drag.
+    window.addEventListener("pointercancel", handleUp);
   };
 
   // Center-anchored, aspect-locked resize: the box's screen-space center stays fixed while
@@ -138,9 +145,10 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       wrapper.style.top = `${centerY - newHeight / 2}px`;
     };
     const handleUp = (upEvent: PointerEvent): void => {
-      handle.releasePointerCapture(upEvent.pointerId);
+      if (handle.hasPointerCapture(upEvent.pointerId)) handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
       onResizeEnd(
         parseFloat(wrapper.style.width),
         parseFloat(wrapper.style.height),
@@ -151,6 +159,9 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
 
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    // A touch the browser takes over (or any cancelled pointer) ends the gesture where it is,
+    // instead of leaving these listeners attached and the box stuck mid-drag.
+    window.addEventListener("pointercancel", handleUp);
   };
 
   const handleRotatePointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
@@ -177,32 +188,42 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
       wrapper.style.transform = `rotate(${next}rad)`;
     };
     const handleUp = (upEvent: PointerEvent): void => {
-      handle.releasePointerCapture(upEvent.pointerId);
+      if (handle.hasPointerCapture(upEvent.pointerId)) handle.releasePointerCapture(upEvent.pointerId);
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
       onRotateEnd(liveRotation);
     };
 
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    // A touch the browser takes over (or any cancelled pointer) ends the gesture where it is,
+    // instead of leaving these listeners attached and the box stuck mid-drag.
+    window.addEventListener("pointercancel", handleUp);
   };
 
   const cornerHandleStyle = (cornerLeft: boolean, cornerTop: boolean): React.CSSProperties => ({
     position: "absolute",
-    left: cornerLeft ? -HANDLE_SIZE / 2 : undefined,
-    right: cornerLeft ? undefined : -HANDLE_SIZE / 2,
-    top: cornerTop ? -HANDLE_SIZE / 2 : undefined,
-    bottom: cornerTop ? undefined : -HANDLE_SIZE / 2,
-    width: HANDLE_SIZE,
-    height: HANDLE_SIZE,
+    left: cornerLeft ? -HANDLE_HIT_SIZE / 2 : undefined,
+    right: cornerLeft ? undefined : -HANDLE_HIT_SIZE / 2,
+    top: cornerTop ? -HANDLE_HIT_SIZE / 2 : undefined,
+    bottom: cornerTop ? undefined : -HANDLE_HIT_SIZE / 2,
+    width: HANDLE_HIT_SIZE,
+    height: HANDLE_HIT_SIZE,
     cursor: cornerLeft === cornerTop ? "nwse-resize" : "nesw-resize",
   });
+
+  // The visible dot, centered inside its (invisible, larger) hit area.
+  const handleDot = <span className="absolute inset-0 m-auto bg-white border-2 border-blue-500 rounded-full shadow-sm pointer-events-none" style={{ width: HANDLE_SIZE, height: HANDLE_SIZE }} />;
 
   return (
     <div
       ref={wrapperRef}
+      data-annotation-editor=""
       className="absolute"
-      style={{ left, top, width, height, transform: `rotate(${rotation}rad)`, transformOrigin: "center center", zIndex: 20 }}
+      // touch-action none: a finger drag on the image or a handle is this editor's gesture, not a
+      // page scroll/swipe - otherwise the browser cancels the pointer mid-drag.
+      style={{ left, top, width, height, transform: `rotate(${rotation}rad)`, transformOrigin: "center center", zIndex: 20, touchAction: "none" }}
     >
       <div onPointerDown={handleMovePointerDown} title="Drag to move" className="absolute inset-0 ring-2 ring-blue-500" style={{ cursor: "move" }}>
         <img
@@ -223,17 +244,20 @@ const ImageAnnotationEditor: React.FC<ImageAnnotationEditorProps> = ({
           key={`${cornerLeft}-${cornerTop}`}
           onPointerDown={handleResizePointerDown}
           title="Drag to resize"
-          className="bg-white border-2 border-blue-500 rounded-full shadow-sm"
           style={cornerHandleStyle(cornerLeft, cornerTop)}
-        />
+        >
+          {handleDot}
+        </div>
       ))}
 
       <div
         onPointerDown={handleRotatePointerDown}
         title="Drag to rotate (hold Shift to snap to 15°)"
-        className="absolute bg-white border-2 border-blue-500 rounded-full shadow-sm"
-        style={{ left: width / 2 - HANDLE_SIZE / 2, top: -ROTATE_HANDLE_OFFSET - HANDLE_SIZE / 2, width: HANDLE_SIZE, height: HANDLE_SIZE, cursor: "grab" }}
-      />
+        className="absolute"
+        style={{ left: width / 2 - HANDLE_HIT_SIZE / 2, top: -ROTATE_HANDLE_OFFSET - HANDLE_HIT_SIZE / 2, width: HANDLE_HIT_SIZE, height: HANDLE_HIT_SIZE, cursor: "grab" }}
+      >
+        {handleDot}
+      </div>
       <div
         className="absolute bg-blue-500 pointer-events-none"
         style={{ left: width / 2 - 1, top: -ROTATE_HANDLE_OFFSET, width: 2, height: ROTATE_HANDLE_OFFSET }}

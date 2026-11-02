@@ -7,19 +7,37 @@
 // three) - single-selection edits still go through editNode so BoardStylePanel's "just the one
 // item" case isn't paying for a batch array it doesn't need.
 import React from "react";
-import { IoCopyOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
+import { IoChevronDown, IoCloseOutline, IoCopyOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
 import {
+  TbAlignCenter,
+  TbAlignLeft,
+  TbAlignRight,
+  TbAngle,
+  TbArrowDown,
+  TbArrowLeft,
+  TbArrowRight,
+  TbArrowsExchange,
+  TbArrowUp,
+  TbBan,
+  TbBold,
+  TbLock,
+  TbLockOpen,
+  TbMinus,
+  TbMovie,
+  TbPlayerPause,
+  TbPhoto,
+  TbTextSize,
   TbComponents,
   TbComponentsOff,
   TbFlipHorizontal,
   TbFlipVertical,
   TbItalic,
   TbLayoutAlignBottom,
-  TbLayoutAlignCenter,
-  TbLayoutAlignLeft,
   TbLayoutAlignMiddle,
-  TbLayoutAlignRight,
   TbLayoutAlignTop,
+  TbRotateClockwise,
+  TbShadow,
+  TbShadowOff,
   TbStackBack,
   TbStackFront,
   TbUnderline,
@@ -65,7 +83,19 @@ import {
   MIN_TABLE_ROWS,
   TableBorderStyle,
   WhiteboardEdge,
+  AxisPlacement,
+  WhiteboardFillPattern,
+  WhiteboardFillType,
+  WhiteboardGradientStop,
   WhiteboardNode,
+  DEFAULT_FILL_PATTERN_OPACITY,
+  DEFAULT_FILL_PATTERN_SPACING,
+  DEFAULT_GRADIENT_ANGLE,
+  DEFAULT_LATTICE_LABEL_BODY,
+  DEFAULT_LATTICE_LABEL_TITLE,
+  DEFAULT_LATTICE_ROTATE_SPEED,
+  MAX_LATTICE_ROTATE_SPEED,
+  resolveGradientStops,
   insertTableFraction,
   removeTableFraction,
   resolveTableGrid,
@@ -109,10 +139,28 @@ import {
   arrangeNodesInGrid,
   compileGraphExpression,
   DEFAULT_GRID_GAP,
+  DEFAULT_SHADOW_BLUR,
+  DEFAULT_SHADOW_COLOR,
+  DEFAULT_SHADOW_OFFSET_X,
+  DEFAULT_SHADOW_OFFSET_Y,
+  DEFAULT_SHADOW_OPACITY,
+  detectShapeCorners,
   distributeNodes,
+  fillImageRect,
+  fillPatternTile,
+  flipEdge,
+  flipItems,
   nudgeEdgeBy,
   outlineOptionsFor,
+  resolveEdgeEndpoints,
+  resolvePlotAxisStyle,
+  reverseEdgeDirection,
+  scaleEdgeLength,
+  supportsCornerRadius,
 } from "../../handlers/whiteboardHandlers";
+import { preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
+import { exportLatticeLoop } from "../../handlers/latticeLoopExport";
+import ColorInput from "../common/ColorInput";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
@@ -182,9 +230,42 @@ const ROUTING_OPTIONS: { value: WhiteboardEdge["routing"]; label: string }[] = [
   { value: "curved", label: "Curved" },
 ];
 
+type ShadowStylePatch = Pick<
+  WhiteboardNode,
+  "shadowEnabled" | "shadowColor" | "shadowOpacity" | "shadowBlur" | "shadowOffsetX" | "shadowOffsetY"
+>;
+
+const SHADOW_PRESETS: {
+  name: string;
+  config?: ShadowStylePatch;
+  makeConfig?: (n: { strokeColor?: string; fillColor?: string | null }) => ShadowStylePatch;
+}[] = [
+  { name: "Soft", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.18, shadowBlur: 12, shadowOffsetX: 0, shadowOffsetY: 4 } },
+  { name: "Medium", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.28, shadowBlur: 20, shadowOffsetX: 0, shadowOffsetY: 8 } },
+  { name: "Floating", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.35, shadowBlur: 32, shadowOffsetX: 0, shadowOffsetY: 16 } },
+  {
+    name: "Glow",
+    makeConfig: (n) => ({
+      shadowEnabled: true,
+      shadowColor:
+        n.strokeColor && n.strokeColor !== "#000000" && n.strokeColor !== "#111111"
+          ? n.strokeColor
+          : n.fillColor && n.fillColor !== "#ffffff"
+          ? n.fillColor
+          : "#3b82f6",
+      shadowOpacity: 0.55,
+      shadowBlur: 18,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+    }),
+  },
+  { name: "Retro", config: { shadowEnabled: true, shadowColor: "#000000", shadowOpacity: 0.85, shadowBlur: 0, shadowOffsetX: 5, shadowOffsetY: 5 } },
+];
+
 interface WhiteboardStylePanelProps {
   selectedNodes: WhiteboardNode[];
   selectedEdges: WhiteboardEdge[];
+  pageNodes?: WhiteboardNode[];
   // The active cell/row/column range within a selected "table" node (or null) - lifted up from
   // WhiteboardTable.tsx via WhiteboardCanvas.tsx/WhiteboardEditor.tsx (see their own doc comments on
   // this same field). Only acted on below when it names the SAME node currently selected here - a
@@ -193,10 +274,16 @@ interface WhiteboardStylePanelProps {
   tableRangeSelection: { nodeId: string; range: { r0: number; c0: number; r1: number; c1: number } } | null;
   onBatchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
   onEditEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
+  onBatchEditEdges?: (before: WhiteboardEdge[], after: WhiteboardEdge[]) => void;
+  // Shapes and connectors edited together as one undo step - flipping/nudging a mixed selection.
+  onBatchEditItems?: (beforeNodes: WhiteboardNode[], afterNodes: WhiteboardNode[], beforeEdges: WhiteboardEdge[], afterEdges: WhiteboardEdge[]) => void;
   onDeleteNode: (node: WhiteboardNode) => void;
   onDeleteEdge: (edge: WhiteboardEdge) => void;
   onDuplicateNode: (node: WhiteboardNode) => void;
+  onDuplicateEdge?: (edge: WhiteboardEdge) => void;
   onBringToFront: () => void;
+  onBringForward?: () => void;
+  onSendBackward?: () => void;
   onSendToBack: () => void;
   onGroup: () => void;
   onUngroup: () => void;
@@ -213,6 +300,15 @@ interface WhiteboardStylePanelProps {
   // commits as one undo step - see LiveRangeSlider's own doc comment for why that split is
   // load-bearing rather than a nicety.
   onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
+  onPreviewEdges?: (patch: Partial<WhiteboardEdge> | null) => void;
+  // Opens the image picker for an "image" fill and imports the choice into this whiteboard's
+  // assets/ folder, resolving to the stored asset file name (null if cancelled). Owned by
+  // WhiteboardEditor for the same reason onReplaceImage is.
+  onPickFillImage?: () => Promise<string | null>;
+  // Resolves an asset file name to a displayable URL - the image-fill thumbnail in the Fill section.
+  assetUrlFor?: (fileName: string) => string | null;
+  // Saves an exported lattice loop through a native save dialog; resolves false if cancelled.
+  onSaveExport?: (bytes: Uint8Array, extension: "mp4" | "gif") => Promise<boolean>;
 }
 
 // A plain `value={n}`-controlled number input re-clamps AND redraws its own text on every
@@ -385,6 +481,7 @@ function LiveRangeSlider({
       onKeyUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
       onBlur={(e) => commit(Number((e.target as HTMLInputElement).value))}
       className={className ?? SLIDER_CLASS}
+      style={{ ["--pct" as string]: `${max > min ? ((Math.min(max, Math.max(min, liveValue)) - min) / (max - min)) * 100 : 0}%` } as React.CSSProperties}
       title={title}
     />
   );
@@ -484,7 +581,7 @@ function ChartDataField({ initialValue, onCommit, className }: { initialValue: n
   );
 }
 
-const FIELD_INPUT_CLASS = "w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs";
+const FIELD_INPUT_CLASS = "w-32 h-7 px-2 rounded-md border border-transparent bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.065] dark:hover:bg-white/[0.09] focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-500/70 focus:ring-[3px] focus:ring-blue-500/15 outline-none transition-[background-color,border-color,box-shadow] duration-150 text-neutral-800 dark:text-neutral-100 text-[12px]";
 // Ceiling for a node's stroke/ink width. Not a design limit - purely a guard against a typo (an
 // accidental extra zero) producing a ring so thick it swallows the shape and leaves nothing visible
 // to click back onto in order to undo it.
@@ -496,14 +593,19 @@ const MAX_STROKE_WIDTH = 400;
 // than a pile of independently-styled inputs. Anything added here should reuse these rather than
 // spelling out its own border/height/radius - that drift is exactly what made the panel look
 // assembled rather than designed.
-const NUMBER_INPUT_CLASS =
-  "w-14 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs tabular-nums outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
-const SELECT_CLASS =
-  "w-36 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
-const TEXT_INPUT_CLASS =
-  "w-36 h-7 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 transition";
-const SLIDER_CLASS = "w-[72px] accent-blue-600 cursor-pointer";
-const SWATCH_CLASS = "w-7 h-7 rounded-md border border-gray-200 dark:border-neutral-700 bg-transparent cursor-pointer p-0.5";
+// Inputs are "filled" (a faint tint, no outline) rather than outlined boxes - a column of
+// outlined boxes reads as a form, a column of filled wells reads as an inspector, and the focus ring
+// then has the whole stage to itself.
+const INPUT_SURFACE_CLASS =
+  "rounded-md border border-transparent bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.065] dark:hover:bg-white/[0.09] focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-500/70 focus:ring-[3px] focus:ring-blue-500/15 outline-none transition-[background-color,border-color,box-shadow] duration-150 text-neutral-800 dark:text-neutral-100";
+const NUMBER_INPUT_CLASS = `w-14 h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px] tabular-nums`;
+const SELECT_CLASS = `w-36 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`;
+// A thin track with a filled "progress" portion up to the thumb (driven by the --pct custom property
+// LiveRangeSlider sets) and a soft white thumb - the native accent-color slider was the single most
+// "default browser widget" looking thing in the panel.
+const SLIDER_CLASS =
+  "wb-slider w-[84px] h-4 appearance-none bg-transparent cursor-pointer focus:outline-none [&::-webkit-slider-runnable-track]:h-[3px] [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:bg-[linear-gradient(to_right,#3b82f6_var(--pct,0%),rgba(0,0,0,0.1)_var(--pct,0%))] dark:[&::-webkit-slider-runnable-track]:bg-[linear-gradient(to_right,#60a5fa_var(--pct,0%),rgba(255,255,255,0.14)_var(--pct,0%))] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:-mt-[5.5px] [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:shadow-[0_0_0_0.5px_rgba(0,0,0,0.18),0_1px_3px_rgba(0,0,0,0.25)] [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:duration-150 hover:[&::-webkit-slider-thumb]:scale-110 active:[&::-webkit-slider-thumb]:scale-125 focus-visible:[&::-webkit-slider-thumb]:ring-[3px] focus-visible:[&::-webkit-slider-thumb]:ring-blue-500/25";
+const SWATCH_CLASS = "w-7 h-7 rounded-md border border-black/10 dark:border-white/10 bg-transparent cursor-pointer p-0.5";
 const CHECKBOX_CLASS = "h-4 w-4 rounded accent-blue-600 cursor-pointer";
 
 // Readable names for the header. Only the shapeTypes whose raw identifier doesn't already read as a
@@ -548,24 +650,69 @@ function shapeLabel(shapeType: WhiteboardNode["shapeType"]): string {
 
 // A titled group of related rows. Sections are what turn a long scroll of controls into something
 // skimmable - without them every field competes equally for attention regardless of how often it's
-// actually reached for.
-function Section({ title, children, dense }: { title?: string; children: React.ReactNode; dense?: boolean }) {
+// actually reached for. Titled sections collapse on a click of their header, and remember that per
+// title across selections and sessions: a researcher who never touches Text styling on their plots
+// folds it away once instead of scrolling past it on every shape forever.
+const COLLAPSED_SECTIONS_KEY = "whiteboard.panel.collapsed";
+function readCollapsedSections(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(COLLAPSED_SECTIONS_KEY) ?? "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+function Section({ title, children, dense, action }: { title?: string; children: React.ReactNode; dense?: boolean; action?: React.ReactNode }) {
+  const [collapsed, setCollapsed] = React.useState(() => (title ? readCollapsedSections().has(title) : false));
+  const toggle = () => {
+    if (!title) return;
+    setCollapsed((prev) => {
+      const next = !prev;
+      try {
+        const set = readCollapsedSections();
+        if (next) set.add(title);
+        else set.delete(title);
+        localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify([...set]));
+      } catch {
+        // Storage unavailable - the fold still works for this session.
+      }
+      return next;
+    });
+  };
   return (
-    <section className={`flex flex-col ${dense ? "gap-1.5" : "gap-2"}`}>
-      {title && <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-neutral-500 select-none">{title}</h3>}
-      {children}
+    // :has() hides a section whose children all rendered nothing (a "Shape" section for a plain
+    // ellipse) - cheaper and less fragile than predicting at every call site which controls apply.
+    <section className="flex flex-col px-3 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06] last:border-b-0 [&:not(:has(.wb-section-body>*))]:hidden">
+      {title && (
+        <div className="flex items-center h-6 -mx-1 mb-1">
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={!collapsed}
+            className="group flex flex-1 min-w-0 items-center gap-1 px-1 h-6 rounded text-[11px] font-semibold text-neutral-800 dark:text-neutral-100 select-none hover:text-neutral-950 dark:hover:text-white"
+          >
+            <IoChevronDown size={11} className={`shrink-0 text-gray-400 dark:text-neutral-500 transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`} />
+            <span className="truncate">{title}</span>
+          </button>
+          {action && !collapsed && <div className="shrink-0 flex items-center">{action}</div>}
+        </div>
+      )}
+      <div
+        className={`grid transition-[grid-template-rows,opacity] duration-200 ease-out ${collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100"}`}
+      >
+        <div className={`wb-section-body min-h-0 flex flex-col ${dense ? "gap-1.5" : "gap-2"} ${collapsed ? "overflow-hidden" : ""}`}>{children}</div>
+      </div>
     </section>
   );
 }
 
-// A bordered sub-panel for a cluster that needs to read as one unit (crop, figure layout, one
-// annotation's settings) rather than as loose rows in its parent section.
+// A sub-panel for a cluster that needs to read as one unit (crop, figure layout, one annotation's
+// settings) rather than as loose rows in its parent section.
 function Card({ children }: { children: React.ReactNode }) {
-  return <div className="flex flex-col gap-1.5 rounded-lg border border-gray-200 dark:border-neutral-700/80 bg-gray-50/60 dark:bg-neutral-800/40 p-2">{children}</div>;
+  return <div className="flex flex-col gap-1.5 rounded-lg bg-black/[0.025] dark:bg-white/[0.04] ring-1 ring-inset ring-black/[0.05] dark:ring-white/[0.06] p-2">{children}</div>;
 }
 
 const MINI_BUTTON_CLASS =
-  "px-2.5 h-7 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs font-medium hover:bg-gray-50 dark:hover:bg-neutral-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition";
+  "px-2.5 h-7 rounded-md bg-black/[0.04] dark:bg-white/[0.06] text-[12px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-black/[0.08] dark:hover:bg-white/[0.1] active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none transition";
 
 // The chart title / x-axis / y-axis caption inputs. Committed on every keystroke (rather than on
 // blur) to match how the "graph" Expression field next to it already behaves - a caption is short
@@ -663,7 +810,7 @@ function SeriesDataField({ node, updateNodes }: { node: WhiteboardNode; updateNo
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+      <div className="flex items-center justify-between text-[12px] text-neutral-500 dark:text-neutral-400">
         <span>Data</span>
         <span className="text-[10px] text-gray-400 dark:text-neutral-500">
           {resolved.series.length} traces × {resolved.series.reduce((m, t) => Math.max(m, t.length), 0)} pts
@@ -678,7 +825,7 @@ function SeriesDataField({ node, updateNodes }: { node: WhiteboardNode; updateNo
         }}
         onBlur={apply}
         rows={5}
-        className="w-full px-1.5 py-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px] font-mono resize-y"
+        className={`w-full px-2 py-1.5 ${INPUT_SURFACE_CLASS} text-[11px] font-mono resize-y`}
         placeholder={"1, 4, 9, 4, 1\n2, 6, 12, 6, 2"}
         title="One trace per line; values separated by commas or spaces"
       />
@@ -718,11 +865,10 @@ function SeriesColorList({ node, updateNodes }: { node: WhiteboardNode; updateNo
     <div className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1">
       {resolved.series.map((_, i) => (
         <div key={i} className="flex items-center gap-1.5">
-          <input
-            type="color"
+          <ColorInput
             value={resolved.colors[i]}
             onChange={(e) => setColor(i, e.target.value)}
-            className="h-6 w-8 rounded border border-gray-200 dark:border-neutral-700 bg-transparent"
+            className="h-6 w-8 rounded-md cursor-pointer bg-transparent"
             title={`Trace ${i + 1} color`}
           />
           <input
@@ -734,13 +880,13 @@ function SeriesColorList({ node, updateNodes }: { node: WhiteboardNode; updateNo
               next[i] = e.target.value;
               updateNodes({ seriesLabels: next });
             }}
-            className="flex-1 min-w-0 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+            className={`flex-1 min-w-0 h-6 px-1.5 ${INPUT_SURFACE_CLASS} text-[11px]`}
           />
           <button
             type="button"
             onClick={() => setColor(i, null)}
             disabled={!node.seriesColors?.[i]}
-            className="px-1 h-6 rounded text-[10px] border border-gray-200 dark:border-neutral-700 disabled:opacity-30"
+            className="px-1.5 h-6 rounded-md text-[10px] bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] disabled:opacity-30"
             title="Back to this trace's colormap color"
           >
             ↺
@@ -757,7 +903,7 @@ function SeriesColorList({ node, updateNodes }: { node: WhiteboardNode; updateNo
 function ColormapSwatch({ name, reversed }: { name: ColormapName; reversed: boolean }) {
   const stops = colormapPalette(name, 24, reversed);
   return (
-    <div className="flex h-3 w-full overflow-hidden rounded border border-gray-200 dark:border-neutral-700">
+    <div className="flex h-3 w-full overflow-hidden rounded ring-1 ring-inset ring-black/10 dark:ring-white/10">
       {stops.map((c, i) => (
         <div key={i} className="flex-1" style={{ backgroundColor: c }} />
       ))}
@@ -786,7 +932,7 @@ function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateN
   };
   return (
     <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+      <div className="flex items-center justify-between text-[12px] text-neutral-500 dark:text-neutral-400">
         <span>Annotations</span>
         <button type="button" onClick={add} className={MINI_BUTTON_CLASS}>
           + Add
@@ -794,19 +940,19 @@ function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateN
       </div>
       {annotations.length === 0 && <span className="text-[10px] text-gray-400 dark:text-neutral-500">None. Add one, then drag its ring on the canvas to place it.</span>}
       {annotations.map((a, i) => (
-        <div key={i} className="flex flex-col gap-1 rounded-lg border border-gray-200 dark:border-neutral-700/80 bg-gray-50/60 dark:bg-neutral-800/40 p-2">
+        <div key={i} className="flex flex-col gap-1 rounded-lg bg-black/[0.025] dark:bg-white/[0.04] ring-1 ring-inset ring-black/[0.05] dark:ring-white/[0.06] p-2">
           <div className="flex items-center gap-1.5">
             <input
               type="text"
               value={a.text ?? ""}
               placeholder="(marker only)"
               onChange={(e) => update(i, { text: e.target.value })}
-              className="flex-1 min-w-0 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+              className={`flex-1 min-w-0 h-6 px-1.5 ${INPUT_SURFACE_CLASS} text-[11px]`}
             />
             <button
               type="button"
               onClick={() => updateNodes({ chartAnnotations: annotations.filter((_, j) => j !== i) })}
-              className="px-1.5 h-6 rounded text-[10px] border border-gray-200 dark:border-neutral-700 text-red-600 dark:text-red-400"
+              className="px-1.5 h-6 rounded-md text-[10px] bg-black/[0.04] dark:bg-white/[0.06] hover:bg-red-500/10 text-red-600 dark:text-red-400"
               title="Remove this annotation"
             >
               ✕
@@ -816,7 +962,7 @@ function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateN
             <select
               value={a.marker ?? "dot"}
               onChange={(e) => update(i, { marker: e.target.value as NonNullable<ChartAnnotation["marker"]> })}
-              className="h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+              className={`h-6 px-1.5 ${INPUT_SURFACE_CLASS} text-[11px]`}
             >
               <option value="dot">Dot</option>
               <option value="ring">Ring</option>
@@ -824,11 +970,10 @@ function AnnotationFields({ node, updateNodes }: { node: WhiteboardNode; updateN
               <option value="cross">Cross</option>
               <option value="none">No marker</option>
             </select>
-            <input
-              type="color"
+            <ColorInput
               value={a.color ?? node.strokeColor}
               onChange={(e) => update(i, { color: e.target.value })}
-              className="h-6 w-8 rounded border border-gray-200 dark:border-neutral-700 bg-transparent"
+              className="h-6 w-8 rounded-md cursor-pointer bg-transparent"
               title="Marker and label color"
             />
             <label className="flex items-center gap-1 text-[10px] text-gray-600 dark:text-neutral-300" title="Draw a thin line from the marker to its label">
@@ -881,7 +1026,7 @@ function FigureLayoutFields({
       <span className="text-xs font-medium text-gray-600 dark:text-neutral-300">Figure layout</span>
       <div className="grid grid-cols-6 gap-1">
         {alignButtons.map((b) => (
-          <button key={b.edge} type="button" onClick={() => apply(alignNodes(nodes, b.edge))} className="h-7 rounded border border-gray-200 dark:border-neutral-700 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700" title={b.title}>
+          <button key={b.edge} type="button" onClick={() => apply(alignNodes(nodes, b.edge))} className="h-7 rounded-md bg-black/[0.04] dark:bg-white/[0.06] text-[12px] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] active:scale-95 transition" title={b.title}>
             {b.label}
           </button>
         ))}
@@ -1023,7 +1168,7 @@ function ImageFields({
       </Field>
 
       <Card>
-        <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
+        <div className="flex items-center justify-between text-[12px] text-neutral-500 dark:text-neutral-400">
           <span className="font-medium">Crop (%)</span>
           <button
             type="button"
@@ -1062,7 +1207,7 @@ function ImageFields({
                 step={1}
                 integer={false}
                 onCommit={(n) => apply(n / 100)}
-                className="w-12 h-6 px-1 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-[11px]"
+                className={`w-12 h-6 px-1.5 ${INPUT_SURFACE_CLASS} text-[11px] tabular-nums`}
               />
             </label>
           ))}
@@ -1109,52 +1254,6 @@ function ImageFields({
         Replace image
       </button>
     </>
-  );
-}
-
-// The 4-direction nudge button grid - shared by the node section's own "Nudge" field and the
-// connector section's (see nudgeEdgeBy's own doc comment for why an edge can be nudged too, not
-// just moved by dragging its body). 1px per click, 10px with Shift held - same step sizes as the
-// arrow-key shortcut (WhiteboardCanvas.tsx's keydown handler) so both controls move a selection by
-// identical, predictable amounts.
-function NudgeGrid({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
-  return (
-    <div className="grid grid-cols-3 grid-rows-2 gap-0.5">
-      <span />
-      <button
-        type="button"
-        onClick={(e) => onNudge(0, e.shiftKey ? -10 : -1)}
-        title="Nudge up (↑, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ↑
-      </button>
-      <span />
-      <button
-        type="button"
-        onClick={(e) => onNudge(e.shiftKey ? -10 : -1, 0)}
-        title="Nudge left (←, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ←
-      </button>
-      <button
-        type="button"
-        onClick={(e) => onNudge(0, e.shiftKey ? 10 : 1)}
-        title="Nudge down (↓, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        ↓
-      </button>
-      <button
-        type="button"
-        onClick={(e) => onNudge(e.shiftKey ? 10 : 1, 0)}
-        title="Nudge right (→, Shift for 10px)"
-        className="h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none"
-      >
-        →
-      </button>
-    </div>
   );
 }
 
@@ -1212,9 +1311,239 @@ function EdgeRotateField({ edge, onCommit }: { edge: WhiteboardEdge; onCommit: (
   );
 }
 
+// A colour well plus its hex code - the code is what a researcher matches against a journal's or a
+// palette's spec, so it's a real editable field (paste "#1f77b4" straight in), not just a readout.
+// The swatch sits on a checkerboard so a translucent or "none" fill reads as such at a glance.
+function HexColorInput({ value, onChange, title }: { value: string; onChange: (color: string) => void; title?: string }) {
+  const [text, setText] = React.useState(value);
+  const [focused, setFocused] = React.useState(false);
+  React.useEffect(() => {
+    if (!focused) setText(value);
+  }, [value, focused]);
+  const normalize = (raw: string): string | null => {
+    const t = raw.trim().replace(/^#?/, "#");
+    if (/^#[0-9a-f]{6}$/i.test(t)) return t.toLowerCase();
+    if (/^#[0-9a-f]{3}$/i.test(t)) return `#${t.slice(1).replace(/./g, (c) => c + c)}`.toLowerCase();
+    return null;
+  };
+  return (
+    <span
+      title={title}
+      className={`flex items-center gap-1.5 h-7 w-[112px] pl-1 pr-1.5 ${INPUT_SURFACE_CLASS} focus-within:bg-white dark:focus-within:bg-neutral-900 focus-within:border-blue-500/70 focus-within:ring-[3px] focus-within:ring-blue-500/15`}
+    >
+      <span className="relative shrink-0 w-5 h-5 rounded-[5px] overflow-hidden ring-1 ring-inset ring-black/10 dark:ring-white/15 bg-[conic-gradient(#d4d4d4_25%,#fff_0_50%,#d4d4d4_0_75%,#fff_0)] bg-[length:8px_8px]">
+        <span className="absolute inset-0" style={{ backgroundColor: value }} />
+        <ColorInput value={value} onChange={(e) => onChange(e.target.value)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+      </span>
+      <input
+        type="text"
+        value={focused ? text : text.replace(/^#/, "").toUpperCase()}
+        spellCheck={false}
+        onFocus={() => {
+          setFocused(true);
+          setText(value.replace(/^#/, "").toUpperCase());
+        }}
+        onChange={(e) => {
+          setText(e.target.value);
+          const next = normalize(e.target.value);
+          if (next) onChange(next);
+        }}
+        onBlur={() => setFocused(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+        }}
+        className="flex-1 min-w-0 bg-transparent text-[11px] font-mono uppercase tabular-nums text-neutral-700 dark:text-neutral-200 outline-none"
+      />
+    </span>
+  );
+}
+
+function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (color: string) => void }) {
+  return (
+    <Field label={label}>
+      <HexColorInput value={value} onChange={onChange} />
+    </Field>
+  );
+}
+
+// A row of mutually-related toggle buttons drawn as one control (B/I/U, alignment, flip, fill type)
+// - a recessed track with the active option raised out of it, the segmented look the Mindmap
+// inspector uses for its font steps. `stretch` makes the options share the full row width.
+function Segmented({ children, stretch }: { children: React.ReactNode; stretch?: boolean }) {
+  return (
+    <div className={`flex items-center p-[2px] gap-[2px] rounded-md bg-black/[0.045] dark:bg-white/[0.06] ${stretch ? "w-full [&>button]:flex-1" : ""}`}>{children}</div>
+  );
+}
+
+function SegmentButton({ active, onClick, title, children }: { active: boolean; onClick: (e: React.MouseEvent) => void; title: string; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={active}
+      className={`h-6 min-w-[26px] px-1.5 flex items-center justify-center gap-1 rounded-[5px] text-[11px] font-medium transition-[background-color,color,box-shadow] duration-150 active:scale-[0.96] ${
+        active
+          ? "bg-white dark:bg-neutral-600 text-neutral-900 dark:text-white shadow-[0_0_0_0.5px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.12)]"
+          : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+// A number field with its label inside the well ("X 120"), the compact form design tools use for
+// geometry - the label reads as part of the value rather than a separate row competing with it.
+// Dragging the label left/right scrubs the value (Shift for 10x), the Figma/After Effects gesture
+// for nudging a number without leaving the mouse - a whole scrub commits once, on release.
+function PrefixedNumber({
+  prefix,
+  title,
+  suffix,
+  resetKey,
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  prefix: React.ReactNode;
+  title: string;
+  suffix?: string;
+  resetKey: string;
+  value: number;
+  min: number;
+  max: number;
+  onCommit: (n: number) => void;
+}) {
+  const [scrub, setScrub] = React.useState<number | null>(null);
+  const scrubRef = React.useRef<{ startX: number; startValue: number; moved: boolean } | null>(null);
+  const shown = scrub ?? value;
+  return (
+    <label
+      title={title}
+      className={`group flex items-center h-7 min-w-0 ${INPUT_SURFACE_CLASS} focus-within:bg-white dark:focus-within:bg-neutral-900 focus-within:border-blue-500/70 focus-within:ring-[3px] focus-within:ring-blue-500/15`}
+    >
+      <span
+        className="shrink-0 w-6 h-full flex items-center justify-center text-[11px] font-medium text-gray-400 dark:text-neutral-500 select-none cursor-ew-resize group-hover:text-gray-500"
+        onPointerDown={(e) => {
+          e.preventDefault();
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+          scrubRef.current = { startX: e.clientX, startValue: value, moved: false };
+        }}
+        onPointerMove={(e) => {
+          const s = scrubRef.current;
+          if (!s) return;
+          const dx = e.clientX - s.startX;
+          if (!s.moved && Math.abs(dx) < 2) return;
+          s.moved = true;
+          setScrub(Math.max(min, Math.min(max, Math.round(s.startValue + dx * (e.shiftKey ? 10 : 1)))));
+        }}
+        onPointerUp={() => {
+          const s = scrubRef.current;
+          scrubRef.current = null;
+          if (s?.moved && scrub !== null && scrub !== value) onCommit(scrub);
+          setScrub(null);
+        }}
+      >
+        {prefix}
+      </span>
+      <ClampedNumberField
+        key={`${resetKey}-${scrub === null ? "idle" : "scrub"}`}
+        initialValue={Math.round(shown)}
+        min={min}
+        max={max}
+        onCommit={onCommit}
+        className="flex-1 min-w-0 h-full bg-transparent text-[12px] tabular-nums outline-none pr-1"
+      />
+      {suffix && <span className="shrink-0 pr-2 text-[11px] text-gray-400 dark:text-neutral-500 select-none">{suffix}</span>}
+    </label>
+  );
+}
+
+// Position, size, rotation and flip for the selection, as one compact block: X/Y and W/H in a 2x2
+// grid (single shape only - a multi-selection shares no one position), then rotation and the flip
+// toggles side by side.
+function TransformBlock({
+  nodes,
+  onCommit,
+  onFlip,
+}: {
+  nodes: WhiteboardNode[];
+  onCommit: (patch: Partial<WhiteboardNode>) => void;
+  onFlip: (axis: "horizontal" | "vertical") => void;
+}) {
+  const node = nodes[0];
+  const ids = nodes.map((n) => n.id).join(",");
+  return (
+    <div className="flex flex-col gap-1.5">
+      {nodes.length === 1 && (
+        <div className="grid grid-cols-2 gap-1.5">
+          <PrefixedNumber prefix="X" title="Horizontal position - drag the label to scrub" resetKey={`${ids}-x`} value={node.x} min={-100000} max={100000} onCommit={(x) => onCommit({ x })} />
+          <PrefixedNumber prefix="Y" title="Vertical position - drag the label to scrub" resetKey={`${ids}-y`} value={node.y} min={-100000} max={100000} onCommit={(y) => onCommit({ y })} />
+          <PrefixedNumber prefix="W" title="Width - drag the label to scrub" resetKey={`${ids}-w`} value={node.width} min={1} max={100000} onCommit={(width) => onCommit({ width })} />
+          <PrefixedNumber prefix="H" title="Height - drag the label to scrub" resetKey={`${ids}-h`} value={node.height} min={1} max={100000} onCommit={(height) => onCommit({ height })} />
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-1.5">
+        <PrefixedNumber
+          prefix={<TbRotateClockwise size={12} />}
+          title="Rotation in degrees - drag the icon to scrub"
+          suffix="°"
+          resetKey={`${ids}-r`}
+          value={node.rotation ?? 0}
+          min={0}
+          max={360}
+          // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
+          // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
+          onCommit={(n) => onCommit({ rotation: n === 0 || n === 360 ? undefined : n })}
+        />
+        <Segmented stretch>
+          <SegmentButton active={false} onClick={() => onFlip("horizontal")} title="Flip horizontal (mirror left to right)">
+            <TbFlipHorizontal size={14} />
+          </SegmentButton>
+          <SegmentButton active={false} onClick={() => onFlip("vertical")} title="Flip vertical (mirror top to bottom)">
+            <TbFlipVertical size={14} />
+          </SegmentButton>
+        </Segmented>
+      </div>
+    </div>
+  );
+}
+
+// Four arrows in one segmented row - the same 1px (10px with Shift) steps as the canvas's arrow keys.
+function NudgeBar({ onNudge }: { onNudge: (dx: number, dy: number) => void }) {
+  const steps: [React.ReactNode, string, (big: boolean) => [number, number]][] = [
+    [<TbArrowLeft size={13} />, "left", (b) => [b ? -10 : -1, 0]],
+    [<TbArrowUp size={13} />, "up", (b) => [0, b ? -10 : -1]],
+    [<TbArrowDown size={13} />, "down", (b) => [0, b ? 10 : 1]],
+    [<TbArrowRight size={13} />, "right", (b) => [b ? 10 : 1, 0]],
+  ];
+  return (
+    <Segmented>
+      {steps.map(([glyph, name, delta]) => (
+        <SegmentButton
+          key={name}
+          active={false}
+          onClick={(e) => {
+            const [dx, dy] = delta(e.shiftKey);
+            onNudge(dx, dy);
+          }}
+          title={`Nudge ${name} (Shift for 10px)`}
+        >
+          {glyph}
+        </SegmentButton>
+      ))}
+    </Segmented>
+  );
+}
+
+const FOOTER_BUTTON_CLASS =
+  "h-7 w-7 flex items-center justify-center rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-900 dark:hover:text-neutral-100 active:scale-95 transition";
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="flex items-center justify-between gap-2 min-h-[28px] text-xs text-gray-600 dark:text-neutral-300">
+    <label className="flex items-center justify-between gap-2 min-h-[28px] text-[12px] text-neutral-500 dark:text-neutral-400">
       {/* The label truncates rather than wrapping: a two-line label would break the even row rhythm
           that makes a long panel scannable, and the full text is still reachable on hover. */}
       <span className="truncate" title={label}>
@@ -1222,6 +1551,879 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       </span>
       {children}
     </label>
+  );
+}
+
+// ---- Fill & pattern -------------------------------------------------------------------------------
+
+// Curated starting points for a gradient - picked to cover the ramps a figure actually reaches for
+// (a cool sequential, a warm one, a diverging pair, a neutral) plus a couple of expressive ones for
+// slides/thumbnails. A preset only seeds the stops; every stop stays editable afterwards.
+const GRADIENT_PRESETS: { name: string; stops: WhiteboardGradientStop[] }[] = [
+  { name: "Ocean", stops: [{ offset: 0, color: "#0ea5e9" }, { offset: 1, color: "#1e3a8a" }] },
+  { name: "Sunset", stops: [{ offset: 0, color: "#f97316" }, { offset: 0.5, color: "#ec4899" }, { offset: 1, color: "#7c3aed" }] },
+  { name: "Mint", stops: [{ offset: 0, color: "#a7f3d0" }, { offset: 1, color: "#059669" }] },
+  { name: "Ember", stops: [{ offset: 0, color: "#fde047" }, { offset: 0.55, color: "#f97316" }, { offset: 1, color: "#b91c1c" }] },
+  { name: "Diverging", stops: [{ offset: 0, color: "#2563eb" }, { offset: 0.5, color: "#f8fafc" }, { offset: 1, color: "#dc2626" }] },
+  { name: "Aurora", stops: [{ offset: 0, color: "#22d3ee" }, { offset: 0.5, color: "#a78bfa" }, { offset: 1, color: "#f472b6" }] },
+  { name: "Graphite", stops: [{ offset: 0, color: "#f5f5f5" }, { offset: 1, color: "#404040" }] },
+  { name: "Spectrum", stops: [{ offset: 0, color: "#ef4444" }, { offset: 0.25, color: "#eab308" }, { offset: 0.5, color: "#22c55e" }, { offset: 0.75, color: "#3b82f6" }, { offset: 1, color: "#a855f7" }] },
+];
+
+function cssStops(stops: WhiteboardGradientStop[]): string {
+  return stops.map((s) => `${s.color} ${(s.offset * 100).toFixed(1)}%`).join(", ");
+}
+
+const CHECKER_BG = "bg-[conic-gradient(#d4d4d4_25%,#fff_0_50%,#d4d4d4_0_75%,#fff_0)] bg-[length:8px_8px]";
+
+// Tiny glyphs for the fill-type and pattern pickers - each one IS a miniature of what it produces,
+// so the row reads without labels.
+function FillTypeGlyph({ type }: { type: WhiteboardFillType }) {
+  const base = "w-3.5 h-3.5 rounded-[3px] ring-1 ring-inset ring-black/15 dark:ring-white/20";
+  if (type === "solid") return <span className={`${base} bg-current`} />;
+  if (type === "linear") return <span className={base} style={{ background: "linear-gradient(135deg, currentColor, transparent)" }} />;
+  if (type === "radial") return <span className={base} style={{ background: "radial-gradient(circle, currentColor, transparent 75%)" }} />;
+  return <TbPhoto size={14} />;
+}
+
+function PatternGlyph({ pattern }: { pattern: WhiteboardFillPattern }) {
+  if (pattern === "none") return <TbBan size={13} />;
+  const tile = fillPatternTile(pattern, 5);
+  return (
+    <svg width={14} height={14} viewBox="0 0 14 14" className="rounded-[2px]">
+      <defs>
+        <pattern id={`wb-glyph-${pattern}`} patternUnits="userSpaceOnUse" width={5} height={5}>
+          {tile.dots ? <path d={tile.d} fill="currentColor" /> : <path d={tile.d} fill="none" stroke="currentColor" strokeWidth={1} />}
+        </pattern>
+      </defs>
+      <rect x={0.5} y={0.5} width={13} height={13} rx={2} fill={`url(#wb-glyph-${pattern})`} stroke="currentColor" strokeOpacity={0.35} />
+    </svg>
+  );
+}
+
+// The gradient ramp itself, with one draggable handle per stop. Dragging a handle previews live on
+// the canvas and commits once on release (same one-gesture-one-undo-step rule as every slider here);
+// clicking the bar between handles drops a new stop there in the color the ramp already has at that
+// point, so adding a stop never visibly changes the gradient until you recolor it.
+function GradientBar({
+  stops,
+  selected,
+  onSelect,
+  onCommit,
+  onPreview,
+}: {
+  stops: WhiteboardGradientStop[];
+  selected: number;
+  onSelect: (index: number) => void;
+  onCommit: (stops: WhiteboardGradientStop[]) => void;
+  onPreview: (stops: WhiteboardGradientStop[] | null) => void;
+}) {
+  const barRef = React.useRef<HTMLDivElement>(null);
+  const dragRef = React.useRef<{ index: number; moved: boolean } | null>(null);
+  const [live, setLive] = React.useState<WhiteboardGradientStop[] | null>(null);
+  const shown = live ?? stops;
+
+  const offsetAt = (clientX: number) => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return 0;
+    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  };
+
+  const colorAt = (offset: number): string => {
+    const sorted = [...stops].sort((a, b) => a.offset - b.offset);
+    const after = sorted.findIndex((s) => s.offset >= offset);
+    if (after <= 0) return sorted[Math.max(0, after)].color;
+    const a = sorted[after - 1];
+    const b = sorted[after];
+    const t = b.offset === a.offset ? 0 : (offset - a.offset) / (b.offset - a.offset);
+    const mix = (i: number) => Math.round(parseInt(a.color.slice(i, i + 2), 16) * (1 - t) + parseInt(b.color.slice(i, i + 2), 16) * t);
+    if (!/^#[0-9a-f]{6}$/i.test(a.color) || !/^#[0-9a-f]{6}$/i.test(b.color)) return a.color;
+    return `#${[1, 3, 5].map((i) => mix(i).toString(16).padStart(2, "0")).join("")}`;
+  };
+
+  return (
+    <div className="relative h-7 pt-0.5 px-[7px]">
+      <div
+        ref={barRef}
+        className={`relative h-5 rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 cursor-copy ${CHECKER_BG}`}
+        title="Click to add a stop - drag a stop to move it"
+        onPointerDown={(e) => {
+          if (e.target !== e.currentTarget) return;
+          const offset = offsetAt(e.clientX);
+          const next = [...stops, { offset, color: colorAt(offset) }];
+          onCommit(next);
+          onSelect(next.length - 1);
+        }}
+      >
+        <div className="absolute inset-0 rounded-md pointer-events-none" style={{ background: `linear-gradient(90deg, ${cssStops([...shown].sort((a, b) => a.offset - b.offset))})` }} />
+        {shown.map((stop, i) => (
+          <button
+            key={i}
+            type="button"
+            title={`${stop.color.toUpperCase()} at ${Math.round(stop.offset * 100)}%`}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+              dragRef.current = { index: i, moved: false };
+              onSelect(i);
+            }}
+            onPointerMove={(e) => {
+              const drag = dragRef.current;
+              if (!drag) return;
+              drag.moved = true;
+              const next = stops.map((s, j) => (j === drag.index ? { ...s, offset: offsetAt(e.clientX) } : s));
+              setLive(next);
+              onPreview(next);
+            }}
+            onPointerUp={() => {
+              const drag = dragRef.current;
+              dragRef.current = null;
+              onPreview(null);
+              if (drag?.moved && live) onCommit(live);
+              setLive(null);
+            }}
+            className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-[26px] rounded-[4px] cursor-ew-resize transition-shadow ${
+              selected === i ? "shadow-[0_0_0_2px_#fff,0_0_0_3.5px_#3b82f6,0_2px_6px_rgba(0,0,0,0.25)] z-10" : "shadow-[0_0_0_2px_#fff,0_0_0_2.5px_rgba(0,0,0,0.18),0_1px_3px_rgba(0,0,0,0.2)]"
+            }`}
+            style={{ left: `${stop.offset * 100}%`, backgroundColor: stop.color }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FillControls({
+  nodes,
+  updateNodes,
+  onPreviewNodes,
+  onPickFillImage,
+  assetUrlFor,
+}: {
+  nodes: WhiteboardNode[];
+  updateNodes: (patch: Partial<WhiteboardNode>) => void;
+  onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
+  onPickFillImage?: () => Promise<string | null>;
+  assetUrlFor?: (fileName: string) => string | null;
+}) {
+  const node = nodes[0];
+  const ids = nodes.map((n) => n.id).join(",");
+  const type = node.fillType ?? "solid";
+  const stops = resolveGradientStops(node);
+  const [selectedStop, setSelectedStop] = React.useState(0);
+  const stop = stops[Math.min(selectedStop, stops.length - 1)];
+  const stopIndex = Math.min(selectedStop, stops.length - 1);
+  const [picking, setPicking] = React.useState(false);
+  const [imgNatural, setImgNatural] = React.useState<{ w: number; h: number } | null>(null);
+  const [dragOffset, setDragOffset] = React.useState<{ x: number; y: number } | null>(null);
+  const [boxSize, setBoxSize] = React.useState<{ w: number; h: number }>({ w: 240, h: 80 });
+  const previewBoxRef = React.useRef<HTMLDivElement>(null);
+  const dragRef = React.useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startOx: number;
+    startOy: number;
+    boxW: number;
+    boxH: number;
+    moved: boolean;
+  } | null>(null);
+
+  const pickImage = async () => {
+    if (!onPickFillImage || picking) return;
+    setPicking(true);
+    try {
+      const asset = await onPickFillImage();
+      if (asset) {
+        updateNodes({
+          fillType: "image",
+          fillImageAsset: asset,
+          fillImageOffsetX: undefined,
+          fillImageOffsetY: undefined,
+          fillImageScale: undefined,
+        });
+      }
+    } finally {
+      setPicking(false);
+    }
+  };
+
+  const setType = (next: WhiteboardFillType) => {
+    if (next === type) return;
+    if (next === "image") {
+      if (node.fillImageAsset) updateNodes({ fillType: "image" });
+      else void pickImage();
+      return;
+    }
+    if (next === "solid") {
+      updateNodes({ fillType: undefined, fillColor: node.fillColor ?? stops[0].color });
+      return;
+    }
+    // Materialize the stops so the gradient keeps the colors it's showing even if fillColor later
+    // changes (resolveGradientStops derives its fallback ramp from fillColor).
+    updateNodes({ fillType: next, fillGradientStops: stops, fillColor: node.fillColor ?? stops[0].color });
+  };
+
+  const commitStops = (next: WhiteboardGradientStop[]) => updateNodes({ fillGradientStops: next });
+  const imageUrl = node.fillImageAsset && assetUrlFor ? assetUrlFor(node.fillImageAsset) : null;
+  const pattern = node.fillPattern ?? "none";
+
+  React.useEffect(() => {
+    if (!previewBoxRef.current) return;
+    const rect = previewBoxRef.current.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      setBoxSize({ w: rect.width, h: rect.height });
+    }
+  }, [type, imageUrl]);
+
+  return (
+    <>
+      <Segmented stretch>
+        {(["solid", "linear", "radial", "image"] as const).map((t) => (
+          <SegmentButton key={t} active={type === t} onClick={() => setType(t)} title={t === "solid" ? "Solid color" : t === "linear" ? "Linear gradient" : t === "radial" ? "Radial gradient" : "Image fill"}>
+            <FillTypeGlyph type={t} />
+          </SegmentButton>
+        ))}
+      </Segmented>
+
+      {type === "solid" && <ColorField label="Color" value={node.fillColor ?? "#ffffff"} onChange={(fillColor) => updateNodes({ fillColor })} />}
+
+      {(type === "linear" || type === "radial") && (
+        <div className="flex flex-col gap-1.5">
+          <GradientBar
+            stops={stops}
+            selected={stopIndex}
+            onSelect={setSelectedStop}
+            onCommit={commitStops}
+            onPreview={(next) => onPreviewNodes?.(next ? { fillGradientStops: next } : null)}
+          />
+          <div className="flex items-center gap-1.5">
+            <HexColorInput value={stop.color} onChange={(color) => commitStops(stops.map((s, i) => (i === stopIndex ? { ...s, color } : s)))} title="Selected stop's color" />
+            <label className={`flex items-center h-7 w-[64px] ${INPUT_SURFACE_CLASS} focus-within:bg-white dark:focus-within:bg-neutral-900 focus-within:border-blue-500/70`} title="Selected stop's position">
+              <ClampedNumberField
+                key={`${ids}-stop-${stopIndex}-${stop.offset}`}
+                initialValue={Math.round(stop.offset * 100)}
+                min={0}
+                max={100}
+                onCommit={(n) => commitStops(stops.map((s, i) => (i === stopIndex ? { ...s, offset: n / 100 } : s)))}
+                className="flex-1 min-w-0 h-full pl-2 bg-transparent text-[12px] tabular-nums outline-none"
+              />
+              <span className="pr-1.5 text-[11px] text-gray-400 dark:text-neutral-500">%</span>
+            </label>
+            <div className="ml-auto flex items-center">
+              <button
+                type="button"
+                className={FOOTER_BUTTON_CLASS}
+                title="Reverse the gradient"
+                onClick={() => commitStops(stops.map((s) => ({ ...s, offset: 1 - s.offset })))}
+              >
+                <TbArrowsExchange size={14} />
+              </button>
+              <button
+                type="button"
+                className={`${FOOTER_BUTTON_CLASS} disabled:opacity-30 disabled:pointer-events-none`}
+                title="Remove the selected stop"
+                disabled={stops.length <= 2}
+                onClick={() => {
+                  commitStops(stops.filter((_, i) => i !== stopIndex));
+                  setSelectedStop(Math.max(0, stopIndex - 1));
+                }}
+              >
+                <TbMinus size={14} />
+              </button>
+            </div>
+          </div>
+          {type === "linear" && (
+            <Field label="Angle">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  className={FOOTER_BUTTON_CLASS}
+                  title="Rotate 45°"
+                  onClick={() => updateNodes({ fillGradientAngle: ((node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE) + 45) % 360 })}
+                >
+                  <span className="inline-block transition-transform duration-200" style={{ transform: `rotate(${node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE}deg)` }}>
+                    <TbArrowRight size={14} />
+                  </span>
+                </button>
+                <div className="w-[76px]">
+                  <PrefixedNumber
+                    prefix={<TbAngle size={12} />}
+                    title="Gradient direction in degrees - 0 runs left to right, 90 top to bottom"
+                    suffix="°"
+                    resetKey={`${ids}-ga`}
+                    value={node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE}
+                    min={0}
+                    max={360}
+                    onCommit={(n) => updateNodes({ fillGradientAngle: n % 360 })}
+                  />
+                </div>
+              </div>
+            </Field>
+          )}
+          <div className="grid grid-cols-8 gap-1 pt-0.5">
+            {GRADIENT_PRESETS.map((preset) => (
+              <button
+                key={preset.name}
+                type="button"
+                title={preset.name}
+                onClick={() => {
+                  setSelectedStop(0);
+                  commitStops(preset.stops);
+                }}
+                className="h-5 rounded-[5px] ring-1 ring-inset ring-black/10 dark:ring-white/10 hover:scale-110 hover:shadow-md active:scale-95 transition"
+                style={{ background: `linear-gradient(135deg, ${cssStops(preset.stops)})` }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {type === "image" && (() => {
+        const fit = node.fillImageFit ?? "cover";
+        const ox = dragOffset ? dragOffset.x : (node.fillImageOffsetX ?? 0);
+        const oy = dragOffset ? dragOffset.y : (node.fillImageOffsetY ?? 0);
+        const scale = Math.max(0.1, node.fillImageScale ?? 1);
+        const hasTransform = ox !== 0 || oy !== 0 || Math.abs(scale - 1) > 1e-3;
+        const previewRect = imgNatural
+          ? fillImageRect(fit, boxSize.w, boxSize.h, imgNatural.w, imgNatural.h, ox, oy, scale)
+          : null;
+
+        return (
+          <div className="flex flex-col gap-1.5">
+            {imageUrl ? (
+              <div
+                ref={previewBoxRef}
+                title="Drag to move the image on the shape"
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  e.preventDefault();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const boxW = Math.max(1, rect.width);
+                  const boxH = Math.max(1, rect.height);
+                  setBoxSize({ w: boxW, h: boxH });
+                  const startOx = node.fillImageOffsetX ?? 0;
+                  const startOy = node.fillImageOffsetY ?? 0;
+                  dragRef.current = {
+                    pointerId: e.pointerId,
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    startOx,
+                    startOy,
+                    boxW,
+                    boxH,
+                    moved: false,
+                  };
+                  setDragOffset({ x: startOx, y: startOy });
+                }}
+                onPointerMove={(e) => {
+                  const d = dragRef.current;
+                  if (!d || d.pointerId !== e.pointerId) return;
+                  const dx = e.clientX - d.startX;
+                  const dy = e.clientY - d.startY;
+                  if (Math.abs(dx) > 1 || Math.abs(dy) > 1) d.moved = true;
+                  const nextOx = +(d.startOx + dx / d.boxW).toFixed(4);
+                  const nextOy = +(d.startOy + dy / d.boxH).toFixed(4);
+                  setDragOffset({ x: nextOx, y: nextOy });
+                  onPreviewNodes?.({ fillImageOffsetX: nextOx, fillImageOffsetY: nextOy });
+                }}
+                onPointerUp={(e) => {
+                  const d = dragRef.current;
+                  if (!d || d.pointerId !== e.pointerId) return;
+                  const dx = e.clientX - d.startX;
+                  const dy = e.clientY - d.startY;
+                  const moved = d.moved;
+                  const nextOx = +(d.startOx + dx / d.boxW).toFixed(4);
+                  const nextOy = +(d.startOy + dy / d.boxH).toFixed(4);
+                  dragRef.current = null;
+                  setDragOffset(null);
+                  onPreviewNodes?.(null);
+                  if (moved) {
+                    updateNodes({ fillImageOffsetX: nextOx, fillImageOffsetY: nextOy });
+                  }
+                }}
+                onPointerCancel={(e) => {
+                  if (!dragRef.current || dragRef.current.pointerId !== e.pointerId) return;
+                  dragRef.current = null;
+                  setDragOffset(null);
+                  onPreviewNodes?.(null);
+                }}
+                className={`group relative h-[80px] w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 cursor-grab active:cursor-grabbing select-none touch-none ${CHECKER_BG}`}
+              >
+                <img
+                  src={imageUrl}
+                  alt=""
+                  draggable={false}
+                  onLoad={(e) => {
+                    const nw = e.currentTarget.naturalWidth;
+                    const nh = e.currentTarget.naturalHeight;
+                    if (nw > 0 && nh > 0) setImgNatural({ w: nw, h: nh });
+                    void preloadWhiteboardImage(imageUrl);
+                  }}
+                  style={
+                    previewRect
+                      ? {
+                          position: "absolute",
+                          left: previewRect.x,
+                          top: previewRect.y,
+                          width: previewRect.w,
+                          height: previewRect.h,
+                          maxWidth: "none",
+                          maxHeight: "none",
+                          pointerEvents: "none",
+                        }
+                      : {
+                          position: "absolute",
+                          left: `${((1 - scale) / 2 + ox) * 100}%`,
+                          top: `${((1 - scale) / 2 + oy) * 100}%`,
+                          width: `${scale * 100}%`,
+                          height: `${scale * 100}%`,
+                          objectFit: fit,
+                          maxWidth: "none",
+                          maxHeight: "none",
+                          pointerEvents: "none",
+                        }
+                  }
+                />
+                <div
+                  onPointerDown={(e) => e.stopPropagation()}
+                  className="absolute top-1.5 right-1.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  {hasTransform && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateNodes({
+                          fillImageOffsetX: undefined,
+                          fillImageOffsetY: undefined,
+                          fillImageScale: undefined,
+                        })
+                      }
+                      title="Reset image position and zoom"
+                      className="h-5 px-1.5 rounded bg-black/65 hover:bg-black/80 text-white text-[10px] font-medium backdrop-blur-sm transition"
+                    >
+                      Reset
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void pickImage()}
+                    disabled={!onPickFillImage || picking}
+                    title="Replace image"
+                    className="h-5 px-1.5 rounded bg-black/65 hover:bg-black/80 text-white text-[10px] font-medium backdrop-blur-sm flex items-center gap-1 transition"
+                  >
+                    <TbPhoto size={11} />
+                    <span>{picking ? "…" : "Replace"}</span>
+                  </button>
+                </div>
+                <span className="pointer-events-none absolute bottom-1 left-1.5 px-1.5 py-0.5 rounded bg-black/55 text-white/90 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">
+                  Drag to move
+                </span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void pickImage()}
+                disabled={!onPickFillImage || picking}
+                title="Choose the picture this shape is filled with"
+                className={`group relative h-[72px] w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/10 dark:ring-white/10 ${CHECKER_BG}`}
+              >
+                <span className="absolute inset-0 flex items-center justify-center gap-1.5 text-[11px] font-medium text-neutral-500">
+                  <TbPhoto size={14} />
+                  {picking ? "Choosing…" : "Choose image…"}
+                </span>
+              </button>
+            )}
+            <Segmented stretch>
+              {(["cover", "contain", "fill"] as const).map((f) => (
+                <SegmentButton
+                  key={f}
+                  active={fit === f}
+                  onClick={() => updateNodes({ fillImageFit: f })}
+                  title={f === "cover" ? "Crop to fill the shape" : f === "contain" ? "Fit the whole picture inside" : "Stretch to the shape"}
+                >
+                  {f === "cover" ? "Fill" : f === "contain" ? "Fit" : "Stretch"}
+                </SegmentButton>
+              ))}
+            </Segmented>
+            {imageUrl && (
+              <SliderField
+                label="Zoom"
+                resetKey={`fis-${ids}`}
+                value={Math.round(scale * 100)}
+                min={25}
+                max={300}
+                step={5}
+                onCommit={(n) => updateNodes({ fillImageScale: n === 100 ? undefined : n / 100 })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillImageScale: n / 100 })}
+                title="Zoom the background image in or out"
+              />
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Fades only the interior - outline and text stay solid - so a shape can sit over the image or
+          plot it annotates without hiding it. */}
+      <SliderField
+        label="Opacity"
+        resetKey={`fo-${ids}`}
+        value={Math.round((node.fillOpacity ?? 1) * 100)}
+        min={0}
+        max={100}
+        step={1}
+        onCommit={(n) => updateNodes({ fillOpacity: n >= 100 ? undefined : n / 100, fillColor: node.fillColor ?? "#ffffff" })}
+        onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillOpacity: n / 100, fillColor: node.fillColor ?? "#ffffff" })}
+        title="100% is a solid fill, 0% fully see-through - the outline and text are unaffected"
+      />
+
+      <div className="flex items-center justify-between gap-2 pt-1">
+        <span className="text-[12px] text-neutral-500 dark:text-neutral-400">Pattern</span>
+        <Segmented>
+          {(["none", "grid", "dots", "lines", "diagonal"] as const).map((p) => (
+            <SegmentButton key={p} active={pattern === p} onClick={() => updateNodes({ fillPattern: p === "none" ? undefined : p })} title={p === "none" ? "No pattern" : `${p[0].toUpperCase()}${p.slice(1)} pattern`}>
+              <PatternGlyph pattern={p} />
+            </SegmentButton>
+          ))}
+        </Segmented>
+      </div>
+      {pattern !== "none" && (
+        <>
+          <ColorField label="Pattern color" value={node.fillPatternColor ?? node.strokeColor} onChange={(fillPatternColor) => updateNodes({ fillPatternColor })} />
+          <SliderField
+            label="Pattern opacity"
+            resetKey={`fpo-${ids}`}
+            value={Math.round((node.fillPatternOpacity ?? DEFAULT_FILL_PATTERN_OPACITY) * 100)}
+            min={0}
+            max={100}
+            onCommit={(n) => updateNodes({ fillPatternOpacity: n / 100 })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillPatternOpacity: n / 100 })}
+          />
+          <SliderField
+            label="Spacing"
+            resetKey={`fps-${ids}`}
+            value={node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING}
+            min={4}
+            max={400}
+            sliderMax={80}
+            onCommit={(n) => updateNodes({ fillPatternSpacing: n })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillPatternSpacing: n })}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
+// ---- Plot axes ----------------------------------------------------------------------------------
+
+// Each axis layout drawn as a tiny plot of itself - the picker reads at a glance as "math class",
+// "journal figure", "framed" and "bare" without needing those words.
+function AxisPlacementGlyph({ placement }: { placement: AxisPlacement }) {
+  return (
+    <svg width={18} height={14} viewBox="0 0 18 14" fill="none" stroke="currentColor" strokeLinecap="round">
+      <path d="M2.5,11 C6,2 9,2 15.5,4" strokeWidth={1.4} opacity={0.55} />
+      {placement === "origin" && <path d="M1,7.5 H17 M9,1 V13" strokeWidth={1.2} />}
+      {placement === "edge" && <path d="M2,1 V12.5 H17" strokeWidth={1.2} />}
+      {placement === "box" && <rect x={2} y={1} width={15} height={11.5} rx={0.5} strokeWidth={1.2} />}
+      {placement === "none" && <path d="M2,12.5 H3 M6,12.5 H7 M10,12.5 H11 M14,12.5 H15" strokeWidth={1.2} opacity={0.6} />}
+    </svg>
+  );
+}
+
+const AXIS_PLACEMENT_OPTIONS: { value: AxisPlacement; title: string }[] = [
+  { value: "origin", title: "Axes through the origin" },
+  { value: "edge", title: "Axes along the left and bottom edges (journal style)" },
+  { value: "box", title: "Framed plot" },
+  { value: "none", title: "No axis lines" },
+];
+
+// Axis placement, where the numbers sit, tick marks, axis color and the gridlines - for "graph" and
+// "functionPlot", which share one axis renderer (whiteboardHandlers.ts's plotAxisDecorations).
+function PlotAxesFields({
+  nodes,
+  updateNodes,
+  onPreviewNodes,
+}: {
+  nodes: WhiteboardNode[];
+  updateNodes: (patch: Partial<WhiteboardNode>) => void;
+  onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
+}) {
+  const node = nodes[0];
+  const ids = nodes.map((n) => n.id).join(",");
+  const style = resolvePlotAxisStyle(outlineOptionsFor(node));
+  const isGraph = node.shapeType === "graph";
+  const showGrid = isGraph ? node.graphShowGrid ?? true : node.plotShowGrid ?? false;
+  const xSide = node.xLabelSide ?? "auto";
+  const ySide = node.yLabelSide ?? "auto";
+  return (
+    <>
+      <Segmented stretch>
+        {AXIS_PLACEMENT_OPTIONS.map((opt) => (
+          <SegmentButton
+            key={opt.value}
+            active={style.placement === opt.value}
+            // Switching layout resets the label sides and ticks to that layout's own defaults - a
+            // "top" label row chosen for a framed plot rarely makes sense once axes cross the origin.
+            onClick={() => updateNodes({ axisPlacement: opt.value === "origin" ? undefined : opt.value, xLabelSide: undefined, yLabelSide: undefined, tickMarks: undefined, axisColor: undefined })}
+            title={opt.title}
+          >
+            <AxisPlacementGlyph placement={opt.value} />
+          </SegmentButton>
+        ))}
+      </Segmented>
+      <Field label="X numbers">
+        <Segmented>
+          {(["auto", "bottom", "top"] as const).map((side) => (
+            <SegmentButton key={side} active={xSide === side} onClick={() => updateNodes({ xLabelSide: side === "auto" ? undefined : side })} title={side === "auto" ? "Follow the axis line" : `Pinned to the ${side} edge`}>
+              {side === "auto" ? "Axis" : side === "bottom" ? "Bottom" : "Top"}
+            </SegmentButton>
+          ))}
+        </Segmented>
+      </Field>
+      <Field label="Y numbers">
+        <Segmented>
+          {(["auto", "left", "right"] as const).map((side) => (
+            <SegmentButton key={side} active={ySide === side} onClick={() => updateNodes({ yLabelSide: side === "auto" ? undefined : side })} title={side === "auto" ? "Follow the axis line" : `Pinned to the ${side} edge`}>
+              {side === "auto" ? "Axis" : side === "left" ? "Left" : "Right"}
+            </SegmentButton>
+          ))}
+        </Segmented>
+      </Field>
+      <Field label="Tick marks">
+        <Segmented>
+          {(["none", "outside", "inside"] as const).map((t) => (
+            <SegmentButton key={t} active={style.tickMarks === t} onClick={() => updateNodes({ tickMarks: t })} title={t === "none" ? "No tick marks" : `Ticks point ${t === "outside" ? "away from" : "into"} the plot`}>
+              {t === "none" ? "None" : t === "outside" ? "Out" : "In"}
+            </SegmentButton>
+          ))}
+        </Segmented>
+      </Field>
+      {style.placement !== "none" && <ColorField label="Axis color" value={style.axisColor} onChange={(axisColor) => updateNodes({ axisColor })} />}
+      <Field label="Gridlines">
+        <input
+          type="checkbox"
+          checked={showGrid}
+          onChange={(e) => updateNodes(isGraph ? { graphShowGrid: e.target.checked } : { plotShowGrid: e.target.checked })}
+          className={CHECKBOX_CLASS}
+          title="Gridlines across the whole plot at every tick"
+        />
+      </Field>
+      {showGrid && (
+        <>
+          <ColorField label="Grid color" value={style.gridColor} onChange={(gridColor) => updateNodes({ gridColor })} />
+          <SliderField
+            label="Grid opacity"
+            resetKey={`go-${ids}`}
+            value={Math.round(style.gridOpacity * 100)}
+            min={0}
+            max={100}
+            onCommit={(n) => updateNodes({ gridOpacity: n >= 100 ? undefined : n / 100 })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { gridOpacity: n / 100 })}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
+// ---- Lattice label / motion / loop export -------------------------------------------------------
+
+// The caption card's on/off, heading and body - editable because the same lattice teaches crystal
+// structures, spin models and unit cells as often as gauge theory (see WhiteboardNode.latticeShowLabel).
+function LatticeLabelFields({ node, updateNodes }: { node: WhiteboardNode; updateNodes: (patch: Partial<WhiteboardNode>) => void }) {
+  const show = node.latticeShowLabel ?? true;
+  const edited = node.latticeLabelTitle !== undefined || node.latticeLabelBody !== undefined;
+  return (
+    <>
+      <Field label="Show label">
+        <input type="checkbox" checked={show} onChange={(e) => updateNodes({ latticeShowLabel: e.target.checked })} className={CHECKBOX_CLASS} />
+      </Field>
+      {show && (
+        <>
+          <input
+            type="text"
+            value={node.latticeLabelTitle ?? DEFAULT_LATTICE_LABEL_TITLE}
+            placeholder="Heading"
+            onChange={(e) => updateNodes({ latticeLabelTitle: e.target.value })}
+            className={`w-full h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px] font-mono font-semibold text-teal-700 dark:text-teal-400`}
+            title="Heading line of the caption"
+          />
+          <textarea
+            value={node.latticeLabelBody ?? DEFAULT_LATTICE_LABEL_BODY}
+            placeholder="Body text - explain the concept on display"
+            onChange={(e) => updateNodes({ latticeLabelBody: e.target.value })}
+            rows={3}
+            className={`w-full px-2 py-1.5 ${INPUT_SURFACE_CLASS} text-[11px] font-mono leading-relaxed resize-y`}
+            title="Body text of the caption - new lines are kept"
+          />
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-1.5 text-[12px] text-neutral-500 dark:text-neutral-400 cursor-pointer">
+              <input type="checkbox" checked={node.latticeLabelShowStats ?? true} onChange={(e) => updateNodes({ latticeLabelShowStats: e.target.checked })} className={CHECKBOX_CLASS} />
+              Size &amp; site count
+            </label>
+            {edited && (
+              <button type="button" className={MINI_BUTTON_CLASS} onClick={() => updateNodes({ latticeLabelTitle: undefined, latticeLabelBody: undefined })} title="Back to the original heading and hint">
+                Reset text
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+const AUTO_ROTATE_OPTIONS: { value: NonNullable<WhiteboardNode["latticeAutoRotate"]>; label: string; title: string }[] = [
+  { value: "off", label: "Off", title: "No auto-rotation" },
+  { value: "x", label: "X", title: "Rotate about the X axis" },
+  { value: "y", label: "Y", title: "Rotate about the Y axis" },
+  { value: "z", label: "Z", title: "Rotate about the Z axis" },
+  { value: "tumble", label: "XYZ", title: "Tumble about all three axes at once" },
+];
+
+// Auto-rotation plus "export the loop as a video/GIF". The export renders frames offline (see
+// latticeLoopExport.ts), so the loop length here is independent of the live speed: whatever length
+// is picked, the clip holds exactly one full cycle and loops seamlessly.
+function LatticeMotionFields({
+  node,
+  updateNodes,
+  onSaveExport,
+}: {
+  node: WhiteboardNode;
+  updateNodes: (patch: Partial<WhiteboardNode>) => void;
+  onSaveExport?: (bytes: Uint8Array, extension: "mp4" | "gif") => Promise<boolean>;
+}) {
+  const mode = node.latticeAutoRotate ?? "off";
+  const speed = node.latticeRotateSpeed ?? DEFAULT_LATTICE_ROTATE_SPEED;
+  const naturalSeconds = Math.round((360 * (mode === "tumble" ? 2 : 1)) / Math.max(1, Math.abs(speed)));
+  const [format, setFormat] = React.useState<"mp4" | "gif">("mp4");
+  const [seconds, setSeconds] = React.useState<number | null>(null);
+  const [size, setSize] = React.useState<number | null>(null);
+  const [progress, setProgress] = React.useState<number | null>(null);
+  const [message, setMessage] = React.useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
+  const loopSeconds = Math.max(1, Math.min(60, seconds ?? Math.min(30, Math.max(3, naturalSeconds))));
+  const longSide = size ?? (format === "gif" ? 480 : 1080);
+
+  const runExport = async () => {
+    if (!onSaveExport) return;
+    const aspect = node.height / node.width;
+    const width = aspect <= 1 ? longSide : Math.round(longSide / aspect);
+    const height = aspect <= 1 ? Math.round(longSide * aspect) : longSide;
+    const showLabel = node.latticeShowLabel ?? true;
+    const n = node.latticeSize ?? DEFAULT_LATTICE_SIZE;
+    const stats = (node.latticeLabelShowStats ?? true) ? `${n}×${n}×${n} · ${n * n * n} sites` : "";
+    const title = [node.latticeLabelTitle ?? DEFAULT_LATTICE_LABEL_TITLE, stats].filter(Boolean).join(" · ");
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setMessage(null);
+    setProgress(0);
+    try {
+      const bytes = await exportLatticeLoop(
+        node.id,
+        {
+          format,
+          seconds: loopSeconds,
+          width,
+          height,
+          fps: format === "gif" ? 20 : 30,
+          background: "#ffffff",
+          caption: showLabel ? { title, body: node.latticeLabelBody ?? DEFAULT_LATTICE_LABEL_BODY } : null,
+        },
+        setProgress,
+        controller.signal
+      );
+      setProgress(null);
+      const saved = await onSaveExport(bytes, format);
+      if (saved) setMessage({ kind: "ok", text: `Saved ${format.toUpperCase()} · ${(bytes.length / 1048576).toFixed(1)} MB` });
+    } catch (err) {
+      setProgress(null);
+      if ((err as Error)?.name !== "AbortError") setMessage({ kind: "error", text: err instanceof Error ? err.message : "Export failed" });
+    } finally {
+      abortRef.current = null;
+    }
+  };
+
+  return (
+    <>
+      <Segmented stretch>
+        {AUTO_ROTATE_OPTIONS.map((opt) => (
+          <SegmentButton key={opt.value} active={mode === opt.value} onClick={() => updateNodes({ latticeAutoRotate: opt.value === "off" ? undefined : opt.value })} title={opt.title}>
+            {opt.value === "off" ? <TbPlayerPause size={13} /> : opt.label}
+          </SegmentButton>
+        ))}
+      </Segmented>
+      {mode !== "off" && (
+        <SliderField
+          label="Speed (°/s)"
+          resetKey={`rs-${node.id}`}
+          value={speed}
+          min={-MAX_LATTICE_ROTATE_SPEED}
+          max={MAX_LATTICE_ROTATE_SPEED}
+          step={1}
+          integer
+          onCommit={(n) => updateNodes({ latticeRotateSpeed: n })}
+          title="Degrees per second - negative spins the other way. Dragging the lattice pauses rotation while you hold it."
+        />
+      )}
+
+      <Card>
+        <div className="flex items-center justify-between">
+          <span className="text-[12px] font-medium text-neutral-700 dark:text-neutral-200">Export loop</span>
+          <Segmented>
+            {(["mp4", "gif"] as const).map((f) => (
+              <SegmentButton
+                key={f}
+                active={format === f}
+                onClick={() => {
+                  setFormat(f);
+                  setSize(null);
+                }}
+                title={f === "mp4" ? "H.264 video - small file, full color" : "Animated GIF - plays anywhere, loops forever"}
+              >
+                {f.toUpperCase()}
+              </SegmentButton>
+            ))}
+          </Segmented>
+        </div>
+        <Field label="Loop length (s)">
+          <ClampedNumberField key={`ls-${node.id}-${naturalSeconds}`} initialValue={loopSeconds} min={1} max={60} onCommit={(n) => setSeconds(n)} className={NUMBER_INPUT_CLASS} title="One full rotation fills the clip exactly, so it loops without a jump" />
+        </Field>
+        <Field label="Size">
+          <Segmented>
+            {(format === "gif" ? [320, 480, 720] : [720, 1080, 1440]).map((s) => (
+              <SegmentButton key={s} active={longSide === s} onClick={() => setSize(s)} title={`${s}px on the long side`}>
+                {s}
+              </SegmentButton>
+            ))}
+          </Segmented>
+        </Field>
+        {progress !== null ? (
+          <div className="flex items-center gap-2 h-7">
+            <div className="relative flex-1 h-1.5 rounded-full bg-black/[0.07] dark:bg-white/10 overflow-hidden">
+              <div className="absolute inset-y-0 left-0 rounded-full bg-blue-500 transition-[width] duration-150" style={{ width: `${Math.round(progress * 100)}%` }} />
+            </div>
+            <span className="w-8 text-right text-[11px] tabular-nums text-neutral-500">{Math.round(progress * 100)}%</span>
+            <button type="button" className={FOOTER_BUTTON_CLASS} title="Cancel export" onClick={() => abortRef.current?.abort()}>
+              <IoCloseOutline size={15} />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            disabled={!onSaveExport}
+            onClick={() => void runExport()}
+            className="h-8 w-full flex items-center justify-center gap-1.5 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-[12px] font-medium hover:opacity-90 active:scale-[0.98] transition disabled:opacity-40"
+          >
+            <TbMovie size={14} />
+            Export {format.toUpperCase()}…
+          </button>
+        )}
+        {message && <span className={`text-[11px] ${message.kind === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>{message.text}</span>}
+      </Card>
+    </>
   );
 }
 
@@ -1252,7 +2454,7 @@ function TableStructureFields({ node, updateNodes }: { node: WhiteboardNode; upd
     if (grid.cols <= MIN_TABLE_COLS) return;
     updateNodes({ tableCols: grid.cols - 1, tableColWidths: removeTableFraction(grid.colWidths, grid.cols - 1), tableCellText: grid.cellText.map((r) => r.slice(0, -1)) });
   };
-  const stepperButtonClass = "h-6 w-6 flex items-center justify-center rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800 text-xs leading-none disabled:opacity-30 disabled:hover:bg-transparent";
+  const stepperButtonClass = "h-6 w-6 flex items-center justify-center rounded-md bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-xs leading-none disabled:opacity-30 disabled:pointer-events-none transition";
   return (
     <>
       <Field label="Rows">
@@ -1319,7 +2521,7 @@ function TableCellFields({
       <select
         value={anchorBorders[side] ?? "solid"}
         onChange={(e) => updateNodes(withRangeBorderSide(node, range, side, e.target.value as TableBorderStyle))}
-        className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+        className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
       >
         <option value="solid">Solid</option>
         <option value="dashed">Dashed</option>
@@ -1335,8 +2537,7 @@ function TableCellFields({
       </p>
       <Field label="Background">
         <div className="flex items-center gap-1.5">
-          <input
-            type="color"
+          <ColorInput
             value={anchorFill ?? node.fillColor ?? "#ffffff"}
             onChange={(e) => updateNodes(withRangeFill(node, range, e.target.value))}
             className={SWATCH_CLASS}
@@ -1363,13 +2564,19 @@ function TableCellFields({
 const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   selectedNodes,
   selectedEdges,
+  pageNodes = [],
   tableRangeSelection,
   onBatchEditNodes,
   onEditEdge,
+  onBatchEditEdges,
+  onBatchEditItems,
   onDeleteNode,
   onDeleteEdge,
   onDuplicateNode,
+  onDuplicateEdge,
   onBringToFront,
+  onBringForward,
+  onSendBackward,
   onSendToBack,
   onGroup,
   onUngroup,
@@ -1377,10 +2584,23 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   croppingNodeId,
   onToggleCrop,
   onPreviewNodes,
+  onPreviewEdges,
+  onPickFillImage,
+  assetUrlFor,
+  onSaveExport,
 }) => {
   const updateNodes = (patch: Partial<WhiteboardNode>) => {
     if (selectedNodes.length === 0) return;
     onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, ...patch })));
+  };
+
+  // Mirrors the whole selection - shapes AND any selected connectors - across its combined bounding
+  // box center (see flipItems), as one undo step.
+  const flipSelected = (axis: "horizontal" | "vertical") => {
+    if (selectedNodes.length === 0 && selectedEdges.length === 0) return;
+    const flipped = flipItems(selectedNodes, selectedEdges, axis, nodesById);
+    if (selectedEdges.length > 0 && onBatchEditItems) onBatchEditItems(selectedNodes, flipped.nodes, selectedEdges, flipped.edges);
+    else onBatchEditNodes(selectedNodes, flipped.nodes);
   };
 
   // Builds the live-preview callback for one node field - every slider gets one, so dragging updates
@@ -1396,167 +2616,417 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   // for a multi-selection of nodes that don't share one position.
   const nudgeSelected = (dx: number, dy: number) => {
     if (selectedNodes.length === 0) return;
-    onBatchEditNodes(selectedNodes, selectedNodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy })));
+    const movedNodes = selectedNodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy }));
+    if (selectedEdges.length > 0 && onBatchEditItems) onBatchEditItems(selectedNodes, movedNodes, selectedEdges, selectedEdges.map((e) => nudgeEdgeBy(e, dx, dy)));
+    else onBatchEditNodes(selectedNodes, movedNodes);
   };
 
   const edge = selectedEdges.length === 1 ? selectedEdges[0] : null;
+  const firstEdge = selectedEdges[0] ?? null;
+  const edgeIds = selectedEdges.map((e) => e.id).join(",");
+  const nodesById = React.useMemo(() => new Map(pageNodes.map((n) => [n.id, n])), [pageNodes]);
+  const edgeEndpoints = edge ? resolveEdgeEndpoints(edge, nodesById) : null;
+  const edgeLength = edgeEndpoints
+    ? Math.round(Math.hypot(edgeEndpoints.target.x - edgeEndpoints.source.x, edgeEndpoints.target.y - edgeEndpoints.source.y))
+    : 0;
+
   const updateEdge = (patch: Partial<WhiteboardEdge>) => {
-    if (!edge) return;
-    onEditEdge(edge, { ...edge, ...patch });
+    if (selectedEdges.length === 0) return;
+    if (selectedEdges.length === 1) {
+      onEditEdge(selectedEdges[0], { ...selectedEdges[0], ...patch });
+    } else if (onBatchEditEdges) {
+      onBatchEditEdges(selectedEdges, selectedEdges.map((e) => ({ ...e, ...patch })));
+    } else {
+      selectedEdges.forEach((e) => onEditEdge(e, { ...e, ...patch }));
+    }
   };
+
+  const transformEdges = (fn: (e: WhiteboardEdge) => WhiteboardEdge) => {
+    if (selectedEdges.length === 0) return;
+    if (selectedEdges.length === 1) {
+      onEditEdge(selectedEdges[0], fn(selectedEdges[0]));
+    } else if (onBatchEditEdges) {
+      onBatchEditEdges(selectedEdges, selectedEdges.map(fn));
+    } else {
+      selectedEdges.forEach((e) => onEditEdge(e, fn(e)));
+    }
+  };
+
+  const previewEdgeField = (key: keyof WhiteboardEdge) => (n: number | null) =>
+    onPreviewEdges?.(n === null ? null : ({ [key]: n } as Partial<WhiteboardEdge>));
 
   if (selectedNodes.length === 0 && selectedEdges.length === 0) return null;
 
+  // Freehand ink and the lattice widget carry no text, so the Text group only shows when some
+  // selected shape can show text.
+  const hasText = selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge");
+
+  // Shapes whose interior takes the full fill paint (gradient/image/pattern). Charts, tables and
+  // images keep the plain color well: their "fill" is bar color / cell background / letterbox matte,
+  // where a gradient or a photo has no sensible meaning.
+  const canPaintFill = (n: WhiteboardNode) =>
+    !["text", "freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
+  const hasFill = selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
+  const ids = selectedNodes.map((n) => n.id).join(",");
+  const allLocked =
+    selectedNodes.length > 0
+      ? selectedNodes.every((n) => n.locked ?? false)
+      : selectedEdges.length > 0 && selectedEdges.every((e) => e.locked ?? false);
+
   return (
-    <div className="absolute top-3 right-3 bottom-3 w-72 bg-white/90 dark:bg-neutral-900/90 backdrop-blur-xl border border-gray-200/80 dark:border-neutral-700/80 rounded-xl shadow-xl shadow-black/5 flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200">
+    <div className="absolute top-3 right-3 bottom-3 w-[264px] bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 animate-[wbPanelIn_180ms_ease-out]">
+      <style>{"@keyframes wbPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
       {/* Sticky header - a long panel scrolls well past its own top, and without this there's no
           persistent indication of WHAT the controls below are acting on. */}
-      <div className="shrink-0 px-3 py-2.5 border-b border-gray-100 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70">
-        <p className="text-xs font-semibold tracking-tight">
-          {selectedNodes.length > 1
-            ? `${selectedNodes.length} shapes selected`
+      <div className="shrink-0 px-3 h-11 flex items-center gap-2 border-b border-black/[0.05] dark:border-white/[0.06]">
+        <p className="text-[13px] font-semibold tracking-tight truncate">
+          {selectedNodes.length > 0 && selectedEdges.length > 0
+            ? `${selectedNodes.length} ${selectedNodes.length === 1 ? "shape" : "shapes"} + ${selectedEdges.length} ${selectedEdges.length === 1 ? "connector" : "connectors"}`
+            : selectedNodes.length > 1
+            ? `${selectedNodes.length} shapes`
             : selectedNodes.length === 1
               ? shapeLabel(selectedNodes[0].shapeType)
               : selectedEdges.length > 1
                 ? `${selectedEdges.length} connectors`
                 : "Connector"}
         </p>
+        {selectedNodes.length === 1 && (
+          <span className="ml-auto shrink-0 px-1.5 h-5 flex items-center rounded bg-black/[0.04] dark:bg-white/[0.06] text-[10px] font-medium tabular-nums text-neutral-500 dark:text-neutral-400">
+            {Math.round(selectedNodes[0].width)} × {Math.round(selectedNodes[0].height)}
+          </span>
+        )}
+        {selectedNodes.length === 0 && edge && (
+          <span className="ml-auto shrink-0 px-1.5 h-5 flex items-center rounded bg-black/[0.04] dark:bg-white/[0.06] text-[10px] font-medium tabular-nums text-neutral-500 dark:text-neutral-400">
+            {edgeLength} px
+          </span>
+        )}
       </div>
-      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-3 flex flex-col gap-4">
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain flex flex-col [scrollbar-width:thin]">
       {selectedNodes.length > 0 && (
         <>
-          <Section title="Position" dense>
-          {selectedNodes.length === 1 && (
-            <>
-              <Field label="X">
-                <ClampedNumberField
-                  key={selectedNodes[0].id}
-                  initialValue={Math.round(selectedNodes[0].x)}
-                  min={-100000}
-                  max={100000}
-                  onCommit={(n) => updateNodes({ x: n })}
-                  className={NUMBER_INPUT_CLASS}
-                />
-              </Field>
-              <Field label="Y">
-                <ClampedNumberField
-                  key={selectedNodes[0].id}
-                  initialValue={Math.round(selectedNodes[0].y)}
-                  min={-100000}
-                  max={100000}
-                  onCommit={(n) => updateNodes({ y: n })}
-                  className={NUMBER_INPUT_CLASS}
-                />
-              </Field>
-            </>
-          )}
-          <Field label="Nudge">
-            <NudgeGrid onNudge={nudgeSelected} />
-          </Field>
-
-          {selectedNodes.length > 1 && <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />}
+          <Section title="Arrange" dense>
+            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} onFlip={flipSelected} />
+            <SliderField
+              label="Opacity"
+              resetKey={`lyo-${ids}`}
+              value={Math.round((selectedNodes[0].opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateNodes({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
+            />
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <NudgeBar onNudge={nudgeSelected} />
+              <Segmented>
+                <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
+                  <TbStackFront size={14} />
+                </SegmentButton>
+                {onBringForward && (
+                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward">
+                    <TbArrowUp size={13} />
+                  </SegmentButton>
+                )}
+                {onSendBackward && (
+                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward">
+                    <TbArrowDown size={13} />
+                  </SegmentButton>
+                )}
+                <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
+                  <TbStackBack size={14} />
+                </SegmentButton>
+                {selectedNodes.length + selectedEdges.length >= 2 && (
+                  <SegmentButton active={false} onClick={onGroup} title="Group (Ctrl+G)">
+                    <TbComponents size={14} />
+                  </SegmentButton>
+                )}
+                {(selectedNodes.some((n) => n.groupId) || selectedEdges.some((e) => e.groupId)) && (
+                  <SegmentButton active={false} onClick={onUngroup} title="Ungroup (Ctrl+Shift+G)">
+                    <TbComponentsOff size={14} />
+                  </SegmentButton>
+                )}
+              </Segmented>
+            </div>
           </Section>
 
-          <Section title="Appearance" dense>
-          {selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType)) && (
-            <Field label="Fill">
-              <input
-                type="color"
-                value={selectedNodes[0].fillColor ?? "#ffffff"}
-                onChange={(e) => updateNodes({ fillColor: e.target.value })}
-                className={SWATCH_CLASS}
-              />
-            </Field>
+          {selectedNodes.length > 1 && (
+            <Section title="Align & distribute" dense>
+              <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />
+            </Section>
           )}
-          {selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+        </>
+      )}
+
+      {selectedNodes.length > 0 && hasFill && (
+        <Section title="Fill" dense>
+          {selectedNodes.every(canPaintFill) ? (
+            <FillControls nodes={selectedNodes} updateNodes={updateNodes} onPreviewNodes={onPreviewNodes} onPickFillImage={onPickFillImage} assetUrlFor={assetUrlFor} />
+          ) : (
             <>
-              <Field label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink color" : "Stroke color"}>
-                <input type="color" value={selectedNodes[0].strokeColor} onChange={(e) => updateNodes({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
-              </Field>
-              {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a
-                  flowchart box, but meaningless on a 3000px-wide imported screenshot, where a 12px
-                  ring is a hairline - the control looked like it was doing nothing. Quarter of the
-                  shorter side is the point past which a ring stops reading as a border and starts
-                  eating the shape. The numeric field beside it accepts any value regardless, so the
-                  slider's range is a convenience, never a ceiling. */}
-              {(() => {
-                const minWidth = selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0;
-                const shortestSide = Math.min(...selectedNodes.map((n) => Math.min(n.width, n.height)));
-                const sliderMax = Math.max(12, Math.round(shortestSide / 4));
-                return (
-                  <SliderField
-                    label={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink width" : "Stroke width"}
-                    resetKey={`sw-${selectedNodes.map((n) => n.id).join(",")}`}
-                    value={selectedNodes[0].strokeWidth}
-                    min={minWidth}
-                    max={MAX_STROKE_WIDTH}
-                    sliderMax={sliderMax}
-                    step={sliderMax > 40 ? 1 : 0.5}
-                    onCommit={(n) => updateNodes({ strokeWidth: n })}
-                    onPreview={previewField("strokeWidth")}
-                    title="Exact width in document units - type any value; the slider beside it is only a convenience range"
-                  />
-                );
-              })()}
+              <ColorField label="Color" value={selectedNodes[0].fillColor ?? "#ffffff"} onChange={(fillColor) => updateNodes({ fillColor })} />
+              <SliderField
+                label="Opacity"
+                resetKey={`fo-${ids}`}
+                value={Math.round((selectedNodes[0].fillOpacity ?? 1) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                onCommit={(n) => updateNodes({ fillOpacity: n >= 100 ? undefined : n / 100, fillColor: selectedNodes[0].fillColor ?? "#ffffff" })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillOpacity: n / 100, fillColor: selectedNodes[0].fillColor ?? "#ffffff" })}
+                title="100% is a solid fill, 0% fully see-through - the outline and text are unaffected"
+              />
             </>
           )}
-          <Field label="Rotation (°)">
-            <ClampedNumberField
-              key={selectedNodes.map((n) => n.id).join(",")}
-              initialValue={selectedNodes[0].rotation ?? 0}
-              min={0}
-              max={360}
-              // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
-              // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
-              onCommit={(n) => updateNodes({ rotation: n === 0 || n === 360 ? undefined : n })}
-              className={NUMBER_INPUT_CLASS}
-            />
-          </Field>
-          <Field label="Locked">
-            <input
-              type="checkbox"
-              checked={selectedNodes.every((n) => n.locked ?? false)}
-              onChange={(e) => updateNodes({ locked: e.target.checked })}
-              className={CHECKBOX_CLASS}
-              title="Prevents dragging, resizing, rotating, or nudging this shape until unlocked again - handy while manually plotting onto a graph, or annotating around a shape you don't want to bump"
-            />
-          </Field>
-          <Field label="Flip">
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => updateNodes({ flipHorizontal: !(selectedNodes[0].flipHorizontal ?? false) })}
-                title="Flip horizontal"
-                className={`p-1.5 rounded ${selectedNodes[0].flipHorizontal ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-              >
-                <TbFlipHorizontal size={16} />
-              </button>
-              <button
-                type="button"
-                onClick={() => updateNodes({ flipVertical: !(selectedNodes[0].flipVertical ?? false) })}
-                title="Flip vertical"
-                className={`p-1.5 rounded ${selectedNodes[0].flipVertical ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-              >
-                <TbFlipVertical size={16} />
-              </button>
-            </div>
-          </Field>
-          {/* An image only uses cornerRadius when its mask is "rounded" - showing the slider for a
-              rect/ellipse-masked image would be a control with no visible effect. */}
-          {selectedNodes.every(
-            (n) => n.shapeType === "rectangle" || n.shapeType === "equation" || (n.shapeType === "image" && (n.imageMask ?? "rect") === "rounded")
-          ) && (
-            <SliderField
-              label="Corner radius"
-              resetKey={`cr-${selectedNodes.map((n) => n.id).join(",")}`}
-              value={selectedNodes[0].cornerRadius ?? 0}
-              min={0}
-              max={Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2}
-              step={1}
-              onCommit={(n) => updateNodes({ cornerRadius: n })}
-              onPreview={previewField("cornerRadius")}
-            />
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+        <Section title={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink" : "Stroke"} dense>
+          <ColorField label="Color" value={selectedNodes[0].strokeColor} onChange={(strokeColor) => updateNodes({ strokeColor })} />
+          {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a
+              flowchart box, but meaningless on a 3000px-wide imported screenshot, where a 12px
+              ring is a hairline - the control looked like it was doing nothing. Quarter of the
+              shorter side is the point past which a ring stops reading as a border and starts
+              eating the shape. The numeric field beside it accepts any value regardless, so the
+              slider's range is a convenience, never a ceiling. */}
+          {(() => {
+            const minWidth = selectedNodes.every((n) => n.shapeType === "freehand") ? 1 : 0;
+            const shortestSide = Math.min(...selectedNodes.map((n) => Math.min(n.width, n.height)));
+            const sliderMax = Math.max(12, Math.round(shortestSide / 4));
+            return (
+              <SliderField
+                label="Width"
+                resetKey={`sw-${ids}`}
+                value={selectedNodes[0].strokeWidth}
+                min={minWidth}
+                max={MAX_STROKE_WIDTH}
+                sliderMax={sliderMax}
+                step={sliderMax > 40 ? 1 : 0.5}
+                onCommit={(n) => updateNodes({ strokeWidth: n })}
+                onPreview={previewField("strokeWidth")}
+                title="Exact width in document units - type any value; the slider beside it is only a convenience range"
+              />
+            );
+          })()}
+          {!selectedNodes.every((n) => n.shapeType === "freehand") && (
+            <Field label="Style">
+              <Segmented>
+                {LINE_STYLE_OPTIONS.map((opt) => (
+                  <SegmentButton
+                    key={opt.value}
+                    active={(selectedNodes[0].strokeStyle ?? "solid") === opt.value}
+                    onClick={() => updateNodes({ strokeStyle: opt.value })}
+                    title={opt.label}
+                  >
+                    <svg width={18} height={8} viewBox="0 0 18 8">
+                      <line
+                        x1={1}
+                        y1={4}
+                        x2={17}
+                        y2={4}
+                        stroke="currentColor"
+                        strokeWidth={1.75}
+                        strokeLinecap="round"
+                        strokeDasharray={opt.value === "dashed" ? "4 3" : opt.value === "dotted" ? "0.1 3.5" : undefined}
+                      />
+                    </svg>
+                  </SegmentButton>
+                ))}
+              </Segmented>
+            </Field>
           )}
+          <SliderField
+            label="Opacity"
+            resetKey={`so-${ids}`}
+            value={Math.round((selectedNodes[0].strokeOpacity ?? 1) * 100)}
+            min={0}
+            max={100}
+            step={1}
+            onCommit={(n) => updateNodes({ strokeOpacity: n >= 100 ? undefined : n / 100 })}
+            onPreview={(n) => onPreviewNodes?.(n === null ? null : { strokeOpacity: n / 100 })}
+            title="Stroke opacity (100% solid, 0% invisible border)"
+          />
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+        <Section
+          title="Shadow"
+          dense
+          action={
+            <button
+              type="button"
+              onClick={() => {
+                const isEnabled = selectedNodes[0].shadowEnabled ?? false;
+                const next = !isEnabled;
+                updateNodes({
+                  shadowEnabled: next,
+                  ...(next && selectedNodes[0].shadowBlur === undefined
+                    ? {
+                        shadowColor: DEFAULT_SHADOW_COLOR,
+                        shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                        shadowBlur: DEFAULT_SHADOW_BLUR,
+                        shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                        shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                      }
+                    : {}),
+                });
+              }}
+              className={`p-1 rounded transition ${
+                selectedNodes[0].shadowEnabled
+                  ? "text-blue-600 dark:text-blue-400 hover:bg-blue-500/10"
+                  : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+              }`}
+              title={selectedNodes[0].shadowEnabled ? "Disable shadow" : "Enable shadow"}
+            >
+              {selectedNodes[0].shadowEnabled ? <TbShadow size={15} /> : <TbShadowOff size={15} />}
+            </button>
+          }
+        >
+          {selectedNodes[0].shadowEnabled ? (
+            <>
+              <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] py-0.5">
+                {SHADOW_PRESETS.map((preset) => (
+                  <button
+                    key={preset.name}
+                    type="button"
+                    onClick={() => {
+                      const patch = "makeConfig" in preset && preset.makeConfig ? preset.makeConfig(selectedNodes[0]) : preset.config ?? {};
+                      updateNodes(patch);
+                    }}
+                    className="px-2 py-0.5 shrink-0 rounded text-[11px] font-medium bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-600 dark:text-neutral-300 transition active:scale-95"
+                    title={`Apply ${preset.name} shadow preset`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+              </div>
+
+              <ColorField
+                label="Color"
+                value={selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR}
+                onChange={(shadowColor) => updateNodes({ shadowColor })}
+              />
+
+              <SliderField
+                label="Opacity"
+                resetKey={`sho-${ids}`}
+                value={Math.round((selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowOpacity: n / 100 })}
+                onPreview={(n) => onPreviewNodes?.(n === null ? null : { shadowOpacity: n / 100 })}
+                title="Shadow opacity (0% to 100%)"
+              />
+
+              <SliderField
+                label="Blur"
+                resetKey={`shb-${ids}`}
+                value={selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR}
+                min={0}
+                max={64}
+                step={1}
+                onCommit={(n) => updateNodes({ shadowBlur: n })}
+                onPreview={previewField("shadowBlur")}
+                title="Shadow blur radius in pixels"
+              />
+
+              <Field label="Offset">
+                <div className="grid grid-cols-2 gap-1.5 w-full">
+                  <PrefixedNumber
+                    prefix="X"
+                    title="Horizontal shadow offset - drag to scrub"
+                    resetKey={`shx-${ids}`}
+                    value={selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
+                    min={-100}
+                    max={100}
+                    onCommit={(x) => updateNodes({ shadowOffsetX: x })}
+                  />
+                  <PrefixedNumber
+                    prefix="Y"
+                    title="Vertical shadow offset - drag to scrub"
+                    resetKey={`shy-${ids}`}
+                    value={selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
+                    min={-100}
+                    max={100}
+                    onCommit={(y) => updateNodes({ shadowOffsetY: y })}
+                  />
+                </div>
+              </Field>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                updateNodes({
+                  shadowEnabled: true,
+                  shadowColor: selectedNodes[0].shadowColor ?? DEFAULT_SHADOW_COLOR,
+                  shadowOpacity: selectedNodes[0].shadowOpacity ?? DEFAULT_SHADOW_OPACITY,
+                  shadowBlur: selectedNodes[0].shadowBlur ?? DEFAULT_SHADOW_BLUR,
+                  shadowOffsetX: selectedNodes[0].shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X,
+                  shadowOffsetY: selectedNodes[0].shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y,
+                });
+              }}
+              className="w-full h-7 rounded-md border border-dashed border-black/15 dark:border-white/15 text-[12px] font-medium text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white hover:border-black/30 dark:hover:border-white/30 transition flex items-center justify-center gap-1.5"
+            >
+              <TbShadow size={14} />
+              <span>Add Shadow</span>
+            </button>
+          )}
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && (
+        <>
+          <Section title="Shape" dense>
+          {/* Every straight-edged outline rounds (see whiteboardHandlers.ts's supportsCornerRadius);
+              an image only when its mask is "rounded" - showing the slider anywhere else would be a
+              control with no visible effect. */}
+          {selectedNodes.every(supportsCornerRadius) && (() => {
+            const maxRadius = Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2));
+            const corners = detectShapeCorners(selectedNodes[0]);
+            const buildCornerRadii = (node: WhiteboardNode, cornerIndex: number, nextRadius: number): (number | null)[] => {
+              const nodeCorners = detectShapeCorners(node);
+              const len = Math.max(nodeCorners.length, cornerIndex + 1);
+              return Array.from({ length: len }, (_, i) => (i === cornerIndex ? nextRadius : (node.cornerRadii?.[i] ?? null)));
+            };
+            return (
+              <>
+                <SliderField
+                  label="Corner radius"
+                  resetKey={`cr-${ids}`}
+                  value={selectedNodes[0].cornerRadius ?? 0}
+                  min={0}
+                  max={maxRadius}
+                  step={1}
+                  onCommit={(n) => updateNodes({ cornerRadius: n, cornerRadii: undefined })}
+                  onPreview={(n) => onPreviewNodes?.(n === null ? null : { cornerRadius: n, cornerRadii: undefined })}
+                />
+                {corners.map((corner) => {
+                  const val = selectedNodes[0].cornerRadii?.[corner.index] ?? selectedNodes[0].cornerRadius ?? 0;
+                  return (
+                    <SliderField
+                      key={`${selectedNodes[0].shapeType}-${corner.index}-${corner.label}`}
+                      label={corner.label}
+                      resetKey={`cr-${ids}-${corner.index}-${selectedNodes[0].cornerRadius ?? 0}`}
+                      value={val}
+                      min={0}
+                      max={maxRadius}
+                      step={1}
+                      onCommit={(n) => updateNodes({ cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) })}
+                      onPreview={(n) =>
+                        onPreviewNodes?.(
+                          n === null ? null : { cornerRadii: buildCornerRadii(selectedNodes[0], corner.index, n) }
+                        )
+                      }
+                    />
+                  );
+                })}
+              </>
+            );
+          })()}
           {selectedNodes.every((n) => n.shapeType === "polygon") && (
             <Field label="Sides">
               <input
@@ -1611,7 +3081,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <select
                   value={selectedNodes[0].waveStyle ?? "sine"}
                   onChange={(e) => updateNodes({ waveStyle: e.target.value as WhiteboardNode["waveStyle"] })}
-                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
                 >
                   {WAVE_STYLE_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -1806,17 +3276,6 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               />
             </Field>
           )}
-          {selectedNodes.every((n) => n.shapeType === "functionPlot") && (
-            <Field label="Show grid">
-              <input
-                type="checkbox"
-                checked={selectedNodes[0].plotShowGrid ?? false}
-                onChange={(e) => updateNodes({ plotShowGrid: e.target.checked })}
-                className={CHECKBOX_CLASS}
-                title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
-              />
-            </Field>
-          )}
           {selectedNodes.every((n) => n.shapeType === "numberLine") && (
             <Field label="Range">
               <div className="flex items-center gap-1.5">
@@ -1867,7 +3326,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   onChange={(e) => updateNodes({ graphExpression: e.target.value })}
                   placeholder="e.g. sin(x), x^2 - 3*x + 2"
                   spellCheck={false}
-                  className="w-32 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs font-mono"
+                  className={`w-32 h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px] font-mono`}
                   title="A formula in terms of x - +-*/^%, parentheses, implicit multiplication (2x), and sin/cos/tan/asin/acos/atan/atan2/sinh/cosh/tanh/sqrt/abs/sign/exp/ln/log/log2/floor/ceil/round/min/max/pow, pi, e"
                 />
               </Field>
@@ -1958,21 +3417,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                   title="Spacing between y-axis tick numbers, in this graph's own y units - 0 picks it automatically"
                 />
               </Field>
-              <Field label="Show grid">
-                <input
-                  type="checkbox"
-                  checked={selectedNodes[0].graphShowGrid ?? true}
-                  onChange={(e) => updateNodes({ graphShowGrid: e.target.checked })}
-                  className={CHECKBOX_CLASS}
-                  title="Faint gridlines across the whole plot at every tick, not just the axis tick marks"
-                />
-              </Field>
               {selectedNodes.length === 1 && (selectedNodes[0].graphPoints?.length ?? 0) > 0 && (
                 <Field label="Manual points">
                   <button
                     type="button"
                     onClick={() => updateNodes({ graphPoints: [] })}
-                    className="h-7 px-2 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700"
+                    className={MINI_BUTTON_CLASS}
                     title="Removes every manually-plotted point - the same points double-clicking the plot area (to add) or one of their own handles (to remove) edits directly on the canvas"
                   >
                     Clear ({selectedNodes[0].graphPoints?.length ?? 0})
@@ -2170,7 +3620,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                       ampOutputLeadYOffset: undefined,
                     })
                   }
-                  className="text-xs px-2 py-1 rounded border border-gray-200 dark:border-neutral-700 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                  className={MINI_BUTTON_CLASS}
                   title="Undo every length change and bend on all three leads, back to the shape's original straight, symmetric layout"
                 >
                   Reset leads
@@ -2390,7 +3840,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <select
                   value={selectedNodes[0].startArrowType ?? "none"}
                   onChange={(e) => updateNodes({ startArrowType: e.target.value as ArrowheadType })}
-                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
                 >
                   {ARROWHEAD_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -2403,7 +3853,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
                 <select
                   value={selectedNodes[0].endArrowType ?? "none"}
                   onChange={(e) => updateNodes({ endArrowType: e.target.value as ArrowheadType })}
-                  className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
+                  className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
                 >
                   {ARROWHEAD_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -2416,239 +3866,618 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           )}
 
           </Section>
+        </>
+      )}
 
-          {selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge") && (
-            <Section title="Text" dense>
-              {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets
-                  with its own math font regardless, so these controls would sit there doing nothing
-                  visible if shown. Font size/color and Align DO still apply (see EquationDisplay/
-                  paintEquation), so only those stay visible for it. */}
-              {selectedNodes.every((n) => n.shapeType !== "equation") && (
-                <Field label="Font">
-                  <select
-                    value={selectedNodes[0].fontFamily}
-                    onChange={(e) => updateNodes({ fontFamily: e.target.value })}
-                    className="w-28 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-                  >
-                    {FONT_FAMILY_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-              )}
-              <Field label="Font size">
-                <input
-                  type="number"
-                  min={8}
-                  max={96}
-                  value={selectedNodes[0].fontSize}
-                  onChange={(e) => updateNodes({ fontSize: Number(e.target.value) })}
-                  className={NUMBER_INPUT_CLASS}
+      {selectedNodes.length === 1 && selectedNodes[0].shapeType === "latticeGauge" && (
+        <>
+          <Section title="Label" dense>
+            <LatticeLabelFields node={selectedNodes[0]} updateNodes={updateNodes} />
+          </Section>
+          <Section title="Motion" dense>
+            <LatticeMotionFields node={selectedNodes[0]} updateNodes={updateNodes} onSaveExport={onSaveExport} />
+          </Section>
+        </>
+      )}
+
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType === "graph" || n.shapeType === "functionPlot") && (
+        <Section title="Axes & grid" dense>
+          <PlotAxesFields nodes={selectedNodes} updateNodes={updateNodes} onPreviewNodes={onPreviewNodes} />
+        </Section>
+      )}
+
+      {selectedNodes.length > 0 && hasText && (
+        <Section title="Text" dense>
+          {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets with its
+              own math font regardless, so these controls would sit there doing nothing visible if
+              shown. Font size/color and Align DO still apply (see EquationDisplay/paintEquation), so
+              only those stay visible for it. */}
+          <div className="flex items-center gap-1.5">
+            {selectedNodes.every((n) => n.shapeType !== "equation") && (
+              <select
+                value={selectedNodes[0].fontFamily}
+                onChange={(e) => updateNodes({ fontFamily: e.target.value })}
+                className={`flex-1 min-w-0 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
+                title="Font"
+              >
+                {FONT_FAMILY_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            <div className="w-[76px] shrink-0 ml-auto">
+              <PrefixedNumber
+                prefix={<TbTextSize size={12} />}
+                title="Font size - drag the icon to scrub"
+                resetKey={`${ids}-fs`}
+                value={selectedNodes[0].fontSize}
+                min={6}
+                max={400}
+                onCommit={(fontSize) => updateNodes({ fontSize })}
+              />
+            </div>
+          </div>
+          <ColorField label="Color" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor })} />
+          <div className="flex items-center justify-between gap-1.5">
+            {selectedNodes.every((n) => n.shapeType !== "equation") && (
+              <Segmented>
+                <SegmentButton
+                  active={selectedNodes[0].fontWeight === "bold"}
+                  onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
+                  title="Bold"
+                >
+                  <TbBold size={13} />
+                </SegmentButton>
+                <SegmentButton
+                  active={selectedNodes[0].fontStyle === "italic"}
+                  onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
+                  title="Italic"
+                >
+                  <TbItalic size={13} />
+                </SegmentButton>
+                <SegmentButton
+                  active={selectedNodes[0].textDecoration === "underline"}
+                  onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
+                  title="Underline"
+                >
+                  <TbUnderline size={13} />
+                </SegmentButton>
+              </Segmented>
+            )}
+            <Segmented>
+              {(["left", "center", "right"] as const).map((align) => (
+                <SegmentButton key={align} active={selectedNodes[0].textAlign === align} onClick={() => updateNodes({ textAlign: align })} title={`Align ${align}`}>
+                  {align === "left" ? <TbAlignLeft size={13} /> : align === "center" ? <TbAlignCenter size={13} /> : <TbAlignRight size={13} />}
+                </SegmentButton>
+              ))}
+            </Segmented>
+          </div>
+          <Field label="Vertical">
+            <Segmented>
+              {(["top", "middle", "bottom"] as const).map((align) => (
+                <SegmentButton key={align} active={selectedNodes[0].verticalAlign === align} onClick={() => updateNodes({ verticalAlign: align })} title={`Align ${align}`}>
+                  {align === "top" ? <TbLayoutAlignTop size={13} /> : align === "middle" ? <TbLayoutAlignMiddle size={13} /> : <TbLayoutAlignBottom size={13} />}
+                </SegmentButton>
+              ))}
+            </Segmented>
+          </Field>
+        </Section>
+      )}
+
+      {selectedNodes.length === 0 && firstEdge && (
+        <>
+          <Section title="Arrange" dense>
+            {edge && edgeEndpoints && !edge.source.nodeId && !edge.target.nodeId && (
+              <>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <PrefixedNumber
+                    resetKey={`ex-${edge.id}`}
+                    prefix="X"
+                    title="Horizontal position of the connector's left bound in document units - drag the label to scrub"
+                    value={Math.round(Math.min(edgeEndpoints.source.x, edgeEndpoints.target.x))}
+                    min={-100000}
+                    max={100000}
+                    onCommit={(x) => {
+                      const curMinX = Math.min(edgeEndpoints.source.x, edgeEndpoints.target.x);
+                      updateEdge(nudgeEdgeBy(edge, x - curMinX, 0));
+                    }}
+                  />
+                  <PrefixedNumber
+                    resetKey={`ey-${edge.id}`}
+                    prefix="Y"
+                    title="Vertical position of the connector's top bound in document units - drag the label to scrub"
+                    value={Math.round(Math.min(edgeEndpoints.source.y, edgeEndpoints.target.y))}
+                    min={-100000}
+                    max={100000}
+                    onCommit={(y) => {
+                      const curMinY = Math.min(edgeEndpoints.source.y, edgeEndpoints.target.y);
+                      updateEdge(nudgeEdgeBy(edge, 0, y - curMinY));
+                    }}
+                  />
+                  <PrefixedNumber
+                    resetKey={`el-${edge.id}`}
+                    prefix="L"
+                    title="End-to-end length in document units (scales symmetrically around the midpoint)"
+                    value={Math.max(1, edgeLength)}
+                    min={4}
+                    max={100000}
+                    onCommit={(len) => updateEdge(scaleEdgeLength(edge, len))}
+                  />
+                  <Segmented stretch>
+                    <SegmentButton
+                      active={false}
+                      onClick={() => transformEdges((e) => flipEdge(e, "horizontal", nodesById))}
+                      title="Flip Horizontal (mirror left to right)"
+                    >
+                      <TbFlipHorizontal size={14} />
+                    </SegmentButton>
+                    <SegmentButton
+                      active={false}
+                      onClick={() => transformEdges((e) => flipEdge(e, "vertical", nodesById))}
+                      title="Flip Vertical (mirror top to bottom)"
+                    >
+                      <TbFlipVertical size={14} />
+                    </SegmentButton>
+                  </Segmented>
+                </div>
+                <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />
+              </>
+            )}
+            {(!edge || edge.source.nodeId || edge.target.nodeId) && (
+              <Segmented stretch>
+                <SegmentButton
+                  active={false}
+                  onClick={() => transformEdges((e) => flipEdge(e, "horizontal", nodesById))}
+                  title="Flip Horizontal (mirror free endpoints and bend points left to right)"
+                >
+                  <TbFlipHorizontal size={14} />
+                </SegmentButton>
+                <SegmentButton
+                  active={false}
+                  onClick={() => transformEdges((e) => flipEdge(e, "vertical", nodesById))}
+                  title="Flip Vertical (mirror free endpoints and bend points top to bottom)"
+                >
+                  <TbFlipVertical size={14} />
+                </SegmentButton>
+              </Segmented>
+            )}
+            <SliderField
+              label="Opacity"
+              resetKey={`eo-${edgeIds}`}
+              value={Math.round((firstEdge.opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateEdge({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewEdges?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall connector opacity (100% solid, 0% fully transparent - affects line, arrowheads, and label)"
+            />
+            <div className="flex items-center justify-between gap-1.5">
+              <NudgeBar onNudge={(dx, dy) => transformEdges((e) => nudgeEdgeBy(e, dx, dy))} />
+              <Segmented>
+                <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
+                  <TbStackFront size={14} />
+                </SegmentButton>
+                {onBringForward && (
+                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward one layer">
+                    <TbArrowUp size={13} />
+                  </SegmentButton>
+                )}
+                {onSendBackward && (
+                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward one layer">
+                    <TbArrowDown size={13} />
+                  </SegmentButton>
+                )}
+                <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
+                  <TbStackBack size={14} />
+                </SegmentButton>
+              </Segmented>
+            </div>
+          </Section>
+
+          <Section title="Line" dense>
+            <ColorField label="Color" value={firstEdge.strokeColor} onChange={(strokeColor) => updateEdge({ strokeColor })} />
+            <SliderField
+              label="Width"
+              resetKey={`ew-${edgeIds}`}
+              value={firstEdge.strokeWidth}
+              min={0.5}
+              max={64}
+              sliderMax={16}
+              step={0.5}
+              onCommit={(n) => updateEdge({ strokeWidth: n })}
+              onPreview={previewEdgeField("strokeWidth")}
+            />
+            <SliderField
+              label="Opacity"
+              resetKey={`eso-${edgeIds}`}
+              value={Math.round((firstEdge.strokeOpacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateEdge({ strokeOpacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewEdges?.(n === null ? null : { strokeOpacity: n / 100 })}
+              title="Line stroke opacity (leaves label opacity untouched)"
+            />
+            <Field label="Style">
+              <Segmented>
+                {LINE_STYLE_OPTIONS.map((opt) => (
+                  <SegmentButton key={opt.value} active={firstEdge.strokeStyle === opt.value} onClick={() => updateEdge({ strokeStyle: opt.value })} title={opt.label}>
+                    <svg width={18} height={8} viewBox="0 0 18 8">
+                      <line
+                        x1={1}
+                        y1={4}
+                        x2={17}
+                        y2={4}
+                        stroke="currentColor"
+                        strokeWidth={1.75}
+                        strokeLinecap="round"
+                        strokeDasharray={opt.value === "dashed" ? "4 3" : opt.value === "dotted" ? "0.1 3.5" : undefined}
+                      />
+                    </svg>
+                  </SegmentButton>
+                ))}
+              </Segmented>
+            </Field>
+            {firstEdge.strokeStyle !== "dotted" && (
+              <Field label="Cap">
+                <Segmented>
+                  {([
+                    { value: "butt", label: "Flat cap" },
+                    { value: "round", label: "Round cap" },
+                    { value: "square", label: "Square cap" },
+                  ] as const).map((cap) => (
+                    <SegmentButton
+                      key={cap.value}
+                      active={(firstEdge.strokeCap ?? "round") === cap.value}
+                      onClick={() => updateEdge({ strokeCap: cap.value })}
+                      title={cap.label}
+                    >
+                      <span className="px-1 text-[10px] capitalize">{cap.value}</span>
+                    </SegmentButton>
+                  ))}
+                </Segmented>
+              </Field>
+            )}
+            <Field label="Routing">
+              <Segmented>
+                {ROUTING_OPTIONS.map((opt) => (
+                  <SegmentButton key={opt.value} active={firstEdge.routing === opt.value} onClick={() => updateEdge({ routing: opt.value })} title={opt.label}>
+                    <svg width={14} height={14} viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+                      {opt.value === "straight" ? <path d="M2,12 L12,2" /> : opt.value === "orthogonal" ? <path d="M2,12 V7 H12 V2" /> : <path d="M2,12 C2,4 12,10 12,2" />}
+                    </svg>
+                  </SegmentButton>
+                ))}
+              </Segmented>
+            </Field>
+            {firstEdge.routing === "curved" && !(firstEdge.waypoints && firstEdge.waypoints.length > 0) && (
+              <Field label="Curve bow">
+                <LiveRangeSlider
+                  min={-1}
+                  max={1}
+                  step={0.05}
+                  value={firstEdge.curveBow ?? DEFAULT_CURVE_BOW}
+                  onCommit={(n) => updateEdge({ curveBow: n })}
+                  onPreview={previewEdgeField("curveBow")}
+                  className={SLIDER_CLASS}
+                  title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
                 />
               </Field>
-              <Field label="Font color">
-                <input type="color" value={selectedNodes[0].fontColor} onChange={(e) => updateNodes({ fontColor: e.target.value })} className={SWATCH_CLASS} />
+            )}
+            {(firstEdge.routing === "orthogonal" || (firstEdge.waypoints && firstEdge.waypoints.length > 0)) && (
+              <SliderField
+                label="Corner radius"
+                resetKey={`ecr-${edgeIds}`}
+                value={firstEdge.cornerRadius ?? 0}
+                min={0}
+                max={120}
+                sliderMax={48}
+                step={1}
+                onCommit={(n) => updateEdge({ cornerRadius: n <= 0 ? undefined : n })}
+                onPreview={previewEdgeField("cornerRadius")}
+                title="Rounds the sharp 90° turns and manual bend points along this connector"
+              />
+            )}
+            {firstEdge.waypoints && firstEdge.waypoints.length > 0 && (
+              <Field label="Bend points">
+                <button
+                  type="button"
+                  onClick={() => updateEdge({ waypoints: [] })}
+                  className={MINI_BUTTON_CLASS}
+                  title="Remove every manually-dragged bend point on this connector, letting the routing style alone decide its path again"
+                >
+                  Clear ({firstEdge.waypoints.length})
+                </button>
               </Field>
-              {selectedNodes.every((n) => n.shapeType !== "equation") && (
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600 dark:text-neutral-300">Style</span>
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
-                      className={`px-2 py-1 rounded font-bold text-xs ${selectedNodes[0].fontWeight === "bold" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
-                      B
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
-                      className={`p-1.5 rounded ${selectedNodes[0].fontStyle === "italic" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
-                      <TbItalic size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
-                      className={`p-1.5 rounded ${selectedNodes[0].textDecoration === "underline" ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
-                      <TbUnderline size={14} />
-                    </button>
-                  </div>
-                </div>
-              )}
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-gray-600 dark:text-neutral-300">Align</span>
-                <div className="flex gap-1">
-                  {(["left", "center", "right"] as const).map((align) => (
-                    <button
-                      key={align}
-                      type="button"
-                      onClick={() => updateNodes({ textAlign: align })}
-                      className={`p-1.5 rounded ${selectedNodes[0].textAlign === align ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
-                      {align === "left" ? <TbLayoutAlignLeft size={14} /> : align === "center" ? <TbLayoutAlignCenter size={14} /> : <TbLayoutAlignRight size={14} />}
-                    </button>
-                  ))}
-                  {(["top", "middle", "bottom"] as const).map((align) => (
-                    <button
-                      key={align}
-                      type="button"
-                      onClick={() => updateNodes({ verticalAlign: align })}
-                      className={`p-1.5 rounded ${selectedNodes[0].verticalAlign === align ? "bg-blue-100 dark:bg-blue-500/30 text-blue-700 dark:text-blue-300" : "hover:bg-gray-100 dark:hover:bg-neutral-800"}`}
-                    >
-                      {align === "top" ? <TbLayoutAlignTop size={14} /> : align === "middle" ? <TbLayoutAlignMiddle size={14} /> : <TbLayoutAlignBottom size={14} />}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </Section>
-          )}
+            )}
+          </Section>
 
-          <div className="border-t border-gray-100 dark:border-neutral-800 pt-3 flex items-center gap-1">
-            <button type="button" onClick={onBringToFront} title="Bring to front" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-              <TbStackFront size={16} />
-            </button>
-            <button type="button" onClick={onSendToBack} title="Send to back" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-              <TbStackBack size={16} />
-            </button>
-            {selectedNodes.length >= 2 && (
-              <button type="button" onClick={onGroup} title="Group" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <TbComponents size={16} />
+          <Section
+            title="Arrows"
+            dense
+            action={
+              <button
+                type="button"
+                onClick={() => transformEdges((e) => reverseEdgeDirection(e))}
+                className="p-1 rounded text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] transition"
+                title="Swap start & end arrowheads and reverse connector direction"
+              >
+                <TbArrowsExchange size={14} />
+              </button>
+            }
+          >
+            <Field label="Start">
+              <select value={firstEdge.startArrowType} onChange={(e) => updateEdge({ startArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
+                {ARROWHEAD_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="End">
+              <select value={firstEdge.endArrowType} onChange={(e) => updateEdge({ endArrowType: e.target.value as ArrowheadType })} className={`w-28 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}>
+                {ARROWHEAD_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </Section>
+
+          <Section
+            title="Shadow"
+            dense
+            action={
+              <button
+                type="button"
+                onClick={() => {
+                  const isEnabled = firstEdge.shadowEnabled ?? false;
+                  const next = !isEnabled;
+                  updateEdge({
+                    shadowEnabled: next,
+                    ...(next && firstEdge.shadowBlur === undefined
+                      ? {
+                          shadowColor: DEFAULT_SHADOW_COLOR,
+                          shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                          shadowBlur: DEFAULT_SHADOW_BLUR,
+                          shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                          shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                        }
+                      : {}),
+                  });
+                }}
+                className={`p-1 rounded transition ${
+                  firstEdge.shadowEnabled
+                    ? "text-blue-600 dark:text-blue-400 hover:bg-blue-500/10"
+                    : "text-neutral-400 dark:text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                }`}
+                title={firstEdge.shadowEnabled ? "Disable shadow" : "Enable shadow"}
+              >
+                {firstEdge.shadowEnabled ? <TbShadow size={15} /> : <TbShadowOff size={15} />}
+              </button>
+            }
+          >
+            {firstEdge.shadowEnabled ? (
+              <>
+                <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] py-0.5">
+                  {SHADOW_PRESETS.map((preset) => (
+                    <button
+                      key={preset.name}
+                      type="button"
+                      onClick={() => {
+                        const patch =
+                          "makeConfig" in preset && preset.makeConfig
+                            ? preset.makeConfig({ strokeColor: firstEdge.strokeColor, fillColor: firstEdge.strokeColor })
+                            : preset.config ?? {};
+                        updateEdge(patch);
+                      }}
+                      className="px-2 py-0.5 shrink-0 rounded text-[11px] font-medium bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-600 dark:text-neutral-300 transition active:scale-95"
+                      title={`Apply ${preset.name} shadow preset`}
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                </div>
+                <ColorField
+                  label="Color"
+                  value={firstEdge.shadowColor ?? DEFAULT_SHADOW_COLOR}
+                  onChange={(shadowColor) => updateEdge({ shadowColor })}
+                />
+                <SliderField
+                  label="Opacity"
+                  resetKey={`esho-${edgeIds}`}
+                  value={Math.round((firstEdge.shadowOpacity ?? DEFAULT_SHADOW_OPACITY) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  onCommit={(n) => updateEdge({ shadowOpacity: n / 100 })}
+                  onPreview={(n) => onPreviewEdges?.(n === null ? null : { shadowOpacity: n / 100 })}
+                />
+                <SliderField
+                  label="Blur"
+                  resetKey={`eshb-${edgeIds}`}
+                  value={firstEdge.shadowBlur ?? DEFAULT_SHADOW_BLUR}
+                  min={0}
+                  max={64}
+                  step={1}
+                  onCommit={(n) => updateEdge({ shadowBlur: n })}
+                  onPreview={previewEdgeField("shadowBlur")}
+                />
+                <Field label="Offset">
+                  <div className="grid grid-cols-2 gap-1.5 w-full">
+                    <PrefixedNumber
+                      resetKey={`eshx-${edgeIds}`}
+                      prefix="X"
+                      title="Horizontal shadow offset in pixels"
+                      value={firstEdge.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X}
+                      min={-100}
+                      max={100}
+                      onCommit={(x) => updateEdge({ shadowOffsetX: x })}
+                    />
+                    <PrefixedNumber
+                      resetKey={`eshy-${edgeIds}`}
+                      prefix="Y"
+                      title="Vertical shadow offset in pixels"
+                      value={firstEdge.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y}
+                      min={-100}
+                      max={100}
+                      onCommit={(y) => updateEdge({ shadowOffsetY: y })}
+                    />
+                  </div>
+                </Field>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() =>
+                  updateEdge({
+                    shadowEnabled: true,
+                    ...(firstEdge.shadowBlur === undefined
+                      ? {
+                          shadowColor: DEFAULT_SHADOW_COLOR,
+                          shadowOpacity: DEFAULT_SHADOW_OPACITY,
+                          shadowBlur: DEFAULT_SHADOW_BLUR,
+                          shadowOffsetX: DEFAULT_SHADOW_OFFSET_X,
+                          shadowOffsetY: DEFAULT_SHADOW_OFFSET_Y,
+                        }
+                      : {}),
+                  })
+                }
+                className="w-full h-7 rounded-md bg-black/[0.03] dark:bg-white/[0.04] hover:bg-black/[0.06] dark:hover:bg-white/[0.08] text-[11px] text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 transition flex items-center justify-center gap-1.5"
+              >
+                <TbShadow size={13} />
+                <span>Add Shadow</span>
               </button>
             )}
-            {selectedNodes.some((n) => n.groupId) && (
-              <button type="button" onClick={onUngroup} title="Ungroup" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <TbComponentsOff size={16} />
-              </button>
+          </Section>
+
+          <Section title="Label" dense>
+            <input
+              type="text"
+              value={firstEdge.label}
+              placeholder="Text shown on the line"
+              onChange={(e) => updateEdge({ label: e.target.value })}
+              className={`w-full h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px]`}
+            />
+            {firstEdge.label.trim().length > 0 && (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-24 shrink-0">
+                    <PrefixedNumber
+                      resetKey={`elfs-${edgeIds}`}
+                      prefix={<TbTextSize size={12} />}
+                      title="Label font size in pixels"
+                      value={firstEdge.labelFontSize ?? 12}
+                      min={8}
+                      max={72}
+                      onCommit={(n) => updateEdge({ labelFontSize: n })}
+                    />
+                  </div>
+                  <Segmented>
+                    <SegmentButton
+                      active={Boolean(firstEdge.labelBold)}
+                      onClick={() => updateEdge({ labelBold: !firstEdge.labelBold })}
+                      title="Bold label"
+                    >
+                      <TbBold size={13} />
+                    </SegmentButton>
+                    <SegmentButton
+                      active={Boolean(firstEdge.labelItalic)}
+                      onClick={() => updateEdge({ labelItalic: !firstEdge.labelItalic })}
+                      title="Italic label"
+                    >
+                      <TbItalic size={13} />
+                    </SegmentButton>
+                  </Segmented>
+                </div>
+                <ColorField
+                  label="Color"
+                  value={firstEdge.labelColor ?? "#1f2937"}
+                  onChange={(labelColor) => updateEdge({ labelColor })}
+                />
+                <SliderField
+                  label="Position"
+                  resetKey={`elp-${edgeIds}`}
+                  value={Math.round((firstEdge.labelPosition ?? 0.5) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  onCommit={(n) => updateEdge({ labelPosition: n / 100 })}
+                  onPreview={(n) => onPreviewEdges?.(n === null ? null : { labelPosition: n / 100 })}
+                  title="Position along the line from Start (0%) to End (100%)"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <label className="flex items-center gap-1.5 text-[11px] text-neutral-500 dark:text-neutral-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={firstEdge.labelShowBackground ?? true}
+                      onChange={(e) => updateEdge({ labelShowBackground: e.target.checked })}
+                      className="rounded border-neutral-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <span>Pill background</span>
+                  </label>
+                  {(firstEdge.labelShowBackground ?? true) && (
+                    <div className="w-28">
+                      <HexColorInput
+                        value={firstEdge.labelBackgroundColor ?? "#ffffff"}
+                        onChange={(labelBackgroundColor) => updateEdge({ labelBackgroundColor })}
+                      />
+                    </div>
+                  )}
+                </div>
+              </>
             )}
+          </Section>
+        </>
+      )}
+      </div>
+
+      {/* Pinned rather than at the end of the scroll, as in the Mindmap inspector: lock, duplicate and
+          delete are the actions reached for most, and on a chart's long Style tab they used to be a
+          scroll away. */}
+      {(selectedNodes.length > 0 || selectedEdges.length > 0) && (
+        <div className="shrink-0 flex items-center gap-0.5 px-2 h-11 border-t border-black/[0.05] dark:border-white/[0.06]">
+          <button
+            type="button"
+            onClick={() => (selectedNodes.length > 0 ? updateNodes({ locked: !allLocked }) : updateEdge({ locked: !allLocked }))}
+            aria-pressed={allLocked}
+            title="Prevents dragging, resizing, rotating, or nudging this item until unlocked again - handy while manually plotting onto a graph, or annotating around a shape or line you don't want to bump"
+            className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[12px] font-medium transition active:scale-[0.97] ${
+              allLocked ? "bg-amber-500/12 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20" : "text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] hover:text-neutral-900 dark:hover:text-neutral-100"
+            }`}
+          >
+            {allLocked ? <TbLock size={14} /> : <TbLockOpen size={14} />}
+            {allLocked ? "Locked" : "Lock"}
+          </button>
+          <div className="ml-auto flex items-center gap-0.5">
             {selectedNodes.length === 1 && (
-              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate" className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-neutral-800">
-                <IoCopyOutline size={16} />
+              <button type="button" onClick={() => onDuplicateNode(selectedNodes[0])} title="Duplicate (Ctrl+D)" className={FOOTER_BUTTON_CLASS}>
+                <IoCopyOutline size={15} />
+              </button>
+            )}
+            {selectedNodes.length === 0 && edge && onDuplicateEdge && (
+              <button type="button" onClick={() => onDuplicateEdge(edge)} title="Duplicate (Ctrl+D)" className={FOOTER_BUTTON_CLASS}>
+                <IoCopyOutline size={15} />
               </button>
             )}
             <button
               type="button"
-              onClick={() => selectedNodes.forEach((n) => onDeleteNode(n))}
+              onClick={() => {
+                if (selectedNodes.length > 0) selectedNodes.forEach((n) => onDeleteNode(n));
+                if (selectedEdges.length > 0) selectedEdges.forEach((e) => onDeleteEdge(e));
+              }}
               title="Delete"
-              className="p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400 ml-auto"
+              className={`${FOOTER_BUTTON_CLASS} hover:!text-red-600 dark:hover:!text-red-400 hover:!bg-red-500/10`}
             >
-              <IoTrashOutline size={16} />
+              <IoTrashOutline size={15} />
             </button>
           </div>
-        </>
+        </div>
       )}
-
-      {edge && (
-        <>
-          <p className="text-xs font-medium uppercase tracking-wide text-gray-400 dark:text-neutral-500">Connector</p>
-          <Field label="Nudge">
-            <NudgeGrid onNudge={(dx, dy) => updateEdge(nudgeEdgeBy(edge, dx, dy))} />
-          </Field>
-          {!edge.source.nodeId && !edge.target.nodeId && <EdgeRotateField key={edge.id} edge={edge} onCommit={updateEdge} />}
-          <Field label="Color">
-            <input type="color" value={edge.strokeColor} onChange={(e) => updateEdge({ strokeColor: e.target.value })} className={SWATCH_CLASS} />
-          </Field>
-          {/* No live preview here: previewNodes only replaces NODES, and an edge's width isn't part
-              of that channel. The thumb still tracks the drag, and the width commits on release. */}
-          <SliderField label="Width" resetKey={edge.id} value={edge.strokeWidth} min={0.5} max={40} sliderMax={12} step={0.5} onCommit={(n) => updateEdge({ strokeWidth: n })} />
-          <Field label="Line">
-            <select
-              value={edge.strokeStyle}
-              onChange={(e) => updateEdge({ strokeStyle: e.target.value as WhiteboardEdge["strokeStyle"] })}
-              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-            >
-              {LINE_STYLE_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Routing">
-            <select
-              value={edge.routing}
-              onChange={(e) => updateEdge({ routing: e.target.value as WhiteboardEdge["routing"] })}
-              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-            >
-              {ROUTING_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {edge.routing === "curved" && !(edge.waypoints && edge.waypoints.length > 0) && (
-            <Field label="Curve bow">
-              <LiveRangeSlider
-                min={-1}
-                max={1}
-                step={0.05}
-                value={edge.curveBow ?? DEFAULT_CURVE_BOW}
-                onCommit={(n) => updateEdge({ curveBow: n })}
-                className={SLIDER_CLASS}
-                title="Which way (and how far) a free-floating end of this curve bows - only matters where the curve has no shape side to bow away from"
-              />
-            </Field>
-          )}
-          {edge.waypoints && edge.waypoints.length > 0 && (
-            <Field label="Bend points">
-              <button
-                type="button"
-                onClick={() => updateEdge({ waypoints: [] })}
-                className="h-7 px-2 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs hover:bg-gray-50 dark:hover:bg-neutral-700"
-                title="Remove every manually-dragged bend point on this connector, letting the routing style alone decide its path again"
-              >
-                Clear ({edge.waypoints.length})
-              </button>
-            </Field>
-          )}
-          <Field label="Start arrow">
-            <select
-              value={edge.startArrowType}
-              onChange={(e) => updateEdge({ startArrowType: e.target.value as ArrowheadType })}
-              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-            >
-              {ARROWHEAD_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="End arrow">
-            <select
-              value={edge.endArrowType}
-              onChange={(e) => updateEdge({ endArrowType: e.target.value as ArrowheadType })}
-              className="w-24 h-7 px-1.5 rounded border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs"
-            >
-              {ARROWHEAD_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <input
-            type="text"
-            value={edge.label}
-            placeholder="Label"
-            onChange={(e) => updateEdge({ label: e.target.value })}
-            className={`w-full ${TEXT_INPUT_CLASS}`}
-          />
-          <button
-            type="button"
-            onClick={() => onDeleteEdge(edge)}
-            title="Delete"
-            className="self-start p-1.5 rounded-md hover:bg-red-50 dark:hover:bg-red-500/10 text-red-600 dark:text-red-400 transition"
-          >
-            <IoTrashOutline size={16} />
-          </button>
-        </>
-      )}
-      </div>
     </div>
   );
 };

@@ -1,9 +1,10 @@
 // hooks/useAnnotationStore.ts
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AnnotationCommand,
   AnnotationObject,
+  CommentObject,
   PdfAnnotationDocument,
   Pt,
   createEmptyDocument,
@@ -16,6 +17,8 @@ interface UseAnnotationStoreResult {
   loading: boolean;
   loadError: string | null;
   getPageObjects: (pageIndex: number) => AnnotationObject[];
+  // Every comment in the document, in reading order (page, then top-to-bottom).
+  comments: CommentObject[];
   addObject: (object: AnnotationObject) => void;
   editObject: (before: AnnotationObject, after: AnnotationObject) => void;
   deleteObject: (object: AnnotationObject) => void;
@@ -122,6 +125,14 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
     },
     [doc]
   );
+
+  const comments = useMemo((): CommentObject[] => {
+    if (!doc) return [];
+    const top = (c: CommentObject): number => Math.max(...c.rects.map((r) => r.y2));
+    return doc.pages
+      .flatMap((p) => p.objects.filter((o): o is CommentObject => o.type === "comment"))
+      .sort((a, b) => a.pageIndex - b.pageIndex || top(b) - top(a) || a.createdAt - b.createdAt);
+  }, [doc]);
 
   const addObject = useCallback(
     (object: AnnotationObject) => {
@@ -237,6 +248,7 @@ export default function useAnnotationStore(sourcePath: string | undefined): UseA
     loading,
     loadError,
     getPageObjects,
+    comments,
     addObject,
     editObject,
     deleteObject,

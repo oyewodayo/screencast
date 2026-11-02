@@ -1,9 +1,33 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { resolve } from "path";
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+
+  build: {
+    rollupOptions: {
+      // The recording-completed popup is a second HTML entry point, not part of the main SPA -
+      // it's opened as its own Tauri window (see the create_webview_window call in
+      // commands/recording.rs, which points at this exact path).
+      //
+      // Without listing it here it is simply never built: `vite build` only follows index.html,
+      // so dist/ shipped without the page and the popup opened as a blank window in any packaged
+      // or `tauri build` binary. It looked fine in `tauri dev` only because the dev server serves
+      // arbitrary files straight from the project root, which production has no equivalent of.
+      //
+      // The HTML lives at the project root, beside index.html, rather than next to its own .tsx
+      // under src-tauri/. Vite emits extra HTML inputs at their path relative to the root, and
+      // Tauri flatly refuses a frontendDist containing a `src-tauri` folder ("Please isolate your
+      // web assets on a separate folder"), so keeping the page there made the build fail outright.
+      // The component itself stays in src-tauri/src/views/ - only the entry HTML moved.
+      input: {
+        main: resolve(__dirname, "index.html"),
+        completed_recording: resolve(__dirname, "completed_recording.html"),
+      },
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

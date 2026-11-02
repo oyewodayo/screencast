@@ -291,6 +291,7 @@ pub async fn capture_window_screenshots_by_title(
                 image_path,
                 hwnd: *window as isize,
                 exe_path: window_exe_path(&conn, &atoms, *window),
+                ..Default::default()
             });
         }
 

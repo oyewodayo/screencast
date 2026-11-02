@@ -1,6 +1,7 @@
 // components/pdf/BackgroundSwatchPicker.tsx
 import React, { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import ColorInput from "../common/ColorInput";
 
 interface BackgroundSwatchPickerProps {
   // undefined == no fill (fully transparent) — the pre-existing, background-less note.
@@ -104,8 +105,7 @@ const BackgroundSwatchPicker: React.FC<BackgroundSwatchPickerProps> = ({ color, 
               />
             ))}
             <div className="w-px h-5 bg-black/[0.08] dark:bg-white/[0.12]" />
-            <input
-              type="color"
+            <ColorInput
               title="Custom background"
               value={color && color.startsWith("#") ? color : "#ffffff"}
               onMouseDown={(e) => e.preventDefault()}

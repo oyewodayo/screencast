@@ -19,8 +19,9 @@ fn sidecar_path_for(image_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[command]
+#[command(async)]
 pub fn save_image_annotations(image_path: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let image = PathBuf::from(&image_path);
     if !image.exists() {
         return Err(format!("Image does not exist: {}", image_path));
@@ -37,8 +38,9 @@ pub fn save_image_annotations(image_path: String, json: String) -> Result<(), St
     Ok(())
 }
 
-#[command]
+#[command(async)]
 pub fn load_image_annotations(image_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sidecar = sidecar_path_for(&PathBuf::from(&image_path));
     if !sidecar.exists() {
         return Ok(None);
@@ -52,8 +54,9 @@ pub fn load_image_annotations(image_path: String) -> Result<Option<String>, Stri
 // frontend's canvas, PNG-encoded) to "<name> (edited).png" next to the source image - same
 // naming convention save_exported_pdf/export_trimmed_video already use for their own sibling
 // output files. The source image is never modified.
-#[command]
+#[command(async)]
 pub fn save_edited_image(image_path: String, bytes: Vec<u8>) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
     let image = PathBuf::from(&image_path);
     if !image.exists() {
         return Err(format!("Image does not exist: {}", image_path));

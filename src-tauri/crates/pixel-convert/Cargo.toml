@@ -1,0 +1,8 @@
+[package]
+name = "pixel-convert"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Frame layout conversions for Briefcast's background removal - its own crate so `tauri dev` builds it optimised."
+
+[dependencies]

@@ -2,6 +2,7 @@
 import React, { useEffect, useRef } from "react";
 import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
 import { TextLayer } from "pdfjs-dist";
+import { cleanSelectedPdfText } from "../../handlers/pdfAnnotationHandlers";
 import "./pdfTextLayer.css";
 
 interface PdfTextLayerProps {
@@ -58,6 +59,23 @@ const PdfTextLayer: React.FC<PdfTextLayerProps> = ({ pdfDoc, pageIndex, viewport
       textLayer?.cancel();
     };
   }, [pdfDoc, pageIndex, viewport]);
+
+  // Ctrl+C from the page puts reflowed prose on the clipboard (no hard line breaks or split
+  // hyphenations) — the same cleaned text the selection menu's Copy button uses.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const handleCopy = (e: ClipboardEvent): void => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !e.clipboardData) return;
+      const text = cleanSelectedPdfText(selection.toString());
+      if (!text) return;
+      e.clipboardData.setData("text/plain", text);
+      e.preventDefault();
+    };
+    container.addEventListener("copy", handleCopy);
+    return () => container.removeEventListener("copy", handleCopy);
+  }, []);
 
   return <div ref={containerRef} className="pdfTextLayer" style={{ pointerEvents: selectable ? "auto" : "none" }} />;
 };

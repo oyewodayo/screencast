@@ -6,6 +6,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 import { formatFileSize } from "../../utils/Formater";
+import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_POINTERS, ANNOTATION_STYLES, ANNOTATION_TAP_SOUNDS } from "../../utils/annotationStyles";
+import { playTapSound } from "../../utils/annotationSound";
+import { HandGraphic } from "../AnnotationPointer";
+import AnnotationPreview from "./AnnotationPreview";
+import ColorInput from "../common/ColorInput";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -39,6 +44,11 @@ const PDF_TOOL_OPTIONS: { value: AppSettings["pdfDefaultTool"]; label: string }[
   { value: "eraser", label: "Eraser" },
 ];
 
+const PDF_PAGE_TURN_OPTIONS: { value: AppSettings["pdfPageTurn"]; label: string }[] = [
+  { value: "flip", label: "Book flip" },
+  { value: "instant", label: "Instant" },
+];
+
 const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
   <div className="mb-6 last:mb-0">
     <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mb-3">{title}</h3>
@@ -52,6 +62,91 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
     {children}
   </label>
 );
+
+// Pill-style single choice (annotation style/fade) - same look as a segmented control.
+const Segmented = <T extends string>({ value, options, onChange, disabled }: {
+  value: T;
+  options: { id: T; label: string }[];
+  onChange: (value: T) => void;
+  disabled?: boolean;
+}) => (
+  <div className="flex p-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-800">
+    {options.map((o) => (
+      <button
+        key={o.id}
+        type="button"
+        disabled={disabled}
+        onClick={() => onChange(o.id)}
+        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+          value === o.id
+            ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
+            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100"
+        }`}
+      >
+        {o.label}
+      </button>
+    ))}
+  </div>
+);
+
+// Whether Windows has an OCR language for sensitive-text detection - it can't work without one.
+const OcrStatus: React.FC = () => {
+  const [language, setLanguage] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    invoke<string | null>("screen_blur_ocr_language").then(setLanguage, () => setLanguage(null));
+  }, []);
+  if (language === undefined) return null;
+  return language ? (
+    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">Reads text with Windows' built-in OCR ({language}) - nothing leaves this PC.</p>
+  ) : (
+    <p className="text-xs text-amber-600 dark:text-amber-400 text-right">
+      Windows has no OCR language installed. Add one in Settings › Time &amp; language › Language (with "Optical character recognition").
+    </p>
+  );
+};
+
+// Mirrors services/telemetry.rs's TelemetrySettings. `available` is false in builds compiled
+// without analytics/crash-report keys (dev and source builds), which send nothing regardless.
+interface TelemetrySettings {
+  enabled: boolean;
+  available: boolean;
+}
+
+const PrivacySection: React.FC = () => {
+  const [telemetry, setTelemetry] = useState<TelemetrySettings | null>(null);
+
+  useEffect(() => {
+    invoke<TelemetrySettings>("get_telemetry_settings").then(setTelemetry).catch(console.error);
+  }, []);
+
+  const toggle = (enabled: boolean) => {
+    setTelemetry((prev) => (prev ? { ...prev, enabled } : prev));
+    invoke("set_telemetry_enabled", { enabled }).catch(console.error);
+  };
+
+  return (
+    <Section title="Privacy">
+      <Field label="Send anonymous usage statistics and crash reports">
+        <input
+          type="checkbox"
+          checked={telemetry?.enabled ?? false}
+          disabled={!telemetry}
+          onChange={(e) => toggle(e.target.checked)}
+          className="w-4 h-4 accent-blue-500 cursor-pointer"
+        />
+      </Field>
+      <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+        Helps decide what to fix and build next. Sent: which features are used (e.g. "recording finished", with its length
+        and type), crash details with your user folder removed from file paths, app version, OS, and a random ID for this
+        install that isn't linked to you (deleted when you turn this off). Never sent: file names,
+        file contents, recordings, documents, or anything you type. Turning this off takes effect immediately.
+      </p>
+      {telemetry && !telemetry.available && (
+        <p className="text-xs text-neutral-400 dark:text-neutral-500">This build has no analytics configured, so nothing is sent either way.</p>
+      )}
+    </Section>
+  );
+};
 
 const fieldInputClass =
   "text-sm rounded-lg border border-neutral-200 dark:border-neutral-700 px-2.5 py-1.5 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent";
@@ -67,7 +162,7 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "help";
+type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
@@ -76,6 +171,7 @@ const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "annotation", label: "Annotation" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
+  { key: "privacy", label: "Privacy" },
   { key: "help", label: "Help & Shortcuts" },
 ];
 
@@ -92,7 +188,12 @@ interface CacheCategoryInfo {
 // namespace (a future cache this list hasn't been updated for) still renders fine via the
 // fallback in the render code below, just without a friendly description.
 const CACHE_CATEGORY_INFO: Record<string, { label: string; description: string }> = {
-  thumb_v1: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  // thumb_v1 predates EXIF-orientation support (see generate_plain_thumbnail) - still listed so
+  // its leftovers can be cleared.
+  thumb_v1: { label: "Image thumbnails (old)", description: "Earlier gallery-grid previews, before photo rotation was honored." },
+  thumb_v2: { label: "Image thumbnails", description: "Gallery-grid preview images for photos." },
+  image_clip_v1: { label: "Image clip previews", description: "Still-video previews of photos used as clips in the video editor." },
+  video_canvas_v3: { label: "Video project canvases", description: "Blank frames video projects preview on." },
   video_thumb_v1: { label: "Video poster frames", description: "Gallery-grid preview frames for videos." },
   scrub_sprite_v1: { label: "Video scrub-bar previews", description: "Hover-preview thumbnails shown while dragging a video's timeline." },
   heic_v2: { label: "HEIC/HEIF photo previews", description: "Decoded previews for iPhone-style photos." },
@@ -377,6 +478,37 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </div>
                 </div>
+
+                <Field label="Show status bar">
+                  <input
+                    type="checkbox"
+                    checked={settings.showDockerStatusBar}
+                    onChange={(e) => update("showDockerStatusBar", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  The last row of the bottom bar - date/time, CPU RAM, OS and the "Request feature / Report a bug" link.
+                </p>
+              </Section>
+            )}
+
+            {activeSection === "appearance" && (
+              <Section title="Closing the window">
+                <Field label="The close button">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.closeToTray === null ? "ask" : settings.closeToTray ? "tray" : "quit"}
+                    onChange={(e) => update("closeToTray", e.target.value === "ask" ? null : e.target.value === "tray")}
+                  >
+                    <option value="tray">Keeps Briefcast in the tray</option>
+                    <option value="quit">Quits Briefcast</option>
+                    <option value="ask">Asks the first time</option>
+                  </select>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  In the tray, Ctrl+Shift+R still starts a recording. Click the tray icon to reopen Briefcast, or right-click it to record, take a screenshot or quit.
+                </p>
               </Section>
             )}
 
@@ -408,6 +540,59 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   Press Ctrl+Shift+B (Cmd+Shift+B on Mac) any time to hide or show it instantly - handy right
                   before presenting or recording a screen that includes this window, so it doesn't end up in
                   the video.
+                </p>
+
+                <Field label="Notify when a recording starts">
+                  <input
+                    type="checkbox"
+                    checked={settings.notifyOnRecordingStart}
+                    onChange={(e) => update("notifyOnRecordingStart", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Shows where the file will be saved and the recording shortcuts each time you start.
+                </p>
+
+                <Field label="Countdown before recording">
+                  <div className="flex items-center gap-2">
+                    <select
+                      className={`${fieldInputClass} w-20`}
+                      value={settings.recordingCountdownSeconds}
+                      disabled={!settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownSeconds", Number(e.target.value))}
+                    >
+                      {[3, 5, 10].map((s) => (
+                        <option key={s} value={s}>
+                          {s} sec
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="checkbox"
+                      checked={settings.recordingCountdownEnabled}
+                      onChange={(e) => update("recordingCountdownEnabled", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Counts down in the middle of the screen before capture starts, so you can get ready. Click the
+                  countdown, or press Record again, to cancel.
+                </p>
+
+                <Field label="Mute notifications while recording">
+                  <input
+                    type="checkbox"
+                    checked={settings.muteNotificationsWhileRecording}
+                    onChange={(e) => update("muteNotificationsWhileRecording", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Turns off Windows notification pop-ups (WhatsApp, mail and the rest) from the moment you start
+                  until you stop, so they never appear in your video. Your notification setting is put back
+                  afterwards, even if Briefcast closes unexpectedly.
                 </p>
 
                 <Field label="Recording type">
@@ -451,6 +636,19 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </select>
                 </Field>
+                <Field label="Enhance audio automatically">
+                  <input
+                    type="checkbox"
+                    checked={settings.autoEnhanceAudio}
+                    onChange={(e) => update("autoEnhanceAudio", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  After each recording: removes background noise, evens out your voice, lowers system
+                  audio while you talk, and sets a consistent loudness. Turn off to keep the audio
+                  exactly as recorded.
+                </p>
                 {/* System audio ("what you hear") is now attempted on every platform - WASAPI
                     loopback on Windows, an auto-selected PulseAudio monitor source on Linux, and
                     (best-effort - only if the user already has a known virtual-audio-loopback
@@ -475,7 +673,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                         value={settings.defaultResolutionWidth ?? ""}
                         onChange={(e) => update("defaultResolutionWidth", e.target.value ? Number(e.target.value) : null)}
                       >
-                        <option value="">1080p (default)</option>
+                        <option value="">Auto - full display resolution on supported GPUs (default)</option>
                         <option value="1280">720p</option>
                         <option value="1920">1080p</option>
                         <option value="2560">1440p</option>
@@ -491,15 +689,17 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                         value={settings.defaultFramerate ?? ""}
                         onChange={(e) => update("defaultFramerate", e.target.value ? Number(e.target.value) : null)}
                       >
-                        <option value="">Default (60fps for Screen+Video+Audio, 30fps otherwise)</option>
+                        <option value="">Auto - 60fps on supported GPUs (default)</option>
                         <option value="24">24 fps</option>
                         <option value="30">30 fps</option>
                         <option value="60">60 fps</option>
                       </select>
                     </Field>
                     <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                      Recordings automatically use hardware-accelerated encoding (NVENC/Quick Sync/AMF) when your
-                      GPU and driver support it, falling back to software encoding otherwise - nothing to configure.
+                      Screen recordings are captured and encoded on your GPU (Quick Sync/NVENC/AMF) when it supports
+                      it - up to 4K at 60fps with almost no CPU, so the app stays smooth while you record. Auto
+                      records at your display's own resolution then; on other machines it records 1080p, and with a
+                      webcam baked into the video it records 1080p at 30fps. Nothing to configure.
                     </p>
                   </>
                 )}
@@ -691,6 +891,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
             )}
 
             {activeSection === "annotation" && (
+              <>
               <Section title="Presentation annotation">
                 <Field label="Enable annotation tool">
                   <input
@@ -702,9 +903,382 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 </Field>
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
                   While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
-                  anything to emphasize it. Strokes fade out on their own after a few seconds.
+                  anything to emphasize it. Press Esc or the shortcut again to stop.
                 </p>
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <Field label="Show toolbar while drawing">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationShowToolbar}
+                      onChange={(e) => update("annotationShowToolbar", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                    {settings.annotationShowToolbar
+                      ? "Turn off to draw with nothing else on screen, so it looks like magic."
+                      : "Hidden - drive it from the keyboard instead:"}
+                  </p>
+                  {/* Shown either way - they work with the toolbar too. */}
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
+                    {[
+                      ["Esc", "Stop drawing"],
+                      ["Backspace", "Clear the screen"],
+                      ["1 – 8", "Pick a colour"],
+                      ["P  M  N  L", "Pen, Marker, Neon, Laser"],
+                      ["Ctrl+Z", "Undo the last stroke"],
+                      ["Hold Shift", "Draw a straight line"],
+                      ["B", "Blur something private"],
+                      ["Shift+Backspace", "Remove every blur"],
+                    ].map(([keys, what]) => (
+                      <div key={keys} className="flex items-center justify-between gap-2">
+                        <span>{what}</span>
+                        <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
+                          {keys}
+                        </kbd>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </Section>
+
+              <Section title="Ink">
+                {/* Everything below applies from the next time draw mode opens - no restart. */}
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <AnnotationPreview
+                    color={settings.annotationColor}
+                    width={settings.annotationWidth}
+                    style={settings.annotationStyle}
+                    shadow={settings.annotationShadow}
+                  />
+
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Color</span>
+                    <div className="flex items-center gap-1.5">
+                      {ANNOTATION_COLORS.map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() => update("annotationColor", c)}
+                          aria-label={`Color ${c}`}
+                          aria-pressed={settings.annotationColor.toLowerCase() === c}
+                          className={`w-6 h-6 rounded-full ring-1 ring-black/15 dark:ring-white/25 transition-transform hover:scale-110 ${
+                            settings.annotationColor.toLowerCase() === c ? "outline outline-2 outline-offset-2 outline-blue-500" : ""
+                          }`}
+                          style={{ backgroundColor: c }}
+                        />
+                      ))}
+                      <label
+                        className={`relative w-6 h-6 rounded-full cursor-pointer ring-1 ring-black/15 dark:ring-white/25 bg-[conic-gradient(#ef4444,#facc15,#22c55e,#3b82f6,#a855f7,#ef4444)] ${
+                          ANNOTATION_COLORS.includes(settings.annotationColor.toLowerCase()) ? "" : "outline outline-2 outline-offset-2 outline-blue-500"
+                        }`}
+                        data-tip="Custom color"
+                      >
+                        <ColorInput
+                          value={settings.annotationColor}
+                          onChange={(e) => update("annotationColor", e.target.value)}
+                          className="absolute inset-0 opacity-0 cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Style</span>
+                      <Segmented value={settings.annotationStyle} options={ANNOTATION_STYLES} onChange={(v) => update("annotationStyle", v)} />
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {ANNOTATION_STYLES.find((st) => st.id === settings.annotationStyle)?.hint}
+                    </p>
+                  </div>
+
+                  <Field label="Size">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min={2}
+                        max={24}
+                        step={1}
+                        value={settings.annotationWidth}
+                        onChange={(e) => update("annotationWidth", Number(e.target.value))}
+                        className="w-32 accent-blue-500"
+                      />
+                      <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-6 text-right">{settings.annotationWidth}</span>
+                    </div>
+                  </Field>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Fade out</span>
+                      <Segmented
+                        value={settings.annotationFade}
+                        options={ANNOTATION_FADES}
+                        onChange={(v) => update("annotationFade", v)}
+                        disabled={settings.annotationStyle === "laser"}
+                      />
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {settings.annotationStyle === "laser"
+                        ? "Laser trails always vanish in under a second."
+                        : settings.annotationFade === "never"
+                        ? "Strokes stay until you press Clear or leave draw mode."
+                        : "How long each stroke stays before fading away."}
+                    </p>
+                  </div>
+
+                  <Field label="Drop shadow">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationShadow}
+                      disabled={settings.annotationStyle === "neon" || settings.annotationStyle === "laser"}
+                      onChange={(e) => update("annotationShadow", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-default"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
+                    {settings.annotationStyle === "neon" || settings.annotationStyle === "laser"
+                      ? "Neon and Laser already glow, so they don't use a shadow."
+                      : "Keeps ink readable on busy or same-coloured backgrounds."}
+                  </p>
+                </div>
+              </Section>
+
+              <Section title="Pointer and tap">
+                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-4">
+                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Pointer</span>
+                      <div className="flex items-center gap-3">
+                        {settings.annotationPointer === "hand" && (
+                          <div className="relative w-6 h-9 overflow-hidden" aria-hidden>
+                            <div className="absolute left-3 top-1.5" style={{ transform: "rotate(-26deg)" }}>
+                              <HandGraphic color={settings.annotationColor} stick={false} />
+                            </div>
+                          </div>
+                        )}
+                        <Segmented value={settings.annotationPointer} options={ANNOTATION_POINTERS} onChange={(v) => update("annotationPointer", v)} />
+                      </div>
+                    </div>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                      {settings.annotationPointer === "hand"
+                        ? "A little hand on a stick that follows your cursor, in the colour you're drawing with."
+                        : settings.annotationPointer === "dot"
+                        ? "A glowing dot in the ink colour."
+                        : settings.annotationPointer === "custom"
+                        ? "Your own image - its top centre is the point."
+                        : "The system crosshair."}
+                    </p>
+                  </div>
+
+                  {settings.annotationPointer === "custom" && (
+                    <Field label="Pointer image">
+                      <div className="flex items-center gap-2">
+                        {settings.annotationPointerImage && (
+                          <img src={settings.annotationPointerImage} alt="" className="h-8 w-auto max-w-[3rem] object-contain" />
+                        )}
+                        <input
+                          type="file"
+                          accept="image/png,image/webp"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = "";
+                            if (!file) return;
+                            // Downscaled before it's stored: settings live in localStorage, and the
+                            // pointer is only ever drawn ~64px tall.
+                            const url = URL.createObjectURL(file);
+                            const img = new Image();
+                            img.onload = () => {
+                              const scale = Math.min(1, 160 / img.naturalHeight);
+                              const canvas = document.createElement("canvas");
+                              canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+                              canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+                              canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+                              update("annotationPointerImage", canvas.toDataURL("image/png"));
+                              URL.revokeObjectURL(url);
+                            };
+                            img.onerror = () => URL.revokeObjectURL(url);
+                            img.src = url;
+                          }}
+                          className="text-xs text-neutral-500 dark:text-neutral-400 file:mr-2 file:px-2.5 file:py-1 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-neutral-100 dark:file:bg-neutral-800 file:text-neutral-700 dark:file:text-neutral-200 file:cursor-pointer"
+                        />
+                      </div>
+                    </Field>
+                  )}
+
+                  <Field label="Tap ripple">
+                    <input
+                      type="checkbox"
+                      checked={settings.annotationTapRipple}
+                      onChange={(e) => update("annotationTapRipple", e.target.checked)}
+                      className="w-4 h-4 accent-blue-500 cursor-pointer"
+                    />
+                  </Field>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">A ring spreads from the point where you click, so viewers see exactly where.</p>
+
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Tap sound</span>
+                    <Segmented
+                      value={settings.annotationTapSound}
+                      options={ANNOTATION_TAP_SOUNDS}
+                      onChange={(v) => {
+                        update("annotationTapSound", v);
+                        playTapSound(v, settings.annotationSoundVolume);
+                      }}
+                    />
+                  </div>
+
+                  <Field label="Volume">
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={settings.annotationTapSound === "off"}
+                      value={settings.annotationSoundVolume}
+                      onChange={(e) => update("annotationSoundVolume", Number(e.target.value))}
+                      onPointerUp={() => playTapSound(settings.annotationTapSound, settings.annotationSoundVolume)}
+                      className="w-32 accent-blue-500 disabled:opacity-40"
+                    />
+                  </Field>
+                </div>
+              </Section>
+
+              <Section title="Privacy blur">
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Press B while drawing and drag over anything private. The blur stays on screen and in recordings, and you
+                  can still click and type underneath it.
+                </p>
+                <Field label="Strength">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={settings.annotationBlurStrength}
+                      onChange={(e) => {
+                        const strength = Number(e.target.value);
+                        update("annotationBlurStrength", strength);
+                        // Live: any blur already on screen changes as the slider moves.
+                        void invoke("screen_blur_configure", { config: { strength } }).catch(() => {});
+                      }}
+                      className="w-32 accent-blue-500"
+                    />
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-8 text-right">
+                      {settings.annotationBlurStrength}
+                    </span>
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
+                  Even at 0 text can't be read. Higher adds more blur and frost.
+                </p>
+
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur WhatsApp chats</span>
+                    <Segmented
+                      value={settings.annotationAutoBlurWhatsApp}
+                      options={[
+                        { id: "off", label: "Off" },
+                        { id: "recording", label: "While recording" },
+                        { id: "always", label: "Always" },
+                      ]}
+                      onChange={(v) => update("annotationAutoBlurWhatsApp", v)}
+                    />
+                  </div>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                    {settings.annotationAutoBlurWhatsApp === "off"
+                      ? "WhatsApp is never blurred automatically."
+                      : "Follows the WhatsApp window as it moves, resizes or switches chats."}
+                  </p>
+                </div>
+                {settings.annotationAutoBlurWhatsApp !== "off" && (
+                  <div className="flex items-center justify-end gap-4 text-sm text-neutral-700 dark:text-neutral-300">
+                    {(
+                      [
+                        ["chatList", "Chat list"],
+                        ["contact", "Contact name & photo"],
+                        ["messages", "Messages"],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <label key={key} className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={settings.annotationBlurWhatsAppParts[key]}
+                          onChange={(e) => update("annotationBlurWhatsAppParts", { ...settings.annotationBlurWhatsAppParts, [key]: e.target.checked })}
+                          className="w-4 h-4 accent-blue-500 cursor-pointer"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1 pt-2">
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur sensitive text</span>
+                    <Segmented
+                      value={settings.annotationAutoBlurText}
+                      options={[
+                        { id: "off", label: "Off" },
+                        { id: "recording", label: "While recording" },
+                        { id: "always", label: "Always" },
+                      ]}
+                      onChange={(v) => update("annotationAutoBlurText", v)}
+                    />
+                  </div>
+                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
+                    {settings.annotationAutoBlurText === "off"
+                      ? "Text on screen is never blurred automatically."
+                      : "Watches the window you're using and blurs what matches below. A safety net, not a guarantee: new text can show for a moment before it's blurred, and unusual fonts can be missed."}
+                  </p>
+                  {settings.annotationAutoBlurText !== "off" && <OcrStatus />}
+                </div>
+                {settings.annotationAutoBlurText !== "off" && (
+                  <>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm text-neutral-700 dark:text-neutral-300">
+                      {(
+                        [
+                          ["passwords", "Passwords & PINs"],
+                          ["keys", "API keys, tokens & private keys"],
+                          ["financial", "Card & bank numbers"],
+                          ["personal", "Emails & phone numbers"],
+                        ] as const
+                      ).map(([key, label]) => (
+                        <label key={key} className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={settings.annotationBlurTextRules[key]}
+                            onChange={(e) => update("annotationBlurTextRules", { ...settings.annotationBlurTextRules, [key]: e.target.checked })}
+                            className="w-4 h-4 accent-blue-500 cursor-pointer"
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                    <Field label="Also blur these words">
+                      <input
+                        type="text"
+                        value={settings.annotationBlurKeywords}
+                        onChange={(e) => update("annotationBlurKeywords", e.target.value)}
+                        placeholder="Client name, project codename…"
+                        className="w-56 px-2 py-1 rounded-md text-sm bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100 placeholder:text-neutral-400"
+                      />
+                    </Field>
+                    <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2 text-right">Separate with commas. Matching ignores upper/lower case.</p>
+                  </>
+                )}
+
+                <div className="flex items-center justify-between gap-4 pt-2">
+                  <span className="text-sm text-neutral-700 dark:text-neutral-300">Blur the whole window you're using</span>
+                  <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
+                    Ctrl+Alt+B
+                  </kbd>
+                </div>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">Works anywhere. Press it again to unblur.</p>
+              </Section>
+              </>
             )}
 
             {activeSection === "files" && (
@@ -725,6 +1299,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
               </Section>
             )}
 
+            {activeSection === "privacy" && <PrivacySection />}
+
             {activeSection === "pdf" && (
               <Section title="PDF annotator defaults">
                 <Field label="Starting tool">
@@ -740,13 +1316,22 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     ))}
                   </select>
                 </Field>
+                <Field label="Fit to screen on open">
+                  <input
+                    type="checkbox"
+                    checked={settings.pdfFitOnOpen}
+                    onChange={(e) => update("pdfFitOnOpen", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer"
+                  />
+                </Field>
                 <Field label="Default zoom">
-                  <div className="flex items-center gap-2">
+                  <div className={`flex items-center gap-2 ${settings.pdfFitOnOpen ? "opacity-40" : ""}`}>
                     <input
                       type="range"
                       min={15}
                       max={300}
                       step={5}
+                      disabled={settings.pdfFitOnOpen}
                       value={Math.round(settings.pdfDefaultZoom * 100)}
                       onChange={(e) => update("pdfDefaultZoom", Number(e.target.value) / 100)}
                       className="w-28 accent-blue-500"
@@ -754,17 +1339,28 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-10 text-right">{Math.round(settings.pdfDefaultZoom * 100)}%</span>
                   </div>
                 </Field>
+                <Field label="Two-page turn">
+                  <select
+                    className={fieldInputClass}
+                    value={settings.pdfPageTurn}
+                    onChange={(e) => update("pdfPageTurn", e.target.value as AppSettings["pdfPageTurn"])}
+                  >
+                    {PDF_PAGE_TURN_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
                 <Field label="Pen color">
-                  <input
-                    type="color"
+                  <ColorInput
                     value={settings.pdfDefaultPenColor}
                     onChange={(e) => update("pdfDefaultPenColor", e.target.value)}
                     className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
                   />
                 </Field>
                 <Field label="Highlighter color">
-                  <input
-                    type="color"
+                  <ColorInput
                     value={settings.pdfDefaultHighlighterColor}
                     onChange={(e) => update("pdfDefaultHighlighterColor", e.target.value)}
                     className="w-7 h-7 p-0 border-0 rounded-full cursor-pointer bg-transparent"
@@ -798,6 +1394,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                   <ShortcutRow keys="Ctrl+Shift+H" description="Show/hide the floating recording overlay (while recording)" />
                   <ShortcutRow keys="Ctrl+Shift+B" description="Show/hide the recording panel buttons - handy right before presenting" />
                   <ShortcutRow keys="Ctrl+Shift+D" description="Toggle the annotation tool's draw mode (see Annotation settings)" />
+                  <ShortcutRow keys="Ctrl+Alt+B" description="Blur the active window, or unblur it" />
                 </Section>
 
                 <Section title="File selection">

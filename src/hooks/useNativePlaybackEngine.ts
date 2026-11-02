@@ -13,15 +13,39 @@ interface PlaybackSessionInfo {
   channels: number;
 }
 
+// get_next_video_frame/get_next_audio_chunk answer with raw bytes (tauri::ipc::Response), not
+// JSON - see encode_video_packet/encode_audio_packet in native_playback.rs for the layout. An
+// empty body means "nothing yet / stream ended".
 interface VideoFrame {
-  data_base64: string;
+  jpeg: Uint8Array;
   pts: number;
 }
 
 interface AudioChunk {
-  data_base64: string;
+  pcm: Uint8Array;
   pts: number;
   sample_count: number;
+}
+
+const toBytes = (body: ArrayBuffer | number[]): Uint8Array =>
+  body instanceof ArrayBuffer ? new Uint8Array(body) : Uint8Array.from(body);
+
+function parseVideoPacket(body: ArrayBuffer | number[]): VideoFrame | null {
+  const bytes = toBytes(body);
+  if (bytes.byteLength <= 8) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { pts: view.getFloat64(0, true), jpeg: bytes.subarray(8) };
+}
+
+function parseAudioPacket(body: ArrayBuffer | number[]): AudioChunk | null {
+  const bytes = toBytes(body);
+  if (bytes.byteLength < 12) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    pts: view.getFloat64(0, true),
+    sample_count: view.getUint32(8, true),
+    pcm: bytes.subarray(12),
+  };
 }
 
 interface DecodedVideoFrame {
@@ -37,13 +61,6 @@ const VIDEO_PREFETCH_TARGET = 10;
 const AUDIO_PREFETCH_SECONDS = 2;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-function base64ToUint8Array(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
 
 // Owns the whole native-decode playback runtime for one <canvas>: two independent pull loops
 // (video frames, audio chunks) feeding local prefetch buffers, plus a requestAnimationFrame loop
@@ -111,7 +128,9 @@ export function useNativePlaybackEngine(canvasRef: RefObject<HTMLCanvasElement>)
       }
       let frame: VideoFrame | null;
       try {
-        frame = await invoke<VideoFrame | null>('get_next_video_frame', { sessionId });
+        frame = parseVideoPacket(
+          await invoke<ArrayBuffer | number[]>('get_next_video_frame', { sessionId })
+        );
       } catch (err) {
         console.error('get_next_video_frame failed:', err);
         return;
@@ -123,9 +142,8 @@ export function useNativePlaybackEngine(canvasRef: RefObject<HTMLCanvasElement>)
         continue;
       }
       try {
-        const bytes = base64ToUint8Array(frame.data_base64);
         const bitmap = await createImageBitmap(
-          new Blob([bytes.buffer as ArrayBuffer], { type: 'image/jpeg' })
+          new Blob([frame.jpeg as BlobPart], { type: 'image/jpeg' })
         );
         if (runIdRef.current !== myRunId) {
           bitmap.close();
@@ -146,7 +164,7 @@ export function useNativePlaybackEngine(canvasRef: RefObject<HTMLCanvasElement>)
     const gain = gainNodeRef.current;
     if (!ctx || !gain) return;
 
-    const bytes = base64ToUint8Array(chunk.data_base64);
+    const bytes = chunk.pcm;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const frameCount = chunk.sample_count;
     if (frameCount === 0) return;
@@ -179,7 +197,9 @@ export function useNativePlaybackEngine(canvasRef: RefObject<HTMLCanvasElement>)
       }
       let chunk: AudioChunk | null;
       try {
-        chunk = await invoke<AudioChunk | null>('get_next_audio_chunk', { sessionId });
+        chunk = parseAudioPacket(
+          await invoke<ArrayBuffer | number[]>('get_next_audio_chunk', { sessionId })
+        );
       } catch (err) {
         console.error('get_next_audio_chunk failed:', err);
         return;

@@ -1,0 +1,8 @@
+[package]
+name = "motion-track"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Follows a picked region through video frames (Median Flow + template re-acquisition) for Briefcast's motion tracking."
+
+[dependencies]

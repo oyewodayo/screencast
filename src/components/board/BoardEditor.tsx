@@ -106,6 +106,7 @@ import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS } from "../../utils/boardC
 import BoardCanvas from "./BoardCanvas";
 import BoardLayerPanel from "./BoardLayerPanel";
 import BoardStylePanel from "./BoardStylePanel";
+import ColorInput from "../common/ColorInput";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 const MIN_ZOOM = 0.1;
@@ -1507,8 +1508,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                       toggles backgroundColor between null (transparent, see BoardDocument's own
                       doc comment) and the swatch's last value, since HTML color inputs never fire
                       onChange with an empty value on their own. */}
-                  <input
-                    type="color"
+                  <ColorInput
                     value={store.doc.backgroundColor ?? "#f5f5f5"}
                     onChange={(e) => store.setBackgroundColor(e.target.value)}
                     className={`w-9 h-9 shrink-0 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer ${
@@ -1529,8 +1529,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                 <div className="flex flex-col gap-3">
                   <label className="flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                     Line color
-                    <input
-                      type="color"
+                    <ColorInput
                       value={currentGrid.lineColor}
                       onChange={(e) => store.setBackgroundGrid({ ...currentGrid, lineColor: e.target.value })}
                       className="w-9 h-9 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
@@ -1548,8 +1547,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                     />
                   </label>
                   <div className="flex items-center gap-2">
-                    <input
-                      type="color"
+                    <ColorInput
                       value={currentGrid.baseColor ?? "#ffffff"}
                       onChange={(e) => store.setBackgroundGrid({ ...currentGrid, baseColor: e.target.value })}
                       className={`w-9 h-9 shrink-0 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer ${
@@ -1572,8 +1570,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                   <div className="flex items-center gap-2">
                     <label className="flex-1 flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                       From
-                      <input
-                        type="color"
+                      <ColorInput
                         value={currentGradient.from}
                         onChange={(e) => store.setBackgroundGradient({ ...currentGradient, from: e.target.value })}
                         className="w-9 h-9 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
@@ -1581,8 +1578,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                     </label>
                     <label className="flex-1 flex items-center justify-between gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                       To
-                      <input
-                        type="color"
+                      <ColorInput
                         value={currentGradient.to}
                         onChange={(e) => store.setBackgroundGradient({ ...currentGradient, to: e.target.value })}
                         className="w-9 h-9 rounded border border-neutral-300 dark:border-neutral-600 bg-transparent cursor-pointer"
