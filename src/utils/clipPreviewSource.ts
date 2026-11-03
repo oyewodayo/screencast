@@ -33,11 +33,14 @@ export function resolveAssetUrl(path: string): Promise<string> {
   return cached(assetUrlCache, path, async () => convertFileSrc(await invoke<string>("convert_file_path_to_url", { filepath: path })));
 }
 
-export function resolveClipPreviewUrl(sourcePath: string, frame: VideoProjectFrame | null): Promise<string> {
+// `background`: "blur" fits an image over a blurred copy of itself (a canvas's Blur background),
+// as export does; otherwise black bars.
+export function resolveClipPreviewUrl(sourcePath: string, frame: VideoProjectFrame | null, background?: "blur" | null): Promise<string> {
   if (!isImageClipPath(sourcePath)) return resolveAssetUrl(sourcePath);
   const { width, height } = frame ?? FALLBACK_PREVIEW_FRAME;
-  return cached(proxyUrlCache, `${sourcePath}|${width}x${height}`, async () => {
-    const proxyPath = await invoke<string>("get_image_clip_proxy", { imagePath: sourcePath, frameWidth: width, frameHeight: height });
+  const blur = background === "blur" ? "blur" : null;
+  return cached(proxyUrlCache, `${sourcePath}|${width}x${height}|${blur ?? ""}`, async () => {
+    const proxyPath = await invoke<string>("get_image_clip_proxy", { imagePath: sourcePath, frameWidth: width, frameHeight: height, background: blur });
     return resolveAssetUrl(proxyPath);
   });
 }

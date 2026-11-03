@@ -436,7 +436,8 @@ const MediaGrid = memo(function MediaGrid({
 // ---------- the dialog ----------
 
 const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryImages, libraryVideos, resolveThumbnailUrl, resolveVideoThumbnailUrl, onCreate, onClose }) => {
-  const [name, setName] = useState("Untitled video");
+  // Empty = the name it gets on its own (autoName below) - shown as the field's placeholder.
+  const [name, setName] = useState("");
   // "auto": the shape most of the picked media are (autoFrameId).
   const [frameId, setFrameId] = useState("auto");
   // In clip order - the order images were picked in, rearranged by dragging in the sequence strip.
@@ -480,6 +481,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const deferredMediaQuery = useDeferredValue(mediaQuery);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [brand, setBrandState] = useState<BrandOptions>(readBrand);
+  // A name worth finding it by later, when none is typed: the brand's, else what it is and when
+  // ("Photo video 3 Nov 2026") - never "Untitled video (38)". Projects live in the library's
+  // Projects folder (create_video_project).
+  const autoName = `${brand.name.trim() || (picked.length > 0 ? "Photo video" : "Video")} ${new Date().toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}`;
   const setBrand = (patch: Partial<BrandOptions>) =>
     setBrandState((prev) => {
       const next = { ...prev, ...patch };
@@ -961,7 +966,7 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
         : undefined;
       trackEvent("video_project_created", { style: template?.id ?? "custom", music: song ? (song.library ? "library" : "file") : "none", photos: picked.length });
       await onCreate({
-        name: name.trim() || "Untitled video",
+        name: name.trim() || autoName,
         frame,
         imagePaths: picked,
         options: { imageDuration, kenBurns, transition: null },
@@ -1408,7 +1413,8 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
               </Section>
 
               <Section title="Name">
-                <TextField value={name} onChange={setName} label="Video name" />
+                <TextField value={name} onChange={setName} label="Video name" placeholder={autoName} />
+                <p className="mt-1.5 text-[11.5px] text-neutral-500 dark:text-neutral-400">Saved in your library's Projects folder.</p>
               </Section>
 
               <Section title="Format">

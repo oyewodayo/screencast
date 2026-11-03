@@ -23,6 +23,8 @@ import type { OverlayAsset } from "./videoAssets";
 import type { TextRevealSettings } from "./textReveal";
 import type { ImageRevealSettings } from "./imageReveal";
 import type { ScreenStyle } from "./screenStyle";
+import type { CanvasFormat } from "./canvasFormats";
+import type { SplitMember } from "./splitLayouts";
 import type { PointerStyle } from "./pointerTrack";
 import type { KeystrokeStyle } from "./keystrokes";
 import type { SpriteTrackSpec } from "./spriteTrack";
@@ -485,6 +487,8 @@ export interface ImageOverlay {
   track?: OverlayTrackInfo;
   // Only this part of the picture shows (layerMask.ts) - in the box's own space.
   mask?: LayerMask;
+  // One cell (or the backdrop) of a split screen, which can be rearranged as a whole (splitGroups.ts).
+  split?: SplitMember;
   // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
   // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
   // unlike every other field on this type (all normalized against the video frame instead). All
@@ -678,6 +682,8 @@ export interface PipOverlay {
   // A webcam bubble lifted off the main recording it was baked into (webcamBubble.ts): `sourcePath`
   // is that recording, `crop` the bubble, and the layer sits exactly over it.
   bakedBubble?: boolean;
+  // One cell of a split screen, which can be rearranged as a whole (splitGroups.ts).
+  split?: SplitMember;
   createdAt: number;
   updatedAt: number;
 }
@@ -730,6 +736,8 @@ export interface AdjustmentLayer {
   // A solid colour ("#rrggbb") instead of the adjusted picture - with a region, what masks the
   // main video: the area (or, inverted, everything around it) shows this colour.
   fill?: string;
+  // A split screen's backdrop - its gap colour, beneath its cells (splitGroups.ts).
+  split?: SplitMember;
   createdAt: number;
   updatedAt: number;
 }
@@ -860,6 +868,9 @@ export interface VideoEditState {
   screenStyle?: ScreenStyle | null;
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
+  // The shape and size the edit is made in and exported at (canvasFormats.ts); undefined/null =
+  // the open video's own.
+  canvas?: CanvasFormat | null;
   // Motion-graphics scenes (Stage - src/utils/stage): elements moving through beats, drawn over the
   // video and its tracks, beneath blur regions, pictures and text. Undefined = none.
   scenes?: StageScene[];
@@ -888,6 +899,7 @@ export interface EditableFields {
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
   scenes?: StageScene[];
+  canvas?: CanvasFormat | null;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -941,6 +953,8 @@ export interface VideoEditCommand {
     | "edit-video-tracks"
     | "find-hide"
     | "edit-screen-style"
+    | "edit-canvas"
+    | "edit-split"
     | "add-scene"
     | "edit-scene"
     | "delete-scene";

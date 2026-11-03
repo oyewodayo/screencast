@@ -400,6 +400,9 @@ fn main() {
             match services::utility::briefcast_dir() {
                 Ok(dir) => {
                     let _ = std::fs::create_dir_all(&dir);
+                    // Companion files written before they were hidden get hidden now (sidecars.rs).
+                    let hide_root = dir.clone();
+                    std::thread::spawn(move || services::sidecars::hide_sidecars_in(&hide_root));
                     services::file_watcher::start_watching(&app.handle(), &dir);
                 }
                 Err(e) => log::warn!("Could not resolve Briefcast dir for file watcher: {}", e),
@@ -719,6 +722,7 @@ fn main() {
             services::video_edits::save_video_chapters,
             services::video_edits::load_video_chapters,
             services::trash::move_to_trash,
+            services::sidecars::prepare_library_tidy,
             services::trash::list_trash,
             services::trash::restore_from_trash,
             services::trash::delete_trash_item,

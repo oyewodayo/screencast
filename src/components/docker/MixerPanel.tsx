@@ -214,14 +214,16 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
           <span>Select audio on the timeline to play it here - Ctrl-click for more</span>
         )}
       </div>
-      <div className={`flex flex-col gap-1 overflow-y-auto -mx-1 px-1 ${dockHost ? "max-h-[70vh]" : "min-h-0"}`}>
+      {/* Two strips across once the docked sidebar is wide enough; an open strip (its effects)
+          spans both. Floating, the panel is always one column. */}
+      <div className={`grid grid-cols-1 @[520px]:grid-cols-2 gap-1 content-start overflow-y-auto -mx-1 px-1 ${dockHost ? "max-h-[70vh]" : "min-h-0"}`}>
         {channels.map((ch) => {
           const isOpen = expanded === ch.key;
           const soloed = session.solo.has(ch.key);
           const silenced = session.solo.size > 0 && !soloed;
           const hasFx = !isNeutralFx(ch.fx);
           return (
-            <div key={ch.key} className={`rounded-md ring-1 ${isOpen ? "ring-teal-400/30 bg-white/[0.04]" : "ring-white/5 bg-white/[0.02]"} ${ch.muted || silenced ? "opacity-60" : ""}`}>
+            <div key={ch.key} className={`rounded-md ring-1 ${isOpen ? "ring-teal-400/30 bg-white/[0.04] @[520px]:col-span-2" : "ring-white/5 bg-white/[0.02]"} ${ch.muted || silenced ? "opacity-60" : ""}`}>
               <div className="flex flex-col gap-1 px-2 py-1.5">
                 <div className="flex items-center gap-1.5 min-w-0">
                   <button type="button" onClick={() => setExpanded(isOpen ? null : ch.key)} className="shrink-0 text-white/50 hover:text-white" title={isOpen ? "Hide effects" : "Show EQ, compressor and balance"}>
@@ -271,7 +273,7 @@ const MixerPanel: React.FC<MixerPanelProps> = ({ anchor, channels, focusKey, onV
             </div>
           );
         })}
-        {channels.length === 0 && <p className="text-[11px] text-white/50 py-2">Nothing in this edit makes a sound yet.</p>}
+        {channels.length === 0 && <p className="@[520px]:col-span-2 text-[11px] text-white/50 py-2">Nothing in this edit makes a sound yet.</p>}
       </div>
       <MasterStrip master={master} onChange={onMasterChange} target={loudnessTarget} onTargetChange={onLoudnessTargetChange} />
     </div>,

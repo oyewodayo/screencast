@@ -404,7 +404,7 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
           <span className="flex-1">Voice</span>
           <span className="normal-case tracking-normal">{selected.accent} · {selected.gender}</span>
         </div>
-        <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label="Voice">
+        <div className="grid grid-cols-2 @[520px]:grid-cols-3 gap-1.5" role="radiogroup" aria-label="Voice">
           {VOICES.map((v) => {
             const on = v.id === voice;
             const isPlaying = playing?.kind === "sample" && playing.voice === v.id;

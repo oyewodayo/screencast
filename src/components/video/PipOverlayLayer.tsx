@@ -876,7 +876,8 @@ const PipOverlayLayer: React.FC<PipOverlayLayerProps> = ({
           currentOutputTime={currentOutputTime}
           isPlaying={isPlaying}
           frameRect={frameRect}
-          isSelected={selectedPipOverlayId === o.id}
+          // Handles hide while playing (the selection itself stays).
+          isSelected={selectedPipOverlayId === o.id && !isPlaying}
           onSelect={() => {
             // A click on the pip whose popover is already open closes it; otherwise (unselected, or
             // selected but with the popover dismissed - e.g. right after the crop editor closes)

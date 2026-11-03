@@ -48,6 +48,56 @@ export function saveSidebarViewMode(mode: SidebarViewMode): void {
   }
 }
 
+// The sidebar's width: dragged wider for long names and big thumbnails, never narrower than its
+// original 300px and at most 2.2x that. Kept separately for browsing and for editing a video - a
+// roomy sidebar for the editor's docked panels (mixer, effects, AI voice) needn't eat into the
+// picture while just watching - so it moves between the two as the editor opens and closes.
+// Or collapsed to a rail of icons (SIDEBAR_RAIL_W) for the most picture while editing.
+export type SidebarMode = "browsing" | "editing";
+const WIDTH_KEYS: Record<SidebarMode, string> = { browsing: "briefcast.sidebarWidth.v1", editing: "briefcast.sidebarWidth.editing.v1" };
+const COLLAPSED_KEY = "briefcast.sidebarCollapsed.v1";
+export const SIDEBAR_MIN_W = 300;
+export const SIDEBAR_MAX_W = 660;
+export const SIDEBAR_RAIL_W = 56;
+
+export const clampSidebarWidth = (w: number): number => Math.round(Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, Number.isFinite(w) ? w : SIDEBAR_MIN_W)));
+
+export function getSidebarWidth(mode: SidebarMode): number {
+  try {
+    // Editing starts from the browsing width until it's been set on its own.
+    const saved = localStorage.getItem(WIDTH_KEYS[mode]) ?? (mode === "editing" ? localStorage.getItem(WIDTH_KEYS.browsing) : null);
+    return clampSidebarWidth(Number(saved ?? SIDEBAR_MIN_W));
+  } catch {
+    return SIDEBAR_MIN_W;
+  }
+}
+
+export function saveSidebarWidth(mode: SidebarMode, w: number): number {
+  const width = clampSidebarWidth(w);
+  try {
+    localStorage.setItem(WIDTH_KEYS[mode], String(width));
+  } catch {
+    /* preference only */
+  }
+  return width;
+}
+
+export function getSidebarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveSidebarCollapsed(collapsed: boolean): void {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    /* preference only */
+  }
+}
+
 // Index in `pinned` of the folder itself or its nearest pinned ancestor, or -1 when neither is
 // pinned. A subfolder rides along with a pinned parent so the tree stays intact on top.
 export function pinRank(folder: string, pinned: string[]): number {

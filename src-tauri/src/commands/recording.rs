@@ -470,7 +470,7 @@ pub(crate) fn write_bubble_sidecar(video_path: &Path, form_data: &FormData, came
         "border": form_data.overlay_border,
         "cameraCount": camera_count,
     });
-    if let Err(e) = fs::write(bubble_sidecar_path(video_path), json.to_string()) {
+    if let Err(e) = crate::services::sidecars::write_sidecar(&bubble_sidecar_path(video_path), json.to_string()) {
         warn!("Failed to write the camera bubble sidecar: {}", e);
     }
 }
@@ -2710,7 +2710,7 @@ pub async fn stop_recording(
                 let clicks_path = click_sidecar_path(&output_path);
                 match serde_json::to_string(&clicks) {
                     Ok(json) => {
-                        if let Err(e) = fs::write(&clicks_path, json) {
+                        if let Err(e) = crate::services::sidecars::write_sidecar(&clicks_path, json) {
                             warn!("Failed to write click-tracking sidecar: {}", e);
                         }
                     }
@@ -2729,7 +2729,7 @@ pub async fn stop_recording(
                     None => Some((hns - started_hns) as f64 / 1e7).filter(|t| *t >= 0.0),
                 };
                 if !log.is_empty() {
-                    if let Err(e) = fs::write(pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
+                    if let Err(e) = crate::services::sidecars::write_sidecar(&pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
                         warn!("Failed to write the pointer sidecar: {}", e);
                     }
                 }
@@ -2739,7 +2739,7 @@ pub async fn stop_recording(
                 let clicks = log.left_clicks(to_output);
                 if !clicks_path.exists() && !clicks.is_empty() {
                     if let Ok(json) = serde_json::to_string(&clicks) {
-                        let _ = fs::write(&clicks_path, json);
+                        let _ = crate::services::sidecars::write_sidecar(&clicks_path, json);
                     }
                 }
             }
@@ -2765,7 +2765,7 @@ pub async fn stop_recording(
             let switches_path = view_switch_sidecar_path(&output_path);
             match serde_json::to_string(&switches) {
                 Ok(json) => {
-                    if let Err(e) = fs::write(&switches_path, json) {
+                    if let Err(e) = crate::services::sidecars::write_sidecar(&switches_path, json) {
                         warn!("Failed to write view-switch sidecar: {}", e);
                     }
                 }

@@ -31,7 +31,7 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, isIdentityAffine, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { isNeutralFx, type AudioFx } from '../utils/audioFx';
 import { createTrackFxNode, loadTrackFxModule, loadWorkletModule, masterInput, mixerContext, resumeMixer, setListenLevel, setNodeFx, useTimelineMuted } from '../utils/mixerGraph';
@@ -39,6 +39,7 @@ import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile }
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
 import GradeCanvas from './video/GradeCanvas';
+import BlurBackdrop from './video/BlurBackdrop';
 import { speedAtSource } from '../utils/clipTiming';
 import ThumbnailPicker, { ScrubSpriteMeta, ThumbnailChoice } from './video/ThumbnailPicker';
 import { getPlayableUrl, isPictureless } from '../utils/playableVideo';
@@ -240,6 +241,9 @@ interface VideoPlayerProps {
   // drawn inside it instead of filling the frame, the frame's wallpaper drawn around it by the
   // caller. Null/undefined: the picture fills the frame.
   contentInset?: { x: number; y: number; width: number; height: number } | null;
+  // "blur": a canvas's Blur background (canvasFormats.ts) - around a clip that doesn't fill the
+  // frame, a blurred copy of it instead of black, as export draws it (frame_fit_blur_chain).
+  frameBackground?: "blur" | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -333,7 +337,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo, editTimeline = null }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo, editTimeline = null, frameBackground = null }, ref) => {
   // While loadSource is switching files: whether to play once there. Play/pause pressed meanwhile
   // (togglePauseAndPlay) changes it - the timeline's Play-from-the-end seeks and then plays.
   const loadPlayIntentRef = useRef<boolean | null>(null);
@@ -348,6 +352,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   };
   const contentInsetRef = useRef(contentInset);
   contentInsetRef.current = contentInset;
+  // The Blur background's layer (blurInnerRef - moved by the clip's crop / Ken Burns with the
+  // picture) and the small canvas the current frame is drawn into, blurred by CSS.
+  const blurInnerRef = useRef<HTMLDivElement>(null);
+  const blurCanvasRef = useRef<HTMLCanvasElement>(null);
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -538,6 +546,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     video.style.transformOrigin = framing.transform ? '0 0' : '';
     video.style.transform = framing.transform;
     video.style.clipPath = framing.clipPath;
+    // The Blur background is part of the frame the clip was fitted into, so crop / Ken Burns /
+    // mirror move it too (export fits first, then crops - frame_fit_blur_chain before crop_chain).
+    const blurInner = blurInnerRef.current;
+    if (blurInner) {
+      blurInner.style.transformOrigin = '0 0';
+      blurInner.style.transform = isIdentityAffine(m) ? '' : `matrix(${m.ax}, 0, 0, ${m.ay}, ${blurInner.clientWidth * m.bx}, ${blurInner.clientHeight * m.by})`;
+    }
   };
 
   useImperativeHandle(ref, () => ({
@@ -1572,7 +1587,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
   // A copy that opens on the chosen thumbnail (make_share_ready_copy, conversion.rs) - what makes
   // it show on WhatsApp, Telegram, Instagram..., which preview a video by its first frame and
-  // ignore the embedded cover. Saved next to the original; progress shows in the notice.
+  // ignore the embedded cover. Saved in the library's Exports folder; progress shows in the notice.
   const makeShareReadyCopy = async (): Promise<void> => {
     if (!filePath || shareCopyBusyRef.current) return;
     shareCopyBusyRef.current = true;
@@ -1586,7 +1601,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       const output = await invoke<string>('make_share_ready_copy', { inputPath: key });
       const name = output.split(/[\\/]/).pop() ?? output;
       showThumbnailNotice({
-        text: `Saved "${name}" next to the original. Share that one - it opens on your thumbnail, so that's what WhatsApp and Telegram show.`,
+        text: `Saved "${name}" in Exports. Share that one - it opens on your thumbnail, so that's what WhatsApp and Telegram show.`,
         action: { label: 'Show in folder', run: () => void invoke('open_file_from_directory', { filepath: output }) },
       });
     } catch (err) {
@@ -3073,8 +3088,17 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
 			{
 				<>
+					{frameBackground === 'blur' && frameRect && (
+						<div className="absolute pointer-events-none overflow-hidden" style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}>
+							<div ref={blurInnerRef} className="absolute inset-0">
+								<BlurBackdrop videoRef={videoRef} canvasRef={blurCanvasRef} width={frameRect.width} height={frameRect.height} onReady={applyCropAndKenBurns} />
+							</div>
+						</div>
+					)}
 					<video
 						ref={videoRef}
+						// Over the Blur background (positioned, so it paints after it).
+						style={frameBackground === 'blur' ? { position: 'relative' } : undefined}
 						loop={loop || isLoopEnabled}
 						crossOrigin="anonymous"
 						onClick={handleVideoClick}

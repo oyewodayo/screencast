@@ -31,7 +31,9 @@ export const SelectionCountBadge: React.FC<{ count?: number }> = ({ count }) =>
 
 // Outer shell for a docked panel - fills the sidebar's width instead of a fixed popover width, and
 // keeps the popovers' own dark styling (their controls are all white-on-dark) as a card.
-export const DOCKED_PANEL_CLASS = "w-full rounded-lg bg-neutral-900 ring-1 ring-black/5 dark:ring-white/10 text-white/90 flex flex-col";
+// @container: a panel lays itself out by how wide the (resizable) sidebar makes it - the mixer
+// two strips across, the AI voice's voices three across - rather than by the window.
+export const DOCKED_PANEL_CLASS = "@container w-full rounded-lg bg-neutral-900 ring-1 ring-black/5 dark:ring-white/10 text-white/90 flex flex-col";
 
 // Outside-click dismissal for a floating panel - deferred a couple of frames, so the click that
 // opens the sidebar docks the panel (useDockSnap) instead of closing it. Clicks inside `selector`

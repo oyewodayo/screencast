@@ -27,7 +27,6 @@ import { fadeTotalMs } from '../utils/annotationStyles';
 import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
-import SidebarFileIcon from "../components/SidebarFileIcon";
 import {
   canMoveFolder,
   folderMatchesQuery,
@@ -38,10 +37,15 @@ import {
   pinRank,
   repathFolderKey,
   repathPinnedFolders,
-  saveSidebarViewMode,
-  togglePinnedFolder,
+  getSidebarCollapsed,
+  getSidebarWidth,
+  saveSidebarCollapsed,
+  saveSidebarWidth,
+  SIDEBAR_RAIL_W,
+  type SidebarMode,
   type SidebarViewMode,
 } from "../utils/sidebarFolders";
+import { FileNameText, SidebarRail, SidebarResizeHandle } from "../components/SidebarResize";
 import VideoPlayer, { EditTimeline, VideoPlayerHandle } from "../components/VideoPlayer";
 import { seekTimeline, timelineTime } from "../utils/timelineTransport";
 import { chapterAtOutputTime, outputChapters } from "../utils/videoChapters";
@@ -71,8 +75,20 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import SidebarFileTree from "../components/sidebar/SidebarFileTree";
+import SidebarHeader from "../components/sidebar/SidebarHeader";
+import { FILE_CATEGORY_TABS } from "../components/sidebar/categoryTabs";
+import TidyLibraryDialog from "../components/video/TidyLibraryDialog";
+import { folderCollapse } from "../components/sidebar/folderCollapse";
+import { useStableCallbacks } from "../hooks/useStableCallbacks";
+import { FileEntry, GALLERY_CATEGORIES, SidebarTab, TrashEntry } from "../utils/libraryEntries";
+import { setEditorIntent, type EditorIntent } from "../utils/editorIntent";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
 import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import PhonePreviewLayer from "../components/video/PhonePreviewLayer";
+import SplitArrangeBar from "../components/video/SplitArrangeBar";
+import { usePhonePreview } from "../hooks/usePhonePreview";
+import { splitGroupMembers } from "../utils/splitGroups";
 import AdjustmentLayersLayer from "../components/video/AdjustmentLayersLayer";
 import StageLayer from "../components/video/StageLayer";
 import TrackTargetPicker from "../components/video/TrackTargetPicker";
@@ -112,7 +128,6 @@ import {
   onPhoneRemote,
   onPhoneTimelineFile,
   PhoneRemoteCommand,
-  openPhoneReceive,
   openPhoneTransfer,
   reportPhonePlacement,
   setPhoneTimeline,
@@ -139,7 +154,6 @@ import {
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import { copyImageUrlToClipboard } from "../utils/imageClipboard";
-import InlineRenameInput from "../components/InlineRenameInput";
 import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
 import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
@@ -150,7 +164,7 @@ import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
-import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
+import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
   getPinnedPaths,
   getRecentPaths,
@@ -177,83 +191,30 @@ import {
   forgetPlaybackState,
 } from "../utils/playbackResume";
 import {
-  IoVideocam,
-  IoMusicalNotes,
-  IoImage,
   IoDocumentText,
   IoChevronBack,
-  IoChevronForward,
-  IoRepeatOutline,
-  IoShuffleOutline,
-  IoPlayForwardOutline,
-  IoTrashOutline,
   IoArrowUndoOutline,
   IoFolderOutline,
-  IoAddCircleOutline,
-  IoBuildOutline,
   IoOptionsOutline,
-  IoAdd,
   IoPin,
-  IoPinOutline,
-  IoGridOutline,
-  IoListOutline,
-  IoCreateOutline,
-  IoSwapHorizontalOutline,
   IoLocateOutline,
-  IoRefresh,
-  IoSearch,
-  IoClose,
-  IoSwapVerticalOutline,
-  IoEyeOffOutline,
-  IoEyeOutline,
-  IoInformationCircleOutline,
   IoCutOutline,
   IoDocumentTextOutline,
   IoGitNetworkOutline,
   IoMapOutline,
   IoImagesOutline,
   IoFolderOpenOutline,
-  IoImageOutline,
   IoPhonePortraitOutline,
-  IoCopyOutline,
 } from "react-icons/io5";
-import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
+import { MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
 
 type RAMInfo = [number, number];
 
-const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.ReactNode }[] = [
-  { category: "video", label: "Video", icon: <IoVideocam size={18} /> },
-  { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
-  { category: "image", label: "Image", icon: <IoImage size={18} /> },
-  { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
-  { category: "document", label: "Documents", icon: <MdOutlineDescription size={18} /> },
-];
 
 // The sidebar's active tab is either a real file category or the Trash view — the latter isn't
 // a FileCategory (getFileCategory never returns it; it's a distinct data source, not an
 // extension-based filter over `files`), so it gets its own type rather than being folded in.
-type SidebarTab = FileCategory | "trash";
-
-// Categories with a folder-click grid view (ImageFolderGallery/VideoFolderGallery/
-// PdfFolderGallery/DocumentFolderGallery) - audio doesn't have one yet. Centralized so adding a
-// category's gallery later is a one-line change here instead of hunting down every
-// activeFileCategory === "x" || activeFileCategory === "y" check this gates.
-const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf", "document"];
-
-interface TrashEntry {
-  trashed_name: string;
-  name: string;
-  original_path: string;
-  deleted_at: number; // unix seconds
-}
-
-const formatDeletedAt = (unixSeconds: number): string => {
-  const diffDays = Math.floor((Date.now() - unixSeconds * 1000) / (1000 * 60 * 60 * 24));
-  if (diffDays <= 0) return "today";
-  if (diffDays === 1) return "1 day ago";
-  return `${diffDays} days ago`;
-};
 
 // Filters shown in the native "open file" dialog — same extensions the sidebar already
 // understands, so anything pickable there is guaranteed playable/viewable here too.
@@ -348,12 +309,6 @@ const annotationFadeGraceMs = (): number => {
 	return Math.max(fadeTotalMs('pen', annotationFade), fadeTotalMs('laser', annotationFade)) + 400;
 };
 
-interface FileEntry {
-    name: string;
-    path: string;
-    size: number;
-    modified?: number;
-}
 
 interface FileMap {
     [folder: string]: FileEntry[]
@@ -550,6 +505,13 @@ const Dashboard = () => {
   // icon lit and gives the open video a "Back to video editor" way out. See
   // components/video/VideoEditorHome.tsx's own doc comment.
   const [videoEditorScreen, setVideoEditorScreen] = useState<VideoEditorScreen | null>(null);
+  // On the Video Editor's home, a video dragged in from outside opens for editing instead of
+  // being imported (VideoEditorHome shows where to drop it, and opens it set up for whatever
+  // starter it was asking for).
+  const videoEditorHomeRef = useRef(false);
+  videoEditorHomeRef.current = videoEditorScreen?.mode === "home";
+  const [editorHomeDrag, setEditorHomeDrag] = useState(false);
+  const [editorHomeDrop, setEditorHomeDrop] = useState<{ paths: string[]; at: number } | null>(null);
   // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
   // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
@@ -568,18 +530,7 @@ const Dashboard = () => {
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
   const [newFolderValue, setNewFolderValue] = useState<string>("");
-  // Folder relative-paths whose file list is currently hidden - in-memory only (resets on
-  // restart), same as every other sidebar UI toggle here. A folder isn't in this set until
-  // explicitly collapsed, so everything starts expanded, matching the pre-existing behavior.
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
-  const toggleFolderCollapsed = (folder: string): void => {
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(folder)) next.delete(folder);
-      else next.add(folder);
-      return next;
-    });
-  };
+  // Which folders are collapsed lives in the sidebar tree's own store (folderCollapse.ts).
   // Sidebar declutter/ordering controls for the active category's file list - both in-memory
   // only, same lifetime as collapsedFolders above. Hiding empty folders only affects folders with
   // zero files in the *active* category (the "No {category} files" ones) — it never hides a
@@ -590,6 +541,16 @@ const Dashboard = () => {
   // list/grid choice - both remembered across restarts, see utils/sidebarFolders.ts.
   const [pinnedFolders, setPinnedFolders] = useState<string[]>(() => getPinnedFolders());
   const [sidebarViewMode, setSidebarViewMode] = useState<SidebarViewMode>(() => getSidebarViewMode());
+  // The sidebar's width, dragged by its right edge (SidebarResizeHandle below) and kept across
+  // launches - one for browsing, one for editing (sidebarFolders.ts) - or folded to its icon rail.
+  const [sidebarWidths, setSidebarWidths] = useState<Record<SidebarMode, number>>(() => ({ browsing: getSidebarWidth("browsing"), editing: getSidebarWidth("editing") }));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => getSidebarCollapsed());
+  const setSidebarFolded = (collapsed: boolean) => {
+    setSidebarCollapsed(collapsed);
+    saveSidebarCollapsed(collapsed);
+  };
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
   const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
   const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
     const sorted = [...fileList];
@@ -645,13 +606,12 @@ const Dashboard = () => {
     }
     if (drag.isDragging) setDragPoint({ x: e.clientX, y: e.clientY, over: dropTargetAt(e.clientX, e.clientY) });
   };
-  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent) => {
+  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent): Promise<void> | void => {
     const drag = sidebarDragRef.current;
     sidebarDragRef.current = null;
     if (!drag?.isDragging) {
       // No real drag happened - a plain tap, handled the same as clicking the filename always has.
-      void openFileFromSidebar(file);
-      return;
+      return openFileFromSidebar(file);
     }
     setDraggingFiles(null);
     setDragPoint(null);
@@ -1099,7 +1059,16 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // get_image_clip_proxy), which is what keeps their crop/Ken Burns/overlay positions identical in
   // preview and export. null if it couldn't be read; cached per primary file for the session.
   const timelineFrameCacheRef = useRef<Map<string, Promise<VideoProjectFrame | null>>>(new Map());
+  // A canvas chosen for the edit (canvasFormats.ts) is the timeline's frame instead.
+  const canvasRef = useRef(editStore.canvas);
+  canvasRef.current = editStore.canvas;
+  // A canvas's Blur background (canvasFormats.ts) - not under a Screen Style, which draws its own.
+  const canvasBlur = editStore.canvas?.background === "blur" && !editStore.screenStyle;
+  const canvasBlurRef = useRef(canvasBlur);
+  canvasBlurRef.current = canvasBlur;
   const resolveTimelineFrame = useCallback((primaryPath: string): Promise<VideoProjectFrame | null> => {
+    const canvas = canvasRef.current;
+    if (canvas) return Promise.resolve({ width: canvas.width, height: canvas.height });
     let pending = timelineFrameCacheRef.current.get(primaryPath);
     if (!pending) {
       pending = (
@@ -1124,7 +1093,8 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // viewer so all three show the same picture). The prefetch effect below and an actual seek share
   // one encode through that module's cache.
   const resolveImageClipProxyUrl = useCallback(
-    async (imagePath: string, primaryPath: string): Promise<string> => resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath)),
+    async (imagePath: string, primaryPath: string): Promise<string> =>
+      resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath), canvasBlurRef.current ? "blur" : null),
     [resolveTimelineFrame]
   );
   // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
@@ -1494,6 +1464,48 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId) setSelectedAdjustmentId(null);
   }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedPipOverlayId]);
+  // A click on the player around the picture (the black bars) lets go of the selected picture,
+  // region or PiP - as a click on the picture away from them already does (VideoOverlayLayer) -
+  // and, like that one, only deselects: the click doesn't also start or pause playback.
+  // The split screen the selected layer belongs to (SplitArrangeBar).
+  const [phonePreview] = usePhonePreview();
+  const selectedSplitGroup =
+    (selectedPipOverlayId ? editStore.pipOverlays.find((o) => o.id === selectedPipOverlayId)?.split?.group : undefined) ??
+    (selectedImageOverlayId ? editStore.imageOverlays.find((o) => o.id === selectedImageOverlayId)?.split?.group : undefined);
+  const selectedSplit = useMemo(() => {
+    if (!selectedSplitGroup) return null;
+    const { cells, settings } = splitGroupMembers(editStore.pipOverlays, editStore.imageOverlays, selectedSplitGroup);
+    return settings && cells > 0 ? { group: selectedSplitGroup, cells, settings } : null;
+  }, [selectedSplitGroup, editStore.pipOverlays, editStore.imageOverlays]);
+  const hasPictureSelectionRef = useRef(false);
+  hasPictureSelectionRef.current = !!(selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId);
+  useEffect(() => {
+    let swallowClick = false;
+    const aroundPicture = (target: EventTarget | null) => {
+      const el = target instanceof Element ? target : null;
+      if (!el || !el.closest(".video-container") || el.closest("[data-video-frame]")) return false;
+      return el.tagName === "VIDEO" || el.tagName === "CANVAS" || el.classList.contains("video-container");
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0 || !hasPictureSelectionRef.current || !aroundPicture(e.target)) return;
+      swallowClick = true;
+      setSelectedImageOverlayId(null);
+      setSelectedBlurOverlayId(null);
+      setSelectedPipOverlayId(null);
+    };
+    const onClick = (e: MouseEvent) => {
+      if (!swallowClick) return;
+      swallowClick = false;
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("click", onClick, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("click", onClick, true);
+    };
+  }, []);
   // A Stage scene is edited on its own - selecting one lets go of every other selection, and the
   // other way round.
   const selectScene = useCallback((id: string | null) => {
@@ -2657,7 +2669,10 @@ const setScreen = () => {
 	// Video Editor already said "I'm here to edit" and shouldn't need the separate
 	// "show tools for this file" click. Ordered after the await because loadFileForPlayback
 	// resolves videoEditorScreen itself (see its own handling below).
-	const handleOpenVideoInEditor = async (file: { path: string; name: string }): Promise<void> => {
+	// `intent`: opened from one of the home's starters - the editor sets itself up for it once
+	// the video has loaded (editorIntent.ts).
+	const handleOpenVideoInEditor = async (file: { path: string; name: string }, intent?: EditorIntent): Promise<void> => {
+		setEditorIntent(file.path, intent);
 		await loadFileForPlayback(file.path, file.name);
 		setVideoEditorScreen({ mode: "editing" });
 		setDockerMode("file-tools");
@@ -2665,7 +2680,7 @@ const setScreen = () => {
 	// The Video Editor's "Open video from anywhere" - same OS picker as the docker's own
 	// open-from-anywhere button, but filtered to video only, since anything else can't be edited
 	// by the tool the user is standing in.
-	const handleOpenExternalVideoForEditing = async (): Promise<void> => {
+	const handleOpenExternalVideoForEditing = async (intent?: EditorIntent): Promise<void> => {
 		try {
 			const selected = await openFileDialog({
 				multiple: false,
@@ -2682,7 +2697,7 @@ const setScreen = () => {
 				return;
 			}
 
-			await handleOpenVideoInEditor({ path: selected, name });
+			await handleOpenVideoInEditor({ path: selected, name }, intent);
 		} catch (error) {
 			console.error('Error opening video for editing:', error);
 			setError(`Failed to open video: ${error}`);
@@ -3430,20 +3445,34 @@ const setScreen = () => {
 	// same arrays back on every unrelated Dashboard render - a new array re-ran their thumbnail
 	// effects and re-rendered every tile.
 	const allLibraryFiles = useMemo(() => Object.values(files).flat(), [files]);
+	// Each library file's folder, looked up at once (findFileFolder walks every folder).
+	const folderByPath = useMemo(() => new Map(Object.entries(files).flatMap(([folder, list]) => list.map((f) => [f.path, folder] as const))), [files]);
+	const folderOfPath = useCallback((path: string) => folderByPath.get(path) ?? null, [folderByPath]);
+	// "Tidy up library" (TidyLibraryDialog) - from the Video Editor's home.
+	const [tidyOpen, setTidyOpen] = useState(false);
 	const libraryVideoFiles = useMemo(() => allLibraryFiles.filter((file) => getFileCategory(file.name) === "video"), [allLibraryFiles]);
 	const libraryImageClipFiles = useMemo(() => allLibraryFiles.filter((file) => isImageClipPath(file.path)), [allLibraryFiles]);
 	const libraryClipVideoFiles = useMemo(() => libraryVideoFiles.filter((file) => !isVideoProjectPath(file.path)), [libraryVideoFiles]);
-	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
-	const homeItems = buildHomeItems({
-		files: allLibraryFiles,
-		pinnedPaths,
-		recentPaths,
-		openedAt,
-		docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
-		whiteboards: whiteboardIndex,
-		mindmaps: mindmapIndex,
-	});
-	const homeFiles = homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : []));
+	// The home screen's items - rebuilt only when the library, pins, history or indexes change,
+	// not on every render of the page (playback ticks re-render it several times a second).
+	const libraryFilesByPath = useMemo(() => new Map(allLibraryFiles.map((file) => [file.path, file])), [allLibraryFiles]);
+	const homeItems = useMemo(
+		() =>
+			buildHomeItems({
+				files: allLibraryFiles,
+				pinnedPaths,
+				recentPaths,
+				openedAt,
+				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
+				whiteboards: whiteboardIndex,
+				mindmaps: mindmapIndex,
+			}),
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex]
+	);
+	const homeFiles = useMemo(
+		() => homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : [])),
+		[homeItems, libraryFilesByPath]
+	);
 	const openHomeItem = (item: HomeItem) => {
 		if (item.kind === "file") {
 			const file = libraryFilesByPath.get(item.id);
@@ -3830,13 +3859,7 @@ const setScreen = () => {
 			setSelectedFolder(null);
 		}
 		const folder = findFileFolder(selectedFile.sourcePath);
-		if (folder !== null && collapsedFolders.has(folder)) {
-			setCollapsedFolders((prev) => {
-				const next = new Set(prev);
-				next.delete(folder);
-				return next;
-			});
-		}
+		if (folder !== null) folderCollapse.expand(folder);
 		setPendingScrollToPath(selectedFile.sourcePath);
 	};
 
@@ -3846,10 +3869,11 @@ const setScreen = () => {
 	// that render instead of waiting on it.
 	useEffect(() => {
 		if (!pendingScrollToPath) return;
-		const row = document.querySelector(`[data-file-path="${CSS.escape(pendingScrollToPath)}"]`);
-		row?.scrollIntoView({ behavior: "smooth", block: "center" });
+		// A frame on, so a folder just expanded (folderCollapse - the tree re-renders on its own) is in.
+		const target = pendingScrollToPath;
+		requestAnimationFrame(() => document.querySelector(`[data-file-path="${CSS.escape(target)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
 		setPendingScrollToPath(null);
-	}, [pendingScrollToPath, activeFileCategory, collapsedFolders]);
+	}, [pendingScrollToPath, activeFileCategory]);
 
 	// True only if the filesystem folder is completely empty — no files of any type, no
 	// subfolders — not merely "no files in the currently active category". Root can never be
@@ -3887,12 +3911,7 @@ const setScreen = () => {
 		setOpenMenu(null);
 		// The new-subfolder input renders inside parentFolder's own (collapsible) body - expand it
 		// first so starting to create a folder never opens an input the user can't actually see.
-		setCollapsedFolders((prev) => {
-			if (!prev.has(parentFolder)) return prev;
-			const next = new Set(prev);
-			next.delete(parentFolder);
-			return next;
-		});
+		folderCollapse.expand(parentFolder);
 	};
 
 	const commitCreateFolder = async () => {
@@ -3931,7 +3950,8 @@ const setScreen = () => {
 		if (toMove.length === 0) return 0;
 		try {
 			const results = await Promise.allSettled(
-				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
+				// A name already taken there: both kept, this one numbered ("name (2).ext") - never overwritten.
+				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder, keepBoth: true }))
 			);
 
 			// Keep pin/recent-history pointed at each moved file's new path — repathFile reads then
@@ -3972,9 +3992,15 @@ const setScreen = () => {
 			} else if (quiet) {
 					// the caller reports the combined result
 				} else if (toMove.length === 1) {
-				setMessage(`Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`);
+				const newName = results[0].status === "fulfilled" ? results[0].value.split(/[\\/]/).pop() ?? toMove[0].name : toMove[0].name;
+				setMessage(
+					newName === toMove[0].name
+						? `Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`
+						: `Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)} as ${formatFileName(newName)} - that name was taken`
+				);
 			} else {
-				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}`);
+				const renamed = results.filter((r, i) => r.status === "fulfilled" && (r.value.split(/[\\/]/).pop() ?? "") !== toMove[i].name).length;
+				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}${renamed ? ` (${renamed} numbered - their names were taken)` : ""}`);
 			}
 			return failedCount;
 		} catch (error) {
@@ -4026,7 +4052,7 @@ const setScreen = () => {
 			}
 			if (leftovers.length === 0) {
 				setPinnedFolders(repathPinnedFolders(folder, newKey));
-				setCollapsedFolders((prev) => new Set([...prev].map((k) => repathFolderKey(k, folder, newKey))));
+				folderCollapse.repath((k) => repathFolderKey(k, folder, newKey));
 				setSelectedFolder((prev) => (prev === null ? prev : repathFolderKey(prev, folder, newKey)));
 			}
 			await handleDirectoryFiles();
@@ -4184,6 +4210,7 @@ const setScreen = () => {
 		const unlistenPromise = appWindow.onDragDropEvent(async (event) => {
 			console.log("[Dashboard] onDragDropEvent", event.payload.type, event.payload.type === "drop" ? event.payload.paths : undefined);
 			if (event.payload.type === "enter" || event.payload.type === "over") {
+				if (videoEditorHomeRef.current) setEditorHomeDrag(true);
 				// v1's single "hover" type (fired repeatedly for the whole drag) is split into "enter"
 				// (once, with paths) and "over" (repeatedly, position only) in v2 - both are treated the
 				// same here since this handler only ever needed the position, not the paths, until drop.
@@ -4207,6 +4234,11 @@ const setScreen = () => {
 					void dropOnPhone(phone, event.payload.paths);
 					return;
 				}
+			}
+			if (event.payload.type === "drop" || event.payload.type === "leave") setEditorHomeDrag(false);
+			if (event.payload.type === "drop" && videoEditorHomeRef.current && event.payload.paths.some((p) => getFileCategory(p) === "video")) {
+				setEditorHomeDrop({ paths: event.payload.paths, at: Date.now() });
+				return;
 			}
 			if (event.payload.type === "drop") {
 				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
@@ -4505,7 +4537,7 @@ const setScreen = () => {
 	const isSearchingFiles = normalizedSearchQuery.length > 0;
 	// Search also matches folder names: a folder whose path matches shows all of its files (and
 	// stays listed even if it holds none in this tab), otherwise only files whose name matches.
-	const filteredEntriesUnordered = Object.entries(files)
+	const filteredEntries = useMemo(() => orderFolders(Object.entries(files)
 		.map(([folder, fileList]) => {
 			const folderMatches = folderMatchesQuery(folder, normalizedSearchQuery);
 			return [
@@ -4527,18 +4559,25 @@ const setScreen = () => {
 		// the active category are dropped too (root exempted - it's never hidden).
 		.filter(([, fileList, folderMatches]) => !isSearchingFiles || fileList.length > 0 || folderMatches)
 		.filter(([folder, fileList]) => !hideEmptyFolders || fileList.length > 0 || folder === "")
-		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]);
-	// Pinned folders (and what's inside them) first, then the usual path order.
-	const filteredEntries = orderFolders(filteredEntriesUnordered, pinnedFolders);
+		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]),
+		// Pinned folders (and what's inside them) first, then the usual path order.
+		pinnedFolders),
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+		[files, normalizedSearchQuery, activeFileCategory, hideEmptyFolders, pinnedFolders, fileSortMode]);
 	// Folders the search is leaving out (of those this tab would otherwise list).
-	const hiddenBySearch = isSearchingFiles
-		? Object.entries(files).filter(([folder, list]) => (!hideEmptyFolders || folder === "" || list.some((f) => getFileCategory(f.name) === activeFileCategory))).length - filteredEntries.length
-		: 0;
+	const hiddenBySearch = useMemo(
+		() =>
+			isSearchingFiles
+				? Object.entries(files).filter(([folder, list]) => !hideEmptyFolders || folder === "" || list.some((f) => getFileCategory(f.name) === activeFileCategory)).length - filteredEntries.length
+				: 0,
+		[isSearchingFiles, files, hideEmptyFolders, activeFileCategory, filteredEntries]
+	);
 	const isGridView = sidebarViewMode === "grid";
 	const firstUnpinnedIndex = filteredEntries.findIndex(([folder]) => pinRank(folder, pinnedFolders) === -1);
-	const filteredTrashItems = isSearchingFiles
-		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
-		: trashItems;
+	const filteredTrashItems = useMemo(
+		() => (normalizedSearchQuery ? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery)) : trashItems),
+		[trashItems, normalizedSearchQuery]
+	);
 	const sidebarHeaderLabel =
 		activeFileCategory === "trash"
 			? "Trash:"
@@ -4565,6 +4604,62 @@ const setScreen = () => {
     videoEditorScreen?.mode !== "home";
   // Tools/Media tabs (and a docking host) whenever something wants the sidebar's Tools tab.
   const showToolsSidebar = isEditingVideo || playerSidebarOpen;
+  // Its own width while editing, so opening the editor can widen it for the docked panels and
+  // closing it gives the picture its room back - animated by the sidebar's width transition.
+  const sidebarMode: SidebarMode = isEditingVideo ? "editing" : "browsing";
+  const sidebarWidth = sidebarCollapsed ? SIDEBAR_RAIL_W : sidebarWidths[sidebarMode];
+  // Picking a file type tab - the sidebar's own tabs and the folded rail's.
+  const selectFileCategory = (category: FileCategory) => {
+    setActiveFileCategory(category);
+    setSelectedFilePaths(new Set());
+    setSelectedFolder(null);
+    // Mid-edit these tabs only switch which files the sidebar lists - reopening the
+    // category's last file would replace the editor with it.
+    if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
+  };
+  const railGroups = [
+    ...(showToolsSidebar
+      ? [
+          [
+            { key: "tools", label: "Tools", icon: <IoOptionsOutline size={18} />, active: videoSidebarTab === "tools", onSelect: () => { setVideoSidebarTab("tools"); setSidebarFolded(false); } },
+            { key: "media", label: "Media", icon: <IoFolderOpenOutline size={18} />, active: videoSidebarTab === "media", onSelect: () => { setVideoSidebarTab("media"); setSidebarFolded(false); } },
+          ],
+        ]
+      : []),
+    FILE_CATEGORY_TABS.map(({ category, label, icon }) => ({
+      key: category,
+      label,
+      icon,
+      active: activeFileCategory === category && !(showToolsSidebar && videoSidebarTab === "tools"),
+      onSelect: () => {
+        if (showToolsSidebar) setVideoSidebarTab("media");
+        selectFileCategory(category);
+        setSidebarFolded(false);
+      },
+    })),
+  ];
+  // Ctrl+\ folds the sidebar to its rail and back (opening it first if it's hidden). Not while
+  // typing - and not Ctrl+B, which is bold in Docs and the text tools.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key !== "\\") return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      if (!showFileList) {
+        setShowFileList(true);
+        setSidebarFolded(false);
+        return;
+      }
+      setSidebarCollapsed((prev) => {
+        saveSidebarCollapsed(!prev);
+        return !prev;
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showFileList]);
 
   // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
   // control bar (fading with it) rather than as a row above the picture.
@@ -4586,6 +4681,62 @@ const setScreen = () => {
       </button>
     ) : undefined;
 
+  // The sidebar file tree's actions - stable, so the memoized tree skips re-rendering when nothing
+  // it shows changed (SidebarFileTree), yet always the latest.
+  const sidebarTreeActions = useStableCallbacks({
+    addMediaToVideo,
+    cancelRename,
+    categoryIcon,
+    categoryIconColorClassName,
+    commitCreateFolder,
+    commitRename,
+    filesToActOn,
+    folderDepth,
+    folderDisplayName,
+    handleAddFilesToBoard,
+    handleCopyFileImage,
+    handleCopyFilePath,
+    handleDeleteFile,
+    handleDeleteFolder,
+    handleDeleteForever,
+    handleEmptyTrash,
+    handleLinkNotes,
+    handleMoveFiles,
+    handleMoveFolder,
+    handleRestoreFromTrash,
+    handleSetThumbnail,
+    handleSidebarFilePointerDown,
+    handleSidebarFilePointerMove,
+    handleSidebarFilePointerUp,
+    handleTogglePin,
+    isFolderEmpty,
+    isSidebarDragging: () => !!sidebarDragRef.current?.isDragging,
+    openFolderGallery,
+    refreshDocsIndex,
+    resolveImageThumbnailUrl,
+    resolveVideoThumbnailUrl,
+    startCreateFolder,
+    startRename,
+    toggleFileSelected,
+    setAddMenuFor,
+    setConversionFile,
+    setCreatingFolderIn,
+    setDocsScreen,
+    setDraggingFiles,
+    setDraggingFolder,
+    setDragOverFolder,
+    setError,
+    setFolderMoveMenu,
+    setInfoFile,
+    setInfoTrashItem,
+    setLinkDocsMenuOpenFor,
+    setNewFolderValue,
+    setOpenMenu,
+    setPinnedFolders,
+    setSelectedFile,
+    setTransferMenu,
+  });
+
   return (
     <ItemLinksProvider files={allLibraryFiles} onOpen={openLinkedItem}>
     <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
@@ -4606,11 +4757,28 @@ const setScreen = () => {
           {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
-            className={`h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 transition-all duration-300 overflow-hidden ${
-              showFileList && !isPdfFullscreen ? "w-[300px] opacity-100" : "w-0 opacity-0"
-            }`}
+            ref={sidebarRef}
+            // No width transition while it's being dragged - the edge must stay under the pointer.
+            className={`relative shrink-0 h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 overflow-hidden ${
+              resizingSidebar ? "" : "transition-[width,opacity] duration-300 ease-out"
+            } ${showFileList && !isPdfFullscreen ? "opacity-100" : "w-0 opacity-0"}`}
+            style={showFileList && !isPdfFullscreen ? { width: sidebarWidth } : undefined}
           >
             {showFileList && !isPdfFullscreen && (
+              <SidebarResizeHandle
+                sidebarRef={sidebarRef}
+                width={sidebarWidths[sidebarMode]}
+                collapsed={sidebarCollapsed}
+                onResizingChange={setResizingSidebar}
+                onCollapsedChange={setSidebarCollapsed}
+                onCommit={(w, collapsed) => {
+                  setSidebarFolded(collapsed);
+                  if (!collapsed) setSidebarWidths((prev) => ({ ...prev, [sidebarMode]: saveSidebarWidth(sidebarMode, w) }));
+                }}
+              />
+            )}
+            {showFileList && !isPdfFullscreen && sidebarCollapsed && <SidebarRail groups={railGroups} onExpand={() => setSidebarFolded(false)} />}
+            {showFileList && !isPdfFullscreen && !sidebarCollapsed && (
               <div className="flex flex-col h-full">
                 {showToolsSidebar && (
                   <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
@@ -4654,322 +4822,45 @@ const setScreen = () => {
                   </div>
                 )}
                 <div className={`flex flex-col flex-1 min-h-0 ${showToolsSidebar && videoSidebarTab === "tools" ? "hidden" : ""}`}>
-                {/* File type tabs */}
-                <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
-                  {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
-                    <button
-                      key={category}
-                      type="button"
-                      title={label}
-                      onClick={() => {
-                        setActiveFileCategory(category);
-                        setSelectedFilePaths(new Set());
-                        setSelectedFolder(null);
-                        // Mid-edit these tabs only switch which files the sidebar lists - reopening the
-                        // category's last file would replace the editor with it.
-                        if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
-                      }}
-                      className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
-                        activeFileCategory === category
-                          ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                          : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                      }`}
-                    >
-                      {icon}
-                      <span>{label}</span>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    title="Trash"
-                    onClick={handleOpenTrash}
-                    className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
-                      activeFileCategory === "trash"
-                        ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                        : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    <IoTrashOutline size={18} />
-                    <span>Trash</span>
-                  </button>
-                </div>
-
-                {/* File search - filters the active tab's files (and trash) by name as you type.
-                    Fixed below the tabs, same as the folder-label bar beneath it. */}
-                <div className="px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
-                  <div className="relative">
-                    <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
-                    <input
-                      type="text"
-                      value={fileSearchQuery}
-                      onChange={(e) => setFileSearchQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape" && fileSearchQuery) {
-                          e.stopPropagation();
-                          setFileSearchQuery("");
-                        }
-                      }}
-                      placeholder="Search files and folders"
-                      className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
-                    />
-                    {fileSearchQuery && (
-                      <button
-                        type="button"
-                        title="Clear search"
-                        onClick={() => setFileSearchQuery("")}
-                        className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                      >
-                        <IoClose size={13} />
-                      </button>
-                    )}
-                  </div>
-                  {/* The query stays while files are opened and tabs switched, so a search typed
-                      earlier can quietly leave most of the library out - say so, with the way back. */}
-                  {isSearchingFiles && activeFileCategory !== "trash" && hiddenBySearch > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setFileSearchQuery("")}
-                      title="Clear the search and show every folder (Esc in the search box)"
-                      className="mt-1.5 w-full flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-left bg-amber-50 text-amber-800 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-200 dark:hover:bg-amber-500/20"
-                    >
-                      <IoSearch size={11} className="shrink-0" />
-                      <span className="flex-1 min-w-0 truncate">
-                        Only matches for “{fileSearchQuery.trim()}” · {hiddenBySearch} {hiddenBySearch === 1 ? "folder" : "folders"} hidden
-                      </span>
-                      <span className="shrink-0 font-medium underline underline-offset-2">Show all</span>
-                    </button>
-                  )}
-                </div>
-
-                {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
-                    tabs, does not scroll with the file list beneath it. */}
-                <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
-                  <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
-                  <div className="flex items-center gap-0.5 shrink-0">
-                    <button
-                      type="button"
-                      title="Refresh files"
-                      onClick={handleRefreshFiles}
-                      disabled={isRefreshingFiles}
-                      className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 disabled:opacity-50"
-                    >
-                      <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
-                    </button>
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title="Get files from phone"
-                        onClick={openPhoneReceive}
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <IoPhonePortraitOutline size={15} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title="New folder"
-                        onClick={() => startCreateFolder("")}
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <MdCreateNewFolder size={16} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={`Sort: ${fileSortMode === "name-asc" ? "Name (A-Z)" : fileSortMode === "name-desc" ? "Name (Z-A)" : "Type"} - click to cycle`}
-                        onClick={() =>
-                          setFileSortMode((prev) => (prev === "name-asc" ? "name-desc" : prev === "name-desc" ? "type" : "name-asc"))
-                        }
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <IoSwapVerticalOutline size={15} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={isGridView ? "Switch to list view" : "Switch to grid view (thumbnails)"}
-                        onClick={() => {
-                          const next: SidebarViewMode = isGridView ? "list" : "grid";
-                          setSidebarViewMode(next);
-                          saveSidebarViewMode(next);
-                        }}
-                        className={`p-1 rounded transition-colors ${
-                          isGridView
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        {isGridView ? <IoListOutline size={15} /> : <IoGridOutline size={15} />}
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={hideEmptyFolders ? `Show folders with no ${activeFileCategory} files` : `Hide folders with no ${activeFileCategory} files`}
-                        onClick={() => setHideEmptyFolders((prev) => !prev)}
-                        className={`p-1 rounded transition-colors ${
-                          hideEmptyFolders
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        {hideEmptyFolders ? <IoEyeOffOutline size={15} /> : <IoEyeOutline size={15} />}
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        disabled={!selectedFile}
-                        title={
-                          !selectedFile
-                            ? "Select a file to see its tools"
-                            : dockerMode === "file-tools"
-                            ? isImageFileSelected
-                              ? "Hide image tools"
-                              : "Show recording controls"
-                            : isImageFileSelected
-                            ? "Show image tools"
-                            : "Show tools for this file"
-                        }
-                        onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
-                        className={`p-1 rounded transition-colors disabled:opacity-30 disabled:pointer-events-none ${
-                          dockerMode === "file-tools"
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        <IoBuildOutline size={15} />
-                      </button>
-                    )}
-                    {(activeFileCategory === "image" || activeFileCategory === "audio") && (
-                      <>
-                        {activeFileCategory === "audio" && (
-                          <>
-                            <button
-                              type="button"
-                              title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
-                              onClick={cycleAudioRepeatMode}
-                              className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioRepeatMode !== "off"
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoRepeatOutline size={14} />
-                              {audioRepeatMode === "one" && (
-                                <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-blue-600 dark:bg-blue-500 text-white text-[8px] font-bold leading-none flex items-center justify-center">
-                                  1
-                                </span>
-                              )}
-                            </button>
-                            <button
-                              type="button"
-                              title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
-                              onClick={() => setAudioShuffle((prev) => !prev)}
-                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioShuffle
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoShuffleOutline size={14} />
-                            </button>
-                            <button
-                              type="button"
-                              title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
-                              onClick={() => setAudioAutoplayNext((prev) => !prev)}
-                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioAutoplayNext
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoPlayForwardOutline size={14} />
-                            </button>
-                            <div className="w-px h-4 bg-gray-300 dark:bg-neutral-600 mx-0.5" />
-                          </>
-                        )}
-                        <button
-                          type="button"
-                          title="Previous (←)"
-                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
-                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        >
-                          <IoChevronBack size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          title="Next (→)"
-                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
-                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        >
-                          <IoChevronForward size={14} />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                {/* Bulk action bar — only for a real multi-selection (not trash, which has its
-                    own per-item restore/delete-forever actions already). */}
-                {activeFileCategory !== "trash" && selectedFilePaths.size > 0 && (
-                  <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-200 dark:border-neutral-700 shrink-0 bg-blue-50 dark:bg-blue-500/10">
-                    <span className="text-xs font-medium text-blue-700 dark:text-blue-300">
-                      {selectedFilePaths.size} selected
-                    </span>
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          const rect = e.currentTarget.getBoundingClientRect();
-                          setTransferMenu({ files: getSelectedFileEntries(), anchor: { left: rect.left, top: rect.bottom + 4 } });
-                        }}
-                        className="flex items-center gap-0.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                      >
-                        Move / Copy
-                        <IoChevronForward size={11} />
-                      </button>
-                      {isConvertibleCategory(activeFileCategory) && (
-                        <button
-                          type="button"
-                          onClick={() => setBulkConversionFiles(getSelectedFileEntries())}
-                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          Convert
-                        </button>
-                      )}
-                      {/* Only when a board is actually open - see BoardEditorHandle/boardEditorRef.
-                          Image tab only, matching FILE_CATEGORY_EXTENSIONS.image being the only
-                          thing Board can place on its canvas. */}
-                      {boardScreen?.mode === "editor" && activeFileCategory === "image" && (
-                        <button
-                          type="button"
-                          onClick={() => void handleAddFilesToBoard(getSelectedFileEntries())}
-                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          Add to board
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleBulkDeleteFiles(getSelectedFileEntries())}
-                        className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSelectedFilePaths(new Set())}
-                        className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  </div>
-                )}
+                <SidebarHeader
+                  activeFileCategory={activeFileCategory}
+                  selectFileCategory={selectFileCategory}
+                  handleOpenTrash={handleOpenTrash}
+                  fileSearchQuery={fileSearchQuery}
+                  setFileSearchQuery={setFileSearchQuery}
+                  isSearchingFiles={isSearchingFiles}
+                  hiddenBySearch={hiddenBySearch}
+                  sidebarHeaderLabel={sidebarHeaderLabel}
+                  isRefreshingFiles={isRefreshingFiles}
+                  handleRefreshFiles={handleRefreshFiles}
+                  startCreateFolder={startCreateFolder}
+                  hideEmptyFolders={hideEmptyFolders}
+                  setHideEmptyFolders={setHideEmptyFolders}
+                  fileSortMode={fileSortMode}
+                  setFileSortMode={setFileSortMode}
+                  isGridView={isGridView}
+                  setSidebarViewMode={setSidebarViewMode}
+                  selectedFile={selectedFile}
+                  isImageFileSelected={isImageFileSelected}
+                  audioRepeatMode={audioRepeatMode}
+                  cycleAudioRepeatMode={cycleAudioRepeatMode}
+                  audioShuffle={audioShuffle}
+                  setAudioShuffle={setAudioShuffle}
+                  audioAutoplayNext={audioAutoplayNext}
+                  setAudioAutoplayNext={setAudioAutoplayNext}
+                  navigateAudio={navigateAudio}
+                  navigateImage={navigateImage}
+                  dockerMode={dockerMode}
+                  setDockerMode={setDockerMode}
+                  selectedFilePaths={selectedFilePaths}
+                  setSelectedFilePaths={setSelectedFilePaths}
+                  getSelectedFileEntries={getSelectedFileEntries}
+                  handleBulkDeleteFiles={handleBulkDeleteFiles}
+                  handleAddFilesToBoard={handleAddFilesToBoard}
+                  boardScreen={boardScreen}
+                  setBulkConversionFiles={setBulkConversionFiles}
+                  setTransferMenu={setTransferMenu}
+                />
 
                 {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
                     player.css for the sibling usage) so the last row can always scroll clear of
@@ -5006,657 +4897,55 @@ const setScreen = () => {
                       <span className="mb-0.5 block text-[10px] font-semibold uppercase leading-none tracking-wide text-blue-400 dark:text-blue-500/80">
                         Now open
                       </span>
-                      <span className="block truncate text-xs font-medium leading-tight text-blue-700 dark:text-blue-300">
-                        {truncateFileName(selectedFile.name)}
-                      </span>
+                      <FileNameText name={selectedFile.name} className="text-xs font-medium leading-tight text-blue-700 dark:text-blue-300" />
                     </span>
                     <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
                   </button>
                 )}
-                {activeFileCategory === "trash" ? (
-                  filteredTrashItems.length === 0 ? (
-                    <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between mb-3">
-                        <span className="text-xs text-neutral-500 dark:text-neutral-400">
-                          {filteredTrashItems.length} item{filteredTrashItems.length === 1 ? "" : "s"}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={handleEmptyTrash}
-                          className="text-xs text-red-600 dark:text-red-400 hover:underline"
-                        >
-                          Empty Trash
-                        </button>
-                      </div>
-                      <ul className="space-y-0.5">
-                        {filteredTrashItems.map((item) => (
-                          <li
-                            key={item.trashed_name}
-                            className="flex items-center justify-between gap-2 group px-1 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-neutral-800"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate" title={item.name}>{formatFileName(item.name)}</div>
-                              <div className="text-[10px] text-neutral-400 dark:text-neutral-500">Deleted {formatDeletedAt(item.deleted_at)}</div>
-                            </div>
-                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                              <button
-                                type="button"
-                                title="Info"
-                                onClick={() => setInfoTrashItem(item)}
-                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                              >
-                                <IoInformationCircleOutline size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                title="Restore"
-                                onClick={() => handleRestoreFromTrash(item)}
-                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                              >
-                                <IoArrowUndoOutline size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                title="Delete forever"
-                                onClick={() => handleDeleteForever(item)}
-                                className="p-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-500/20"
-                              >
-                                <IoTrashOutline size={14} />
-                              </button>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </>
-                  )
-                ) : filteredEntries.length === 0 ? (
-                  <p>{isSearchingFiles ? `No ${activeFileCategory} files match "${fileSearchQuery.trim()}"` : `No ${activeFileCategory} files found`}</p>
-                ) : (
-                  filteredEntries.map(([folder, fileList], folderIndex) => (
-                    <div
-                      key={folder}
-                      className="mb-3"
-                      // Folder-as-drop-target: reacts to an in-app file drag (draggingFiles) or an
-                      // OS file being dragged in from outside (e.dataTransfer.types includes
-                      // "Files", e.g. from Windows Explorer — this "types" check works during
-                      // dragover regardless of Tauri's native file-drop interception, which only
-                      // affects the final `drop` event's data, not the drag session itself) —
-                      // plain mouse hovering does neither, so it never lights up on its own.
-                      // This is purely visual/targeting state: for an external OS drag, the actual
-                      // import happens in the top-level onFileDropEvent listener above (which is
-                      // where the real file paths are available), not in onDrop below — a plain
-                      // HTML5 drop of an OS file never carries a usable path here.
-                      onDragOver={(e) => {
-                        if (draggingFolder !== null) {
-                          if (!canMoveFolder(draggingFolder, folder)) return;
-                        } else if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
-                        e.preventDefault();
-                        if (dragOverFolder !== folder) setDragOverFolder(folder);
-                      }}
-                      onDragLeave={() => setDragOverFolder((prev) => (prev === folder ? null : prev))}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        if (draggingFolder !== null) void handleMoveFolder(draggingFolder, folder);
-                        else if (draggingFiles) handleMoveFiles(draggingFiles, folder);
-                      }}
-                    >
-                      {folderIndex === 0 && firstUnpinnedIndex !== 0 && (
-                        <div className="flex items-center gap-1 -mx-1 px-1 mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-500 dark:text-blue-400">
-                          <IoPin size={10} /> Pinned
-                        </div>
-                      )}
-                      {folderIndex === firstUnpinnedIndex && firstUnpinnedIndex > 0 && (
-                        <div className="-mx-1 px-1 mb-1 pt-2 border-t border-gray-200 dark:border-neutral-700 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-neutral-500">
-                          All folders
-                        </div>
-                      )}
-                      <div
-                        className={`group/folder flex items-center justify-between gap-1 -mx-1 px-1 py-0.5 rounded transition-colors ${
-                          dragOverFolder === folder ? "bg-blue-100 dark:bg-blue-500/20 ring-1 ring-blue-400" : ""
-                        }`}
-                        style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
-                        // Drag a folder onto another folder (or the Briefcast root) to move all of it.
-                        draggable={folder !== ""}
-                        onDragStart={(e) => {
-                          if (folder === "") return;
-                          e.stopPropagation();
-                          setDraggingFolder(folder);
-                          e.dataTransfer.effectAllowed = "move";
-                          e.dataTransfer.setData("text/plain", folder);
-                        }}
-                        onDragEnd={() => {
-                          setDraggingFolder(null);
-                          setDragOverFolder(null);
-                        }}
-                      >
-                        <h4
-                          className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
-                            GALLERY_CATEGORIES.includes(activeFileCategory) && selectedFolder === folder
-                              ? "text-blue-600 dark:text-blue-400"
-                              : "text-gray-500 dark:text-neutral-400"
-                          }`}
-                          // Full relative path here (not just folderDisplayName's leaf segment) so
-                          // two folders sharing a name at different nesting depths - e.g. two
-                          // "MSC Research" folders - are distinguishable on hover instead of both
-                          // showing an identical tooltip.
-                          title={`Open "${folder || "Briefcast"}"`}
-                        >
-                          <button
-                            type="button"
-                            title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleFolderCollapsed(folder);
-                            }}
-                            className="shrink-0 p-1 -m-1 rounded hover:bg-gray-200 dark:hover:bg-neutral-700"
-                          >
-                            <IoChevronForward size={10} className={`transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
-                          </button>
-                          <span className="flex items-center gap-1 min-w-0 ml-1" onClick={() => void openFolderGallery(folder)}>
-                            <IoFolderOutline size={12} className="shrink-0" />
-                            <span className="truncate">{folderDisplayName(folder)}</span>
-                          </span>
-                          {pinnedFolders.includes(folder) && <IoPin size={11} className="shrink-0 text-blue-500 dark:text-blue-400" />}
-                        </h4>
-                        <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity shrink-0">
-                          {folder !== "" && (
-                            <button
-                              type="button"
-                              title={pinnedFolders.includes(folder) ? "Unpin folder" : "Pin folder to the top"}
-                              onClick={() => setPinnedFolders(togglePinnedFolder(folder))}
-                              className={`p-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 ${
-                                pinnedFolders.includes(folder) ? "text-blue-500 dark:text-blue-400" : "text-gray-400 hover:text-blue-500"
-                              }`}
-                            >
-                              {pinnedFolders.includes(folder) ? <IoPin size={13} /> : <IoPinOutline size={13} />}
-                            </button>
-                          )}
-                          {isFolderEmpty(folder) && (
-                            <button
-                              type="button"
-                              title="Delete empty folder"
-                              onClick={() => handleDeleteFolder(folder)}
-                              className="p-0.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                            >
-                              <IoTrashOutline size={13} />
-                            </button>
-                          )}
-                          {folder !== "" && (
-                            <button
-                              type="button"
-                              title="Move folder to…"
-                              onClick={(e) => {
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                setFolderMoveMenu({ folder, anchor: { left: rect.left, top: rect.bottom + 4 } });
-                              }}
-                              className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                            >
-                              <IoFolderOpenOutline size={13} />
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            title="New subfolder"
-                            onClick={() => startCreateFolder(folder)}
-                            className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                          >
-                            <IoAddCircleOutline size={14} />
-                          </button>
-                        </div>
-                      </div>
-
-                      {!collapsedFolders.has(folder) && creatingFolderIn === folder && (
-                        <div className="flex items-center gap-1 mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
-                          <IoFolderOutline size={12} className="text-gray-400 shrink-0" />
-                          <input
-                            autoFocus
-                            value={newFolderValue}
-                            onChange={(e) => setNewFolderValue(e.target.value)}
-                            onBlur={commitCreateFolder}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") commitCreateFolder();
-                              if (e.key === "Escape") setCreatingFolderIn(null);
-                            }}
-                            placeholder="Folder name"
-                            className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-xs bg-white dark:bg-neutral-800"
-                          />
-                        </div>
-                      )}
-
-                      {collapsedFolders.has(folder) && !isSearchingFiles ? null : fileList.length === 0 ? (
-                        <p
-                          className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
-                          style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
-                        >
-                          No {activeFileCategory} files
-                        </p>
-                      ) : (
-                        <ul className={isGridView ? "mt-1 grid grid-cols-2 gap-2" : "mt-1 space-y-0.5"} style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
-                          {fileList.map((file) => (
-                            <li
-                              key={file.path}
-                              data-file-path={file.path}
-                              draggable
-                              onDragStart={(e) => {
-                                // While a video is being edited, dragging a video, picture or sound
-                                // takes it into the editor (handleSidebarFilePointerDown) - the
-                                // browser's own drag would cancel that gesture the moment it began.
-                                if (editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "")) {
-                                  e.preventDefault();
-                                  return;
-                                }
-                                setDraggingFiles(filesToActOn(file));
-                                e.dataTransfer.effectAllowed = "move";
-                              }}
-                              onDragEnd={() => {
-                                setDraggingFiles(null);
-                                setDragOverFolder(null);
-                              }}
-                              className={`${isGridView ? "relative flex flex-col gap-1 min-w-0 group cursor-pointer p-1 rounded-lg" : "flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md"} hover:bg-gray-50 dark:hover:bg-neutral-800 ${
-                                selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
-                              } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={selectedFilePaths.has(file.path)}
-                                onClick={(e) => e.stopPropagation()}
-                                onChange={() => toggleFileSelected(file.path)}
-                                title="Select for bulk move"
-                                className={`shrink-0 accent-blue-500 transition-opacity ${isGridView ? "absolute top-2 left-2 z-10" : ""} ${
-                                  selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                                }`}
-                              />
-                              {isGridView ? (
-                                // Same tap-to-open / drag-to-timeline gesture as the filename in list view.
-                                <div
-                                  className="w-full"
-                                  title={file.name}
-                                  onPointerDown={handleSidebarFilePointerDown(file)}
-                                  onPointerMove={handleSidebarFilePointerMove}
-                                  onPointerUp={handleSidebarFilePointerUp(file)}
-                                >
-                                  <SidebarFileIcon
-                                    large
-                                    name={file.name}
-                                    path={file.path}
-                                    isImage={["image", "video"].includes(getFileCategory(file.name) ?? "")}
-                                    resolveThumbnailUrl={getFileCategory(file.name) === "video" ? resolveVideoThumbnailUrl : resolveImageThumbnailUrl}
-                                    fallbackIcon={categoryIcon(getFileCategory(file.name))}
-                                    fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
-                                  />
-                                </div>
-                              ) : (
-                                <SidebarFileIcon
-                                  name={file.name}
-                                  path={file.path}
-                                  isImage={getFileCategory(file.name) === "image"}
-                                  resolveThumbnailUrl={resolveImageThumbnailUrl}
-                                  fallbackIcon={categoryIcon(getFileCategory(file.name))}
-                                  fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
-                                />
-                              )}
-                              {/* Name + badges: one row under the tile in grid view, plain siblings of the row in list view. */}
-                              <div className={isGridView ? "flex items-center gap-1 min-w-0 px-0.5 text-xs" : "contents"}>
-                              {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
-                              {renamingFile === file.path && !renameInGallery ? (
-                                <InlineRenameInput
-                                  fileName={file.name}
-                                  onCommit={(value) => void commitRename(file, value)}
-                                  onCancel={cancelRename}
-                                  className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-                                />
-                              ) : (
-                                <div
-                                  className={`flex-1 min-w-0 truncate hover:text-blue-500 dark:hover:text-blue-400 ${
-                                    selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
-                                  }`}
-                                  title={file.name}
-                                  onPointerDown={handleSidebarFilePointerDown(file)}
-                                  onPointerMove={handleSidebarFilePointerMove}
-                                  onPointerUp={handleSidebarFilePointerUp(file)}
-                                >
-                                  {truncateFileName(file.name)}
-                                </div>
-                              )}
-
-                              {pinnedPaths.includes(file.path) && (
-                                <IoPin
-                                  size={12}
-                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
-                                  title="Pinned to home"
-                                />
-                              )}
-
-                              {linkedDocsByPath.has(file.path) && (
-                                <MdOutlineDescription
-                                  size={13}
-                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
-                                  title={`${linkedDocsByPath.get(file.path)!.length} linked note(s)`}
-                                />
-                              )}
-
-                              </div>
-                              {/* Add + menu: floating over the tile's corner in grid view (on hover, or while a menu is open). */}
-                              <div
-                                className={
-                                  isGridView
-                                    ? `absolute top-2 right-2 z-10 flex items-center gap-0.5 rounded-md bg-white/90 dark:bg-neutral-900/85 shadow-sm transition-opacity ${
-                                      openMenu === file.path || addMenuFor === file.path ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                                    }`
-                                    : "contents"
-                                }
-                              >
-                              {/* Add to the video being edited: insert, append, or show on the picture. */}
-                              {editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "") && file.path !== selectedFile?.sourcePath && (
-                                <div className="relative">
-                                  <button
-                                    title="Add to the video you're editing (or drag it onto the timeline or the picture)"
-                                    className={`p-1 rounded-md transition-colors ${addMenuFor === file.path ? 'opacity-100 bg-gray-200 dark:bg-neutral-700' : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'}`}
-                                    onPointerDown={(e) => e.stopPropagation()}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      if (getFileCategory(file.name) === "audio") {
-                                        void addMediaToVideo(file.path, "end");
-                                        return;
-                                      }
-                                      setAddMenuFor(addMenuFor === file.path ? null : file.path);
-                                    }}
-                                  >
-                                    <IoAdd size={14} />
-                                  </button>
-                                  {addMenuFor === file.path && (
-                                    <div
-                                      onPointerDown={(e) => e.stopPropagation()}
-                                      className="absolute right-0 top-full mt-1.5 w-52 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl overflow-hidden z-20 py-1 text-sm text-neutral-700 dark:text-neutral-200"
-                                    >
-                                      {(
-                                        [
-                                          ["insert", "Insert at the playhead"],
-                                          ["end", "Add to the end"],
-                                          ["overlay", getFileCategory(file.name) === "image" ? "Show on the video" : "Show on the video (picture-in-picture)"],
-                                        ] as const
-                                      ).map(([how, label]) => (
-                                        <button
-                                          key={how}
-                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700/70"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setAddMenuFor(null);
-                                            void addMediaToVideo(file.path, how);
-                                          }}
-                                        >
-                                          {label}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {/* Three vertical dots menu */}
-                              <div className="relative">
-                                <button
-                                  className={`p-1 rounded-md transition-colors ${
-                                    openMenu === file.path
-                                      ? 'opacity-100 bg-gray-200 dark:bg-neutral-700'
-                                      : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'
-                                  }`}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setOpenMenu(openMenu === file.path ? null : file.path);
-                                    setLinkDocsMenuOpenFor(null);
-                                  }}
-                                >
-                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
-                                    <path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/>
-                                  </svg>
-                                </button>
-
-                                {/* Popup Menu - see the "Closes a file row's 3-dot menu" effect
-                                    above for outside-click/Escape handling. onPointerDown here
-                                    stops that same document-level listener from treating a click
-                                    *inside* this menu (e.g. expanding "Move to") as a click
-                                    outside it - mirrors ImageFolderGallery.tsx's own context menu. */}
-                                {openMenu === file.path && (
-                                  <>
-                                    <style>{`
-                                      @keyframes sidebarFileMenuIn {
-                                        from { opacity: 0; transform: translateY(-4px) scale(0.98); }
-                                        to { opacity: 1; transform: translateY(0) scale(1); }
-                                      }
-                                    `}</style>
-                                    <div
-                                      onPointerDown={(e) => e.stopPropagation()}
-                                      style={{ animation: "sidebarFileMenuIn 140ms cubic-bezier(0.16, 1, 0.3, 1)" }}
-                                      className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-20 py-1"
-                                    >
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleTogglePin(file);
-                                        }}
-                                      >
-                                        {pinnedPaths.includes(file.path) ? (
-                                          <IoPin size={15} className="shrink-0 text-blue-500 dark:text-blue-400" />
-                                        ) : (
-                                          <IoPinOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        )}
-                                        <span className="flex-1 text-left">
-                                          {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
-                                        </span>
-                                      </button>
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void handleLinkNotes(file);
-                                        }}
-                                      >
-                                        <MdOutlineDescription size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Link notes</span>
-                                        {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
-                                          <IoChevronForward
-                                            size={12}
-                                            className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                          />
-                                        )}
-                                      </button>
-                                      {linkDocsMenuOpenFor === file.path && (
-                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
-                                          {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
-                                            <button
-                                              key={doc.id}
-                                              className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setOpenMenu(null);
-                                                setLinkDocsMenuOpenFor(null);
-                                                setSelectedFile(null);
-                                                setDocsScreen({ mode: "editor", docId: doc.id });
-                                              }}
-                                            >
-                                              {doc.title || "Untitled document"}
-                                            </button>
-                                          ))}
-                                          <button
-                                            className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setLinkDocsMenuOpenFor(null);
-                                              void (async () => {
-                                                try {
-                                                  const id = crypto.randomUUID();
-                                                  const title = `Notes for ${file.name}`;
-                                                  const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
-                                                  await invoke("create_doc", { id, title, bytes });
-                                                  await invoke("link_doc_to_file", { id, filePath: file.path });
-                                                  await refreshDocsIndex();
-                                                  setOpenMenu(null);
-                                                  setSelectedFile(null);
-                                                  setDocsScreen({ mode: "editor", docId: id });
-                                                } catch (error) {
-                                                  console.error("Failed to create linked notes:", error);
-                                                  setError(`Failed to create linked notes: ${error}`);
-                                                }
-                                              })();
-                                            }}
-                                          >
-                                            + New linked doc
-                                          </button>
-                                        </div>
-                                      )}
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          startRename(file);
-                                        }}
-                                      >
-                                        <IoCreateOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Rename</span>
-                                      </button>
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void handleCopyFilePath(file);
-                                        }}
-                                      >
-                                        <IoCopyOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Copy path</span>
-                                      </button>
-                                      {getFileCategory(file.name) === "image" && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleCopyFileImage(file);
-                                          }}
-                                        >
-                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Copy image</span>
-                                        </button>
-                                      )}
-                                       {isConvertibleCategory(getFileCategory(file.name)) && (
-                                         <button
-                                            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setConversionFile(file);
-                                              setOpenMenu(null);
-                                            }}
-                                          >
-                                          <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Convert</span>
-                                        </button>
-                                       )}
-
-                                      {/* Only when a board is actually open (boardEditorRef) and
-                                          this is an image - see handleAddFilesToBoard. */}
-                                      {boardScreen?.mode === "editor" && getFileCategory(file.name) === "image" && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleAddFilesToBoard(filesToActOn(file));
-                                          }}
-                                        >
-                                          <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">
-                                            {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
-                                          </span>
-                                        </button>
-                                      )}
-
-                                      {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) beside this one. */}
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          const rect = e.currentTarget.getBoundingClientRect();
-                                          setTransferMenu({ files: filesToActOn(file), anchor: { left: rect.right + 4, top: rect.top } });
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                        <IoFolderOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">
-                                          {filesToActOn(file).length > 1 ? `Move or copy ${filesToActOn(file).length} items…` : "Move or copy to…"}
-                                        </span>
-                                        <IoChevronForward size={12} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                      </button>
-                                      {/* A project file is an edit list, not media a phone can play -
-                                          Save renders it first. */}
-                                      {!isVideoProjectPath(file.path) && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            openPhoneTransfer(filesToActOn(file).filter((f) => !isVideoProjectPath(f.path)));
-                                            setOpenMenu(null);
-                                          }}
-                                        >
-                                          <IoPhonePortraitOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">
-                                            {filesToActOn(file).length > 1 ? `Transfer ${filesToActOn(file).length} to phone` : "Transfer to phone"}
-                                          </span>
-                                        </button>
-                                      )}
-                                      {getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path) && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleSetThumbnail(file);
-                                          }}
-                                        >
-                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Set thumbnail…</span>
-                                        </button>
-                                      )}
-
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setInfoFile({ path: file.path, name: file.name });
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                        <IoInformationCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Info</span>
-                                      </button>
-
-                                      <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
-                                      <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteFile(file);
-                                          }}
-                                        >
-                                        <IoTrashOutline size={15} className="shrink-0" />
-                                        <span className="flex-1 text-left">Delete</span>
-                                      </button>
-                                    </div>
-                                  </>
-                                )}
-                              </div>
-                              </div>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  ))
-                )}
+                <SidebarFileTree
+                  activeFileCategory={activeFileCategory}
+                  filteredEntries={filteredEntries}
+                  filteredTrashItems={filteredTrashItems}
+                  firstUnpinnedIndex={firstUnpinnedIndex}
+                  isSearchingFiles={isSearchingFiles}
+                  fileSearchQuery={fileSearchQuery}
+                  isGridView={isGridView}
+                  selectedPath={selectedFile?.sourcePath}
+                  selectedFolder={selectedFolder}
+                  selectedFilePaths={selectedFilePaths}
+                  editingVideo={editingVideoRef.current}
+                  boardScreen={boardScreen}
+                  pinnedFolders={pinnedFolders}
+                  pinnedPaths={pinnedPaths}
+                  linkedDocsByPath={linkedDocsByPath}
+                  openMenu={openMenu}
+                  addMenuFor={addMenuFor}
+                  linkDocsMenuOpenFor={linkDocsMenuOpenFor}
+                  renamingFile={renamingFile}
+                  renameInGallery={renameInGallery}
+                  creatingFolderIn={creatingFolderIn}
+                  newFolderValue={newFolderValue}
+                  draggingFiles={draggingFiles}
+                  draggingFolder={draggingFolder}
+                  dragOverFolder={dragOverFolder}
+                  {...sidebarTreeActions}
+                />
                 </div>
                 </div>
               </div>
             )}
           </div>
+
+          {tidyOpen && (
+            <TidyLibraryDialog
+              files={allLibraryFiles}
+              folderOf={folderOfPath}
+              // handleMoveFiles answers how many failed; the dialog wants how many moved.
+              onMove={async (list, folder) => list.length - (await handleMoveFiles(list, folder, true))}
+              onDone={() => void handleDirectoryFiles()}
+              onClose={() => setTidyOpen(false)}
+            />
+          )}
 
           {infoTrashItem && (
             <FileInfoModal
@@ -5823,9 +5112,13 @@ const setScreen = () => {
               videos={libraryVideoFiles}
               recentPaths={recentPaths}
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
-              onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
-              onOpenExternalVideo={() => void handleOpenExternalVideoForEditing()}
+              onOpenVideo={(file, intent) => void handleOpenVideoInEditor(file, intent)}
+              onOpenExternalVideo={(intent) => void handleOpenExternalVideoForEditing(intent)}
               onCreateVideo={() => setIsNewVideoProjectOpen(true)}
+              onSendToPhone={openPhoneTransfer}
+              externalDrag={editorHomeDrag}
+              droppedPaths={editorHomeDrop}
+              onTidyUp={() => setTidyOpen(true)}
             />
           ) : mindmapScreen ? (
             <ErrorBoundary
@@ -5957,6 +5250,7 @@ const setScreen = () => {
                           onSelectOverlay={setSelectedOverlayId}
                           selectedImageOverlayId={selectedImageOverlayId}
                           onSelectImageOverlay={setSelectedImageOverlayId}
+                          isPlaying={playerIsPlaying}
                           isPlacingText={isPlacingText}
                           onPlacementConsumed={() => setIsPlacingText(false)}
                           onAddTextOverlay={editStore.addTextOverlay}
@@ -6081,6 +5375,20 @@ const setScreen = () => {
                           </div>
                         )}
                         <KeystrokeLayer frameRect={fullFrame} chips={keyChips} style={keystrokeStyle} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />
+                        {/* The canvas as the phone's screen - its corners, camera and app areas (guides only). */}
+                        {editStore.canvas && phonePreview && <PhonePreviewLayer canvas={editStore.canvas} width={fullFrame.width} height={fullFrame.height} isPlaying={playerIsPlaying} />}
+                        {/* Rearranging the selected layer's split screen, right over the picture. */}
+                        {selectedSplit && !playerIsPlaying && (
+                          <div className="absolute left-0 right-0 flex justify-center pointer-events-none" style={{ top: Math.max(6, fullFrame.height * 0.055), zIndex: 70 }}>
+                            <SplitArrangeBar
+                              settings={selectedSplit.settings}
+                              cells={selectedSplit.cells}
+                              frameAspect={frameRect.width / Math.max(1, frameRect.height)}
+                              onChange={(change) => editStore.updateSplitGroup({ group: selectedSplit.group, ...change }, frameRect.width / Math.max(1, frameRect.height))}
+                              onEdit={() => window.dispatchEvent(new CustomEvent("briefcast:edit-split", { detail: { group: selectedSplit.group } }))}
+                            />
+                          </div>
+                        )}
                         {/* Above PiP and every other overlay - same stacking as the export, where the
                             captions are the last video stage (export_trimmed_video). */}
                         {editStore.captions?.settings.enabled && captionLines.length > 0 && (
@@ -6205,6 +5513,7 @@ const setScreen = () => {
                 // The master bus in use takes every sound through it - this one included.
                 meterTrack={mixerSession.open || !isNeutralMaster(editStore.master)}
                 activeClipEffects={activeClipEffects}
+                frameBackground={canvasBlur ? "blur" : null}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
               />

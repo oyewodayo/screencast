@@ -449,7 +449,7 @@ fn repair_sidecars_in_tree(
         repair_value_paths(&mut value, index, &mut fixed_any);
         if fixed_any {
             if let Ok(rewritten) = serde_json::to_string_pretty(&value) {
-                if fs::write(&path, rewritten).is_ok() {
+                if crate::services::sidecars::write_sidecar(&path, rewritten).is_ok() {
                     *repaired_count += 1;
                 }
             }
@@ -797,7 +797,10 @@ pub fn delete_folder(folder_path: String) -> Result<(), String> {
 // success rather than an error, so the frontend doesn't need to special-case "dropped it back
 // where it came from".
 #[command(async)]
-pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String, String> {
+// `keep_both`: when the folder already has a file of that name, this one arrives as "name (2).ext"
+// (the next free number - its saved edits' names free too) instead of the move failing, the way
+// File Explorer's "Keep both" does. Nothing is ever overwritten either way.
+pub fn move_file(source_path: String, dest_folder_path: String, keep_both: Option<bool>) -> Result<String, String> {
     let _serial = crate::services::responsiveness::serial();
     let root = briefcast_dir()?;
     let dest_dir = resolve_relative(&root, &dest_folder_path)?;
@@ -811,15 +814,31 @@ pub fn move_file(source_path: String, dest_folder_path: String) -> Result<String
     }
 
     let file_name = source.file_name().ok_or("Invalid source file name")?;
-    let dest_path = dest_dir.join(file_name);
+    let mut dest_path = dest_dir.join(file_name);
 
     if dest_path == source {
         return path_to_str(&source).map(|s| s.to_string());
     }
-    if dest_path.exists() {
-        return Err("A file with that name already exists in that folder".to_string());
+    let taken = |p: &Path| p.exists() || crate::services::sidecars::check_destination_free(p).is_err();
+    if taken(&dest_path) {
+        if !keep_both.unwrap_or(false) {
+            if dest_path.exists() {
+                return Err("A file with that name already exists in that folder".to_string());
+            }
+            crate::services::sidecars::check_destination_free(&dest_path)?;
+        }
+        let stem = source.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = source.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let mut n = 2;
+        loop {
+            let candidate = dest_dir.join(format!("{} ({}){}", stem, n, ext));
+            if !taken(&candidate) {
+                dest_path = candidate;
+                break;
+            }
+            n += 1;
+        }
     }
-    crate::services::sidecars::check_destination_free(&dest_path)?;
 
     fs::rename(&source, &dest_path).map_err(|e| format!("Failed to move file: {}", e))?;
     if let Err(e) = crate::services::sidecars::carry_sidecars(&source, &dest_path) {
