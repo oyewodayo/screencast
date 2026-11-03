@@ -33,7 +33,7 @@ import PipOverlayPopover, { PipOverlayPatch } from "./PipOverlayPopover";
 import { cssBlendMode } from "../../utils/blendModes";
 import ClipCropOverlay from "./ClipCropOverlay";
 import { isNeutralFx } from "../../utils/audioFx";
-import { syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
+import { syncElementFx, unrouteElement, useTimelineMuted } from "../../utils/mixerGraph";
 import { pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, layerOpacityAt, pipTrack, stackOrder } from "../../utils/videoTracks";
 import { DEFAULT_CHROMA_KEY, guessKeyColor } from "../../utils/chromaKey";
@@ -345,6 +345,7 @@ const PipVideoElement: React.FC<{
   // Solo on another mixer channel silences it (preview only); its mixer effects route it through
   // the track-fx worklet (mixerGraph.ts) once it has any, or the mixer's meters want it.
   const mixer = useMixerSession();
+  const soundsSeenRef = useRef(new Set<HTMLMediaElement>());
   const soloOff = silencedBySolo(mixer, pipChannelKey(overlay.id));
   // Silent while a voice-over records over the picture (setTimelineMuted).
   const timelineMuted = useTimelineMuted();
@@ -357,8 +358,15 @@ const PipVideoElement: React.FC<{
   useEffect(() => {
     const sound = cutout ? audioRef.current : videoRef.current;
     if (!sound || overlay.muted !== false) return;
+    soundsSeenRef.current.add(sound);
     syncElementFx(sound, `pip:${overlay.id}`, overlay.fx, !isNeutralFx(overlay.fx) || mixer.open);
   }, [overlay.id, overlay.fx, overlay.muted, mixer.open, cutout]);
+  // Out of the mix once the layer goes - only then, as an element can never be routed again once
+  // taken out (createMediaElementSource is once per element), so a live one must stay in.
+  useEffect(() => {
+    const seen = soundsSeenRef.current;
+    return () => seen.forEach((el) => unrouteElement(el));
+  }, []);
 
   // Live (uncommitted) box while a move/resize gesture is in progress - only committed (one
   // onChangeBox -> one pushCommand) on release, so dragging never spams undo history with one

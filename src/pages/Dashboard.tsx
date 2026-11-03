@@ -1008,6 +1008,20 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     if (!selectedFile) setDockerMode("record");
   }, [selectedFile]);
+  // Whether each video had its editor open when it was left (a linked document opened, a folder,
+  // home, another file), so coming back to it brings the editor back exactly as it was - open or
+  // closed - instead of always closed. Session-only. Read in the cleanup, which runs before the
+  // reset just above has had its own render, so it still sees the mode the video was left in.
+  const dockerModeRef = useRef(dockerMode);
+  dockerModeRef.current = dockerMode;
+  const editorOpenByVideoRef = useRef(new Map<string, boolean>());
+  const selectedVideoPath = selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : null;
+  useEffect(() => {
+    if (!selectedVideoPath) return;
+    return () => {
+      editorOpenByVideoRef.current.set(selectedVideoPath, dockerModeRef.current === "file-tools");
+    };
+  }, [selectedVideoPath]);
   // Lets the video-tools timeline (FileToolsDocker -> VideoTimelineDocker) seek the actual player
   // imperatively — there's no controlled "currentTime" prop on VideoPlayer, since native
   // <video>/timeupdate already reports position out via onTimeUpdate below; this ref is just the
@@ -3316,6 +3330,12 @@ const setScreen = () => {
 			setVideoEditorScreen({ mode: "editing" });
 			setDockerMode("file-tools");
 			window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+		} else if (getFileCategory(fileName) === "video" && editorOpenByVideoRef.current.has(filePath)) {
+			// Back to a video seen earlier this session: its editor as it was left (see
+			// editorOpenByVideoRef). The timeline puts the playhead back too (leftAtByFile).
+			const wasOpen = editorOpenByVideoRef.current.get(filePath);
+			setDockerMode(wasOpen ? "file-tools" : "record");
+			if (wasOpen) window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
 		}
 		setRecentPaths(recordFileOpened(filePath));
 		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
@@ -4510,6 +4530,10 @@ const setScreen = () => {
 		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]);
 	// Pinned folders (and what's inside them) first, then the usual path order.
 	const filteredEntries = orderFolders(filteredEntriesUnordered, pinnedFolders);
+	// Folders the search is leaving out (of those this tab would otherwise list).
+	const hiddenBySearch = isSearchingFiles
+		? Object.entries(files).filter(([folder, list]) => (!hideEmptyFolders || folder === "" || list.some((f) => getFileCategory(f.name) === activeFileCategory))).length - filteredEntries.length
+		: 0;
 	const isGridView = sidebarViewMode === "grid";
 	const firstUnpinnedIndex = filteredEntries.findIndex(([folder]) => pinRank(folder, pinnedFolders) === -1);
 	const filteredTrashItems = isSearchingFiles
@@ -4679,6 +4703,12 @@ const setScreen = () => {
                       type="text"
                       value={fileSearchQuery}
                       onChange={(e) => setFileSearchQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape" && fileSearchQuery) {
+                          e.stopPropagation();
+                          setFileSearchQuery("");
+                        }
+                      }}
                       placeholder="Search files and folders"
                       className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
                     />
@@ -4693,6 +4723,22 @@ const setScreen = () => {
                       </button>
                     )}
                   </div>
+                  {/* The query stays while files are opened and tabs switched, so a search typed
+                      earlier can quietly leave most of the library out - say so, with the way back. */}
+                  {isSearchingFiles && activeFileCategory !== "trash" && hiddenBySearch > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setFileSearchQuery("")}
+                      title="Clear the search and show every folder (Esc in the search box)"
+                      className="mt-1.5 w-full flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-left bg-amber-50 text-amber-800 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-200 dark:hover:bg-amber-500/20"
+                    >
+                      <IoSearch size={11} className="shrink-0" />
+                      <span className="flex-1 min-w-0 truncate">
+                        Only matches for “{fileSearchQuery.trim()}” · {hiddenBySearch} {hiddenBySearch === 1 ? "folder" : "folders"} hidden
+                      </span>
+                      <span className="shrink-0 font-medium underline underline-offset-2">Show all</span>
+                    </button>
+                  )}
                 </div>
 
                 {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the

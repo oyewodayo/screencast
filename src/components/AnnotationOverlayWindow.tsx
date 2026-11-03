@@ -27,7 +27,10 @@ import {
   AnnotationStrokePoint,
   AnnotationStyle,
   AnnotationTapSound,
+  bakeAnnotationInk,
+  BakedInk,
   drawAnnotationInk,
+  fadeTiming,
   fadeTotalMs,
   strokeOpacity,
 } from '../utils/annotationStyles';
@@ -62,7 +65,13 @@ interface Stroke extends AnnotationInk {
   // performance.now() timestamp of pointerup, i.e. when the fade countdown starts - 0 while the
   // stroke is still being drawn.
   finishedAt: number;
+  // The finished stroke as a bitmap (bakeAnnotationInk), made on its first frame after pointerup.
+  baked?: BakedInk | null;
 }
+
+// A predicted pointer position further than this from the real one is a bad guess (a flick, a
+// sudden stop) and is ignored.
+const MAX_PREDICTION_PX = 48;
 
 const STYLE_ICONS: Record<AnnotationStyle, React.ReactNode> = {
   pen: <IoPencil size={14} />,
@@ -86,7 +95,11 @@ const AnnotationOverlayWindow = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
+  // Where the pointer is about to be (PointerEvent.getPredictedEvents) - drawn as the live
+  // stroke's last stretch, never stored in it, so the ink's tip keeps up with the hand.
+  const predictedTailRef = useRef<AnnotationStrokePoint[]>([]);
   const rafRef = useRef<number | null>(null);
+  const wakeTimerRef = useRef<number | null>(null);
 
   const [drawModeActive, setDrawModeActive] = useState(false);
   // Seeded from Settings > Annotation every time draw mode turns on (see the listener below);
@@ -208,27 +221,53 @@ const AnnotationOverlayWindow = () => {
   }, [drawModeActive]);
 
   // Draws on demand rather than in a perpetual loop: a frame is requested by pointer input, Clear
-  // and resizes, and the loop only keeps itself going while some stroke is still on its way out.
-  // So an idle overlay - hidden, empty, or holding only "Until I exit" strokes - costs no CPU/GPU
-  // at all, which matters while recording or presenting alongside heavier apps.
+  // and resizes, and frames keep coming only while some stroke is actually fading out. A stroke
+  // holding at full opacity looks the same every frame, so its hold is waited out on a timer
+  // rather than redrawn ~60 times a second - those redraws used to compete with the stroke being
+  // drawn right then. So an idle overlay - hidden, empty, or holding only "Until I exit" strokes -
+  // costs no CPU/GPU at all, which matters while recording or presenting alongside heavier apps.
+  //
+  // Finished strokes are bitmaps (bakeAnnotationInk) - one drawImage each, whatever their glow -
+  // and only the stroke under the pen is traced live.
   const render = (): void => {
     rafRef.current = null;
+    if (wakeTimerRef.current !== null) {
+      window.clearTimeout(wakeTimerRef.current);
+      wakeTimerRef.current = null;
+    }
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     // clearRect in CSS pixels under the DPR transform (see the resize effect) - covers the canvas.
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const now = performance.now();
+    const dpr = window.devicePixelRatio || 1;
     strokesRef.current = strokesRef.current.filter((st) => strokeOpacity(now - st.finishedAt, st.style, st.fade) > 0);
-    let fading = false;
+    let fadingOut = false;
+    let nextFadeAt = Infinity;
     for (const stroke of strokesRef.current) {
-      drawAnnotationInk(ctx, stroke, strokeOpacity(now - stroke.finishedAt, stroke.style, stroke.fade));
-      if (fadeTotalMs(stroke.style, stroke.fade) > 0) fading = true;
+      const opacity = strokeOpacity(now - stroke.finishedAt, stroke.style, stroke.fade);
+      if (stroke.baked === undefined) stroke.baked = bakeAnnotationInk(stroke, dpr);
+      const baked = stroke.baked;
+      if (baked) {
+        ctx.globalAlpha = opacity;
+        ctx.drawImage(baked.image, baked.x, baked.y, baked.width, baked.height);
+        ctx.globalAlpha = 1;
+      } else {
+        drawAnnotationInk(ctx, stroke, opacity);
+      }
+      if (fadeTotalMs(stroke.style, stroke.fade) === 0) continue;
+      const fadeStart = stroke.finishedAt + fadeTiming(stroke.style, stroke.fade).hold;
+      if (now >= fadeStart) fadingOut = true;
+      else nextFadeAt = Math.min(nextFadeAt, fadeStart);
     }
-    if (currentStrokeRef.current) {
-      drawAnnotationInk(ctx, currentStrokeRef.current, 1);
+    const current = currentStrokeRef.current;
+    if (current) {
+      const tail = predictedTailRef.current;
+      drawAnnotationInk(ctx, tail.length > 0 ? { ...current, points: current.points.concat(tail) } : current, 1);
     }
-    if (fading) requestRender();
+    if (fadingOut) requestRender();
+    else if (Number.isFinite(nextFadeAt)) wakeTimerRef.current = window.setTimeout(requestRender, Math.max(0, nextFadeAt - now));
   };
   const renderRef = useRef(render);
   renderRef.current = render;
@@ -244,6 +283,8 @@ const AnnotationOverlayWindow = () => {
   useEffect(() => () => {
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
+    if (wakeTimerRef.current !== null) window.clearTimeout(wakeTimerRef.current);
+    wakeTimerRef.current = null;
   }, []);
 
   // Real stylus pressure (0 for mouse/touch, normalized to 0.5 - perfect-freehand's own
@@ -279,10 +320,19 @@ const AnnotationOverlayWindow = () => {
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    // Hovering counts too: the hand follows the cursor whether or not a stroke is in progress.
-    pointerRef.current?.move(e.clientX, e.clientY);
+    // Hovering counts too: the hand follows the cursor whether or not a stroke is in progress -
+    // drawn where the pointer is about to be rather than where it was, which is what makes it feel
+    // stuck to the cursor instead of chasing it a frame or two behind.
+    const predicted = (e.nativeEvent.getPredictedEvents?.() ?? []).filter(
+      (ev) => Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) <= MAX_PREDICTION_PX
+    );
+    const lead = predicted.length > 0 ? predicted[predicted.length - 1] : e;
+    pointerRef.current?.move(lead.clientX, lead.clientY);
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
+    predictedTailRef.current = e.shiftKey
+      ? []
+      : predicted.map((ev) => ({ x: ev.clientX, y: ev.clientY, pressure: ev.pressure > 0 ? ev.pressure : 0.5 }));
     const press = pressRef.current;
     if (press && !press.moved && Math.hypot(e.clientX - press.x, e.clientY - press.y) > TAP_SLOP_PX) press.moved = true;
 
@@ -318,6 +368,7 @@ const AnnotationOverlayWindow = () => {
     pointerRef.current?.setPressed(false);
     const press = pressRef.current;
     pressRef.current = null;
+    predictedTailRef.current = [];
     setDrawing(false);
     if (!currentStrokeRef.current) return;
     // A cancel (e.g. the OS taking the pointer) isn't a tap, so no ring.

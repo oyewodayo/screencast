@@ -127,8 +127,9 @@ import { audioChannelKey, audioChannelName, fileStem, fxForExport, isNeutralFx }
 
 // A video-track layer covering the whole frame - B-roll rather than a picture-in-picture.
 const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.width >= 0.999 && o.height >= 0.999;
-import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
+import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, unrouteElement, useTimelineMuted } from "../../utils/mixerGraph";
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
+import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
 import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
 import DuckShade from "./DuckShade";
@@ -237,6 +238,12 @@ const bootstrappedClipIdByFile = new Map<string, string>();
 export const forgetTimelineBootstrap = (path: string): void => {
   bootstrappedClipIdByFile.delete(path);
 };
+
+// Where the playhead was when this file's timeline last went away (the editor closed, or the video
+// left for a linked document, a folder, home), so coming back with the editor open lands there
+// rather than on the first clip. Kept with the player's saved position at that moment: if the
+// video played on afterwards with the editor closed, that newer position wins and this is dropped.
+const leftAtByFile = new Map<string, { outputTime: number; playerAt: number | undefined }>();
 
 // "4:05", or "1:04:05" past the hour - a timeline can run for a day or more.
 const formatTimestamp = (totalSeconds: number): string => {
@@ -927,12 +934,17 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     audioElementsRef.current.forEach((el, id) => {
       if (live.has(id)) return;
       el.pause();
+      unrouteElement(el);
       audioElementsRef.current.delete(id);
     });
   }, [audioOverlayIdsKey]);
   useEffect(() => {
     const elements = audioElementsRef.current;
-    return () => elements.forEach((el) => el.pause());
+    return () =>
+      elements.forEach((el) => {
+        el.pause();
+        unrouteElement(el);
+      });
   }, []);
   const trackAreaRef = useRef<HTMLDivElement>(null);
   const trackContentRef = useRef<HTMLDivElement>(null);
@@ -3291,6 +3303,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
     if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
     bootstrappedClipIdByFile.set(file.path, first.id);
+    const leftAt = leftAtByFile.get(file.path);
+    leftAtByFile.delete(file.path);
+    const playerAt = getResumeTime(file.path);
+    const unchanged = leftAt && (leftAt.playerAt === undefined ? playerAt === undefined : playerAt !== undefined && Math.abs(playerAt - leftAt.playerAt) < 1.5);
+    if (leftAt && unchanged && leftAt.outputTime > 0 && renderClips.length > 0) {
+      seekToOutputTime(leftAt.outputTime);
+      return;
+    }
     activeClipIndexRef.current = 0;
     lastAppliedTimeRef.current = first.start;
     onSeek(first.sourcePath, first.start);
@@ -3502,6 +3522,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // time" text overlays are time-gated against - factored out under its own name (rather than
   // just feeding playheadLeft) so it can be reported upward via onOutputTimeChange too.
   const activeIndexForDisplay = Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
+  // Read at unmount (leftAtByFile) - the player may be gone by then, so not asked live.
+  const outputTimeAtRenderRef = useRef(0);
   const currentOutputTime =
     renderClips.length > 0
       ? outputStarts[activeIndexForDisplay] +
@@ -3519,6 +3541,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         )
       : 0;
   const playheadLeft = currentOutputTime * pxPerSec;
+  outputTimeAtRenderRef.current = currentOutputTime;
+  useEffect(
+    () => () => {
+      leftAtByFile.set(file.path, { outputTime: outputTimeAtRenderRef.current, playerAt: getResumeTime(file.path) });
+    },
+    [file.path]
+  );
 
   // Picking a transition, motion or effect plays it straight away on the selected clip - the
   // moment around the cut for a transition, the clip's opening for the rest - then stops, so
@@ -5848,6 +5877,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             if (ids[0]) setSelectedAudioOverlayId(ids[0]);
             return ids;
           }}
+          pieces={editStore.audioOverlays}
           onClose={() => setMusicAnchor(null)}
         />
       )}

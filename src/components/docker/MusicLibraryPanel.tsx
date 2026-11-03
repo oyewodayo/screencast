@@ -61,6 +61,8 @@ interface MusicLibraryPanelProps {
   onTimelinePlay: (play: boolean) => void;
   onSeek: (time: number) => void;
   onTakes: (takes: { path: string; seconds: number; label: string }[], at: number, replaces: string[]) => string[];
+  // The edit's audio pieces - the AI voice history marks which voice-overs are on this video.
+  pieces: { id: string; src: string; startTime: number }[];
   onClose: () => void;
 }
 
@@ -348,7 +350,7 @@ const PartPicker: React.FC<PartPickerProps> = ({ track, part, wanted, beats, pla
   );
 };
 
-const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, videoDuration, context, timelinePlaying, onPreviewStart, onAdd, onLateBeats, onPickFile, recordAt, onTimelinePlay, onSeek, onTakes, onClose }) => {
+const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, videoDuration, context, timelinePlaying, onPreviewStart, onAdd, onLateBeats, onPickFile, recordAt, onTimelinePlay, onSeek, onTakes, pieces, onClose }) => {
   const dockHost = useToolPanelHost();
   const { ref: panelRef, position } = useClampedPopoverPosition(anchor);
   const [catalog, setCatalog] = useState<Catalog>({ status: "loading" });
@@ -818,7 +820,7 @@ const MusicLibraryPanel: React.FC<MusicLibraryPanelProps> = ({ anchor, placeAt, 
       </div>
 
       {voiceOpen ? (
-        <AiVoicePanel placeAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} />
+        <AiVoicePanel placeAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} pieces={pieces} />
       ) : recordOpen ? (
         <VoiceRecorder recordAt={recordAt} timelinePlaying={timelinePlaying} onTimelinePlay={onTimelinePlay} onSeek={onSeek} onTakes={onTakes} />
       ) : (

@@ -6,7 +6,8 @@
 // anyway: multiply on a light page only darkens the paper (black text stays black), screen on a
 // dark page only lightens it.
 import React from "react";
-import { PAGE_GAP_PX, pageHeightPx, type PageFormat } from "../../utils/docPageGeometry";
+import { pageHeightPx, type PageFormat } from "../../utils/docPageGeometry";
+import useDocSheets from "../../hooks/useDocSheets";
 
 interface DocWatermarkOverlayProps {
   dataUrl: string;
@@ -17,18 +18,19 @@ interface DocWatermarkOverlayProps {
 }
 
 const DocWatermarkOverlay: React.FC<DocWatermarkOverlayProps> = ({ dataUrl, pageCount, page, skipFirstPage, dark }) => {
+  // At each sheet's real top (useDocSheets) - a long table can make a sheet taller than a page.
+  const { sheets, ref: rootRef } = useDocSheets(pageCount, page);
   if (!dataUrl) return null;
   const height = pageHeightPx(page);
-  const pitch = height + PAGE_GAP_PX;
   return (
-    <div aria-hidden className="absolute inset-0 z-[1] pointer-events-none overflow-hidden print:hidden">
+    <div ref={rootRef} aria-hidden className="absolute inset-0 z-[1] pointer-events-none overflow-hidden print:hidden">
       {Array.from({ length: pageCount }, (_, k) =>
         skipFirstPage && k === 0 ? null : (
           <div
             key={k}
             className="absolute inset-x-0"
             style={{
-              top: k * pitch,
+              top: sheets[k]?.top ?? 0,
               height,
               backgroundImage: `url("${dataUrl}")`,
               backgroundSize: "100% 100%",

@@ -582,6 +582,7 @@ fn main() {
             commands::tts::download_tts,
             commands::tts::cancel_tts_download,
             commands::tts::tts_synthesize,
+            commands::tts::tts_history,
             commands::tts::cancel_tts,
             commands::tts::tts_preview,
             commands::tts::tts_release,

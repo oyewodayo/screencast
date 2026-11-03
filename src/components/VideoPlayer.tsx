@@ -137,6 +137,7 @@ interface KeyboardHandlerActions {
   toggleShortcutsOverlay: () => void;
   playPrevious?: () => void;
   playNext?: () => void;
+  toggleEditor?: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -473,6 +474,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Fresh every render so the keyboard handler (bound once per mediaType) never calls a stale one.
   const onPreviousRef = useRef(onPrevious);
   onPreviousRef.current = onPrevious;
+  const onEditVideoRef = useRef(onEditVideo);
+  onEditVideoRef.current = onEditVideo;
   const onNextRef = useRef(onNext);
   onNextRef.current = onNext;
   const onNoiseReductionStatusChangeRef = useRef<VideoPlayerProps['onNoiseReductionStatusChange']>(undefined);
@@ -1301,6 +1304,20 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  // While editing, the picture sits above the control bar rather than under it (player.css
+  // .editing): the container is padded by the bar's live height, and since the ResizeObserver
+  // above reports the content box, the letterbox math and every overlay fit the space left.
+  const controlsBarRef = useRef<HTMLDivElement>(null);
+  const [controlsBarHeight, setControlsBarHeight] = useState(0);
+  useEffect(() => {
+    const el = controlsBarRef.current;
+    if (!el || !isEditingVideo) return;
+    const observer = new ResizeObserver(() => setControlsBarHeight(Math.round(el.offsetHeight)));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [isEditingVideo, mediaType]);
+  const reserveControls = !!isEditingVideo && mediaType === 'video' && !isFullscreen;
 
   // The project frame when editing (every clip is fitted into it, as export does), else the file's.
   const frameSize = activeClipEffects?.frame ?? videoIntrinsicSize;
@@ -2460,7 +2477,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       stepFrameForward: () => stepFrame(1),
       toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev),
       playPrevious: () => onPreviousRef.current?.(),
-      playNext: () => onNextRef.current?.()
+      playNext: () => onNextRef.current?.(),
+      // Read live: the file (and whether it's a video) changes without this effect re-running.
+      toggleEditor: () => onEditVideoRef.current?.()
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -2627,6 +2646,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					<div className="flex flex-col gap-3 text-sm">
 						{[
 							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
+							...(onEditVideo ? [{ title: 'Editing', rows: [['E', isEditingVideo ? 'Close the editor' : 'Open the editor']] }] : []),
 							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
 							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
 							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
@@ -2652,15 +2672,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded`}
 			ref={videoContainerRef}
 			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
 			// flyout menus in player.css so a short player scrolls them instead of clipping their top.
-			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}) } as React.CSSProperties}
+			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}), ...(reserveControls ? { paddingBottom: controlsBarHeight } : {}) } as React.CSSProperties}
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<div className="video-controls-container pt-1 pb-1 place-items-center">
+					<div ref={controlsBarRef} className="video-controls-container pt-1 pb-1 place-items-center">
 					<div
 						className="timeline-container"
 						id="timelineContainer"

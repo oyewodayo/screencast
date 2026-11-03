@@ -39,7 +39,20 @@ export interface SpokenFile {
   cached: boolean;
 }
 
+// A voice-over in the library, with what it was made from (services' tts_history). text/speed/
+// pause are null for one made before v0.1.4, when scripts weren't kept.
+export interface VoiceOverEntry {
+  path: string;
+  seconds: number;
+  text: string | null;
+  voice: string | null;
+  speed: number | null;
+  pause: number | null;
+  createdAt: number;
+}
+
 export const ttsStatus = () => invoke<TtsStatus>("tts_status");
+export const ttsHistory = () => invoke<VoiceOverEntry[]>("tts_history");
 export const downloadTts = () => invoke<void>("download_tts");
 export const cancelTtsDownload = () => invoke<void>("cancel_tts_download");
 export const ttsSynthesize = (text: string, voice: string, speed: number, pause: number) => invoke<SpokenFile>("tts_synthesize", { text, voice, speed, pause });
@@ -59,6 +72,18 @@ export const PAUSE_STYLES = [
   { id: "measured", label: "Measured", value: 1.6, hint: "Long gaps - lectures and documentary narration" },
 ] as const;
 export type PauseStyleId = (typeof PAUSE_STYLES)[number]["id"];
+
+// The pause style nearest a stored gap scale.
+export function pauseStyleFor(value: number): PauseStyleId {
+  return PAUSE_STYLES.reduce((best, p) => (Math.abs(p.value - value) < Math.abs(best.value - value) ? p : best)).id;
+}
+
+// The words a pre-v0.1.4 voice-over still carries, from "AI voice - <words> - <voice> <key>.wav".
+export function wordsFromFileName(path: string): string {
+  const name = path.split(/[\\/]/).pop() ?? "";
+  const m = /^AI voice - (.*) - [a-z]{2}_[a-z]+ [0-9a-f]+\.wav$/i.exec(name);
+  return m ? m[1] : name.replace(/\.wav$/i, "");
+}
 
 export const MIN_SPEED = 0.7;
 export const MAX_SPEED = 1.3;

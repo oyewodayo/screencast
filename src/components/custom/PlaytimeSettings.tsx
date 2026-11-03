@@ -120,6 +120,7 @@ const PlaytimeSettings: React.FC<PlaytimeSettingsProps> = ({
             className="settings-row"
             onClick={onEditVideo}
             data-tip={isEditingVideo ? "Hide the editing timeline" : "Trim, cut, add transitions, effects, music, text and captions"}
+            data-tip-kbd="E"
           >
             <span className="settings-row-label">
               <IoCutOutline />
