@@ -39,7 +39,7 @@ interface Props {
     isRecording:boolean;
     recordingStartTime: number | null;
     handleFolderSettings:()=>void;
-    handleGoHome:()=>void;
+    handleGoHome:(force?: boolean)=>void;
     isHome:boolean;
     handleOpenBoard:()=>void;
     isBoard:boolean;
@@ -217,7 +217,8 @@ const ActiveRecordingState = (
                     type="button"
                     className={iconButtonClass(isHome)}
                     onClick={() => handleGoHome()}
-                    title="Home"
+                    onDoubleClick={() => handleGoHome(true)}
+                    title="Home (double-click to force the main home screen)"
                     >
                       <IoHomeOutline />
                     </button>

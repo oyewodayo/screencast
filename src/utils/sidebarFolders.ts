@@ -32,6 +32,40 @@ export function togglePinnedFolder(folder: string): string[] {
   return next;
 }
 
+// Per-folder file order: by name (the default), newest first, or oldest first. Kept per folder
+// path so e.g. "recordings" can show the latest take on top while other folders stay A-Z.
+const FOLDER_SORT_KEY = "briefcast.folderSort.v1";
+export type FolderSort = "name" | "date-desc" | "date-asc";
+export type FolderSortMap = Record<string, FolderSort>;
+
+export function getFolderSorts(): FolderSortMap {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FOLDER_SORT_KEY) ?? "{}");
+    const out: FolderSortMap = {};
+    if (parsed && typeof parsed === "object") {
+      for (const [k, v] of Object.entries(parsed)) if (v === "date-desc" || v === "date-asc") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// name -> newest first -> oldest first -> name.
+export function cycleFolderSort(folder: string): FolderSortMap {
+  const sorts = getFolderSorts();
+  const cur = sorts[folder] ?? "name";
+  const next: FolderSort = cur === "name" ? "date-desc" : cur === "date-desc" ? "date-asc" : "name";
+  if (next === "name") delete sorts[folder];
+  else sorts[folder] = next;
+  try {
+    localStorage.setItem(FOLDER_SORT_KEY, JSON.stringify(sorts));
+  } catch {
+    /* preference only */
+  }
+  return sorts;
+}
+
 export function getSidebarViewMode(): SidebarViewMode {
   try {
     return localStorage.getItem(VIEW_MODE_KEY) === "grid" ? "grid" : "list";

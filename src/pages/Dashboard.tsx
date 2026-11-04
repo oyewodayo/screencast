@@ -37,6 +37,8 @@ import {
   pinRank,
   repathFolderKey,
   repathPinnedFolders,
+  getFolderSorts,
+  type FolderSortMap,
   getSidebarCollapsed,
   getSidebarWidth,
   saveSidebarCollapsed,
@@ -552,8 +554,15 @@ const Dashboard = () => {
   const sidebarRef = useRef<HTMLDivElement>(null);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
-  const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
+  const [folderSorts, setFolderSorts] = useState<FolderSortMap>(() => getFolderSorts());
+  const sortFileList = (fileList: FileEntry[], folder: string): FileEntry[] => {
     const sorted = [...fileList];
+    const folderSort = folderSorts[folder];
+    if (folderSort) {
+      const dir = folderSort === "date-desc" ? -1 : 1;
+      sorted.sort((a, b) => dir * ((a.modified ?? 0) - (b.modified ?? 0)) || a.name.localeCompare(b.name));
+      return sorted;
+    }
     if (fileSortMode === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
     else if (fileSortMode === "type") {
       sorted.sort((a, b) => {
@@ -2657,7 +2666,9 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
+	// `force` (double-click on Home): also leave a folder gallery and drop the "back to…" point, so
+	// it always lands on the main home screen whatever was on top.
+	const handleGoHome = (force?: boolean) => { if (force === true) { setSelectedFolder(null); setReturnPoint(null); } setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); setMindmapScreen(null); setVideoEditorScreen(null); };
@@ -4547,7 +4558,8 @@ const setScreen = () => {
 						(file) =>
 							getFileCategory(file.name) === activeFileCategory &&
 							(!isSearchingFiles || folderMatches || file.name.toLowerCase().includes(normalizedSearchQuery))
-					)
+					),
+						folder
 				),
 				folderMatches,
 			] as [string, FileEntry[], boolean];
@@ -4563,7 +4575,7 @@ const setScreen = () => {
 		// Pinned folders (and what's inside them) first, then the usual path order.
 		pinnedFolders),
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[files, normalizedSearchQuery, activeFileCategory, hideEmptyFolders, pinnedFolders, fileSortMode]);
+		[files, normalizedSearchQuery, activeFileCategory, hideEmptyFolders, pinnedFolders, fileSortMode, folderSorts]);
 	// Folders the search is leaving out (of those this tab would otherwise list).
 	const hiddenBySearch = useMemo(
 		() =>
@@ -4916,6 +4928,8 @@ const setScreen = () => {
                   editingVideo={editingVideoRef.current}
                   boardScreen={boardScreen}
                   pinnedFolders={pinnedFolders}
+                  folderSorts={folderSorts}
+                  setFolderSorts={setFolderSorts}
                   pinnedPaths={pinnedPaths}
                   linkedDocsByPath={linkedDocsByPath}
                   openMenu={openMenu}

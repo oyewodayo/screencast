@@ -143,7 +143,7 @@ interface Props {
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
   handleFolderSettings: () => void;
-  handleGoHome: () => void;
+  handleGoHome: (force?: boolean) => void;
   isHome: boolean;
   handleOpenBoard: () => void;
   isBoard: boolean;

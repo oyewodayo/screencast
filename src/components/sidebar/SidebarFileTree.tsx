@@ -18,11 +18,13 @@ import {
   IoInformationCircleOutline,
   IoPin,
   IoPinOutline,
+  IoSwapVerticalOutline,
+  IoTimeOutline,
   IoTrashOutline,
 } from "react-icons/io5";
 import { formatFileName } from "../../utils/Formater";
 import type { FileCategory } from "../../utils/fileCategory";
-import { canMoveFolder, togglePinnedFolder } from "../../utils/sidebarFolders";
+import { canMoveFolder, cycleFolderSort, togglePinnedFolder, type FolderSortMap } from "../../utils/sidebarFolders";
 import { FileEntry, GALLERY_CATEGORIES, SidebarTab, TrashEntry, formatDeletedAt } from "../../utils/libraryEntries";
 import type { DocSummary } from "../../utils/docTypes";
 import type { BoardScreen } from "../board/BoardWorkspace";
@@ -48,6 +50,8 @@ export interface SidebarFileTreeProps {
   editingVideo: boolean;
   boardScreen: BoardScreen | null;
   pinnedFolders: string[];
+  folderSorts: FolderSortMap;
+  setFolderSorts: Dispatch<SetStateAction<FolderSortMap>>;
   pinnedPaths: string[];
   linkedDocsByPath: Map<string, DocSummary[]>;
   openMenu: string | null;
@@ -133,6 +137,8 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     editingVideo,
     boardScreen,
     pinnedFolders,
+    folderSorts,
+    setFolderSorts,
     pinnedPaths,
     linkedDocsByPath,
     openMenu,
@@ -407,7 +413,35 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
               </span>
               {pinnedFolders.includes(folder) && <IoPin size={11} className="shrink-0 text-blue-500 dark:text-blue-400" />}
             </h4>
-            <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity shrink-0">
+            <div className="flex items-center gap-0.5 shrink-0">
+              {(
+                <button
+                  type="button"
+                  title={
+                    folderSorts[folder] === "date-desc"
+                      ? "Sorted by date: newest first - click for oldest first"
+                      : folderSorts[folder] === "date-asc"
+                        ? "Sorted by date: oldest first - click for name order"
+                        : "Sorted by name - click to sort by date (newest first)"
+                  }
+                  onClick={() => setFolderSorts(cycleFolderSort(folder))}
+                  className={`p-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 transition-opacity ${
+                    folderSorts[folder]
+                      ? "text-blue-500 dark:text-blue-400"
+                      : "text-gray-400 hover:text-blue-500 opacity-0 group-hover/folder:opacity-100"
+                  }`}
+                >
+                  {folderSorts[folder] ? (
+                    <span className="flex items-center">
+                      <IoTimeOutline size={12} />
+                      <span className="text-[10px] leading-none">{folderSorts[folder] === "date-desc" ? "↓" : "↑"}</span>
+                    </span>
+                  ) : (
+                    <IoSwapVerticalOutline size={13} />
+                  )}
+                </button>
+              )}
+             <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity">
               {folder !== "" && (
                 <button
                   type="button"
@@ -451,6 +485,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
               >
                 <IoAddCircleOutline size={14} />
               </button>
+             </div>
             </div>
           </div>
 
