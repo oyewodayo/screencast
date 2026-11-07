@@ -16,6 +16,8 @@ const QUALITY_OPTIONS: { value: ExportQuality; label: string; hint: string }[] =
   { value: "small", label: "Smaller file", hint: "Faster export, more compression - good for a quick share" },
   { value: "standard", label: "Standard", hint: "Balanced quality and export time - the default" },
   { value: "high", label: "High quality", hint: "Slower export, less compression - best for archiving" },
+  { value: "youtube", label: "YouTube", hint: "Full resolution and frame rate, high quality picture and audio" },
+  { value: "social", label: "WhatsApp / Instagram", hint: "1080p, 30 fps, phone-friendly - accepted by WhatsApp Status and Reels" },
 ];
 
 interface ExportOptionsPopoverProps {

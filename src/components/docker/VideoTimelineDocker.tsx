@@ -155,12 +155,11 @@ const THUMB_TILE_HEIGHT = 52; // px - filmstrip tile height inside the h-16 clip
 // capped at MAX_CACHED_FRAMES (the step widens for long videos). Tiles pick their nearest cached
 // frame, so this is what bounds how short a shot can be and still show up on the strip.
 const FRAME_CACHE_STEP_SEC = 0.5;
-const MAX_CACHED_FRAMES = 360;
-const THUMB_CAPTURE_HEIGHT = 90; // px - frames are downscaled at capture; tiles never draw larger
-// On a long video those 360 are minutes apart, so the tiles in view also ask for their own frame
-// (a frame inside each tile's own stretch of source) - kept up to this many, oldest dropped first:
-// ~4 KB each, so a few MB however long the video and however much of it has been looked at.
-const MAX_DETAIL_FRAMES = 1500;
+const MAX_CACHED_FRAMES = 120;
+const THUMB_CAPTURE_HEIGHT = 80; // px - frames are downscaled at capture; tiles never draw larger
+// On a long video those 120 are minutes apart, so the tiles in view also ask for their own frame
+// (a frame inside each tile's own stretch of source) - kept up to this many, oldest dropped first.
+const MAX_DETAIL_FRAMES = 240;
 
 // Nearest cached frame to `time` (frames sorted by time), or null if none captured yet.
 const nearestFrame = (frames: ThumbFrame[], time: number): ThumbFrame | null => {
@@ -322,7 +321,7 @@ const ActionButton: React.FC<{
 // re-decodes) whenever the visible window (trimStart/duration, from drag or resize) or pixel size
 // changes, so a live trim drag updates the waveform every frame from already-decoded data.
 // `visible`: the part of the chip (its own px) to draw - a canvas can't be millions of px wide.
-const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number] }> = ({ overlay, widthPx, heightPx, visible }) => {
+const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({ overlay, widthPx, heightPx, visible }) => {
   const [vFrom, vTo] = [Math.max(0, visible[0]), Math.min(widthPx, visible[1])];
   const vWidth = Math.max(0, vTo - vFrom);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -367,7 +366,13 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
   }, [peaks, widthPx, heightPx, vFrom, vWidth, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, canvasRestoreTick]);
 
   return <canvas ref={canvasRef} className="absolute top-0 pointer-events-none" style={{ left: vFrom, width: vWidth, height: heightPx }} />;
-};
+}, (prev, next) =>
+  prev.overlay === next.overlay &&
+  prev.widthPx === next.widthPx &&
+  prev.heightPx === next.heightPx &&
+  prev.visible[0] === next.visible[0] &&
+  prev.visible[1] === next.visible[1]
+);
 
 // The audio panel's preview position on its own track (previewHead.ts) - a line with the time, moved
 // straight on the DOM every frame (the timeline itself never re-renders for it). While the preview
@@ -569,7 +574,7 @@ const ForeignVideoClipTiles: React.FC<{ clip: Clip; first: number; last: number;
 // to line up against instead of guessing from the filmstrip's video frames alone. Drawn baseline-up
 // as a bottom ledge (not centered, unlike the audio-overlay chip) with its own scrim behind it, so
 // it reads clearly over a filmstrip frame of any brightness instead of competing with it.
-const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: number; sourceDuration: number | null; widthPx: number; heightPx: number; visible: [number, number] }> = ({
+const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: number; sourceDuration: number | null; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({
   sourcePath,
   trimStart,
   trimEnd,
@@ -630,7 +635,16 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
       <canvas ref={canvasRef} className="absolute top-0" style={{ left: vFrom, width: vWidth, height: heightPx }} />
     </div>
   );
-};
+}, (prev, next) =>
+  prev.sourcePath === next.sourcePath &&
+  prev.trimStart === next.trimStart &&
+  prev.trimEnd === next.trimEnd &&
+  prev.sourceDuration === next.sourceDuration &&
+  prev.widthPx === next.widthPx &&
+  prev.heightPx === next.heightPx &&
+  prev.visible[0] === next.visible[0] &&
+  prev.visible[1] === next.visible[1]
+);
 
 // The main video's own audio level (volume + mute) - see videoEditTypes.ts's
 // videoAudioMuted/videoAudioVolume doc comment for why this is separate from any AudioOverlay's
@@ -1282,7 +1296,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }
           }
         }
-        if (dirty && performance.now() - lastFlush > 250) flush();
+        if (dirty && performance.now() - lastFlush > 500) flush();
       }
     };
 
@@ -1434,7 +1448,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Screen style (ScreenStylePanel) - the frame, the drawn pointer and shortcut keys, whole-video.
   const [screenStyleAnchor, setScreenStyleAnchor] = useState<{ left: number; top: number } | null>(null);
   const clipRecordings = useClipRecordings(editStore.clips);
-  const hasEditablePointer = [...clipRecordings.values()].some((r) => hasPointerPath(r));
+  const hasEditablePointer = useMemo(() => [...clipRecordings.values()].some((r) => hasPointerPath(r)), [clipRecordings]);
   const shortcutCount = useMemo(() => buildKeyChips(editStore.clips, clipRecordings).reduce((n, c) => n + c.count, 0), [editStore.clips, clipRecordings]);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
@@ -2545,6 +2559,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // time 0 on load, and after a reorder that raw position can legitimately belong to some *other*
   // clip than whichever one is actually first in the new playback order.
   const activeClipIndexRef = useRef<number>(-1);
+  const [activeClipIndexState, setActiveClipIndexState] = useState<number>(0);
+  const setActiveClipIndex = (index: number) => {
+    activeClipIndexRef.current = index;
+    setActiveClipIndexState((prev) => (prev === index ? prev : index));
+  };
   const lastAppliedTimeRef = useRef<number>(-1);
 
   // Output-timeline (assembled/preview order) pixel position -> which clip it falls into and the
@@ -2574,11 +2593,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   // A deliberate scrub/seek always knows exactly which clip it landed in, so it sets
   // activeClipIndexRef directly instead of leaving it for the tracking effect to guess.
-  const seekToOutputTime = (outputTime: number) => {
+  const seekToOutputTime = (outputTime: number, resume?: boolean) => {
     const { index, sourceTime } = clipAtOutputTime(outputTime);
-    activeClipIndexRef.current = index;
+    setActiveClipIndex(index);
     lastAppliedTimeRef.current = sourceTime;
-    onSeek(renderClips[index].sourcePath, sourceTime);
+    onSeek(renderClips[index].sourcePath, sourceTime, resume);
   };
   // The player's scrub bar reads and seeks the edit through here (timelineTransport.ts) - always
   // against the latest clips, and the active clip as of this very frame.
@@ -2756,7 +2775,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
       // video", not as a deliberate seek.
       if (!isPlaying) {
-        activeClipIndexRef.current = index;
+        setActiveClipIndex(index);
         lastAppliedTimeRef.current = clip.start;
         onSeek(clip.sourcePath, clip.start);
       }
@@ -2991,7 +3010,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const atEnd = !!last && !isPlaying && activeClipIndexRef.current >= lastIndex && currentTime >= last.end - SEEK_TOLERANCE_SEC;
     if (atEnd) {
       const first = baseClips[0];
-      activeClipIndexRef.current = 0;
+      setActiveClipIndex(0);
       lastAppliedTimeRef.current = first.start;
       onSeek(first.sourcePath, first.start);
     }
@@ -3060,7 +3079,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       });
       if (!payload) return;
       const format = EXPORT_FORMATS.find((f) => f.value === exportFormat);
-      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
+      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : exportQuality === "youtube" ? "YouTube" : exportQuality === "social" ? "WhatsApp / Instagram" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
       enqueueExport(payload, file.name.replace(/\.[^.]+$/, ""), detail);
     } finally {
       setPreparingExport(false);
@@ -3446,11 +3465,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // bringing it back (undo) plays from it again.
     if (!first && isProject && !editStore.loading) {
       bootstrappedClipIdByFile.delete(file.path);
-      activeClipIndexRef.current = 0;
+      setActiveClipIndex(0);
       onSeek(file.path, 0);
       return;
     }
-    if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
+    if (!first || first.id === "__pending__") return;
+    if (bootstrappedClipIdByFile.get(file.path) === first.id) {
+      if (activeClipIndexRef.current < 0 || activeClipIndexRef.current >= baseClips.length) {
+        const idx = baseClips.findIndex((c) => c.sourcePath === file.path && currentTime >= c.start - SEEK_TOLERANCE_SEC && currentTime <= c.end + SEEK_TOLERANCE_SEC);
+        setActiveClipIndex(idx >= 0 ? idx : 0);
+      }
+      return;
+    }
     bootstrappedClipIdByFile.set(file.path, first.id);
     const leftAt = leftAtByFile.get(file.path);
     leftAtByFile.delete(file.path);
@@ -3460,7 +3486,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       seekToOutputTime(leftAt.outputTime);
       return;
     }
-    activeClipIndexRef.current = 0;
+    setActiveClipIndex(0);
     lastAppliedTimeRef.current = first.start;
     onSeek(first.sourcePath, first.start);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3503,7 +3529,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [currentTime, editStore.clips]);
   function advanceToClip(index: number, resume: boolean) {
     const clip = baseClips[index];
-    activeClipIndexRef.current = index;
+    setActiveClipIndex(index);
     lastAppliedTimeRef.current = clip.start;
     onSeek(clip.sourcePath, clip.start, resume);
   }
@@ -3670,7 +3696,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // into range in case clips changed shape since it was last set). Also the "current output
   // time" text overlays are time-gated against - factored out under its own name (rather than
   // just feeding playheadLeft) so it can be reported upward via onOutputTimeChange too.
-  const activeIndexForDisplay = Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
+  const activeIndexForDisplay = Math.min(Math.max(activeClipIndexState, 0), renderClips.length - 1);
   // Read at unmount (leftAtByFile) - the player may be gone by then, so not asked live.
   const outputTimeAtRenderRef = useRef(0);
   const currentOutputTime =
@@ -3703,33 +3729,39 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // what was picked is seen without reaching for Play. Only discrete picks (a slider's drag
   // would replay on every step); playing or pausing by hand drops it.
   const previewEndRef = useRef<number | null>(null);
+  const previewRestAtRef = useRef<number | null>(null);
   const previewSafetyRef = useRef<number | null>(null);
   const previewOwnsPlayRef = useRef(false);
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
   const stopPickPreview = useCallback(() => {
     previewEndRef.current = null;
+    previewRestAtRef.current = null;
     if (previewSafetyRef.current) window.clearTimeout(previewSafetyRef.current);
     previewSafetyRef.current = null;
   }, []);
-  const playPickPreview = (from: number, to: number) => {
+  const playPickPreview = (from: number, to: number, restAt?: number) => {
     stopPickPreview();
-    seekToOutputTime(Math.max(0, from));
     previewEndRef.current = to;
+    previewRestAtRef.current = restAt ?? null;
     previewOwnsPlayRef.current = true;
-    if (!isPlayingRef.current) onTogglePlay();
+    seekToOutputTime(Math.max(0, from), true);
     // A safety stop, in case the playhead's reports stall (a slow clip switch).
     previewSafetyRef.current = window.setTimeout(() => {
+      const rest = previewRestAtRef.current;
       if (previewEndRef.current !== null && isPlayingRef.current) onTogglePlay();
       stopPickPreview();
+      if (rest !== null) seekToOutputTime(rest, false);
     }, (to - from) * 1000 + 3000);
   };
   useEffect(() => {
     const end = previewEndRef.current;
     if (end === null) return;
     if (isPlaying && currentOutputTime >= end) {
+      const rest = previewRestAtRef.current;
       stopPickPreview();
       onTogglePlay();
+      if (rest !== null) seekToOutputTime(rest, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOutputTime]);
@@ -3752,7 +3784,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
     const newMotion = patch.kenBurns !== undefined && patch.kenBurns?.preset !== clip.kenBurns?.preset;
     const newEffect = patch.fx !== undefined && patch.fx?.kind !== clip.fx?.kind;
-    if ((newMotion && patch.kenBurns) || (newEffect && patch.fx)) playPickPreview(start, start + Math.min(length, 2.5));
+    if ((newMotion && patch.kenBurns) || (newEffect && patch.fx)) {
+      const isIntroFx = newEffect && (patch.fx?.kind === "focus" || patch.fx?.kind === "colorin");
+      const restAt = isIntroFx ? start + Math.min(0.2, length * 0.25) : undefined;
+      playPickPreview(start, start + Math.min(length, 2.5), restAt);
+      return;
+    }
+    // If paused and editing a clip that isn't currently on screen (or adjusting an intro effect's
+    // strength past its intro window), move the playhead into the edited clip so the change shows live.
+    if (!isPlayingRef.current) {
+      const isIntroSlider = patch.fx && (patch.fx.kind === "focus" || patch.fx.kind === "colorin");
+      if (activeClipIndexRef.current !== clipIndex) {
+        seekToOutputTime(start + (isIntroSlider ? Math.min(0.2, length * 0.25) : 0), false);
+      } else if (isIntroSlider && currentOutputTime - start > 0.6) {
+        seekToOutputTime(start + Math.min(0.2, length * 0.25), false);
+      }
+    }
   };
 
   // Snap landmarks for every overlay drag/resize handler above (they're all defined earlier in
@@ -4306,7 +4353,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <ActionButton
             title={selectedClipId ? (isCroppingClip ? "Stop cropping" : "Crop clip") : "Select a clip to crop"}
-            onClick={() => onToggleCroppingClip?.()}
+            onClick={() => {
+              if (!isPlaying && selectedClipId) {
+                const idx = renderClips.findIndex((c) => c.id === selectedClipId);
+                if (idx >= 0 && activeClipIndexRef.current !== idx) seekToOutputTime(outputStarts[idx] ?? 0, false);
+              }
+              onToggleCroppingClip?.();
+            }}
             disabled={!selectedClipId}
           >
             <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
@@ -4374,7 +4427,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <ActionButton
             title={selectedClipId ? `Mirror ${selectionLabel} horizontally` : "Select a clip to mirror"}
-            onClick={() => selectedClip && updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal })}
+            onClick={() => {
+              if (!selectedClip) return;
+              if (!isPlaying && selectedClipId) {
+                const idx = renderClips.findIndex((c) => c.id === selectedClipId);
+                if (idx >= 0 && activeClipIndexRef.current !== idx) seekToOutputTime(outputStarts[idx] ?? 0, false);
+              }
+              updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal });
+            }}
             disabled={!selectedClipId}
           >
             <MdFlip size={15} className={selectedClip?.flipHorizontal ? "text-blue-400" : undefined} />

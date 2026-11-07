@@ -179,8 +179,8 @@ const EDIT_MERGE_MS = 700;
 // Mirrors export_trimmed_video's own `quality`/`output_path` params (conversion.rs) - both
 // optional so a caller that passes nothing gets the exact same default behavior as before this
 // existed (resolve_export_quality's own "standard" fallback, and the default "<name> (edited).ext"
-// location next to the source).
-export type ExportQuality = "standard" | "high" | "small";
+// location next to the source). "youtube"/"social" are platform presets - see export_hw_tier.
+export type ExportQuality = "standard" | "high" | "small" | "youtube" | "social";
 export interface ExportOptions {
   quality?: ExportQuality;
   outputPath?: string;

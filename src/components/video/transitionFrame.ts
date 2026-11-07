@@ -70,9 +70,15 @@ function noiseField(cols: number, rows: number): Float32Array {
   return field;
 }
 let dissolveCanvas: HTMLCanvasElement | null = null;
+const dissolveMaskCache = new Map<string, string>();
 // The outgoing picture's dissolve mask at progress p, as a data URL (opaque = still showing).
 function dissolveMask(W: number, H: number, p: number, cols: number): string {
   const rows = Math.max(1, Math.round((cols * H) / W));
+  const step = Math.round(Math.max(0, Math.min(1, p)) * 32);
+  const key = `${cols}x${rows}:${step}`;
+  const cached = dissolveMaskCache.get(key);
+  if (cached) return cached;
+  const qp = step / 32;
   const field = noiseField(cols, rows);
   dissolveCanvas ??= document.createElement("canvas");
   if (dissolveCanvas.width !== cols || dissolveCanvas.height !== rows) {
@@ -81,9 +87,15 @@ function dissolveMask(W: number, H: number, p: number, cols: number): string {
   }
   const ctx = dissolveCanvas.getContext("2d")!;
   const image = ctx.createImageData(cols, rows);
-  for (let i = 0; i < field.length; i++) image.data[i * 4 + 3] = field[i] >= p ? 255 : 0;
+  for (let i = 0; i < field.length; i++) image.data[i * 4 + 3] = field[i] >= qp ? 255 : 0;
   ctx.putImageData(image, 0, 0);
-  return dissolveCanvas.toDataURL();
+  const url = dissolveCanvas.toDataURL();
+  if (dissolveMaskCache.size >= 128) {
+    const oldest = dissolveMaskCache.keys().next().value;
+    if (oldest !== undefined) dissolveMaskCache.delete(oldest);
+  }
+  dissolveMaskCache.set(key, url);
+  return url;
 }
 
 // Colour sweep: the lighter band at the panel's edges, as a fraction of the frame.
@@ -136,8 +148,8 @@ const sweepAxis = (direction: LeakDirection | undefined): "up" | "down" | "left"
   direction === "down" || direction === "left" || direction === "right" ? direction : "up";
 
 // Sizes the fx canvas to the frame (device pixels) and returns a context in frame CSS px.
-function fxContext(fx: HTMLCanvasElement, W: number, H: number): CanvasRenderingContext2D | null {
-  const dpr = window.devicePixelRatio || 1;
+function fxContext(fx: HTMLCanvasElement, W: number, H: number): { ctx: CanvasRenderingContext2D; dpr: number } | null {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1280 / Math.max(1, W));
   const w = Math.max(1, Math.round(W * dpr));
   const h = Math.max(1, Math.round(H * dpr));
   if (fx.width !== w || fx.height !== h) {
@@ -148,7 +160,7 @@ function fxContext(fx: HTMLCanvasElement, W: number, H: number): CanvasRendering
   if (!ctx) return null;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  return ctx;
+  return { ctx, dpr };
 }
 
 export function renderTransitionFrame(type: TransitionType | null, look: TransitionLook, p: number, els: TransitionElements, g: TransitionGeometry): void {
@@ -175,11 +187,11 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
   if (isCanvasTransition(type)) {
     // Composited whole from both pictures on the fx canvas, which covers the frame.
     const pics = els.pictures?.() ?? null;
-    const ctx = pics && fx ? fxContext(fx, W, H) : null;
-    if (!pics || !fx || !ctx) return;
+    const prepared = pics && fx ? fxContext(fx, W, H) : null;
+    if (!pics || !fx || !prepared) return;
     fx.style.display = "block";
     mover.style.opacity = "0";
-    drawCanvasTransition(ctx, type, look, p, pics, W, H, window.devicePixelRatio || 1);
+    drawCanvasTransition(prepared.ctx, type, look, p, pics, W, H, prepared.dpr);
     return;
   }
 
@@ -258,8 +270,9 @@ export function renderTransitionFrame(type: TransitionType | null, look: Transit
       const lead = (2 + 2 * a) * smoothstep(p);
       const trail = lead - 1 - 2 * a;
       if (p >= 0.5) mover.style.opacity = "0";
-      const ctx = fx && fxContext(fx, W, H);
-      if (!fx || !ctx) break;
+      const prepared = fx && fxContext(fx, W, H);
+      if (!fx || !prepared) break;
+      const { ctx } = prepared;
       fx.style.display = "block";
       const color = look.color ?? DEFAULT_SWEEP_COLOR;
       const accent = lighten(color, 0.55);

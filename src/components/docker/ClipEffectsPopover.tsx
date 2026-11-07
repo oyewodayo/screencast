@@ -150,7 +150,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       ref={popoverRef}
       data-clip-effects-popover
       style={dockHost ? undefined : { position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-3` : "w-72 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-3"}
+      className={dockHost ? `${DOCKED_PANEL_CLASS} p-3 gap-3` : "w-72 max-h-[calc(100vh-24px)] overflow-y-auto overscroll-contain p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-3"}
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium flex items-center gap-1.5">

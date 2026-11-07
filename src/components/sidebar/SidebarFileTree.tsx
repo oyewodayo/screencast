@@ -34,6 +34,37 @@ import { folderCollapse, useCollapsedFolders } from "./folderCollapse";
 import SidebarFileRow, { type SidebarRowActions } from "./SidebarFileRow";
 import { useStableCallbacks } from "../../hooks/useStableCallbacks";
 
+export const SidebarSkeleton: React.FC<{ isGridView: boolean }> = ({ isGridView }) => (
+  <div className="space-y-3 animate-pulse select-none" aria-busy="true" aria-label="Loading files">
+    <div className="flex items-center gap-1.5 py-0.5">
+      <div className="w-3 h-3 rounded bg-gray-200 dark:bg-neutral-800" />
+      <div className="w-24 h-3.5 rounded bg-gray-200 dark:bg-neutral-800" />
+    </div>
+    {isGridView ? (
+      <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(118px,1fr))] pl-3">
+        {Array.from({ length: 8 }).map((_, i) => (
+          <div key={i} className="flex flex-col gap-1.5 p-1">
+            <div className="w-full aspect-video rounded-lg bg-gray-200/80 dark:bg-neutral-800/90 ring-1 ring-black/5 dark:ring-white/5" />
+            <div className="h-3 w-4/5 rounded bg-gray-200/80 dark:bg-neutral-800/80" />
+          </div>
+        ))}
+      </div>
+    ) : (
+      <div className="space-y-2 pl-3">
+        {Array.from({ length: 10 }).map((_, i) => (
+          <div key={i} className="flex items-center gap-2 py-1">
+            <div className="w-5 h-5 rounded-md bg-gray-200/80 dark:bg-neutral-800/90 shrink-0" />
+            <div
+              className="h-3.5 rounded bg-gray-200/80 dark:bg-neutral-800/80"
+              style={{ width: `${60 + ((i * 17) % 30)}%` }}
+            />
+          </div>
+        ))}
+      </div>
+    )}
+  </div>
+);
+
 export interface SidebarFileTreeProps {
   activeFileCategory: SidebarTab;
   filteredEntries: [string, FileEntry[]][];
@@ -42,6 +73,7 @@ export interface SidebarFileTreeProps {
   isSearchingFiles: boolean;
   fileSearchQuery: string;
   isGridView: boolean;
+  isLoading?: boolean;
   // The open file's path, the gallery's folder, and the files ticked for a bulk move.
   selectedPath: string | undefined;
   selectedFolder: string | null;
@@ -131,6 +163,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     isSearchingFiles,
     fileSearchQuery,
     isGridView,
+    isLoading = false,
     selectedPath,
     selectedFolder,
     selectedFilePaths,
@@ -263,6 +296,19 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     setOpeningFolder(folder);
     afterPaint(() => void openFolderGallery(folder).finally(() => setOpeningFolder(null)));
   };
+
+  // Render the first viewport slice (20 items per folder) on initial mount or category change,
+  // then unlock the full list on the next animation frame so large folders never block paint.
+  const [initialBatchOnly, setInitialBatchOnly] = useState<boolean>(true);
+  useEffect(() => {
+    setInitialBatchOnly(true);
+    const raf = requestAnimationFrame(() => setInitialBatchOnly(false));
+    return () => cancelAnimationFrame(raf);
+  }, [activeFileCategory, isGridView]);
+
+  if (isLoading) {
+    return <SidebarSkeleton isGridView={isGridView} />;
+  }
 
   return (
     <>
@@ -520,7 +566,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
               className={isGridView ? "mt-1 grid gap-2 grid-cols-[repeat(auto-fill,minmax(118px,1fr))]" : "mt-1 space-y-0.5"}
               style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
             >
-              {fileList.map((file) => (
+              {(initialBatchOnly && fileList.length > 20 ? fileList.slice(0, 20) : fileList).map((file) => (
                 <SidebarFileRow
                   key={file.path}
                   file={file}

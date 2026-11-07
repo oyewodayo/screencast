@@ -499,15 +499,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reduction is never used at all this session. 48kHz because RNNoise ("Remove" mode) only works
   // at that rate - the media element source is resampled into it automatically.
   useEffect(() => {
-    // The mixer's own context (48kHz too), shared with every track so they all reach one master bus -
-    // it outlives this player, so unmounting only lets go of this element's nodes.
-    const ctx = mixerContext();
-    noiseCtxRef.current = ctx;
-    noiseWorkletReadyRef.current = loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
-      .catch((err) => {
-        console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
-        throw err;
-      });
+    noiseGraphUnmountedRef.current = false;
     return () => {
       noiseGraphUnmountedRef.current = true;
       mediaSourceRef.current?.source.disconnect();
@@ -830,14 +822,27 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
 
   // Time and skip state
-  const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
-  const [totalTimeElement, setTotalTimeElement] = useState<string | null>(null);
+  const [currentTimeElement, setCurrentTimeElementState] = useState<string>("0:00");
+  const [totalTimeElement, setTotalTimeElementState] = useState<string | null>(null);
+  const lastCurrentTimeTextRef = useRef<string>("0:00");
+  const lastTotalTimeTextRef = useRef<string | null>(null);
+  const setCurrentTimeElement = (next: string) => {
+    if (lastCurrentTimeTextRef.current === next) return;
+    lastCurrentTimeTextRef.current = next;
+    setCurrentTimeElementState(next);
+  };
+  const setTotalTimeElement = (next: string | null) => {
+    if (lastTotalTimeTextRef.current === next) return;
+    lastTotalTimeTextRef.current = next;
+    setTotalTimeElementState(next);
+  };
   const [currentSkipTime, setCurrentSkipTime] = useState<number>(30);
 
   // Scrub-bar hover-preview sprite (see handleTimelineHover) - null until the backend finishes
   // generating it, or permanently for a file it can't be built for (audio/image, or ffmpeg
   // failure), in which case hovering the timeline just shows no preview.
   const [scrubSprite, setScrubSprite] = useState<ScrubSpriteMeta | null>(null);
+  const scrubSpriteRequestedForRef = useRef<string | null>(null);
   const previewWrapRef = useRef<HTMLDivElement>(null);
   // Audio's own equivalent of the video scrub-sprite above - a real decoded waveform (see
   // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
@@ -907,9 +912,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // error to the user.
   useEffect(() => {
     setScrubSprite(null); // clear the previous file's sprite immediately, don't show a stale one
-    if (mediaType !== 'video' || !filePath) return;
+    scrubSpriteRequestedForRef.current = null;
+  }, [mediaType, filePath]);
 
-    let cancelled = false;
+  const ensureScrubSprite = (): void => {
+    if (mediaType !== 'video' || !filePath || editTimelineRef.current) return;
+    if (scrubSpriteRequestedForRef.current === filePath) return;
+    const requestedPath = filePath;
+    scrubSpriteRequestedForRef.current = requestedPath;
     invoke<{
       spritePath: string;
       columns: number;
@@ -918,9 +928,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       tileHeight: number;
       count: number;
       interval: number;
-    }>('get_video_scrub_sprite', { inputPath: filePath })
+    }>('get_video_scrub_sprite', { inputPath: requestedPath })
       .then((sprite) => {
-        if (cancelled) return;
+        if (scrubSpriteRequestedForRef.current !== requestedPath) return;
         setScrubSprite({
           url: convertFileSrc(sprite.spritePath),
           columns: sprite.columns,
@@ -934,11 +944,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       .catch((err) => {
         console.warn('Scrub-bar preview unavailable for this file:', err);
       });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [mediaType, filePath]);
+  };
 
   // Audio's counterpart to the effect above - decodes the whole file's peak amplitudes (see
   // utils/audioWaveform.ts) as soon as an audio file opens, drawn onto the timeline once ready by
@@ -973,8 +979,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     if (mediaType !== 'audio') return;
     const video = videoRef.current;
-    const ctx = noiseCtxRef.current;
-    if (!video || !ctx) return;
+    if (!video) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
 
     let bus: GainNode;
     try {
@@ -1522,6 +1528,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const openThumbnailPicker = (): void => {
     const video = videoRef.current;
     if (!video || !filePath || mediaType !== 'video') return;
+    ensureScrubSprite();
     video.pause();
     setThumbnailError(null);
     const primary = primarySrcRef.current;
@@ -1838,8 +1845,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       return;
     }
     if ((isNeutralFx(trackFx) && !meterTrack) || trackFxSetupRef.current) return;
-    const ctx = noiseCtxRef.current;
-    if (!ctx || !videoRef.current) return;
+    if (!videoRef.current) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
     trackFxSetupRef.current = true;
     loadTrackFxModule(ctx)
       .then(() => {
@@ -2015,8 +2022,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (noiseGraphSetupInProgressRef.current) return;
 
     const video = videoRef.current;
-    const ctx = noiseCtxRef.current;
-    if (!video || !ctx || !noiseWorkletReadyRef.current) return;
+    if (!video) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
+    noiseWorkletReadyRef.current ??= loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
+      .catch((err) => {
+        console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
+        noiseWorkletReadyRef.current = null;
+        throw err;
+      });
     noiseGraphSetupInProgressRef.current = true;
 
     noiseWorkletReadyRef.current
@@ -2261,6 +2274,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
 
     const sprite = scrubSprite;
+    if (!sprite) ensureScrubSprite();
     const wrap = previewWrapRef.current;
     if (!sprite || !wrap || sprite.count === 0) return;
 
@@ -2445,7 +2459,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const handlePlay = (): void => {
       // Sound routed through Web Audio (cleanup, mixer) is silent while its context is suspended.
       if (noiseCtxRef.current?.state === 'suspended' && mediaSourceRef.current) noiseCtxRef.current.resume().catch(() => {});
-      resumeMixer();
+      if (mediaSourceRef.current || editTimelineRef.current) resumeMixer();
       setIsPlaying(true);
       setIsPaused(false);
       onPlayStateChange?.(true);

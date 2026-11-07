@@ -12,12 +12,17 @@ export const PEAKS_PER_SECOND = 50;
 // Keyed by source path - two pieces of the same file share one read. Kept for the session; files on
 // disk aren't expected to change under an open edit (and the disk cache is keyed by size and date).
 const peaksCache = new Map<string, Promise<Float32Array>>();
+const MAX_PEAKS_CACHE = 12;
 
 // The whole file's peaks, PEAKS_PER_SECOND a second, each 0..1 - a typed array, since a day-long file
 // has millions. Callers slice the stretch they show (sliceWaveformWindow) rather than asking per trim.
 export function getWaveformPeaks(path: string): Promise<Float32Array> {
   let cached = peaksCache.get(path);
   if (!cached) {
+    if (peaksCache.size >= MAX_PEAKS_CACHE) {
+      const oldest = peaksCache.keys().next().value;
+      if (oldest !== undefined) peaksCache.delete(oldest);
+    }
     cached = invoke<ArrayBuffer>("audio_peaks", { path })
       .then((buffer) => new Float32Array(buffer))
       .catch((err) => {

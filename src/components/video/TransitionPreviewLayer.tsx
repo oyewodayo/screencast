@@ -57,7 +57,8 @@ const hasTransition = (clip: Clip | undefined): clip is Clip => !!clip?.transiti
 
 // Last frame of the outgoing clip, by source URL + source time. A handful at most stay alive.
 const frameCache = new Map<string, Promise<HTMLCanvasElement>>();
-const FRAME_CACHE_MAX = 8;
+const FRAME_CACHE_MAX = 4;
+const MAX_CAPTURE_DIM = 1280;
 
 function captureFrame(url: string, time: number): Promise<HTMLCanvasElement> {
   const key = `${url}|${time.toFixed(3)}`;
@@ -83,8 +84,11 @@ function captureFrame(url: string, time: number): Promise<HTMLCanvasElement> {
           "seeked",
           () => {
             const canvas = document.createElement("canvas");
-            canvas.width = video.videoWidth || 2;
-            canvas.height = video.videoHeight || 2;
+            const vw = video.videoWidth || 2;
+            const vh = video.videoHeight || 2;
+            const scale = Math.min(1, MAX_CAPTURE_DIM / Math.max(vw, vh));
+            canvas.width = Math.max(2, Math.round(vw * scale));
+            canvas.height = Math.max(2, Math.round(vh * scale));
             canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
             finish();
             resolve(canvas);
@@ -150,7 +154,7 @@ const tailSpeed = (clip: Clip): number => Math.max(0.0625, Math.min(16, speedAtS
 // Detached tail players, by source URL + out-point: created (and seeked to the out-point) while the
 // outgoing clip is still on screen, so the tail is decoded and waiting when playback crosses over.
 const tailPool = new Map<string, HTMLVideoElement>();
-const TAIL_POOL_MAX = 3;
+const TAIL_POOL_MAX = 2;
 
 function tailVideo(url: string, start: number): HTMLVideoElement {
   const key = `${url}|${start.toFixed(3)}`;

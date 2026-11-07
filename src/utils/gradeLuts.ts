@@ -10,6 +10,20 @@ import { Lut3D, bakeGradeLut, hasGrade, lutToCube, parseCubeLut } from "./colorG
 import type { ClipGrade } from "./videoEditTypes";
 
 const userLutCache = new Map<string, Promise<Lut3D>>();
+const bakedLutCache = new Map<string, Lut3D>();
+
+function getCachedBakedLut(grade: ClipGrade, userLut: Lut3D | null): Lut3D {
+  const key = `${JSON.stringify(grade)}|${userLut ? "1" : "0"}`;
+  const hit = bakedLutCache.get(key);
+  if (hit) return hit;
+  const baked = bakeGradeLut(grade, userLut);
+  if (bakedLutCache.size >= 16) {
+    const oldest = bakedLutCache.keys().next().value;
+    if (oldest !== undefined) bakedLutCache.delete(oldest);
+  }
+  bakedLutCache.set(key, baked);
+  return baked;
+}
 
 export function loadUserLut(path: string): Promise<Lut3D> {
   let pending = userLutCache.get(path);
@@ -24,7 +38,7 @@ export function loadUserLut(path: string): Promise<Lut3D> {
 export async function bakedLutForGrade(grade: ClipGrade | undefined): Promise<Lut3D | null> {
   if (!hasGrade(grade)) return null;
   const userLut = grade.lut && grade.lut.intensity > 0 ? await loadUserLut(grade.lut.path) : null;
-  return bakeGradeLut(grade, userLut);
+  return getCachedBakedLut(grade, userLut);
 }
 
 // The .cube text a clip exports with, or null when it has no grade.
@@ -53,7 +67,8 @@ export function useGradeLut(grade: ClipGrade | undefined): Lut3D | null {
     if (!hasGrade(grade)) return null;
     const lut = lutPath ? (userLut?.path === lutPath ? userLut.lut : null) : null;
     // Waiting on the LUT file: preview the rest of the grade meanwhile.
-    return bakeGradeLut(lutPath && !lut ? { ...grade, lut: undefined } : grade, lut);
+    const effectiveGrade = lutPath && !lut ? { ...grade, lut: undefined } : grade;
+    return getCachedBakedLut(effectiveGrade, lut);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, userLut]);
 }

@@ -9,7 +9,7 @@ import type { BubbleRegion } from "../utils/webcamBubble";
 import { removeBackground } from "../utils/backgroundRemoval";
 import { BLUR_DEFAULT, cutoutBackgroundFromPref } from "../utils/cutoutBackground";
 import { VIDEO_CHANNEL, silencedBySolo, useMixerSession } from "../utils/mixerState";
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, startTransition } from "react";
 import { ToolPanelHostContext, ToolPanelOpenContext } from "../components/docker/ToolPanelHost";
 import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
 import { buildCaptionLines } from "../utils/captions";
@@ -77,7 +77,7 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
-import SidebarFileTree from "../components/sidebar/SidebarFileTree";
+import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
 import SidebarHeader from "../components/sidebar/SidebarHeader";
 import { FILE_CATEGORY_TABS } from "../components/sidebar/categoryTabs";
 import TidyLibraryDialog from "../components/video/TidyLibraryDialog";
@@ -447,9 +447,23 @@ const Dashboard = () => {
   }, []);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
+  const [sidebarContentReady, setSidebarContentReady] = useState<boolean>(false);
+  const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(true);
+  const [isLoadingTrash, setIsLoadingTrash] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
   const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
   const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
+
+  useEffect(() => {
+    if (!showFileList) {
+      setSidebarContentReady(false);
+      return;
+    }
+    const raf = requestAnimationFrame(() => {
+      startTransition(() => setSidebarContentReady(true));
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [showFileList]);
   // Sidebar file-list search - filters the active category's files (and trash) by name, case-
   // insensitive substring match. Kept as a single query shared across every tab/trash rather than
   // per-tab state, same as a normal file explorer's search box.
@@ -2390,6 +2404,8 @@ const setScreen = () => {
     } catch (error) {
       console.error("Error getting files:", error);
       setError(`Failed to load files: ${error}`);
+    } finally {
+      setIsLoadingFiles(false);
     }
   };
 
@@ -2473,12 +2489,15 @@ const setScreen = () => {
 	}, []);
 
 	const loadTrash = async () => {
+		setIsLoadingTrash(true);
 		try {
 			const items = await invoke<TrashEntry[]>("list_trash");
 			setTrashItems(items);
 		} catch (error) {
 			console.error("Error loading trash:", error);
 			setError(`Failed to load trash: ${error}`);
+		} finally {
+			setIsLoadingTrash(false);
 		}
 	};
 
@@ -4772,7 +4791,7 @@ const setScreen = () => {
             ref={sidebarRef}
             // No width transition while it's being dragged - the edge must stay under the pointer.
             className={`relative shrink-0 h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 overflow-hidden ${
-              resizingSidebar ? "" : "transition-[width,opacity] duration-300 ease-out"
+              resizingSidebar ? "" : "transition-[width,opacity] duration-150 ease-out"
             } ${showFileList && !isPdfFullscreen ? "opacity-100" : "w-0 opacity-0"}`}
             style={showFileList && !isPdfFullscreen ? { width: sidebarWidth } : undefined}
           >
@@ -4791,7 +4810,10 @@ const setScreen = () => {
             )}
             {showFileList && !isPdfFullscreen && sidebarCollapsed && <SidebarRail groups={railGroups} onExpand={() => setSidebarFolded(false)} />}
             {showFileList && !isPdfFullscreen && !sidebarCollapsed && (
-              <div className="flex flex-col h-full">
+              <div
+                className="flex flex-col h-full"
+                style={!resizingSidebar ? { width: sidebarWidths[sidebarMode], minWidth: sidebarWidths[sidebarMode] } : undefined}
+              >
                 {showToolsSidebar && (
                   <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
                     {([
@@ -4914,36 +4936,41 @@ const setScreen = () => {
                     <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
                   </button>
                 )}
-                <SidebarFileTree
-                  activeFileCategory={activeFileCategory}
-                  filteredEntries={filteredEntries}
-                  filteredTrashItems={filteredTrashItems}
-                  firstUnpinnedIndex={firstUnpinnedIndex}
-                  isSearchingFiles={isSearchingFiles}
-                  fileSearchQuery={fileSearchQuery}
-                  isGridView={isGridView}
-                  selectedPath={selectedFile?.sourcePath}
-                  selectedFolder={selectedFolder}
-                  selectedFilePaths={selectedFilePaths}
-                  editingVideo={editingVideoRef.current}
-                  boardScreen={boardScreen}
-                  pinnedFolders={pinnedFolders}
-                  folderSorts={folderSorts}
-                  setFolderSorts={setFolderSorts}
-                  pinnedPaths={pinnedPaths}
-                  linkedDocsByPath={linkedDocsByPath}
-                  openMenu={openMenu}
-                  addMenuFor={addMenuFor}
-                  linkDocsMenuOpenFor={linkDocsMenuOpenFor}
-                  renamingFile={renamingFile}
-                  renameInGallery={renameInGallery}
-                  creatingFolderIn={creatingFolderIn}
-                  newFolderValue={newFolderValue}
-                  draggingFiles={draggingFiles}
-                  draggingFolder={draggingFolder}
-                  dragOverFolder={dragOverFolder}
-                  {...sidebarTreeActions}
-                />
+                {!sidebarContentReady ? (
+                  <SidebarSkeleton isGridView={isGridView} />
+                ) : (
+                  <SidebarFileTree
+                    activeFileCategory={activeFileCategory}
+                    filteredEntries={filteredEntries}
+                    filteredTrashItems={filteredTrashItems}
+                    firstUnpinnedIndex={firstUnpinnedIndex}
+                    isSearchingFiles={isSearchingFiles}
+                    fileSearchQuery={fileSearchQuery}
+                    isGridView={isGridView}
+                    isLoading={activeFileCategory === "trash" ? isLoadingTrash : isLoadingFiles}
+                    selectedPath={selectedFile?.sourcePath}
+                    selectedFolder={selectedFolder}
+                    selectedFilePaths={selectedFilePaths}
+                    editingVideo={editingVideoRef.current}
+                    boardScreen={boardScreen}
+                    pinnedFolders={pinnedFolders}
+                    folderSorts={folderSorts}
+                    setFolderSorts={setFolderSorts}
+                    pinnedPaths={pinnedPaths}
+                    linkedDocsByPath={linkedDocsByPath}
+                    openMenu={openMenu}
+                    addMenuFor={addMenuFor}
+                    linkDocsMenuOpenFor={linkDocsMenuOpenFor}
+                    renamingFile={renamingFile}
+                    renameInGallery={renameInGallery}
+                    creatingFolderIn={creatingFolderIn}
+                    newFolderValue={newFolderValue}
+                    draggingFiles={draggingFiles}
+                    draggingFolder={draggingFolder}
+                    dragOverFolder={dragOverFolder}
+                    {...sidebarTreeActions}
+                  />
+                )}
                 </div>
                 </div>
               </div>
@@ -5950,7 +5977,7 @@ const setScreen = () => {
         {pendingUpdate && (
           <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
         )}
-        <TelemetryNotice />
+        <TelemetryNotice /> 
       </div>
     </div>
     </ToolPanelOpenContext.Provider>

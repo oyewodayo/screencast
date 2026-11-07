@@ -799,7 +799,7 @@ pub async fn make_share_ready_copy(
         .unwrap_or("30")
         .to_string();
 
-    let fit = format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p");
+    let fit = format!("scale={width}:{height}:force_original_aspect_ratio=decrease:out_range=tv,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p");
     let cover_chain = format!("[1:v]{fit},trim=duration={SHARE_COVER_SECONDS},setpts=PTS-STARTPTS[c]");
     let video_chain = format!("[0:V:0]{fit}[v]");
     let graph = if has_audio {
@@ -823,8 +823,10 @@ pub async fn make_share_ready_copy(
     // the original, vs 0.99 - the encoder's own ceiling at this CRF - with this).
     args.extend(["-r".to_string(), fps.clone()]);
     // The source's colour description carries over (an iPhone's Display-P3 tagging, HDR transfer...)
-    // - without it, colour-managed players show the copy slightly off.
-    for (flag, key) in [("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"), ("-colorspace", "color_space"), ("-color_range", "color_range")] {
+    // - without it, colour-managed players show the copy slightly off. Not its range, though:
+    // `fit` above converts to standard range (out_range=tv) whatever the source was, so
+    // copying a "pc" tag over would mislabel the picture (washed out, or refused by uploaders).
+    for (flag, key) in [("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"), ("-colorspace", "color_space")] {
         if let Some(value) = video[key].as_str().filter(|v| !v.is_empty() && *v != "unknown" && *v != "reserved") {
             args.extend([flag.to_string(), value.to_string()]);
         }
@@ -6610,10 +6612,61 @@ fn trim_input_seek(trim_start: f64) -> f64 {
 
 fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str) {
     match quality.unwrap_or("standard") {
-        "high" => ("slow", "18"),
+        "high" | "youtube" => ("slow", "18"),
         "small" => ("veryfast", "28"),
         _ => ("medium", "23"),
     }
+}
+
+// Platform presets on top of the quality tiers (the Save button's quality picker):
+// - "youtube": the "high" tier's picture (hardware encoders included, at their "high" point) at
+//   the source's own resolution and frame rate, with higher-bitrate audio - YouTube re-compresses
+//   every upload, so the cleaner the file it starts from, the better the result looks.
+// - "social": what WhatsApp Status / Instagram / Facebook accept without complaint - fitted into
+//   1920x1080 (1080x1920 portrait), at most 30 fps, H.264 High@4.0 with a capped bitrate. Measured
+//   failure this exists for: a 3840x2160 60 fps High@5.2 export that phones played fine but
+//   WhatsApp Status refused as "format not supported". Always software x264, the only encoder
+//   whose -profile/-level/-maxrate flags behave the same everywhere.
+fn export_hw_tier(quality: Option<&str>) -> Option<&'static str> {
+    match quality.unwrap_or("standard") {
+        "social" => None,
+        "high" | "youtube" => Some("high"),
+        "small" => Some("small"),
+        _ => Some("standard"),
+    }
+}
+
+fn export_audio_bitrate(quality: Option<&str>) -> &'static str {
+    if quality == Some("youtube") { "320k" } else { "128k" }
+}
+
+// Extra x264 flags a preset needs beyond preset/CRF.
+fn export_extra_video_args(quality: Option<&str>) -> Vec<String> {
+    match quality {
+        Some("social") => ["-profile:v", "high", "-level:v", "4.0", "-maxrate", "6M", "-bufsize", "12M"].iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// The last video stage of every editor export. Always: standard (limited "tv") range 4:2:0 -
+// a full-range yuvj420p source (screen captures can come out that way) otherwise passed straight
+// through into the export, which many players/uploaders (WhatsApp, some TVs, YouTube's ingest)
+// either reject or show washed out / with crushed blacks. nv12 is listed too as the same picture
+// in the layout hardware encoders take (QSV only accepts nv12). For "social", also the size/rate
+// limits described on export_hw_tier.
+fn export_delivery_filter(quality: Option<&str>, source_fps: f64) -> String {
+    let mut stages: Vec<String> = Vec::new();
+    if quality == Some("social") {
+        stages.push(
+            "scale=w='if(gte(iw,ih),min(iw,1920),min(iw,1080))':h='if(gte(iw,ih),min(ih,1080),min(ih,1920))':force_original_aspect_ratio=decrease:force_divisible_by=2".to_string(),
+        );
+        if source_fps > 30.5 {
+            stages.push("fps=30".to_string());
+        }
+    }
+    stages.push("scale=out_range=tv".to_string());
+    stages.push("format=yuv420p|nv12".to_string());
+    stages.join(",")
 }
 
 pub(crate) fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
@@ -7740,8 +7793,8 @@ pub async fn export_trimmed_video(
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
     // Plain cuts (nothing drawn, nothing re-timed or re-coloured) keep the source's own video
-    // wherever whole GOPs survive - smart_render_export. "small" asks for recompression, so it
-    // still re-encodes. Anything smart render can't do (or can't verify) falls through to the
+    // wherever whole GOPs survive - smart_render_export. "small" asks for recompression and
+    // "social" for a smaller size/rate, so both still re-encode. Anything smart render can't do (or can't verify) falls through to the
     // normal render below.
     let has_adjustments = !adjustment_layers.is_empty();
     let fit_to_frame = fit_to_frame.unwrap_or(false);
@@ -7759,7 +7812,8 @@ pub async fn export_trimmed_video(
         && output_frame.is_none()
         && screen_style.is_none()
         && keystrokes.is_none()
-        && quality.as_deref() != Some("small");
+        && quality.as_deref() != Some("small")
+        && quality.as_deref() != Some("social");
     if plain_cuts {
         let ffprobe_path = get_ffprobe_path(&app_handle)?;
         let mut has_audio = Vec::with_capacity(segments.len());
@@ -7823,10 +7877,12 @@ pub async fn export_trimmed_video(
         let mut args = vec![
             "-t".into(),
             format!("{:.6}", (seg.end - seg.start).max(0.0)),
+            "-vf".into(),
+            export_delivery_filter(quality.as_deref(), video_fps),
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "128k".into(),
+            export_audio_bitrate(quality.as_deref()).into(),
             "-movflags".into(),
             "+faststart".into(),
         ];
@@ -8383,6 +8439,11 @@ pub async fn export_trimmed_video(
             current_label = "capv".to_string();
         }
 
+        // Standard-range 4:2:0 (and a preset's size/rate limits) on the finished picture - see
+        // export_delivery_filter.
+        filter.push_str(&format!("[{current_label}]{}[delivered];", export_delivery_filter(quality.as_deref(), video_fps)));
+        current_label = "delivered".to_string();
+
         if let Some(path) = &preview_frame {
             // The queue's live preview: a small copy of the finished picture, a couple of frames
             // per second of output, split off the very last stage.
@@ -8579,7 +8640,7 @@ pub async fn export_trimmed_video(
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "128k".into(),
+            export_audio_bitrate(quality.as_deref()).into(),
             "-movflags".into(),
             "+faststart".into(),
         ]
@@ -8589,10 +8650,15 @@ pub async fn export_trimmed_video(
     // (HwEncoding::export_args - same picture as x264, many times faster), else software x264.
     // A hardware encode that fails for any reason other than the user cancelling is re-run in
     // software, so a flaky driver costs time, never the export.
-    let software: Vec<String> = ["-c:v", "libx264", "-preset", quality_preset, "-crf", quality_crf].iter().map(|s| s.to_string()).collect();
-    let tier = quality.clone().unwrap_or_default();
+    let mut software: Vec<String> = ["-c:v", "libx264", "-preset", quality_preset, "-crf", quality_crf].iter().map(|s| s.to_string()).collect();
+    software.extend(export_extra_video_args(quality.as_deref()));
+    // None for a preset that has to stay on x264 (export_hw_tier).
+    let tier = export_hw_tier(quality.as_deref());
     let ffmpeg_for_probe = get_ffmpeg_path(&app_handle)?;
-    let hardware = blocking(move || crate::services::hw_encoder::detect(&ffmpeg_for_probe)).await?.and_then(|hw| hw.export_args(&tier));
+    let hardware = match tier {
+        Some(tier) => blocking(move || crate::services::hw_encoder::detect(&ffmpeg_for_probe)).await?.and_then(|hw| hw.export_args(tier)),
+        None => None,
+    };
     let encoders: Vec<Vec<String>> = hardware.into_iter().chain(std::iter::once(software)).collect();
     let output_seconds: f64 = segments.iter().map(segment_output_duration).sum();
 
@@ -10607,6 +10673,25 @@ mod tests {
         assert_eq!(resolve_export_quality(Some("ultra")), ("medium", "23"));
         assert_eq!(resolve_export_quality(Some("high")), ("slow", "18"));
         assert_eq!(resolve_export_quality(Some("small")), ("veryfast", "28"));
+    }
+
+    #[test]
+    fn platform_presets_map_to_their_encoders_and_limits() {
+        assert_eq!(resolve_export_quality(Some("youtube")), ("slow", "18"));
+        assert_eq!(export_hw_tier(Some("youtube")), Some("high"));
+        assert_eq!(export_hw_tier(Some("social")), None);
+        assert_eq!(export_hw_tier(None), Some("standard"));
+        assert_eq!(export_audio_bitrate(Some("youtube")), "320k");
+        assert_eq!(export_audio_bitrate(None), "128k");
+        assert!(export_extra_video_args(Some("social")).windows(2).any(|w| w[0] == "-level:v" && w[1] == "4.0"));
+        assert!(export_extra_video_args(None).is_empty());
+        // Every export ends on standard-range 4:2:0; only "social" resizes, and only drops the
+        // rate of a source above 30 fps.
+        let plain = export_delivery_filter(None, 60.0);
+        assert_eq!(plain, "scale=out_range=tv,format=yuv420p|nv12");
+        assert!(export_delivery_filter(Some("social"), 60.0).contains("fps=30"));
+        assert!(!export_delivery_filter(Some("social"), 30.0).contains("fps="));
+        assert!(export_delivery_filter(Some("social"), 30.0).ends_with(&plain));
     }
 
     #[test]
