@@ -124,6 +124,16 @@ video {
     opacity: 1;
 }
 
+/* Editing: the picture sits above the bar (VideoPlayer pads the container by the bar's height), so
+   the bar is always shown, on the player's own black, with no shade over the picture to fade in. */
+.video-container.editing .video-controls-container {
+    opacity: 1;
+}
+
+.video-container.editing .video-controls-container::before {
+    display: none;
+}
+
 .video-controls-container .controls {
     display: flex;
     gap: 0.5rem;

@@ -60,7 +60,11 @@ import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudio
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import ElementsGallery from "../video/ElementsGallery";
-import SplitScreenPanel from "../video/SplitScreenPanel";
+import SplitScreenPanel, { type ExistingSplit } from "../video/SplitScreenPanel";
+import CanvasPanel from "../video/CanvasPanel";
+import { aspectLabel, canvasFromPreset, canvasPreset } from "../../utils/canvasFormats";
+import { takeEditorIntent } from "../../utils/editorIntent";
+import { splitGroupMembers } from "../../utils/splitGroups";
 import HighlightIntroPanel from "../video/HighlightIntroPanel";
 import ShortsStudio from "../shorts/ShortsStudio";
 import { OverlayAsset, assetEntry } from "../../utils/videoAssets";
@@ -127,8 +131,9 @@ import { audioChannelKey, audioChannelName, fileStem, fxForExport, isNeutralFx }
 
 // A video-track layer covering the whole frame - B-roll rather than a picture-in-picture.
 const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.width >= 0.999 && o.height >= 0.999;
-import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, useTimelineMuted } from "../../utils/mixerGraph";
+import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, unrouteElement, useTimelineMuted } from "../../utils/mixerGraph";
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
+import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
 import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
 import DuckShade from "./DuckShade";
@@ -150,12 +155,11 @@ const THUMB_TILE_HEIGHT = 52; // px - filmstrip tile height inside the h-16 clip
 // capped at MAX_CACHED_FRAMES (the step widens for long videos). Tiles pick their nearest cached
 // frame, so this is what bounds how short a shot can be and still show up on the strip.
 const FRAME_CACHE_STEP_SEC = 0.5;
-const MAX_CACHED_FRAMES = 360;
-const THUMB_CAPTURE_HEIGHT = 90; // px - frames are downscaled at capture; tiles never draw larger
-// On a long video those 360 are minutes apart, so the tiles in view also ask for their own frame
-// (a frame inside each tile's own stretch of source) - kept up to this many, oldest dropped first:
-// ~4 KB each, so a few MB however long the video and however much of it has been looked at.
-const MAX_DETAIL_FRAMES = 1500;
+const MAX_CACHED_FRAMES = 120;
+const THUMB_CAPTURE_HEIGHT = 80; // px - frames are downscaled at capture; tiles never draw larger
+// On a long video those 120 are minutes apart, so the tiles in view also ask for their own frame
+// (a frame inside each tile's own stretch of source) - kept up to this many, oldest dropped first.
+const MAX_DETAIL_FRAMES = 240;
 
 // Nearest cached frame to `time` (frames sorted by time), or null if none captured yet.
 const nearestFrame = (frames: ThumbFrame[], time: number): ThumbFrame | null => {
@@ -238,6 +242,40 @@ export const forgetTimelineBootstrap = (path: string): void => {
   bootstrappedClipIdByFile.delete(path);
 };
 
+// Where the playhead was when this file's timeline last went away (the editor closed, or the video
+// left for a linked document, a folder, home), so coming back with the editor open lands there
+// rather than on the first clip. Kept with the player's saved position at that moment: if the
+// video played on afterwards with the editor closed, that newer position wins and this is dropped.
+const leftAtByFile = new Map<string, { outputTime: number; playerAt: number | undefined }>();
+
+// The track area's height, set by dragging the divider between the player and the timeline (the
+// panel's top edge) - null is automatic: as tall as its lanes, up to TRACK_AUTO_MAX_PX, then it
+// scrolls. Kept across launches.
+const TRACK_HEIGHT_KEY = "briefcast.timelineTrackHeight.v1";
+const TRACK_AUTO_MAX_PX = 236;
+// The track-button column's own height (eye, lock, sound, play, more, cover): the column is
+// pinned beside the lanes rather than in the row's flow, so the lanes alone set the row's height
+// - a measured, stretching column used to fight the divider - and never go shorter than it.
+const TRACK_MIN_PX = 168;
+// The picture keeps at least this much of the window above the timeline.
+const PLAYER_MIN_PX = 240;
+const readTrackHeight = (): number | null => {
+  try {
+    const v = Number(localStorage.getItem(TRACK_HEIGHT_KEY));
+    return Number.isFinite(v) && v >= TRACK_MIN_PX ? v : null;
+  } catch {
+    return null;
+  }
+};
+const saveTrackHeight = (h: number | null) => {
+  try {
+    if (h === null) localStorage.removeItem(TRACK_HEIGHT_KEY);
+    else localStorage.setItem(TRACK_HEIGHT_KEY, String(Math.round(h)));
+  } catch {
+    /* preference only */
+  }
+};
+
 // "4:05", or "1:04:05" past the hour - a timeline can run for a day or more.
 const formatTimestamp = (totalSeconds: number): string => {
   const hours = Math.floor(totalSeconds / 3600);
@@ -283,7 +321,7 @@ const ActionButton: React.FC<{
 // re-decodes) whenever the visible window (trimStart/duration, from drag or resize) or pixel size
 // changes, so a live trim drag updates the waveform every frame from already-decoded data.
 // `visible`: the part of the chip (its own px) to draw - a canvas can't be millions of px wide.
-const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number] }> = ({ overlay, widthPx, heightPx, visible }) => {
+const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({ overlay, widthPx, heightPx, visible }) => {
   const [vFrom, vTo] = [Math.max(0, visible[0]), Math.min(widthPx, visible[1])];
   const vWidth = Math.max(0, vTo - vFrom);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -328,7 +366,13 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
   }, [peaks, widthPx, heightPx, vFrom, vWidth, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, canvasRestoreTick]);
 
   return <canvas ref={canvasRef} className="absolute top-0 pointer-events-none" style={{ left: vFrom, width: vWidth, height: heightPx }} />;
-};
+}, (prev, next) =>
+  prev.overlay === next.overlay &&
+  prev.widthPx === next.widthPx &&
+  prev.heightPx === next.heightPx &&
+  prev.visible[0] === next.visible[0] &&
+  prev.visible[1] === next.visible[1]
+);
 
 // The audio panel's preview position on its own track (previewHead.ts) - a line with the time, moved
 // straight on the DOM every frame (the timeline itself never re-renders for it). While the preview
@@ -530,7 +574,7 @@ const ForeignVideoClipTiles: React.FC<{ clip: Clip; first: number; last: number;
 // to line up against instead of guessing from the filmstrip's video frames alone. Drawn baseline-up
 // as a bottom ledge (not centered, unlike the audio-overlay chip) with its own scrim behind it, so
 // it reads clearly over a filmstrip frame of any brightness instead of competing with it.
-const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: number; sourceDuration: number | null; widthPx: number; heightPx: number; visible: [number, number] }> = ({
+const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: number; sourceDuration: number | null; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({
   sourcePath,
   trimStart,
   trimEnd,
@@ -591,7 +635,16 @@ const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: n
       <canvas ref={canvasRef} className="absolute top-0" style={{ left: vFrom, width: vWidth, height: heightPx }} />
     </div>
   );
-};
+}, (prev, next) =>
+  prev.sourcePath === next.sourcePath &&
+  prev.trimStart === next.trimStart &&
+  prev.trimEnd === next.trimEnd &&
+  prev.sourceDuration === next.sourceDuration &&
+  prev.widthPx === next.widthPx &&
+  prev.heightPx === next.heightPx &&
+  prev.visible[0] === next.visible[0] &&
+  prev.visible[1] === next.visible[1]
+);
 
 // The main video's own audio level (volume + mute) - see videoEditTypes.ts's
 // videoAudioMuted/videoAudioVolume doc comment for why this is separate from any AudioOverlay's
@@ -927,14 +980,29 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     audioElementsRef.current.forEach((el, id) => {
       if (live.has(id)) return;
       el.pause();
+      unrouteElement(el);
       audioElementsRef.current.delete(id);
     });
   }, [audioOverlayIdsKey]);
   useEffect(() => {
     const elements = audioElementsRef.current;
-    return () => elements.forEach((el) => el.pause());
+    return () =>
+      elements.forEach((el) => {
+        el.pause();
+        unrouteElement(el);
+      });
   }, []);
   const trackAreaRef = useRef<HTMLDivElement>(null);
+  const [trackHeight, setTrackHeight] = useState<number | null>(readTrackHeight);
+  const trackDragRef = useRef<{ startY: number; startH: number; h: number; raf: number } | null>(null);
+  // The most the track area may take: whatever leaves the picture PLAYER_MIN_PX, given everything
+  // else in the docker (toolbar, status bar) as it stands.
+  const maxTrackHeight = () => {
+    const area = trackAreaRef.current;
+    const docker = rootRef.current?.closest(".fixed") as HTMLElement | null;
+    const rest = docker && area ? docker.offsetHeight - area.offsetHeight : 160;
+    return Math.max(TRACK_MIN_PX, window.innerHeight - PLAYER_MIN_PX - rest);
+  };
   const trackContentRef = useRef<HTMLDivElement>(null);
   // The stretch of the track (in px) worth drawing: what's in view and a screen either side. Only
   // the ruler's ticks, filmstrip tiles and waveforms inside it are made - a timeline a day long is
@@ -987,7 +1055,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // for thumbnails once its metadata loads - Save needs this to know what resolution to render
   // text/image overlay PNGs at for burn-in (see videoOverlayRender.ts / exportEdited), since
   // TextOverlay/ImageOverlay only store position/size as frame-relative fractions.
-  const [videoPixelSize, setVideoPixelSize] = useState<{ width: number; height: number } | null>(null);
+  // The open file's own picture size, and the timeline's frame: that, or the canvas chosen for the
+  // edit (canvasFormats.ts) - what every clip is fitted into, every layer laid out on and the
+  // export made at.
+  const [nativePixelSize, setVideoPixelSize] = useState<{ width: number; height: number } | null>(null);
+  const canvasWidth = editStore.canvas?.width;
+  const canvasHeight = editStore.canvas?.height;
+  const videoPixelSize = useMemo(
+    () => (canvasWidth && canvasHeight ? { width: canvasWidth, height: canvasHeight } : nativePixelSize),
+    [canvasWidth, canvasHeight, nativePixelSize]
+  );
   const [pxPerSec, setPxPerSec] = useState<number>(DEFAULT_PX_PER_SEC);
   const [thumbnails, setThumbnails] = useState<ThumbFrame[]>([]);
   const [coverThumbnail, setCoverThumbnail] = useState<string | null>(null);
@@ -1219,7 +1296,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             }
           }
         }
-        if (dirty && performance.now() - lastFlush > 250) flush();
+        if (dirty && performance.now() - lastFlush > 500) flush();
       }
     };
 
@@ -1371,14 +1448,85 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // Screen style (ScreenStylePanel) - the frame, the drawn pointer and shortcut keys, whole-video.
   const [screenStyleAnchor, setScreenStyleAnchor] = useState<{ left: number; top: number } | null>(null);
   const clipRecordings = useClipRecordings(editStore.clips);
-  const hasEditablePointer = [...clipRecordings.values()].some((r) => hasPointerPath(r));
+  const hasEditablePointer = useMemo(() => [...clipRecordings.values()].some((r) => hasPointerPath(r)), [clipRecordings]);
   const shortcutCount = useMemo(() => buildKeyChips(editStore.clips, clipRecordings).reduce((n, c) => n + c.count, 0), [editStore.clips, clipRecordings]);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
   // Split screen builder (SplitScreenPanel).
   const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
+  // Editing a split screen already made (its group), rather than adding one.
+  const [splitEditing, setSplitEditing] = useState<string | null>(null);
+  const splitButtonRef = useRef<HTMLButtonElement>(null);
+  const [canvasAnchor, setCanvasAnchor] = useState<{ left: number; top: number } | null>(null);
+  // The split screen the selected layer belongs to, if any.
+  const selectedSplitGroup =
+    (selectedPipOverlayId ? editStore.pipOverlays.find((o) => o.id === selectedPipOverlayId)?.split?.group : undefined) ??
+    (selectedImageOverlayId ? editStore.imageOverlays.find((o) => o.id === selectedImageOverlayId)?.split?.group : undefined) ??
+    null;
+  const openSplitPanel = (group: string | null) => {
+    const rect = splitButtonRef.current?.getBoundingClientRect();
+    setSplitEditing(group);
+    setSplitAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 180, top: 80 });
+  };
+  // "Edit" on the split-screen bar over the picture (SplitArrangeBar, Dashboard).
+  useEffect(() => {
+    const onEdit = (e: Event) => openSplitPanel((e as CustomEvent<{ group: string }>).detail.group);
+    window.addEventListener("briefcast:edit-split", onEdit);
+    return () => window.removeEventListener("briefcast:edit-split", onEdit);
+  });
+  // The split screen being edited, as the panel reopens it.
+  const existingSplit = useMemo((): ExistingSplit | undefined => {
+    if (!splitEditing) return undefined;
+    const { pips, images, settings } = splitGroupMembers(editStore.pipOverlays, editStore.imageOverlays, splitEditing);
+    const cells = [...pips, ...images].filter((o) => (o.split?.cell ?? -1) >= 0);
+    if (!settings || cells.length === 0) return undefined;
+    return {
+      group: splitEditing,
+      settings,
+      startTime: Math.min(...cells.map((o) => o.startTime)),
+      endTime: Math.max(...cells.map((o) => o.endTime)),
+      members: [
+        ...pips.filter((o) => o.split!.cell >= 0).map((o) => ({ cell: o.split!.cell, path: o.sourcePath, trim: o.trimStart, muted: o.muted !== false, crop: o.crop, shotAspect: o.split!.shotAspect })),
+        ...images
+          .filter((o) => o.split!.cell >= 0)
+          .map((o) => ({
+            cell: o.split!.cell,
+            path: o.src,
+            trim: 0,
+            muted: true,
+            crop: o.cropWidth !== undefined && o.cropHeight !== undefined ? { x: o.cropX ?? 0, y: o.cropY ?? 0, width: o.cropWidth, height: o.cropHeight } : undefined,
+            shotAspect: o.split!.shotAspect,
+          })),
+      ],
+    };
+    // Read once as the panel opens - its own state takes over from there.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [splitEditing]);
+  // Split screens made before they could be rearranged are recognised once the edit has loaded and
+  // its frame is known (adoptLegacySplits).
+  const editLoaded = !!editStore.editState;
+  const frameAspectForAdoption = videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 0;
+  useEffect(() => {
+    if (editLoaded && frameAspectForAdoption > 0) editStore.adoptSplitGroups(frameAspectForAdoption);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editLoaded, frameAspectForAdoption, file.path]);
   // Make it a Short (ShortsStudio).
   const [shortsOpen, setShortsOpen] = useState(false);
+  // Opened from one of the Video Editor home's starters (editorIntent.ts): once the video has
+  // loaded and its frame is known, the editor sets itself up - the canvas, then the split-screen
+  // panel or Shorts.
+  const intentReady = !!editStore.editState && !!nativePixelSize;
+  useEffect(() => {
+    if (!intentReady || !videoPixelSize) return;
+    const intent = takeEditorIntent(file.path);
+    if (!intent) return;
+    const preset = intent.canvas ? canvasPreset(intent.canvas) : undefined;
+    if (preset && editStore.canvas?.preset !== preset.id) editStore.setCanvas(canvasFromPreset(preset, editStore.canvas?.background ?? "blur"), videoPixelSize, { width: preset.width, height: preset.height });
+    // After the canvas has taken (the panel lays its cells out for it).
+    if (intent.split) window.setTimeout(() => openSplitPanel(null), 60);
+    if (intent.shorts) setShortsOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intentReady, file.path]);
   // Highlight intro builder (HighlightIntroPanel).
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
   // The music & sound-effects library (MusicLibraryPanel).
@@ -1556,9 +1704,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // first. Asks the cache already answers cost nothing, so a short video never captures more.
   const filmstripClipsKey = laneClips.map((c) => `${c.sourcePath}|${c.start}|${c.end}|${c.speed ?? 1}`).join(";");
   useEffect(() => {
-    if (isProject || !videoPixelSize) return;
+    if (isProject || !nativePixelSize) return;
     const timer = window.setTimeout(() => {
-      const tileWidth = Math.max(24, Math.round((THUMB_TILE_HEIGHT * videoPixelSize.width) / videoPixelSize.height));
+      const tileWidth = Math.max(24, Math.round((THUMB_TILE_HEIGHT * nativePixelSize.width) / nativePixelSize.height));
       const center = (drawWindow.from + drawWindow.to) / 2;
       const wants: (DetailWant & { distance: number })[] = [];
       laneClips.forEach((clip, i) => {
@@ -1579,7 +1727,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }, 150);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawWindow, pxPerSec, filmstripClipsKey, videoPixelSize, duration, isProject, file.path]);
+  }, [drawWindow, pxPerSec, filmstripClipsKey, nativePixelSize, duration, isProject, file.path]);
   const totalWidth = Math.max(1, totalOutputDuration * pxPerSec);
 
   // Live drag state for the text-overlay lane below - same delta-based/live-preview shape as
@@ -1700,6 +1848,43 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     liveStartTime: number;
   }>(null);
 
+  const [pipOverlayResizeDrag, setPipOverlayResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; liveValue: number }>(null);
+  const [pipOverlayDrag, setPipOverlayDrag] = useState<null | {
+    id: string;
+    startClientX: number;
+    startTime: number;
+    duration: number;
+    isDragging: boolean;
+    liveStartTime: number;
+    // The video track it started on, and the one under the pointer now (dragging up or down moves
+    // it between tracks; the drop zone above the top one makes a new track).
+    startTrack: number;
+    liveTrack: number;
+  }>(null);
+
+  // A split screen moves and trims as one (alignSplitTiming does it on drop): while one of its
+  // layers is dragged, the rest follow along live.
+  const splitFollow = (() => {
+    const live: { id: string; start: number; end: number } | null = pipOverlayDrag
+      ? { id: pipOverlayDrag.id, start: pipOverlayDrag.liveStartTime, end: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration }
+      : imageOverlayDrag
+        ? { id: imageOverlayDrag.id, start: imageOverlayDrag.liveStartTime, end: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration }
+        : null;
+    const edge: { id: string; edge: "start" | "end"; value: number } | null = pipOverlayResizeDrag
+      ? { id: pipOverlayResizeDrag.id, edge: pipOverlayResizeDrag.edge, value: pipOverlayResizeDrag.liveValue }
+      : imageOverlayResizeDrag
+        ? { id: imageOverlayResizeDrag.id, edge: imageOverlayResizeDrag.edge, value: imageOverlayResizeDrag.liveValue }
+        : null;
+    const id = live?.id ?? edge?.id;
+    const dragged = id ? editStore.pipOverlays.find((o) => o.id === id) ?? editStore.imageOverlays.find((o) => o.id === id) : undefined;
+    if (!dragged?.split || dragged.split.cell < 0) return null;
+    const ds = live ? live.start - dragged.startTime : edge!.edge === "start" ? edge!.value - dragged.startTime : 0;
+    const de = live ? live.end - dragged.endTime : edge!.edge === "end" ? edge!.value - dragged.endTime : 0;
+    return { group: dragged.split.group, id: dragged.id, ds, de };
+  })();
+  const followSplit = <T extends { id: string; startTime: number; endTime: number; split?: { group: string } }>(o: T): T =>
+    splitFollow && o.id !== splitFollow.id && o.split?.group === splitFollow.group ? { ...o, startTime: o.startTime + splitFollow.ds, endTime: o.endTime + splitFollow.de } : o;
+
   const renderImageOverlays: ImageOverlay[] = editStore.imageOverlays.map((o) => {
     if (imageOverlayResizeDrag && o.id === imageOverlayResizeDrag.id) {
       return imageOverlayResizeDrag.edge === "start" ? { ...o, startTime: imageOverlayResizeDrag.liveValue } : { ...o, endTime: imageOverlayResizeDrag.liveValue };
@@ -1707,7 +1892,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (imageOverlayDrag && o.id === imageOverlayDrag.id) {
       return { ...o, startTime: imageOverlayDrag.liveStartTime, endTime: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration };
     }
-    return o;
+    return followSplit(o);
   });
 
   const beginImageOverlayResizeDrag = (overlay: ImageOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
@@ -2002,7 +2187,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (total <= 0) return;
     const length = Math.min(5, total);
     const startTime = Math.max(0, Math.min(currentOutputTime, total - length));
-    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 0.7 } });
+    // Strong enough to see at once - the grade alone at 0.7 barely shows on a bright screen
+    // recording, which read as "does nothing". The panel opens with it to dial it back.
+    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 1 }, vignette: 0.35 });
     onSelectAdjustment?.(id);
   };
 
@@ -2012,19 +2199,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // resize reuses the pure resizePipOverlayTime handler the same way audio's own resize does below,
   // since a PipOverlay trims into a real source file too (trimStart/sourceDuration), unlike blur's
   // free-stretch box. ------------------------------------------------------------------------------
-  const [pipOverlayResizeDrag, setPipOverlayResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; liveValue: number }>(null);
-  const [pipOverlayDrag, setPipOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-    // The video track it started on, and the one under the pointer now (dragging up or down moves
-    // it between tracks; the drop zone above the top one makes a new track).
-    startTrack: number;
-    liveTrack: number;
-  }>(null);
 
   const renderPipOverlays: PipOverlay[] = editStore.pipOverlays.map((o) => {
     if (pipOverlayResizeDrag && o.id === pipOverlayResizeDrag.id) {
@@ -2033,7 +2207,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (pipOverlayDrag && o.id === pipOverlayDrag.id) {
       return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration, track: pipOverlayDrag.liveTrack };
     }
-    return o;
+    return followSplit(o);
   });
   // One lane per video track in use, top track first (it draws over the ones below it).
   const videoTrackLanes = tracksInUse(renderPipOverlays).reverse();
@@ -2385,6 +2559,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // time 0 on load, and after a reorder that raw position can legitimately belong to some *other*
   // clip than whichever one is actually first in the new playback order.
   const activeClipIndexRef = useRef<number>(-1);
+  const [activeClipIndexState, setActiveClipIndexState] = useState<number>(0);
+  const setActiveClipIndex = (index: number) => {
+    activeClipIndexRef.current = index;
+    setActiveClipIndexState((prev) => (prev === index ? prev : index));
+  };
   const lastAppliedTimeRef = useRef<number>(-1);
 
   // Output-timeline (assembled/preview order) pixel position -> which clip it falls into and the
@@ -2414,11 +2593,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
   // A deliberate scrub/seek always knows exactly which clip it landed in, so it sets
   // activeClipIndexRef directly instead of leaving it for the tracking effect to guess.
-  const seekToOutputTime = (outputTime: number) => {
+  const seekToOutputTime = (outputTime: number, resume?: boolean) => {
     const { index, sourceTime } = clipAtOutputTime(outputTime);
-    activeClipIndexRef.current = index;
+    setActiveClipIndex(index);
     lastAppliedTimeRef.current = sourceTime;
-    onSeek(renderClips[index].sourcePath, sourceTime);
+    onSeek(renderClips[index].sourcePath, sourceTime, resume);
   };
   // The player's scrub bar reads and seeks the edit through here (timelineTransport.ts) - always
   // against the latest clips, and the active clip as of this very frame.
@@ -2596,7 +2775,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
       // video", not as a deliberate seek.
       if (!isPlaying) {
-        activeClipIndexRef.current = index;
+        setActiveClipIndex(index);
         lastAppliedTimeRef.current = clip.start;
         onSeek(clip.sourcePath, clip.start);
       }
@@ -2831,7 +3010,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const atEnd = !!last && !isPlaying && activeClipIndexRef.current >= lastIndex && currentTime >= last.end - SEEK_TOLERANCE_SEC;
     if (atEnd) {
       const first = baseClips[0];
-      activeClipIndexRef.current = 0;
+      setActiveClipIndex(0);
       lastAppliedTimeRef.current = first.start;
       onSeek(first.sourcePath, first.start);
     }
@@ -2900,21 +3079,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       });
       if (!payload) return;
       const format = EXPORT_FORMATS.find((f) => f.value === exportFormat);
-      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
+      const detail = [format && format.size ? format.label : null, exportQuality === "high" ? "High quality" : exportQuality === "small" ? "Small file" : exportQuality === "youtube" ? "YouTube" : exportQuality === "social" ? "WhatsApp / Instagram" : "Standard", formatTimestamp(totalOutputDuration)].filter(Boolean).join(" · ");
       enqueueExport(payload, file.name.replace(/\.[^.]+$/, ""), detail);
     } finally {
       setPreparingExport(false);
     }
   };
 
-  // Defaults the save dialog to exactly the same "<name> (edited).<ext>" filename
-  // export_trimmed_video would otherwise pick on its own (see its own doc comment,
-  // conversion.rs) - the user is choosing WHERE to put it, not renaming it.
+  // Defaults the save dialog to the same kind of name export_trimmed_video picks on its own -
+  // "<name> - v1.<ext>" (export_output_path, conversion.rs; it numbers the versions in the Exports
+  // folder) - the user is choosing WHERE to put it, not renaming it.
   const handleChooseExportLocation = async () => {
     const stem = file.path.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? file.name;
     // A project renders to "<name>.mp4" (see export_trimmed_video), not another project file.
     const ext = isProject ? "mp4" : file.path.split(".").pop() ?? "mp4";
-    const chosen = await saveFileDialog({ defaultPath: isProject ? `${stem}.mp4` : `${stem} (edited).${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+    const base = stem.replace(/(\s\((edited|share-ready)\)(\s\(\d+\))?|\s-\sv\d+)+$/i, "");
+    const chosen = await saveFileDialog({ defaultPath: `${base} - v1.${isProject ? "mp4" : ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
     if (chosen) setCustomOutputPath(chosen);
   };
 
@@ -3285,13 +3465,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // bringing it back (undo) plays from it again.
     if (!first && isProject && !editStore.loading) {
       bootstrappedClipIdByFile.delete(file.path);
-      activeClipIndexRef.current = 0;
+      setActiveClipIndex(0);
       onSeek(file.path, 0);
       return;
     }
-    if (!first || first.id === "__pending__" || bootstrappedClipIdByFile.get(file.path) === first.id) return;
+    if (!first || first.id === "__pending__") return;
+    if (bootstrappedClipIdByFile.get(file.path) === first.id) {
+      if (activeClipIndexRef.current < 0 || activeClipIndexRef.current >= baseClips.length) {
+        const idx = baseClips.findIndex((c) => c.sourcePath === file.path && currentTime >= c.start - SEEK_TOLERANCE_SEC && currentTime <= c.end + SEEK_TOLERANCE_SEC);
+        setActiveClipIndex(idx >= 0 ? idx : 0);
+      }
+      return;
+    }
     bootstrappedClipIdByFile.set(file.path, first.id);
-    activeClipIndexRef.current = 0;
+    const leftAt = leftAtByFile.get(file.path);
+    leftAtByFile.delete(file.path);
+    const playerAt = getResumeTime(file.path);
+    const unchanged = leftAt && (leftAt.playerAt === undefined ? playerAt === undefined : playerAt !== undefined && Math.abs(playerAt - leftAt.playerAt) < 1.5);
+    if (leftAt && unchanged && leftAt.outputTime > 0 && renderClips.length > 0) {
+      seekToOutputTime(leftAt.outputTime);
+      return;
+    }
+    setActiveClipIndex(0);
     lastAppliedTimeRef.current = first.start;
     onSeek(first.sourcePath, first.start);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3334,7 +3529,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [currentTime, editStore.clips]);
   function advanceToClip(index: number, resume: boolean) {
     const clip = baseClips[index];
-    activeClipIndexRef.current = index;
+    setActiveClipIndex(index);
     lastAppliedTimeRef.current = clip.start;
     onSeek(clip.sourcePath, clip.start, resume);
   }
@@ -3466,7 +3661,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const stem = clip.sourcePath.replace(/\.[^./\\]+$/, "").split(/[\\/]/).pop() ?? "clip";
     const chosen = await saveFileDialog({ defaultPath: `${stem} - clip ${index + 1}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
     if (!chosen) return;
-    const result = await editStore.exportClip(clip.id, videoPixelSize, chosen);
+    const result = await editStore.exportClip(clip.id, nativePixelSize, chosen);
     if (result) onExported(result.path, result.name);
   };
   const handleViewClip = (clip: Clip) => {
@@ -3501,7 +3696,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   // into range in case clips changed shape since it was last set). Also the "current output
   // time" text overlays are time-gated against - factored out under its own name (rather than
   // just feeding playheadLeft) so it can be reported upward via onOutputTimeChange too.
-  const activeIndexForDisplay = Math.min(Math.max(activeClipIndexRef.current, 0), renderClips.length - 1);
+  const activeIndexForDisplay = Math.min(Math.max(activeClipIndexState, 0), renderClips.length - 1);
+  // Read at unmount (leftAtByFile) - the player may be gone by then, so not asked live.
+  const outputTimeAtRenderRef = useRef(0);
   const currentOutputTime =
     renderClips.length > 0
       ? outputStarts[activeIndexForDisplay] +
@@ -3519,39 +3716,52 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         )
       : 0;
   const playheadLeft = currentOutputTime * pxPerSec;
+  outputTimeAtRenderRef.current = currentOutputTime;
+  useEffect(
+    () => () => {
+      leftAtByFile.set(file.path, { outputTime: outputTimeAtRenderRef.current, playerAt: getResumeTime(file.path) });
+    },
+    [file.path]
+  );
 
   // Picking a transition, motion or effect plays it straight away on the selected clip - the
   // moment around the cut for a transition, the clip's opening for the rest - then stops, so
   // what was picked is seen without reaching for Play. Only discrete picks (a slider's drag
   // would replay on every step); playing or pausing by hand drops it.
   const previewEndRef = useRef<number | null>(null);
+  const previewRestAtRef = useRef<number | null>(null);
   const previewSafetyRef = useRef<number | null>(null);
   const previewOwnsPlayRef = useRef(false);
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
   const stopPickPreview = useCallback(() => {
     previewEndRef.current = null;
+    previewRestAtRef.current = null;
     if (previewSafetyRef.current) window.clearTimeout(previewSafetyRef.current);
     previewSafetyRef.current = null;
   }, []);
-  const playPickPreview = (from: number, to: number) => {
+  const playPickPreview = (from: number, to: number, restAt?: number) => {
     stopPickPreview();
-    seekToOutputTime(Math.max(0, from));
     previewEndRef.current = to;
+    previewRestAtRef.current = restAt ?? null;
     previewOwnsPlayRef.current = true;
-    if (!isPlayingRef.current) onTogglePlay();
+    seekToOutputTime(Math.max(0, from), true);
     // A safety stop, in case the playhead's reports stall (a slow clip switch).
     previewSafetyRef.current = window.setTimeout(() => {
+      const rest = previewRestAtRef.current;
       if (previewEndRef.current !== null && isPlayingRef.current) onTogglePlay();
       stopPickPreview();
+      if (rest !== null) seekToOutputTime(rest, false);
     }, (to - from) * 1000 + 3000);
   };
   useEffect(() => {
     const end = previewEndRef.current;
     if (end === null) return;
     if (isPlaying && currentOutputTime >= end) {
+      const rest = previewRestAtRef.current;
       stopPickPreview();
       onTogglePlay();
+      if (rest !== null) seekToOutputTime(rest, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOutputTime]);
@@ -3574,7 +3784,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
     const newMotion = patch.kenBurns !== undefined && patch.kenBurns?.preset !== clip.kenBurns?.preset;
     const newEffect = patch.fx !== undefined && patch.fx?.kind !== clip.fx?.kind;
-    if ((newMotion && patch.kenBurns) || (newEffect && patch.fx)) playPickPreview(start, start + Math.min(length, 2.5));
+    if ((newMotion && patch.kenBurns) || (newEffect && patch.fx)) {
+      const isIntroFx = newEffect && (patch.fx?.kind === "focus" || patch.fx?.kind === "colorin");
+      const restAt = isIntroFx ? start + Math.min(0.2, length * 0.25) : undefined;
+      playPickPreview(start, start + Math.min(length, 2.5), restAt);
+      return;
+    }
+    // If paused and editing a clip that isn't currently on screen (or adjusting an intro effect's
+    // strength past its intro window), move the playhead into the edited clip so the change shows live.
+    if (!isPlayingRef.current) {
+      const isIntroSlider = patch.fx && (patch.fx.kind === "focus" || patch.fx.kind === "colorin");
+      if (activeClipIndexRef.current !== clipIndex) {
+        seekToOutputTime(start + (isIntroSlider ? Math.min(0.2, length * 0.25) : 0), false);
+      } else if (isIntroSlider && currentOutputTime - start > 0.6) {
+        seekToOutputTime(start + Math.min(0.2, length * 0.25), false);
+      }
+    }
   };
 
   // Snap landmarks for every overlay drag/resize handler above (they're all defined earlier in
@@ -3846,7 +4071,75 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   return (
     // The webview's native menu (Save image as / Copy image / Inspect) means nothing on a timeline -
     // clips get their own menu (openClipMenu), everything else simply gets none.
-    <div ref={rootRef} className="w-full flex flex-col gap-2" onContextMenu={(e) => e.preventDefault()}>
+    <div ref={rootRef} className="relative w-full flex flex-col gap-2" onContextMenu={(e) => e.preventDefault()}>
+      {/* The divider between the player and the timeline: drag up for more lanes, down for more
+          picture. Written straight to the track area while dragging (the docker's ResizeObserver
+          re-fits the player as it goes); double-click goes back to automatic. */}
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize timeline"
+        title="Drag to give the timeline or the picture more room - double-click for automatic"
+        className="group absolute -top-5 inset-x-0 h-5 z-50 cursor-row-resize touch-none"
+        onPointerDown={(e) => {
+          const area = trackAreaRef.current;
+          if (e.button !== 0 || !area) return;
+          e.preventDefault();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          trackDragRef.current = { startY: e.clientY, startH: area.offsetHeight, h: area.offsetHeight, raf: 0 };
+          document.body.style.cursor = "row-resize";
+          document.body.style.userSelect = "none";
+        }}
+        onPointerMove={(e) => {
+          const drag = trackDragRef.current;
+          if (!drag) return;
+          drag.h = Math.min(maxTrackHeight(), Math.max(TRACK_MIN_PX, drag.startH + drag.startY - e.clientY));
+          if (drag.raf) return;
+          drag.raf = requestAnimationFrame(() => {
+            drag.raf = 0;
+            const area = trackAreaRef.current;
+            if (!area) return;
+            area.style.maxHeight = "none";
+            area.style.height = `${drag.h}px`;
+          });
+        }}
+        onPointerUp={(e) => {
+          const drag = trackDragRef.current;
+          if (!drag) return;
+          trackDragRef.current = null;
+          cancelAnimationFrame(drag.raf);
+          e.currentTarget.releasePointerCapture(e.pointerId);
+          document.body.style.cursor = "";
+          document.body.style.userSelect = "";
+          if (trackAreaRef.current) trackAreaRef.current.style.maxHeight = "";
+          setTrackHeight(drag.h);
+          saveTrackHeight(drag.h);
+        }}
+        onPointerCancel={() => {
+          const drag = trackDragRef.current;
+          if (!drag) return;
+          trackDragRef.current = null;
+          cancelAnimationFrame(drag.raf);
+          document.body.style.cursor = "";
+          document.body.style.userSelect = "";
+          const area = trackAreaRef.current;
+          if (area) {
+            area.style.maxHeight = trackHeight === null ? `${TRACK_AUTO_MAX_PX}px` : "";
+            area.style.height = trackHeight === null ? "" : `${trackHeight}px`;
+          }
+        }}
+        onDoubleClick={() => {
+          const area = trackAreaRef.current;
+          if (area) {
+            area.style.height = "";
+            area.style.maxHeight = `${TRACK_AUTO_MAX_PX}px`;
+          }
+          setTrackHeight(null);
+          saveTrackHeight(null);
+        }}
+      >
+        <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-1 w-10 rounded-full bg-neutral-400/30 transition-colors group-hover:bg-neutral-400/80 group-active:bg-blue-500" />
+      </div>
       {clipMenu && menuClip && (
         <ClipContextMenu
           anchor={clipMenu.anchor}
@@ -3868,14 +4161,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onMerge={() => {
             const ids = menuSelection;
             if (mergeClipsInPlace(editStore.clips, ids)) {
-              void editStore.mergeClips(ids, videoPixelSize).then((mergedId) => mergedId && setSelectedClipId(mergedId));
+              void editStore.mergeClips(ids, nativePixelSize).then((mergedId) => mergedId && setSelectedClipId(mergedId));
               return;
             }
             if (mergingIds) return; // one render at a time
             setMergingIds(ids);
             runBusy(`Merging ${ids.length} clips…`, async () => {
               try {
-                const mergedId = await editStore.mergeClips(ids, videoPixelSize);
+                const mergedId = await editStore.mergeClips(ids, nativePixelSize);
                 if (mergedId) setSelectedClipId(mergedId);
               } finally {
                 setMergingIds(null);
@@ -4060,7 +4353,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
           <ActionButton
             title={selectedClipId ? (isCroppingClip ? "Stop cropping" : "Crop clip") : "Select a clip to crop"}
-            onClick={() => onToggleCroppingClip?.()}
+            onClick={() => {
+              if (!isPlaying && selectedClipId) {
+                const idx = renderClips.findIndex((c) => c.id === selectedClipId);
+                if (idx >= 0 && activeClipIndexRef.current !== idx) seekToOutputTime(outputStarts[idx] ?? 0, false);
+              }
+              onToggleCroppingClip?.();
+            }}
             disabled={!selectedClipId}
           >
             <IoCropOutline size={15} className={isCroppingClip ? "text-blue-400" : undefined} />
@@ -4128,7 +4427,14 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <ActionButton
             title={selectedClipId ? `Mirror ${selectionLabel} horizontally` : "Select a clip to mirror"}
-            onClick={() => selectedClip && updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal })}
+            onClick={() => {
+              if (!selectedClip) return;
+              if (!isPlaying && selectedClipId) {
+                const idx = renderClips.findIndex((c) => c.id === selectedClipId);
+                if (idx >= 0 && activeClipIndexRef.current !== idx) seekToOutputTime(outputStarts[idx] ?? 0, false);
+              }
+              updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal });
+            }}
             disabled={!selectedClipId}
           >
             <MdFlip size={15} className={selectedClip?.flipHorizontal ? "text-blue-400" : undefined} />
@@ -4274,20 +4580,41 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <button
             type="button"
-            title="Split screen - several shots at once"
-            onClick={(e) => {
+            ref={splitButtonRef}
+            title={selectedSplitGroup ? "Edit this split screen" : "Split screen - several shots at once"}
+            onClick={() => {
               if (splitAnchor) {
                 setSplitAnchor(null);
                 return;
               }
-              const rect = e.currentTarget.getBoundingClientRect();
-              setSplitAnchor({ left: rect.left, top: rect.bottom + 4 });
+              openSplitPanel(selectedSplitGroup);
             }}
             className={`shrink-0 flex items-center justify-center w-7 h-7 rounded transition-colors ${
               splitAnchor ? "bg-neutral-700 text-fuchsia-400" : "text-neutral-300 hover:bg-neutral-700"
             }`}
           >
             <MdViewQuilt size={16} />
+          </button>
+          <button
+            type="button"
+            title={`Canvas - ${editStore.canvas ? canvasPreset(editStore.canvas.preset)?.label ?? "custom" : "the video's own shape"}: change the shape for TikTok, Reels, Shorts or a phone screen`}
+            onClick={(e) => {
+              if (canvasAnchor) {
+                setCanvasAnchor(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setCanvasAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`shrink-0 flex items-center justify-center gap-1 h-7 px-1.5 rounded text-[11px] font-medium tabular-nums transition-colors ${
+              canvasAnchor || editStore.canvas ? "bg-neutral-700 text-sky-300" : "text-neutral-300 hover:bg-neutral-700"
+            }`}
+          >
+            <span
+              className="block rounded-[2px] border-[1.5px] border-current"
+              style={videoPixelSize ? (videoPixelSize.width >= videoPixelSize.height ? { width: 14, height: Math.max(6, (14 * videoPixelSize.height) / videoPixelSize.width) } : { height: 14, width: Math.max(6, (14 * videoPixelSize.width) / videoPixelSize.height) }) : { width: 14, height: 9 }}
+            />
+            {videoPixelSize ? aspectLabel(videoPixelSize.width, videoPixelSize.height) : ""}
           </button>
           <button
             type="button"
@@ -4514,7 +4841,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       {/* Timeline */}
       <div className="relative w-full flex border border-neutral-800 rounded-md overflow-hidden bg-neutral-950 text-neutral-200">
         {/* Track control rail */}
-        <div className="w-14 shrink-0 flex flex-col items-center gap-1.5 py-2 bg-neutral-900 border-r border-neutral-800">
+        <div className="absolute inset-y-0 left-0 z-10 w-14 flex flex-col items-center gap-1.5 py-2 overflow-hidden bg-neutral-900 border-r border-neutral-800">
           <button
             type="button"
             title={trackVisible ? "Hide preview" : "Show preview"}
@@ -4707,7 +5034,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         {/* Capped height: lanes only exist once something is on them (empty ones are hidden
             above), and past ~4 lanes the stack scrolls vertically here instead of growing the
             panel up over the video preview. The ruler stays pinned while scrolling. */}
-        <div ref={trackAreaRef} className="flex-1 max-h-[236px] overflow-x-auto overflow-y-auto relative select-none">
+        <div
+          ref={trackAreaRef}
+          className="flex-1 ml-14 overflow-x-auto overflow-y-auto relative select-none"
+          style={trackHeight === null ? { minHeight: TRACK_MIN_PX, maxHeight: TRACK_AUTO_MAX_PX } : { height: Math.max(TRACK_MIN_PX, Math.min(trackHeight, window.innerHeight - PLAYER_MIN_PX - 160)) }}
+        >
           {/* An empty project's track fills the panel (its drop zone/"Add media" needs the room);
               otherwise the clips' own width plus space for the "+" after the last clip. */}
           <div
@@ -4829,7 +5160,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 // frame nearest the source time at its own center - so tile count, and therefore
                 // how many distinct shots are visible, grows with zoom instead of stretching a
                 // fixed handful of frames across the clip.
-                const tileWidth = videoPixelSize ? Math.max(24, Math.round((THUMB_TILE_HEIGHT * videoPixelSize.width) / videoPixelSize.height)) : 92;
+                const tileWidth = nativePixelSize ? Math.max(24, Math.round((THUMB_TILE_HEIGHT * nativePixelSize.width) / nativePixelSize.height)) : 92;
                 const tileCount = Math.max(1, Math.ceil(width / tileWidth));
                 // Only the tiles in the drawn window - a long clip zoomed in is thousands of them.
                 const firstTile = Math.max(0, Math.min(tileCount, Math.floor((drawWindow.from - left) / tileWidth)));
@@ -5848,6 +6179,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             if (ids[0]) setSelectedAudioOverlayId(ids[0]);
             return ids;
           }}
+          pieces={editStore.audioOverlays}
           onClose={() => setMusicAnchor(null)}
         />
       )}
@@ -5879,16 +6211,38 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         />
       )}
 
+      {canvasAnchor && (
+        <CanvasPanel
+          anchor={canvasAnchor}
+          canvas={editStore.canvas}
+          native={nativePixelSize}
+          onChange={(canvas) => {
+            if ((canvas?.preset ?? null) === (editStore.canvas?.preset ?? null)) {
+              // The same shape: only what's around the picture changed.
+              if (canvas && canvas.background !== editStore.canvas?.background && videoPixelSize) editStore.setCanvas(canvas, videoPixelSize, videoPixelSize);
+              return;
+            }
+            const from = videoPixelSize;
+            const to = canvas ?? nativePixelSize;
+            if (!from || !to) return;
+            editStore.setCanvas(canvas, from, to);
+          }}
+          onClose={() => setCanvasAnchor(null)}
+        />
+      )}
+
       {splitAnchor && (
         <SplitScreenPanel
+          key={splitEditing ?? "new"}
           anchor={splitAnchor}
           clips={editStore.clips}
           selectedClipIds={selectedClipIds}
           playhead={currentOutputTime}
           totalDuration={totalOutputDuration}
           frameAspect={videoPixelSize && videoPixelSize.height > 0 ? videoPixelSize.width / videoPixelSize.height : 16 / 9}
-          onApply={(cells, startTime, endTime, backdrop) => {
-            editStore.addSplitScreen(cells, startTime, endTime, backdrop);
+          existing={existingSplit}
+          onApply={(cells, startTime, endTime, backdrop, settings) => {
+            editStore.addSplitScreen(cells, startTime, endTime, backdrop, { id: existingSplit?.group ?? crypto.randomUUID(), settings, replace: !!existingSplit });
             setSplitAnchor(null);
           }}
           onClose={() => setSplitAnchor(null)}

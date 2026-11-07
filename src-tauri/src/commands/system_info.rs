@@ -130,3 +130,9 @@ mod macos {
             .unwrap_or(0)
     }
 }
+
+/// "WINDOWS" / "MACOS" / "LINUX" / "ANDROID" / "IOS" - the compile-time target, upper-cased.
+#[tauri::command(async)]
+pub fn get_os_info() -> String {
+    std::env::consts::OS.to_uppercase()
+}

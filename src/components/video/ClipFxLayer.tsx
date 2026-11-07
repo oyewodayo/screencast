@@ -33,15 +33,38 @@ const ClipFxLayer: React.FC<ClipFxLayerProps> = ({ frameRect, clips, activeClipI
     if (!canvas || !clip || !fx) return;
     const vignette = clip.colorFilter?.preset === "vignette" ? clip.colorFilter.intensity : 0;
     let raf = 0;
+    let lastTime = -1;
+    let lastTransform = "";
+    let lastFilter = "";
+    let lastSizeKey = "";
     const tick = () => {
       raf = requestAnimationFrame(tick);
       const video = getVideoElement();
       const state = getPlaybackState();
       if (!video || !state || !state.hasFrame || video.readyState < 2) return;
-      const dpr = window.devicePixelRatio || 1;
       const { width: W, height: H } = frameRect;
+      if (W <= 0 || H <= 0) return;
+      const dpr = Math.min(window.devicePixelRatio || 1, 1280 / Math.max(1, W));
       const w = Math.max(1, Math.round(W * dpr));
       const h = Math.max(1, Math.round(H * dpr));
+      const graded = video.parentElement?.querySelector<HTMLCanvasElement>("canvas[data-grade-canvas]");
+      const useGraded = !!(graded && graded.style.display !== "none" && graded.width > 0);
+      const sizeKey = `${w}x${h}|${useGraded ? 1 : 0}`;
+      if (
+        video.paused &&
+        !video.seeking &&
+        state.time === lastTime &&
+        video.style.transform === lastTransform &&
+        video.style.filter === lastFilter &&
+        sizeKey === lastSizeKey
+      ) {
+        return;
+      }
+      lastTime = state.time;
+      lastTransform = video.style.transform;
+      lastFilter = video.style.filter;
+      lastSizeKey = sizeKey;
+
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
@@ -65,8 +88,7 @@ const ClipFxLayer: React.FC<ClipFxLayerProps> = ({ frameRect, clips, activeClipI
       const box = parent
         ? { x: parent.left + video.offsetLeft - self.left, y: parent.top + video.offsetTop - self.top, w: video.offsetWidth, h: video.offsetHeight }
         : { x: 0, y: 0, w: W, h: H };
-      const graded = video.parentElement?.querySelector<HTMLCanvasElement>("canvas[data-grade-canvas]");
-      const source = graded && graded.style.display !== "none" && graded.width > 0 ? graded : video;
+      const source = useGraded ? graded! : video;
       paintDisplayedPicture(pctx, source, box, video.style.transform, video.style.transformOrigin, video.style.filter);
       drawClipFx(ctx, fx, pic, Math.max(0, sourceToOutputOffset(clip, state.time)), w, h, W, H, dpr);
       if (vignette > 0) drawVignette(ctx, vignette, w, h);
@@ -74,7 +96,7 @@ const ClipFxLayer: React.FC<ClipFxLayerProps> = ({ frameRect, clips, activeClipI
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip?.id, clip?.start, clip?.end, clip?.speed, clip?.speedRamp, clip?.colorFilter?.preset, clip?.colorFilter?.intensity, fx?.kind, fx?.intensity, frameRect.width, frameRect.height, getPlaybackState, getVideoElement]);
+  }, [clip?.id, clip?.start, clip?.end, clip?.speed, clip?.speedRamp, clip?.colorFilter?.preset, clip?.colorFilter?.intensity, clip?.grade, fx?.kind, fx?.intensity, frameRect.width, frameRect.height, getPlaybackState, getVideoElement]);
 
   return (
     <canvas

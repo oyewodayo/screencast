@@ -30,7 +30,7 @@ pub fn save_video_edit_state(video_path: String, json: String) -> Result<(), Str
 
     // Write-then-rename so a crash mid-write can't leave a truncated/corrupt sidecar behind.
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write edit state: {}", e))?;
-    fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save edit state: {}", e))?;
+    crate::services::sidecars::commit_sidecar(&tmp, &sidecar).map_err(|e| format!("Failed to save edit state: {}", e))?;
 
     Ok(())
 }
@@ -70,7 +70,7 @@ pub fn save_video_chapters(video_path: String, json: String) -> Result<(), Strin
     let tmp = sidecar.with_file_name(tmp_file_name);
 
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write chapters: {}", e))?;
-    fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save chapters: {}", e))?;
+    crate::services::sidecars::commit_sidecar(&tmp, &sidecar).map_err(|e| format!("Failed to save chapters: {}", e))?;
 
     Ok(())
 }
@@ -105,13 +105,19 @@ pub struct VideoProjectHeader {
 
 const VIDEO_PROJECT_KIND: &str = "briefcast-video-project";
 
-// Creates "<name>.briefvideo" in the library root (suffixing " (2)", " (3)"... on a name clash) with
-// `edit_state_json` as its initial timeline, and returns the new project's path.
+// The library folders new video projects and finished exports go into.
+pub const PROJECTS_FOLDER: &str = "Projects";
+pub const EXPORTS_FOLDER: &str = "Exports";
+
+// Creates "<name>.briefvideo" in the library's Projects folder (suffixing " (2)", " (3)"... on a
+// name clash) with `edit_state_json` as its initial timeline, and returns the new project's path.
+// Projects get a folder of their own so they're easy to find, rather than mixed into the library
+// root with every recording and import.
 #[command(async)]
 pub fn create_video_project(name: String, width: u32, height: u32, edit_state_json: String) -> Result<String, String> {
     let _serial = crate::services::responsiveness::serial();
-    let root = crate::services::utility::briefcast_dir()?;
-    fs::create_dir_all(&root).map_err(|e| format!("Failed to create library folder: {}", e))?;
+    let root = crate::services::utility::briefcast_dir()?.join(PROJECTS_FOLDER);
+    fs::create_dir_all(&root).map_err(|e| format!("Failed to create the Projects folder: {}", e))?;
     let safe: String = name
         .trim()
         .chars()
@@ -135,7 +141,7 @@ pub fn create_video_project(name: String, width: u32, height: u32, edit_state_js
     };
     let header_json = serde_json::to_string_pretty(&header).map_err(|e| e.to_string())?;
     fs::write(&path, header_json).map_err(|e| format!("Failed to create project: {}", e))?;
-    if let Err(e) = fs::write(sidecar_path_for(&path), edit_state_json.as_bytes()) {
+    if let Err(e) = crate::services::sidecars::write_sidecar(&sidecar_path_for(&path), edit_state_json.as_bytes()) {
         let _ = fs::remove_file(&path);
         return Err(format!("Failed to create project: {}", e));
     }

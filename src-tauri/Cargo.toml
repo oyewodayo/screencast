@@ -1,10 +1,22 @@
 [package]
 name = "Briefcast"
-version = "0.1.3"
+version = "0.1.4"
 description = "A screen recording and streaming application for easy use."
 authors = ["Temidayo Oyewo"]
 license = "MIT"
 edition = "2021"
+
+# The app is a library (src/lib.rs) with a thin desktop binary (src/main.rs), the layout Tauri v2's
+# Android and iOS shells need. The name differs from the package's so the lib and the `Briefcast`
+# binary don't collide on Windows, where both would otherwise produce a Briefcast.pdb.
+#
+# rlib only, for now: the mobile shells also need "staticlib" (iOS) and "cdylib" (Android), but each
+# extra crate type is a full extra link on every desktop build - on this crate that is minutes per
+# `tauri dev` restart, for targets not yet set up. Add both when running `tauri android init` /
+# `tauri ios init`.
+[lib]
+name = "briefcast_lib"
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -147,3 +159,11 @@ custom-protocol = ["tauri/custom-protocol"]
 # edit-save-reload turnaround.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Shipped builds. Thin LTO inlines across crate boundaries (the ffmpeg-arg builders, image and
+# serde paths all cross several crates) at a fraction of fat LTO's link time; stripping drops the
+# symbol tables from the installer. panic stays "unwind": the panic hook in logging.rs records the
+# message, and a panicking worker thread must not take a recording in progress down with it.
+[profile.release]
+lto = "thin"
+strip = "symbols"

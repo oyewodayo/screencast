@@ -33,7 +33,7 @@ pub fn save_image_annotations(image_path: String, json: String) -> Result<(), St
 
     // Write-then-rename so a crash mid-write can't leave a truncated/corrupt sidecar behind.
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write image edits: {}", e))?;
-    fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save image edits: {}", e))?;
+    crate::services::sidecars::commit_sidecar(&tmp, &sidecar).map_err(|e| format!("Failed to save image edits: {}", e))?;
 
     Ok(())
 }

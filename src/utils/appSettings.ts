@@ -1,10 +1,17 @@
 // utils/appSettings.ts
 //
-// App-wide preferences, persisted in localStorage (WebView2 persists this across app restarts
-// same as a browser profile would). Deliberately not routed through a Rust command — this is
-// small, non-sensitive UI preference data with no need for filesystem placement or the
-// asset-scope concerns that apply to actual recording/annotation files.
+// App-wide preferences. The source of truth is settings.json in the app config directory, owned by
+// src-tauri/src/services/settings_store.rs, so the Rust side can read them with no window alive
+// (global shortcuts, the tray, the phone remote). This module keeps a synchronous in-memory copy:
+// `loadSettings()` is called from render paths and initial-state initialisers all over the app, and
+// none of them can await. `initSettings()` fills that copy before the first render (main.tsx), and
+// the `settings-changed` event keeps it current when another window saves.
+//
+// The old home was localStorage under "briefcast.settings.v1". It is read once, to migrate an
+// existing install into the file, and never written again.
 
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { AnnotationFade, AnnotationPointer, AnnotationStyle, AnnotationTapSound } from "./annotationStyles";
 
 export interface AppSettings {
@@ -125,6 +132,20 @@ export interface AppSettings {
   // The window's close button: true hides Briefcast to the tray (shortcuts keep working), false
   // quits. null = not decided yet - the first close asks (see closeGuards.ts).
   closeToTray: boolean | null;
+  // After a minute in the tray, release the window to give back its memory (roughly 150-300 MB);
+  // it is rebuilt when Briefcast is opened again, in a second or two. Shortcuts, the tray, the
+  // phone remote and recording all work without it (closeGuards.ts, services/main_window.rs).
+  // Off by default until the saving is measured against the reopen cost.
+  releaseWindowInTray: boolean;
+  // The rest of "my current setup" - what the record shortcut, the tray and the phone remote start
+  // with. Persisted (rather than living only in Dashboard state) because Rust builds that start
+  // request itself, with no window alive (services/recording_setup.rs). Changed from the bottom
+  // bar and the Screen Options modal; remembered between launches.
+  cameraOverlayShape: string;
+  cameraOverlayPosition: string;
+  cameraOverlaySize: string;
+  separateWebcamCapture: boolean;
+  trackClicks: boolean;
 }
 
 export interface CameraBackgroundPref {
@@ -200,6 +221,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   editablePointer: false,
   recordShortcuts: false,
   closeToTray: null,
+  releaseWindowInTray: false,
+  cameraOverlayShape: "rounded",
+  cameraOverlayPosition: "bottom_right",
+  cameraOverlaySize: "small",
+  separateWebcamCapture: false,
+  trackClicks: false,
 };
 
 // One-time correction for installs whose settings were saved back when "avi" was still the coded
@@ -213,29 +240,134 @@ export const DEFAULT_SETTINGS: AppSettings = {
 // silently reverting to mp4 on the next launch.
 const AVI_DEFAULT_MIGRATION_KEY = "briefcast.settings.aviDefaultMigrated.v1";
 
-export function loadSettings(): AppSettings {
+function readLegacyLocalStorage(): AppSettings | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
+    if (!raw) return null;
     const merged: AppSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-
     if (merged.defaultFileExt === "avi" && !localStorage.getItem(AVI_DEFAULT_MIGRATION_KEY)) {
       merged.defaultFileExt = DEFAULT_SETTINGS.defaultFileExt;
       try {
         localStorage.setItem(AVI_DEFAULT_MIGRATION_KEY, "1");
-        saveSettings(merged);
       } catch {
-        // Best-effort - the in-memory correction above still applies for this call either way.
+        // Best-effort - the in-memory correction above still applies either way.
       }
     }
-
     return merged;
   } catch (err) {
-    console.error("Failed to load settings, using defaults:", err);
-    return { ...DEFAULT_SETTINGS };
+    console.error("Failed to read the legacy settings, using defaults:", err);
+    return null;
   }
 }
 
+// The in-memory copy every synchronous reader sees. null until initSettings() has run.
+let cache: AppSettings | null = null;
+// Set once Rust has answered. When it never does (a plain browser tab, unit tests), saves stay
+// in memory plus localStorage, which is exactly how this module behaved before the file existed.
+let backendAvailable = false;
+
+export const SETTINGS_CHANGED_DOM_EVENT = "briefcast:settings-changed";
+
+function isTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function adopt(next: AppSettings): void {
+  cache = next;
+  window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_DOM_EVENT, { detail: next }));
+}
+
+// Saves are coalesced: a burst (a slider, several toggles in one handler) sends only the newest
+// object, in order, instead of racing several IPC calls against each other.
+let pendingWrite: AppSettings | null = null;
+let writing = false;
+
+async function flushWrites(): Promise<void> {
+  if (writing) return;
+  writing = true;
+  try {
+    while (pendingWrite) {
+      const next = pendingWrite;
+      pendingWrite = null;
+      try {
+        await invoke("set_settings", { settings: next });
+      } catch (err) {
+        console.error("Failed to save settings:", err);
+      }
+    }
+  } finally {
+    writing = false;
+  }
+}
+
+/**
+ * Loads settings from Rust, migrating the legacy localStorage copy on first run, and starts
+ * following changes made in other windows. Call once, before the first render, in every window.
+ * Never rejects: on any failure the app starts on whatever it can read.
+ */
+export async function initSettings(): Promise<void> {
+  if (!isTauri()) {
+    cache = readLegacyLocalStorage() ?? { ...DEFAULT_SETTINGS };
+    return;
+  }
+  try {
+    const stored = await invoke<Partial<AppSettings> | null>("get_settings");
+    backendAvailable = true;
+    if (stored) {
+      cache = { ...DEFAULT_SETTINGS, ...stored };
+    } else {
+      // First launch on the file-backed store: carry the user's existing choices over.
+      const legacy = readLegacyLocalStorage();
+      cache = legacy ?? { ...DEFAULT_SETTINGS };
+      if (legacy) {
+        pendingWrite = cache;
+        void flushWrites();
+      }
+    }
+    await listen<Partial<AppSettings>>("settings-changed", (event) => {
+      const next = { ...DEFAULT_SETTINGS, ...event.payload };
+      // Our own save echoes back through here; nothing to do if it matches what we hold.
+      if (cache && JSON.stringify(next) === JSON.stringify(cache)) return;
+      adopt(next);
+    });
+  } catch (err) {
+    console.error("Failed to load settings from the backend, falling back to local storage:", err);
+    backendAvailable = false;
+    cache = readLegacyLocalStorage() ?? { ...DEFAULT_SETTINGS };
+  }
+}
+
+export function loadSettings(): AppSettings {
+  // Before initSettings() (tests, a module that runs at import time) read the legacy copy rather
+  // than hand back defaults that would then be saved over the user's real choices.
+  if (!cache) cache = readLegacyLocalStorage() ?? { ...DEFAULT_SETTINGS };
+  return { ...cache };
+}
+
+/**
+ * Merges `patch` into the current settings and saves, but only when something actually changed -
+ * so write-through effects can call it on every render-driven change without a disk write each
+ * time. Returns whether a save happened.
+ */
+export function updateSettings(patch: Partial<AppSettings>): boolean {
+  const current = loadSettings();
+  const changed = (Object.keys(patch) as (keyof AppSettings)[]).some(
+    (key) => JSON.stringify(current[key]) !== JSON.stringify(patch[key]),
+  );
+  if (changed) saveSettings({ ...current, ...patch });
+  return changed;
+}
+
 export function saveSettings(settings: AppSettings): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  cache = { ...settings };
+  if (backendAvailable) {
+    pendingWrite = cache;
+    void flushWrites();
+    return;
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch (err) {
+    console.error("Failed to save settings:", err);
+  }
 }

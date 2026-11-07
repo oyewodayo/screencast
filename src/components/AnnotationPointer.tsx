@@ -3,12 +3,17 @@
 // What follows the cursor while the annotation overlay is in draw mode: a little glove on a stick
 // (tinted to the current ink colour, so the pointer always tells you what colour you're about to
 // draw), a glowing dot, or the user's own PNG. The hotspot - the fingertip - sits exactly on the
-// real cursor position; only the stick sways, swinging on a spring when the cursor moves fast and
-// settling when it stops.
+// real cursor position.
 //
-// Everything per-frame is imperative (refs + a rAF spring that sleeps once settled), never React
-// state, so tracking the mouse at 1000Hz re-renders nothing.
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
+// The hand is rigid, at one fixed tilt: it used to swing on a spring as the cursor moved, which
+// read as a dangling handle and, worse, re-rasterised the whole shadowed graphic every frame it
+// swung - so it fell behind the cursor. Now a move is a single transform on a layer the GPU
+// already holds, and the stick is a short pointer that fades out rather than a pole across the
+// screen covering what's being explained.
+//
+// Everything per-move is imperative (refs), never React state, so tracking the mouse at 1000Hz
+// re-renders nothing.
+import { forwardRef, useImperativeHandle, useRef } from 'react';
 import type { AnnotationPointer as PointerKind } from '../utils/annotationStyles';
 
 export interface AnnotationPointerHandle {
@@ -38,6 +43,10 @@ const mixWithBlack = (hex: string, amount: number): string => {
   return `rgb(${ch[0]}, ${ch[1]}, ${ch[2]})`;
 };
 
+// Where the stick starts (under the cuff) and ends, in the hand's local units.
+const STICK_TOP = 58;
+const STICK_END = 420;
+
 // Local coordinates have the fingertip at (0,0) with the stick running down +y; the caller rotates
 // the whole thing about that origin. `stick` is off for the small static previews in Settings.
 export const HandGraphic: React.FC<{ color: string; stick?: boolean }> = ({ color, stick = true }) => {
@@ -54,8 +63,15 @@ export const HandGraphic: React.FC<{ color: string; stick?: boolean }> = ({ colo
       </defs>
       {stick && (
         <>
-          <line x1={0} y1={58} x2={0} y2={1800} stroke="#151515" strokeWidth={7} strokeLinecap="round" />
-          <line x1={-1.7} y1={58} x2={-1.7} y2={1800} stroke="#fff" strokeOpacity={0.2} strokeWidth={1.6} />
+          <defs>
+            <linearGradient id="hand-stick-fade" gradientUnits="userSpaceOnUse" x1="0" y1={STICK_TOP} x2="0" y2={STICK_END}>
+              <stop offset="0" stopColor="#151515" />
+              <stop offset="0.7" stopColor="#151515" />
+              <stop offset="1" stopColor="#151515" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <line x1={0} y1={STICK_TOP} x2={0} y2={STICK_END} stroke="url(#hand-stick-fade)" strokeWidth={7} strokeLinecap="round" />
+          <line x1={-1.7} y1={STICK_TOP} x2={-1.7} y2={STICK_END * 0.75} stroke="#fff" strokeOpacity={0.2} strokeWidth={1.6} />
         </>
       )}
       <rect x={-12} y={50} width={24} height={13} rx={5} fill="#f5f5f4" stroke="#d6d3d1" strokeWidth={1} />
@@ -73,74 +89,24 @@ export const HandGraphic: React.FC<{ color: string; stick?: boolean }> = ({ colo
   );
 };
 
-// Resting tilt (finger up-left, stick running off toward the bottom-right) and how far the spring
-// may swing from it.
-const REST_ANGLE = -26;
-const MAX_SWAY = 22;
+// The hand's tilt: finger up-left, stick running off toward the bottom-right.
+const TILT = -26;
 
 const AnnotationPointer = forwardRef<AnnotationPointerHandle, AnnotationPointerProps>(({ kind, color, image, ripple }, ref) => {
   const rootRef = useRef<HTMLDivElement>(null);
-  const swayRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const rippleLayerRef = useRef<HTMLDivElement>(null);
-
-  const posRef = useRef({ x: 0, y: 0, hasPos: false });
-  const springRef = useRef({ angle: 0, vel: 0, running: false, last: 0 });
-  const rafRef = useRef<number | null>(null);
-  const kindRef = useRef(kind);
-  kindRef.current = kind;
   const rippleRef = useRef(ripple);
   rippleRef.current = ripple;
   const colorRef = useRef(color);
   colorRef.current = color;
 
-  const applySway = (): void => {
-    if (swayRef.current) swayRef.current.style.transform = `rotate(${REST_ANGLE + springRef.current.angle}deg)`;
-  };
-
-  const step = (now: number): void => {
-    const s = springRef.current;
-    // Frame-rate independent: 1 unit = one 60Hz frame, capped so a stalled tab can't explode it.
-    const dt = Math.min(2.5, (now - s.last) / 16.667);
-    s.last = now;
-    s.vel += (-0.085 * s.angle - 0.13 * s.vel) * dt;
-    s.angle = Math.max(-MAX_SWAY, Math.min(MAX_SWAY, s.angle + s.vel * dt));
-    applySway();
-    if (Math.abs(s.angle) < 0.04 && Math.abs(s.vel) < 0.04) {
-      s.angle = 0;
-      s.vel = 0;
-      s.running = false;
-      rafRef.current = null;
-      applySway();
-      return;
-    }
-    rafRef.current = requestAnimationFrame(step);
-  };
-
-  const kick = (): void => {
-    const s = springRef.current;
-    if (s.running) return;
-    s.running = true;
-    s.last = performance.now();
-    rafRef.current = requestAnimationFrame(step);
-  };
-
   useImperativeHandle(ref, () => ({
     move: (x, y) => {
-      const p = posRef.current;
-      const dx = p.hasPos ? x - p.x : 0;
-      p.x = x;
-      p.y = y;
-      p.hasPos = true;
       const root = rootRef.current;
       if (!root) return;
       root.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-      root.style.opacity = '1';
-      if (kindRef.current === 'hand' && dx !== 0) {
-        // Moving right flings the stick's far end left (and vice versa), like a real pole.
-        springRef.current.vel += Math.max(-4, Math.min(4, dx * 0.12));
-        kick();
-      }
+      if (root.style.opacity !== '1') root.style.opacity = '1';
     },
     setPressed: (pressed) => {
       const body = bodyRef.current;
@@ -189,18 +155,8 @@ const AnnotationPointer = forwardRef<AnnotationPointerHandle, AnnotationPointerP
     },
     hide: () => {
       if (rootRef.current) rootRef.current.style.opacity = '0';
-      posRef.current.hasPos = false;
     },
   }));
-
-  useEffect(() => {
-    applySway();
-    return () => {
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-      springRef.current.running = false;
-    };
-  }, []);
 
   return (
     <>
@@ -211,7 +167,7 @@ const AnnotationPointer = forwardRef<AnnotationPointerHandle, AnnotationPointerP
         style={{ opacity: 0, willChange: 'transform', zIndex: 50 }}
       >
         {kind === 'hand' && (
-          <div ref={swayRef} style={{ transformOrigin: '0 0', willChange: 'transform' }}>
+          <div style={{ transform: `rotate(${TILT}deg)`, transformOrigin: '0 0' }}>
             <div
               ref={bodyRef}
               style={{ transformOrigin: '0 0', filter: 'drop-shadow(2px 4px 3px rgba(0,0,0,0.35))' }}

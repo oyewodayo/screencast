@@ -118,6 +118,75 @@ fn parse_duration(output: &str) -> Option<f64> {
 // for no reason a user could act on other than renaming or deleting the previous output
 // themselves first. Recording's own resolve_output_path (commands/recording.rs) already takes
 // this same approach for a name collision - conversion output just never got the same treatment.
+// Where an export goes when no location was chosen: the library's Exports folder, named after what
+// was edited and numbered by version - "Hand_Explainer_Demo - v1.mp4", then "- v2"... Finished
+// videos then sit together, easy to find (and send), instead of next to each source as
+// "(edited) (edited) (2)": exporting an export, or re-exporting, counts on from the same name.
+// A video project renders to an .mp4 named after the project.
+fn export_output_path(output_base_path: &str) -> Result<PathBuf, String> {
+    let base = PathBuf::from(output_base_path);
+    let ext = base.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".to_string());
+    let ext = if ext.eq_ignore_ascii_case(crate::services::video_edits::VIDEO_PROJECT_EXTENSION) { "mp4".to_string() } else { ext };
+    let name = export_base_name(&base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+    let dir = crate::services::utility::briefcast_dir()?.join(crate::services::video_edits::EXPORTS_FOLDER);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create the Exports folder: {}", e))?;
+    Ok(next_version_path(&dir, &name, &ext))
+}
+
+// A name with the export suffixes earlier exports gave it taken off: " (edited)", " (share-ready)",
+// " (2)" after those, " - v3" - repeatedly ("x (edited) (edited) (2)" -> "x").
+fn export_base_name(stem: &str) -> String {
+    let mut name = stem.trim().to_string();
+    loop {
+        let before = name.len();
+        for suffix in [" (edited)", " (share-ready)"] {
+            if name.to_lowercase().ends_with(suffix) {
+                name.truncate(name.len() - suffix.len());
+            }
+        }
+        // " (n)" right after an export suffix, and " - vN".
+        if let Some(i) = name.rfind(" (") {
+            let tail = &name[i + 2..];
+            if tail.ends_with(')') && tail[..tail.len() - 1].chars().all(|c| c.is_ascii_digit()) && !tail[..tail.len() - 1].is_empty() {
+                let rest = name[..i].to_lowercase();
+                if rest.ends_with(" (edited)") || rest.ends_with(" (share-ready)") {
+                    name.truncate(i);
+                }
+            }
+        }
+        if let Some(i) = name.rfind(" - v") {
+            let digits = &name[i + 4..];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                name.truncate(i);
+            }
+        }
+        if name.len() == before {
+            break;
+        }
+    }
+    let name = name.trim().to_string();
+    if name.is_empty() { "Video".to_string() } else { name }
+}
+
+// "<name> - vN.<ext>" in `dir`, N one past the highest version already there.
+fn next_version_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    let prefix = format!("{} - v", name).to_lowercase();
+    let highest = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let file = e.file_name().to_string_lossy().to_lowercase();
+                    let stem = file.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(file);
+                    stem.strip_prefix(&prefix).and_then(|n| n.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    dir.join(format!("{} - v{}.{}", name, highest + 1, ext))
+}
+
 fn unique_output_path(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
@@ -730,7 +799,7 @@ pub async fn make_share_ready_copy(
         .unwrap_or("30")
         .to_string();
 
-    let fit = format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p");
+    let fit = format!("scale={width}:{height}:force_original_aspect_ratio=decrease:out_range=tv,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p");
     let cover_chain = format!("[1:v]{fit},trim=duration={SHARE_COVER_SECONDS},setpts=PTS-STARTPTS[c]");
     let video_chain = format!("[0:V:0]{fit}[v]");
     let graph = if has_audio {
@@ -754,8 +823,10 @@ pub async fn make_share_ready_copy(
     // the original, vs 0.99 - the encoder's own ceiling at this CRF - with this).
     args.extend(["-r".to_string(), fps.clone()]);
     // The source's colour description carries over (an iPhone's Display-P3 tagging, HDR transfer...)
-    // - without it, colour-managed players show the copy slightly off.
-    for (flag, key) in [("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"), ("-colorspace", "color_space"), ("-color_range", "color_range")] {
+    // - without it, colour-managed players show the copy slightly off. Not its range, though:
+    // `fit` above converts to standard range (out_range=tv) whatever the source was, so
+    // copying a "pc" tag over would mislabel the picture (washed out, or refused by uploaders).
+    for (flag, key) in [("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"), ("-colorspace", "color_space")] {
         if let Some(value) = video[key].as_str().filter(|v| !v.is_empty() && *v != "unknown" && *v != "reserved") {
             args.extend([flag.to_string(), value.to_string()]);
         }
@@ -763,7 +834,10 @@ pub async fn make_share_ready_copy(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
-    let output = input.with_file_name(format!("{stem} (share-ready).mp4"));
+    // With the other finished videos, in the library's Exports folder (export_output_path).
+    let exports = crate::services::utility::briefcast_dir()?.join(crate::services::video_edits::EXPORTS_FOLDER);
+    std::fs::create_dir_all(&exports).map_err(|e| format!("Failed to create the Exports folder: {}", e))?;
+    let output = exports.join(format!("{} (share-ready).mp4", export_base_name(stem)));
     let cover_input = InputSpec {
         path: path_to_str(&cover)?.to_string(),
         pre_args: vec!["-framerate".into(), fps.clone(), "-loop".into(), "1".into(), "-t".into(), format!("{SHARE_COVER_SECONDS}")],
@@ -865,12 +939,15 @@ pub async fn get_image_clip_proxy(
     image_path: String,
     frame_width: u32,
     frame_height: u32,
+    // "blur": fitted over a blurred copy of itself (a canvas's Blur background), as export does.
+    background: Option<String>,
 ) -> Result<String, String> {
     let input = PathBuf::from(&image_path);
     let (w, h) = proxy_size(frame_width, frame_height);
+    let blur = background.as_deref() == Some("blur");
     // Frame size goes in the file name, not the namespace, so every proxy shares one cache entry in
     // Settings' storage list regardless of how many frame sizes have been used.
-    let cache_path = preview_cache_path(&input, "image_clip_v1", &format!("{}x{}.mp4", w, h))?;
+    let cache_path = preview_cache_path(&input, "image_clip_v1", &format!("{}x{}{}.mp4", w, h, if blur { "_blur" } else { "" }))?;
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
@@ -883,7 +960,7 @@ pub async fn get_image_clip_proxy(
         "-framerate".into(), "0.1".into(),
         "-i".into(), source,
         "-t".into(), IMAGE_CLIP_PROXY_SECONDS.to_string(),
-        "-vf".into(), frame_fit_chain(w as i64, h as i64, true)[1..].to_string(),
+        "-vf".into(), if blur { frame_fit_blur_chain(w as i64, h as i64, true, "p")[1..].to_string() } else { frame_fit_chain(w as i64, h as i64, true)[1..].to_string() },
         "-c:v".into(), "libx264".into(),
         "-preset".into(), "ultrafast".into(),
         "-tune".into(), "stillimage".into(),
@@ -3275,6 +3352,11 @@ pub struct KeepSegment {
     // export_trimmed_video before the graph is built; never sent by the frontend.
     #[serde(skip)]
     pub source_fps: Option<f64>,
+    // Fitted into the frame over a blurred copy of itself rather than black bars (a canvas's "Blur"
+    // background - canvasFormats.ts), with this number keeping its filter labels apart from other
+    // segments'. Filled in by export_trimmed_video; never sent by the frontend.
+    #[serde(skip)]
+    pub fit_blur: Option<usize>,
 }
 
 fn has_pointer_layers(seg: &KeepSegment) -> bool {
@@ -5706,6 +5788,20 @@ fn frame_fit_chain(out_w: i64, out_h: i64, is_image: bool) -> String {
     )
 }
 
+// frame_fit_chain over a blurred, zoomed, slightly darkened copy of the picture instead of black
+// bars - the canvas's "Blur" background, the look of OutputFrame's "fit-blur" (reframe_chain),
+// blurred at a quarter of the size (the same softness for a sixteenth of the work). It branches, so
+// `tag` keeps one segment's labels apart from another's.
+fn frame_fit_blur_chain(out_w: i64, out_h: i64, is_image: bool, tag: &str) -> String {
+    let (bw, bh) = (((out_w / 4) / 2 * 2).max(2), ((out_h / 4) / 2 * 2).max(2));
+    format!(
+        ",split=2[{tag}b][{tag}f];         [{tag}b]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=luma_radius=10:luma_power=2,eq=brightness=-0.06,scale={w}:{h},setsar=1[{tag}bg];         [{tag}f]scale={w}:{h}:force_original_aspect_ratio=decrease,setsar=1[{tag}fg];         [{tag}bg][{tag}fg]overlay=(W-w)/2:(H-h)/2,setsar=1{fmt}",
+        w = out_w,
+        h = out_h,
+        fmt = if is_image { ",format=yuv420p" } else { "" }
+    )
+}
+
 fn segment_needs_filter_graph(seg: &KeepSegment) -> bool {
     is_still_image_path(&seg.source_path) || seg.lut_cube.is_some() || seg.stabilize.is_some() || seg.color_filter
         .as_ref()
@@ -5760,7 +5856,10 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
     }
     let fit_and_flip = |extra: &mut String| {
         if let (true, Some(w), Some(h)) = (fit_frame, out_w, out_h) {
-            extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path)));
+            match seg.fit_blur {
+                Some(i) => extra.push_str(&frame_fit_blur_chain(w, h, is_still_image_path(&seg.source_path), &format!("fb{i}"))),
+                None => extra.push_str(&frame_fit_chain(w, h, is_still_image_path(&seg.source_path))),
+            }
         }
         if seg.flip_horizontal.unwrap_or(false) {
             extra.push_str(",hflip");
@@ -6513,10 +6612,61 @@ fn trim_input_seek(trim_start: f64) -> f64 {
 
 fn resolve_export_quality(quality: Option<&str>) -> (&'static str, &'static str) {
     match quality.unwrap_or("standard") {
-        "high" => ("slow", "18"),
+        "high" | "youtube" => ("slow", "18"),
         "small" => ("veryfast", "28"),
         _ => ("medium", "23"),
     }
+}
+
+// Platform presets on top of the quality tiers (the Save button's quality picker):
+// - "youtube": the "high" tier's picture (hardware encoders included, at their "high" point) at
+//   the source's own resolution and frame rate, with higher-bitrate audio - YouTube re-compresses
+//   every upload, so the cleaner the file it starts from, the better the result looks.
+// - "social": what WhatsApp Status / Instagram / Facebook accept without complaint - fitted into
+//   1920x1080 (1080x1920 portrait), at most 30 fps, H.264 High@4.0 with a capped bitrate. Measured
+//   failure this exists for: a 3840x2160 60 fps High@5.2 export that phones played fine but
+//   WhatsApp Status refused as "format not supported". Always software x264, the only encoder
+//   whose -profile/-level/-maxrate flags behave the same everywhere.
+fn export_hw_tier(quality: Option<&str>) -> Option<&'static str> {
+    match quality.unwrap_or("standard") {
+        "social" => None,
+        "high" | "youtube" => Some("high"),
+        "small" => Some("small"),
+        _ => Some("standard"),
+    }
+}
+
+fn export_audio_bitrate(quality: Option<&str>) -> &'static str {
+    if quality == Some("youtube") { "320k" } else { "128k" }
+}
+
+// Extra x264 flags a preset needs beyond preset/CRF.
+fn export_extra_video_args(quality: Option<&str>) -> Vec<String> {
+    match quality {
+        Some("social") => ["-profile:v", "high", "-level:v", "4.0", "-maxrate", "6M", "-bufsize", "12M"].iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// The last video stage of every editor export. Always: standard (limited "tv") range 4:2:0 -
+// a full-range yuvj420p source (screen captures can come out that way) otherwise passed straight
+// through into the export, which many players/uploaders (WhatsApp, some TVs, YouTube's ingest)
+// either reject or show washed out / with crushed blacks. nv12 is listed too as the same picture
+// in the layout hardware encoders take (QSV only accepts nv12). For "social", also the size/rate
+// limits described on export_hw_tier.
+fn export_delivery_filter(quality: Option<&str>, source_fps: f64) -> String {
+    let mut stages: Vec<String> = Vec::new();
+    if quality == Some("social") {
+        stages.push(
+            "scale=w='if(gte(iw,ih),min(iw,1920),min(iw,1080))':h='if(gte(iw,ih),min(ih,1080),min(ih,1920))':force_original_aspect_ratio=decrease:force_divisible_by=2".to_string(),
+        );
+        if source_fps > 30.5 {
+            stages.push("fps=30".to_string());
+        }
+    }
+    stages.push("scale=out_range=tv".to_string());
+    stages.push("format=yuv420p|nv12".to_string());
+    stages.join(",")
 }
 
 pub(crate) fn probe_video_dimensions(ffprobe_path: &PathBuf, source_path: &str) -> Option<(i64, i64)> {
@@ -7224,6 +7374,12 @@ pub async fn export_trimmed_video(
     captions_ass: Option<String>,
     // A platform format to export in (see OutputFrame); None keeps the timeline's own frame.
     output_frame: Option<OutputFrame>,
+    // The edit has a canvas of its own (canvasFormats.ts): video_width x video_height isn't the
+    // source's size, so every segment is fitted into it - as a project's frame does.
+    fit_to_frame: Option<bool>,
+    // What fills the canvas around a clip that doesn't fill it: "blur" (a blurred copy of the clip)
+    // or black (None / anything else).
+    frame_background: Option<String>,
     // Loudness target in LUFS (e.g. -14 for YouTube/Spotify, -16 for podcasts); None = as mixed.
     loudness_lufs: Option<f64>,
     // Adjustment layers (see AdjustmentLayerSpec), in stacking order; None = none.
@@ -7298,27 +7454,8 @@ pub async fn export_trimmed_video(
 
     let output = match output_path {
         Some(p) => PathBuf::from(p),
-        None => {
-            let base = PathBuf::from(&output_base_path);
-            let stem = base
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let ext = base
-                .extension()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "mp4".to_string());
-            let parent = base.parent().map(PathBuf::from).unwrap_or_default();
-            if ext.eq_ignore_ascii_case(crate::services::video_edits::VIDEO_PROJECT_EXTENSION) {
-                // A video project (made from images - see video_edits.rs) isn't itself a video, so
-                // its render is "<project name>.mp4", not "<name> (edited).briefvideo".
-                parent.join(format!("{}.mp4", stem))
-            } else {
-                parent.join(format!("{} (edited).{}", stem, ext))
-            }
-        }
+        None => export_output_path(&output_base_path)?,
     };
-
     // An image segment is a single still looped into a constant-rate stream long enough to cover
     // its own [start,end) window plus any transition tail out of it - trim= below then cuts it
     // exactly like a video segment.
@@ -7656,11 +7793,13 @@ pub async fn export_trimmed_video(
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
 
     // Plain cuts (nothing drawn, nothing re-timed or re-coloured) keep the source's own video
-    // wherever whole GOPs survive - smart_render_export. "small" asks for recompression, so it
-    // still re-encodes. Anything smart render can't do (or can't verify) falls through to the
+    // wherever whole GOPs survive - smart_render_export. "small" asks for recompression and
+    // "social" for a smaller size/rate, so both still re-encode. Anything smart render can't do (or can't verify) falls through to the
     // normal render below.
     let has_adjustments = !adjustment_layers.is_empty();
-    let plain_cuts = !has_video_overlays
+    let fit_to_frame = fit_to_frame.unwrap_or(false);
+    let plain_cuts = !fit_to_frame
+        && !has_video_overlays
         && !has_blur_overlays
         && !has_audio_overlays
         && !has_pip_overlays
@@ -7673,7 +7812,8 @@ pub async fn export_trimmed_video(
         && output_frame.is_none()
         && screen_style.is_none()
         && keystrokes.is_none()
-        && quality.as_deref() != Some("small");
+        && quality.as_deref() != Some("small")
+        && quality.as_deref() != Some("social");
     if plain_cuts {
         let ffprobe_path = get_ffprobe_path(&app_handle)?;
         let mut has_audio = Vec::with_capacity(segments.len());
@@ -7717,6 +7857,7 @@ pub async fn export_trimmed_video(
         && !has_clip_effects
         && captions_ass_path.is_none()
         && output_frame.is_none()
+        && !fit_to_frame
         && loudness_lufs.is_none()
         && screen_style.is_none()
         && keystrokes.is_none()
@@ -7736,10 +7877,12 @@ pub async fn export_trimmed_video(
         let mut args = vec![
             "-t".into(),
             format!("{:.6}", (seg.end - seg.start).max(0.0)),
+            "-vf".into(),
+            export_delivery_filter(quality.as_deref(), video_fps),
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "128k".into(),
+            export_audio_bitrate(quality.as_deref()).into(),
             "-movflags".into(),
             "+faststart".into(),
         ];
@@ -7946,7 +8089,15 @@ pub async fn export_trimmed_video(
         // Transitions are drawn at the output size (transition_window_graph), so with any, every
         // segment is fitted to it too - exactly that size, frame for frame (a no-op scale for a
         // source already that size).
-        let fit_frame = has_image_segments || unique_source_paths.len() > 1 || (has_transitions && video_width.is_some() && video_height.is_some());
+        let fit_frame = has_image_segments
+            || unique_source_paths.len() > 1
+            || ((has_transitions || fit_to_frame) && video_width.is_some() && video_height.is_some());
+        // A canvas with the "Blur" background: every clip over a blurred copy of itself.
+        if fit_to_frame && frame_background.as_deref() == Some("blur") {
+            for (i, seg) in segments.iter_mut().enumerate() {
+                seg.fit_blur = Some(i);
+            }
+        }
 
         // Base video (trim, or trim+concat) always lands in a [base] node so the overlay chain
         // below has one consistent label to start from regardless of how many segments there were.
@@ -8288,6 +8439,11 @@ pub async fn export_trimmed_video(
             current_label = "capv".to_string();
         }
 
+        // Standard-range 4:2:0 (and a preset's size/rate limits) on the finished picture - see
+        // export_delivery_filter.
+        filter.push_str(&format!("[{current_label}]{}[delivered];", export_delivery_filter(quality.as_deref(), video_fps)));
+        current_label = "delivered".to_string();
+
         if let Some(path) = &preview_frame {
             // The queue's live preview: a small copy of the finished picture, a couple of frames
             // per second of output, split off the very last stage.
@@ -8484,7 +8640,7 @@ pub async fn export_trimmed_video(
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
-            "128k".into(),
+            export_audio_bitrate(quality.as_deref()).into(),
             "-movflags".into(),
             "+faststart".into(),
         ]
@@ -8494,10 +8650,15 @@ pub async fn export_trimmed_video(
     // (HwEncoding::export_args - same picture as x264, many times faster), else software x264.
     // A hardware encode that fails for any reason other than the user cancelling is re-run in
     // software, so a flaky driver costs time, never the export.
-    let software: Vec<String> = ["-c:v", "libx264", "-preset", quality_preset, "-crf", quality_crf].iter().map(|s| s.to_string()).collect();
-    let tier = quality.clone().unwrap_or_default();
+    let mut software: Vec<String> = ["-c:v", "libx264", "-preset", quality_preset, "-crf", quality_crf].iter().map(|s| s.to_string()).collect();
+    software.extend(export_extra_video_args(quality.as_deref()));
+    // None for a preset that has to stay on x264 (export_hw_tier).
+    let tier = export_hw_tier(quality.as_deref());
     let ffmpeg_for_probe = get_ffmpeg_path(&app_handle)?;
-    let hardware = blocking(move || crate::services::hw_encoder::detect(&ffmpeg_for_probe)).await?.and_then(|hw| hw.export_args(&tier));
+    let hardware = match tier {
+        Some(tier) => blocking(move || crate::services::hw_encoder::detect(&ffmpeg_for_probe)).await?.and_then(|hw| hw.export_args(tier)),
+        None => None,
+    };
     let encoders: Vec<Vec<String>> = hardware.into_iter().chain(std::iter::once(software)).collect();
     let output_seconds: f64 = segments.iter().map(segment_output_duration).sum();
 
@@ -9785,6 +9946,7 @@ mod tests {
             muted: None,
             pointer_layers: None,
             source_fps: None,
+            fit_blur: None,
             fx: None,
         }
     }
@@ -10514,11 +10676,47 @@ mod tests {
     }
 
     #[test]
+    fn platform_presets_map_to_their_encoders_and_limits() {
+        assert_eq!(resolve_export_quality(Some("youtube")), ("slow", "18"));
+        assert_eq!(export_hw_tier(Some("youtube")), Some("high"));
+        assert_eq!(export_hw_tier(Some("social")), None);
+        assert_eq!(export_hw_tier(None), Some("standard"));
+        assert_eq!(export_audio_bitrate(Some("youtube")), "320k");
+        assert_eq!(export_audio_bitrate(None), "128k");
+        assert!(export_extra_video_args(Some("social")).windows(2).any(|w| w[0] == "-level:v" && w[1] == "4.0"));
+        assert!(export_extra_video_args(None).is_empty());
+        // Every export ends on standard-range 4:2:0; only "social" resizes, and only drops the
+        // rate of a source above 30 fps.
+        let plain = export_delivery_filter(None, 60.0);
+        assert_eq!(plain, "scale=out_range=tv,format=yuv420p|nv12");
+        assert!(export_delivery_filter(Some("social"), 60.0).contains("fps=30"));
+        assert!(!export_delivery_filter(Some("social"), 30.0).contains("fps="));
+        assert!(export_delivery_filter(Some("social"), 30.0).ends_with(&plain));
+    }
+
+    #[test]
     fn should_convert_file_flags_only_the_documented_extensions() {
         assert!(should_convert_file("clip.mkv".to_string()));
         assert!(should_convert_file("clip.MOV".to_string())); // case-insensitive
         assert!(!should_convert_file("clip.mp4".to_string()));
         assert!(!should_convert_file("no_extension".to_string()));
+    }
+
+    #[test]
+    fn export_names_drop_earlier_export_suffixes_and_count_versions() {
+        assert_eq!(super::export_base_name("Demo"), "Demo");
+        assert_eq!(super::export_base_name("Demo (edited) (edited) (2)"), "Demo");
+        assert_eq!(super::export_base_name("Demo - v3"), "Demo");
+        assert_eq!(super::export_base_name("Demo (share-ready)"), "Demo");
+        assert_eq!(super::export_base_name("Untitled video (8)"), "Untitled video (8)");
+        let dir = std::env::temp_dir().join(format!("briefcast_versions_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::next_version_path(&dir, "Demo", "mp4"), dir.join("Demo - v1.mp4"));
+        std::fs::write(dir.join("Demo - v1.mp4"), b"").unwrap();
+        std::fs::write(dir.join("Demo - v4.mov"), b"").unwrap();
+        std::fs::write(dir.join("Demo two - v9.mp4"), b"").unwrap();
+        assert_eq!(super::next_version_path(&dir, "Demo", "mp4"), dir.join("Demo - v5.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10635,6 +10833,9 @@ mod tests {
         let seg = KeepSegment { source_path: "photo.jpg".to_string(), ..base_segment() };
         assert_eq!(segment_effect_chain(&seg, Some(1920), Some(1080), false, None, None, None), "");
         assert!(!frame_fit_chain(1280, 720, false).contains("format="), "videos keep their own pixel format");
+        let blur = frame_fit_blur_chain(1080, 1920, false, "fb3");
+        assert!(blur.starts_with(",split=2[fb3b][fb3f];"), "{blur}");
+        assert!(blur.contains("crop=270:480,boxblur") && blur.contains("overlay=(W-w)/2:(H-h)/2"), "{blur}");
     }
 
     #[test]

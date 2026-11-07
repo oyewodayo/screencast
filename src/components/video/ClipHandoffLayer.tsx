@@ -75,7 +75,7 @@ const SEEK_LEAD_SEC = 0.08;
 const SYNC_TOLERANCE_SEC = 0.07;
 // A handoff that never syncs (a source that won't load) gives up and shows the player as it is.
 const MAX_HANDOFF_MS = 4000;
-const POOL_MAX = 3;
+const POOL_MAX = 2;
 
 const needsHandoff = (from: Clip, to: Clip) => to.sourcePath !== from.sourcePath || Math.abs(to.start - from.end) > 0.05;
 
@@ -135,16 +135,18 @@ const ClipHandoffLayer: React.FC<ClipHandoffLayerProps> = ({ frameRect, clips, a
         }
       })
       .catch(() => {});
-    if (hasGrade(next.grade) && !lutsRef.current.has(next.id)) {
+    if (hasGrade(next.grade)) {
       bakedLutForGrade(next.grade)
         .then((lut) => lutsRef.current.set(next.id, lut))
         .catch(() => lutsRef.current.set(next.id, null));
+    } else {
+      lutsRef.current.delete(next.id);
     }
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextKey, next?.id, resolveClipUrl]);
+  }, [nextKey, next?.id, next?.grade, resolveClipUrl]);
 
   useEffect(
     () => () => {

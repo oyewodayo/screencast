@@ -27,6 +27,9 @@ interface KeyboardHandlers {
   // file buttons.
   playPrevious?: () => void;
   playNext?: () => void;
+  // E - into the editing timeline (or out of it), the same as Settings > Edit video. Only offered
+  // for a video file.
+  toggleEditor?: () => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -134,6 +137,11 @@ export const createKeyboardHandler = (
         if (!e.shiftKey || !handlers.playNext) break;
         e.preventDefault();
         handlers.playNext();
+        break;
+      case "e":
+        if (!handlers.toggleEditor || e.repeat) break;
+        e.preventDefault();
+        handlers.toggleEditor();
         break;
       default:
         break;

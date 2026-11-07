@@ -231,6 +231,18 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const { theme, setTheme } = useTheme();
   const [activeSection, setActiveSection] = useState<SectionKey>("appearance");
+  // "Start Briefcast when I sign in" lives with the OS (services/autostart.rs), not in the settings
+  // file, so it's read from there and written back on Save. null until read.
+  const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
+  const [launchAtLoginSaved, setLaunchAtLoginSaved] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<boolean>("get_launch_at_login")
+      .then((enabled) => {
+        setLaunchAtLogin(enabled);
+        setLaunchAtLoginSaved(enabled);
+      })
+      .catch((err) => console.error("Couldn't read the sign-in setting:", err));
+  }, []);
 
   const [currentDir, setCurrentDir] = useState<string | null>(null);
   const [defaultDir, setDefaultDir] = useState<string | null>(null);
@@ -304,6 +316,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
   };
 
   const handleSave = (): void => {
+    if (launchAtLogin !== null && launchAtLogin !== launchAtLoginSaved) {
+      invoke("set_launch_at_login", { enabled: launchAtLogin }).catch((err) => console.error("Couldn't change the sign-in setting:", err));
+    }
     saveSettings(settings);
     onSave(settings);
     onClose();
@@ -508,6 +523,30 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                 </Field>
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
                   In the tray, Ctrl+Shift+R still starts a recording. Click the tray icon to reopen Briefcast, or right-click it to record, take a screenshot or quit.
+                </p>
+                <Field label="Free memory while in the tray">
+                  <input
+                    type="checkbox"
+                    checked={settings.releaseWindowInTray}
+                    disabled={settings.closeToTray === false}
+                    onChange={(e) => update("releaseWindowInTray", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  After a minute in the tray, Briefcast closes its window to give back memory, and reopens it in a second or two when you click the tray icon. Recording, shortcuts and the phone remote keep working. It waits while an export, the live display or a phone-camera recording is running.
+                </p>
+                <Field label="Start Briefcast when I sign in">
+                  <input
+                    type="checkbox"
+                    checked={launchAtLogin ?? false}
+                    disabled={launchAtLogin === null}
+                    onChange={(e) => setLaunchAtLogin(e.target.checked)}
+                    className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
+                  Starts in the tray without opening a window, so Ctrl+Shift+R works from the moment you sign in.
                 </p>
               </Section>
             )}

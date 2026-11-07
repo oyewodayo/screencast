@@ -153,14 +153,26 @@ const GradeCanvas: React.FC<GradeCanvasProps> = ({ videoRef, lut }) => {
       raf = requestAnimationFrame(tick);
       const state = glRef.current;
       if (!state) return;
+      const boxL = `${video.offsetLeft}px`;
+      const boxT = `${video.offsetTop}px`;
+      const boxW = `${video.clientWidth}px`;
+      const boxH = `${video.clientHeight}px`;
+      if (canvas.style.left !== boxL) canvas.style.left = boxL;
+      if (canvas.style.top !== boxT) canvas.style.top = boxT;
+      if (canvas.style.width !== boxW) canvas.style.width = boxW;
+      if (canvas.style.height !== boxH) canvas.style.height = boxH;
       canvas.style.transform = video.style.transform;
       canvas.style.transformOrigin = video.style.transformOrigin;
       canvas.style.clipPath = video.style.clipPath;
       canvas.style.filter = video.style.filter;
       if (video.readyState < 2 || video.videoWidth === 0) return;
-      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+      const maxDim = 1920;
+      const scale = Math.min(1, maxDim / Math.max(video.videoWidth, video.videoHeight));
+      const targetW = Math.max(1, Math.round(video.videoWidth * scale));
+      const targetH = Math.max(1, Math.round(video.videoHeight * scale));
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
         lastTime = -1;
       }
       // currentTime changes with every new frame (and seeks); a paused, unchanged frame needs no
@@ -199,7 +211,7 @@ const GradeCanvas: React.FC<GradeCanvasProps> = ({ videoRef, lut }) => {
       ref={canvasRef}
       aria-hidden
       data-grade-canvas
-      className="absolute inset-0 w-full h-full pointer-events-none"
+      className="absolute pointer-events-none"
       style={{ objectFit: "contain", display: active && !failedRef.current ? "block" : "none" }}
     />
   );

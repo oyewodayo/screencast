@@ -43,8 +43,60 @@ export const loadTrackFxModule = (ctx: BaseAudioContext): Promise<void> => loadW
 let sharedCtx: AudioContext | null = null;
 // The one context every channel plays through - so they can all meet on the master bus.
 export function mixerContext(): AudioContext {
-  if (!sharedCtx) sharedCtx = new AudioContext({ sampleRate: 48000 });
+  if (!sharedCtx) {
+    sharedCtx = new AudioContext({ sampleRate: 48000 });
+    watchOutputDevice(sharedCtx);
+  }
   return sharedCtx;
+}
+
+// ---- Output device -------------------------------------------------------------------------------
+//
+// A plain <audio>/<video> follows Windows' output device by itself; an AudioContext can keep
+// rendering into the one it opened after that device goes away (headphones or a Bluetooth set
+// switched, a monitor's speakers asleep, the PC waking from sleep) - the graph still runs, the
+// meters and waveforms still move, and nothing reaches the speakers. Since a routed element plays
+// only through the context, that silenced every sound in the editor until a restart. So the
+// context re-opens the current default device whenever one of those may have happened. Re-opening
+// leaves it suspended, which stalls every routed element, hence the resume (checked in Edge 156).
+// Chromium's AudioContext.setSinkId (110+) - not in this TypeScript's DOM types yet.
+type SinkableContext = AudioContext & { setSinkId?: (sink: string | { type: "none" }) => Promise<void> };
+let reopening: Promise<void> | null = null;
+export function reopenMixerOutput(): Promise<void> {
+  const ctx = sharedCtx as SinkableContext | null;
+  if (!ctx || ctx.state === "closed" || typeof ctx.setSinkId !== "function") return Promise.resolve();
+  if (reopening) return reopening;
+  reopening = (async () => {
+    try {
+      await ctx.setSinkId!({ type: "none" });
+      await ctx.setSinkId!("");
+    } catch (err) {
+      console.warn("Couldn't re-open the audio output:", err);
+    } finally {
+      await ctx.resume().catch(() => {});
+      reopening = null;
+    }
+  })();
+  return reopening;
+}
+
+const WAKE_GAP_MS = 20_000;
+function watchOutputDevice(ctx: AudioContext) {
+  let debounce = 0;
+  const soon = () => {
+    window.clearTimeout(debounce);
+    // One plug-in fires several devicechange events in a row.
+    debounce = window.setTimeout(() => void reopenMixerOutput(), 400);
+  };
+  navigator.mediaDevices?.addEventListener?.("devicechange", soon);
+  ctx.addEventListener("error", soon);
+  // Timers stop while the PC sleeps, so a long gap between ticks means it just woke up.
+  let last = Date.now();
+  window.setInterval(() => {
+    const now = Date.now();
+    if (now - last > WAKE_GAP_MS) soon();
+    last = now;
+  }, 5_000);
 }
 
 // ---- Channel levels and scopes ------------------------------------------------------------------
@@ -223,6 +275,8 @@ interface RoutedElement {
   node: AudioWorkletNode;
   // Volume automation (audioAutomation.ts), scheduled ahead by setElementGain.
   automation: GainNode;
+  source: MediaElementAudioSourceNode;
+  meterId: string;
 }
 const routed = new WeakMap<HTMLMediaElement, RoutedElement>();
 const routing = new WeakMap<HTMLMediaElement, Promise<RoutedElement | null>>();
@@ -246,7 +300,7 @@ export function routeElement(el: HTMLMediaElement, meterId: string, fx: AudioFx 
         const automation = new GainNode(ctx, { gain: 1 });
         const node = createTrackFxNode(ctx, meterId);
         source.connect(automation).connect(node).connect(masterInput());
-        const entry = { node, automation };
+        const entry = { node, automation, source, meterId };
         routed.set(el, entry);
         if (ctx.state === "suspended") ctx.resume().catch(() => {});
         return entry;
@@ -262,6 +316,33 @@ export function routeElement(el: HTMLMediaElement, meterId: string, fx: AudioFx 
     if (entry) setNodeFx(entry.node, latestFx.get(el) ?? fx);
     return entry;
   });
+}
+
+// Takes a routed element out of the mix for good, once it's being thrown away (a piece deleted or
+// re-made, the editor closed, an audition player let go). Its worklet never stops on its own
+// (process() keeps returning true), so without this every discarded player left one running on the
+// audio thread for the rest of the session.
+export function unrouteElement(el: HTMLMediaElement) {
+  const pending = routing.get(el);
+  routing.delete(el);
+  sentFx.delete(el);
+  latestFx.delete(el);
+  const drop = (entry: RoutedElement | null | undefined) => {
+    if (!entry) return;
+    routed.delete(el);
+    entry.source.disconnect();
+    entry.automation.disconnect();
+    entry.node.disconnect();
+    entry.node.port.onmessage = null;
+    // A newer node may already sit under the same meter id (the element was replaced).
+    if (meterNodes.get(entry.meterId) === entry.node) {
+      meterNodes.delete(entry.meterId);
+      meterAnalysers.delete(entry.meterId);
+    }
+  };
+  const existing = routed.get(el);
+  if (existing) drop(existing);
+  else if (pending) void pending.then(drop);
 }
 
 const latestFx = new WeakMap<HTMLMediaElement, AudioFx | undefined>();
@@ -321,6 +402,7 @@ export function setElementGain(el: HTMLMediaElement, gainAt: ((mediaTime: number
 }
 
 // The shared context is created suspended when nothing has been clicked yet - playback resumes it.
+// (Or left suspended - "interrupted" where the engine has it - by the system taking the device.)
 export function resumeMixer() {
-  if (sharedCtx?.state === "suspended") sharedCtx.resume().catch(() => {});
+  if (sharedCtx && sharedCtx.state !== "running" && sharedCtx.state !== "closed" && !reopening) sharedCtx.resume().catch(() => {});
 }

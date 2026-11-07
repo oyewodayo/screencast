@@ -22,12 +22,13 @@ export interface CachedFrame {
 }
 
 const STEP_SEC = 0.5;
-const MAX_FRAMES = 240;
-const MAX_DETAIL_FRAMES = 1000;
-const CAPTURE_HEIGHT = 90;
+const MAX_FRAMES = 120;
+const MAX_DETAIL_FRAMES = 240;
+const MAX_ENTRIES = 6;
+const CAPTURE_HEIGHT = 80;
 // A seek that never lands (a corrupt stretch of file) skips its slot instead of stalling the queue.
 const SEEK_TIMEOUT_MS = 4000;
-const FLUSH_MS = 250;
+const FLUSH_MS = 500;
 
 // A tile's ask: a frame within `tolerance` seconds of `time` (source time).
 export interface FrameWant {
@@ -240,6 +241,14 @@ export const subscribeVideoFrames = (sourcePath: string, listener: (frames: Cach
   let entry = entries.get(sourcePath);
   const isNew = !entry;
   if (!entry) {
+    if (entries.size >= MAX_ENTRIES) {
+      for (const [k, old] of entries) {
+        if (old.listeners.size === 0 && k !== current) {
+          entries.delete(k);
+          if (entries.size < MAX_ENTRIES) break;
+        }
+      }
+    }
     entry = { frames: [], listeners: new Set(), wants: new Map(), pending: [], detailTimes: [], overviewDone: false };
     entries.set(sourcePath, entry);
   }

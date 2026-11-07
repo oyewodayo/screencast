@@ -15,6 +15,110 @@ use std::{
 // Every companion-file suffix the app writes (see each service's own sidecar_path_for).
 pub const SIDECAR_SUFFIXES: &[&str] = &[".edits.json", ".chapters.json", ".imageedit.json", ".annotations.json", ".pointer.json"];
 
+// Companions are hidden in Explorer (the Windows "hidden" attribute): the library folder shows the
+// files people made, not the app's bookkeeping beside each one - yet each companion still sits next
+// to its file, so copying or moving the two together in Explorer keeps the edits. A hidden file
+// can't be overwritten in place on Windows (CreateFile refuses to truncate one), so every write
+// goes through write_sidecar / commit_sidecar, which lift the attribute around it.
+#[cfg(windows)]
+pub fn set_hidden(path: &Path, hidden: bool) {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES};
+    let wide = HSTRING::from(path.as_os_str());
+    // SAFETY: plain Win32 attribute calls on a null-terminated path that outlives them.
+    unsafe {
+        let attrs = GetFileAttributesW(&wide);
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return;
+        }
+        // NORMAL is only valid alone.
+        let mut next = if hidden { (attrs & !FILE_ATTRIBUTE_NORMAL.0) | FILE_ATTRIBUTE_HIDDEN.0 } else { attrs & !FILE_ATTRIBUTE_HIDDEN.0 };
+        if next == 0 {
+            next = FILE_ATTRIBUTE_NORMAL.0;
+        }
+        if next != attrs {
+            let _ = SetFileAttributesW(&wide, FILE_FLAGS_AND_ATTRIBUTES(next));
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn set_hidden(_path: &Path, _hidden: bool) {}
+
+// Puts a fully written temp file in place as the companion `dest` (write-then-rename, so a crash
+// can't leave a half-written one), hidden.
+pub fn commit_sidecar(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    set_hidden(dest, false);
+    let result = fs::rename(tmp, dest);
+    set_hidden(dest, true);
+    result
+}
+
+// Writes the companion `path` (a new one, or over a hidden one), hidden.
+pub fn write_sidecar(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    set_hidden(path, false);
+    let result = fs::write(path, contents);
+    set_hidden(path, true);
+    result
+}
+
+// Whether a file name is one of the app's companions (including a recording's clicks, webcam
+// bubble and view switches - recording.rs - named after its stem rather than its whole name).
+pub fn is_sidecar_name(name: &str) -> bool {
+    SIDECAR_SUFFIXES.iter().any(|s| name.ends_with(s)) || [".clicks.json", ".bubble.json", ".viewswitch.json"].iter().any(|s| name.ends_with(s))
+}
+
+// Hides every companion under `root` that isn't yet - the ones written before they were hidden.
+// Cheap (attributes only), so it simply runs at each start.
+pub fn hide_sidecars_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            hide_sidecars_in(&path);
+        } else if path.file_name().and_then(|n| n.to_str()).map_or(false, is_sidecar_name) {
+            set_hidden(&path, true);
+        }
+    }
+}
+
+// Companions whose file is gone (deleted or moved outside the app), under `root` - left there,
+// they'd be picked up by the next file to take that name. The trash's own folder is skipped (its
+// companions sit with their trashed files).
+pub fn find_orphans_in(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if kind.is_dir() {
+            if !name.starts_with('.') {
+                find_orphans_in(&path, out);
+            }
+            continue;
+        }
+        if let Some(suffix) = SIDECAR_SUFFIXES.iter().find(|s| name.ends_with(*s)) {
+            let file = path.with_file_name(&name[..name.len() - suffix.len()]);
+            if !file.exists() {
+                out.push(path);
+            }
+        }
+    }
+}
+
+// What "Tidy up library" needs before it starts: the Projects and Exports folders made, and the
+// orphaned companions found (moved to the trash by the frontend, one by one).
+#[tauri::command(async)]
+pub fn prepare_library_tidy() -> Result<Vec<String>, String> {
+    let root = crate::services::utility::briefcast_dir()?;
+    for folder in [crate::services::video_edits::PROJECTS_FOLDER, crate::services::video_edits::EXPORTS_FOLDER] {
+        fs::create_dir_all(root.join(folder)).map_err(|e| format!("Failed to create the {} folder: {}", folder, e))?;
+    }
+    let mut orphans = Vec::new();
+    find_orphans_in(&root, &mut orphans);
+    Ok(orphans.iter().filter_map(|p| p.to_str().map(String::from)).collect())
+}
+
 pub fn sidecar_path(file: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = file.as_os_str().to_os_string();
     name.push(suffix);
@@ -118,7 +222,7 @@ fn rewrite_path_references(sidecar: &Path, old: &str, new: &str) {
     }
     let Ok(out) = serde_json::to_string(&value) else { return };
     let tmp = sidecar_path(sidecar, ".tmp");
-    if fs::write(&tmp, out).is_ok() && fs::rename(&tmp, sidecar).is_err() {
+    if fs::write(&tmp, out).is_ok() && commit_sidecar(&tmp, sidecar).is_err() {
         let _ = fs::remove_file(&tmp);
     }
 }
@@ -126,6 +230,53 @@ fn rewrite_path_references(sidecar: &Path, old: &str, new: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn is_hidden(path: &Path) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        fs::metadata(path).map(|m| m.file_attributes() & 0x2 != 0).unwrap_or(false)
+    }
+
+    #[test]
+    fn finds_companions_whose_file_is_gone() {
+        let dir = temp_dir("orphans");
+        fs::write(dir.join("kept.mp4"), b"v").unwrap();
+        fs::write(sidecar_path(&dir.join("kept.mp4"), ".edits.json"), "{}").unwrap();
+        fs::write(sidecar_path(&dir.join("gone.mp4"), ".edits.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join(".trash")).unwrap();
+        fs::write(sidecar_path(&dir.join(".trash").join("x.mp4"), ".edits.json"), "{}").unwrap();
+        let mut found = Vec::new();
+        find_orphans_in(&dir, &mut found);
+        assert_eq!(found, vec![sidecar_path(&dir.join("gone.mp4"), ".edits.json")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_sidecars_can_be_written_again() {
+        let dir = temp_dir("hidden");
+        let file = dir.join("clip.mp4");
+        let edits = sidecar_path(&file, ".edits.json");
+        // New, then over the hidden one - the write Windows refuses without lifting the attribute.
+        write_sidecar(&edits, "{\"a\":1}").unwrap();
+        assert!(is_hidden(&edits));
+        write_sidecar(&edits, "{\"a\":2}").unwrap();
+        assert!(is_hidden(&edits));
+        // Write-then-rename onto the hidden one.
+        let tmp = sidecar_path(&edits, ".tmp");
+        fs::write(&tmp, "{\"a\":3}").unwrap();
+        commit_sidecar(&tmp, &edits).unwrap();
+        assert!(is_hidden(&edits));
+        assert_eq!(fs::read_to_string(&edits).unwrap(), "{\"a\":3}");
+        // Older visible ones get hidden by the start-up pass; other files don't.
+        let old = sidecar_path(&dir.join("old.png"), ".imageedit.json");
+        fs::write(&old, "{}").unwrap();
+        fs::write(dir.join("old.png"), b"png").unwrap();
+        hide_sidecars_in(&dir);
+        assert!(is_hidden(&old));
+        assert!(!is_hidden(&dir.join("old.png")));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("briefcast_sidecars_{}_{}", tag, std::process::id()));

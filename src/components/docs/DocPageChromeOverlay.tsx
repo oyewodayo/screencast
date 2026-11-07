@@ -2,17 +2,18 @@
 //
 // The header, footer and page number drawn in the margins of every sheet on screen, exactly where
 // print puts them (docPageChrome.ts's printChromeCss: centred in the top and bottom margins,
-// between the side margins). Sheet k starts at k * (page height + PAGE_GAP_PX) in both the
-// single-column view (docAutoPaginate.ts keeps every sheet exactly one page tall) and the
-// two-column view (.doc-sheet), so the bands are placed by arithmetic, not by measuring the text.
+// between the side margins). The sheets are where the page really draws them (useDocSheets) - a
+// long table overflowing its sheet used to leave every band below it sitting on the text, catching
+// its clicks and showing a dashed outline mid-page.
 //
 // Every margin band is a double-click target, filled or not - as in Word and Google Docs, that's
 // how you get to the header or footer. Print draws its own copy (margin boxes), so this is
 // print:hidden.
 import React from "react";
 import { CHROME_SLOTS, renderSlot, type ChromeBand, type DocPageChrome } from "../../utils/docPageChrome";
-import { PAGE_GAP_PX, inToPx, pageHeightPx, type PageFormat } from "../../utils/docPageGeometry";
+import { inToPx, type PageFormat } from "../../utils/docPageGeometry";
 import type { DocMargins } from "../../utils/docTypes";
+import useDocSheets from "../../hooks/useDocSheets";
 
 interface DocPageChromeOverlayProps {
   chrome: DocPageChrome;
@@ -26,14 +27,14 @@ interface DocPageChromeOverlayProps {
 }
 
 const DocPageChromeOverlay: React.FC<DocPageChromeOverlayProps> = ({ chrome, pageCount, page, margins, title, date, dark, onEdit }) => {
-  const pitch = pageHeightPx(page) + PAGE_GAP_PX;
+  const { sheets, ref: rootRef } = useDocSheets(pageCount, page);
   const ctx = { title, date, pages: pageCount };
   const bands: React.ReactNode[] = [];
-  for (let k = 0; k < pageCount; k++) {
+  sheets.forEach((sheet, k) => {
     const blank = chrome.differentFirstPage && k === 0;
     for (const band of ["header", "footer"] as ChromeBand[]) {
       const height = inToPx(band === "header" ? margins.top : margins.bottom);
-      const top = band === "header" ? k * pitch : k * pitch + pageHeightPx(page) - height;
+      const top = band === "header" ? sheet.top : sheet.bottom - height;
       const texts = CHROME_SLOTS.map((slot) => (blank ? "" : renderSlot(chrome, band, slot, k + 1, ctx)));
       bands.push(
         <div
@@ -59,9 +60,9 @@ const DocPageChromeOverlay: React.FC<DocPageChromeOverlayProps> = ({ chrome, pag
         </div>
       );
     }
-  }
+  });
   return (
-    <div aria-hidden className="absolute inset-0 z-[2] pointer-events-none print:hidden" style={{ fontFamily: "var(--doc-body-font, inherit)" }}>
+    <div ref={rootRef} aria-hidden className="absolute inset-0 z-[2] pointer-events-none print:hidden" style={{ fontFamily: "var(--doc-body-font, inherit)" }}>
       {bands}
     </div>
   );
