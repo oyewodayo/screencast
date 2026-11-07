@@ -24,7 +24,7 @@ import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
 import { fadeTotalMs } from '../utils/annotationStyles';
-import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
+import { describeShortcutFailures, onGlobalShortcut, onShortcutFailures, type ShortcutAction } from '../services/globalShortcuts';
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
 import {
@@ -97,7 +97,7 @@ import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
-import { addCloseGuard, installCloseGuards, quitApp } from "../utils/closeGuards";
+import { addCloseGuard, addReleaseBlocker, installCloseGuards, quitApp } from "../utils/closeGuards";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
@@ -141,7 +141,7 @@ import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
-import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
+import { SnipResult, startSnip } from "../services/snip";
 
 // Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
@@ -165,7 +165,7 @@ import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../u
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
+import { AppSettings, loadSettings, saveSettings, updateSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
   getPinnedPaths,
@@ -229,17 +229,10 @@ const OPEN_FILE_DIALOG_FILTERS = [
   { name: "Document", extensions: FILE_CATEGORY_EXTENSIONS.document },
 ];
 
-// Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
-// Tauri's globalShortcut API (backed by RegisterHotKey) while a recording is in progress -
-// this only ever fires for this exact key combo, unlike a low-level keyboard hook that would
-// see every keystroke system-wide.
-const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
+// Every system-wide shortcut is registered by Rust (src-tauri/src/services/shortcuts.rs, which
+// holds the key combinations) and arrives here as a `global-shortcut` action - see the dispatcher
+// effect below. The constants that remain are for labels shown to the user.
 
-// Cuts the recording's main view between the screen and a full-frame camera, while recording -
-// only registered when the recording has a separate camera file to cut to (see canSwitchView).
-// Alt+Shift rather than Ctrl+Shift: Ctrl+Shift+V is "paste as plain text" in browsers, Slack and
-// Docs - exactly the apps people demo - and a global shortcut would swallow it.
-const VIEW_SWITCH_SHORTCUT = 'Alt+Shift+V';
 
 const toggleOverlayVisibility = async () => {
   const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
@@ -251,56 +244,16 @@ const toggleOverlayVisibility = async () => {
   }
 };
 
-// Global shortcuts go through these two instead of register/unregister directly:
-//
-//  - bindShortcut always re-registers. The plugin keeps a shortcut registered on the Rust side
-//    across a page reload, still pointing at the dead page's callback - the old "register only if
-//    !isRegistered" check then skipped registering for the new page, so the shortcut silently did
-//    nothing after any reload (a Vite full reload in dev, Settings' "Reload app").
-//  - Every bind/unbind for one shortcut runs strictly in call order. Effect cleanups used to
-//    unregister asynchronously, so under StrictMode's mount -> unmount -> mount (and on effect
-//    re-runs) a late unregister could land after the new register and remove it.
-//  - The handler fires on key-down only; the plugin reports release too.
-const shortcutQueues = new Map<string, Promise<void>>();
-const queueShortcutOp = (accelerator: string, op: () => Promise<void>): Promise<void> => {
-  const next = (shortcutQueues.get(accelerator) ?? Promise.resolve()).catch(() => {}).then(op);
-  shortcutQueues.set(accelerator, next);
-  return next;
-};
-const bindShortcut = (accelerator: string, onPress: () => void): Promise<void> =>
-  queueShortcutOp(accelerator, async () => {
-    if (await isRegistered(accelerator)) await unregister(accelerator);
-    await register(accelerator, (event) => {
-      if (event.state === 'Pressed') onPress();
-    });
-  });
-const unbindShortcut = (accelerator: string): Promise<void> =>
-  queueShortcutOp(accelerator, async () => {
-    if (await isRegistered(accelerator)) await unregister(accelerator);
-  });
+// The record shortcut (Ctrl+Shift+R, "record-toggle") starts a full-screen recording with the
+// current setup when not recording, or stops the one in progress - a single toggle rather than two
+// bindings. It deliberately skips EnhancedScreenOptions' target picker (screen_size is always
+// "fullscreen"), since the whole point of a global shortcut is starting without switching to this
+// window first.
 
-// Toggles the system-wide stylus annotation overlay's "draw mode" - unlike the recording overlay
-// above, this one is available any time (not gated on an active recording), so its hotkey is
-// registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
-// watches annotationEnabled below), not recording state.
-const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
-// Blurs the whole active window, or unblurs it (services/screen_blur) - from anywhere, no draw mode
-// needed. Lives and dies with the annotation tool, like the shortcut above.
-const BLUR_WINDOW_SHORTCUT = 'CommandOrControl+Alt+B';
-
-// Toggles visibility of the bottom-right recording-panel buttons (screenshot/screen-webcam-mic/
-// record) - meant for hiding them right before presenting/recording a screen that includes this
-// app's own window, without opening Settings mid-presentation. Registered once on mount, unlike
-// the two shortcuts above: there's no window to create/tear down, just a boolean to flip.
-const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
-
-// Starts a full-screen recording with whatever settings are currently configured (record type,
-// file name/ext, audio/video devices, overlay options) when not recording, or stops the
-// in-progress one when pressed again - a single toggle rather than two separate bindings, same
-// convention as OVERLAY_TOGGLE_SHORTCUT/PANEL_BUTTONS_TOGGLE_SHORTCUT above. Deliberately skips
-// EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
-// point of a global hotkey is starting a recording without switching to this window first.
-const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
+// Whether a format from the bottom bar can carry this record type - a format picked while on
+// "mic only" (mp3) must not be handed to a screen recording started from the tray.
+const formatSuitsRecordType = (ext: string, recordType: string): boolean =>
+	recordType === 'a' ? ['mp3', 'wav', 'aac', 'wma'].includes(ext) : ['mp4', 'mkv', 'mov', 'webm', 'avi'].includes(ext);
 // How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
 // stroke that's still fading gets to finish instead of vanishing instantly - the longest fade the
 // current Settings > Annotation fade can produce (the overlay's toolbar can switch style, never
@@ -362,18 +315,31 @@ const Dashboard = () => {
   // Scoped correctly to only the main window: Dashboard only ever mounts on the "/" route (see
   // App.tsx's router), never in the recording-overlay/screenshot-overlay/annotation-overlay
   // windows, which manage their own visibility entirely separately.
+  //
+  // Not revealed when Rust rebuilt this window hidden to run a recording that needs a page (the
+  // phone camera - services/main_window.rs). If asking fails, reveal anyway.
   useEffect(() => {
+    let cancelled = false;
+    let fallbackTimer: number | undefined;
     const revealWindow = (): void => {
       appWindow.show().catch((err) => console.error("Failed to show main window:", err));
       appWindow.setFocus().catch((err) => console.error("Failed to focus main window:", err));
     };
-    revealWindow();
-    // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
-    // after is free insurance against this specific call failing/never resolving for some
-    // reason - a bug in this effect must never be able to leave the user with an app that looks
-    // like it silently failed to launch (permanently hidden behind nothing).
-    const fallbackTimer = window.setTimeout(revealWindow, 1500);
-    return () => window.clearTimeout(fallbackTimer);
+    void invoke<boolean>("main_window_should_reveal")
+      .catch(() => true)
+      .then((reveal) => {
+        if (cancelled || !reveal) return;
+        revealWindow();
+        // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
+        // after is free insurance against this specific call failing/never resolving for some
+        // reason - a bug in this effect must never be able to leave the user with an app that
+        // looks like it silently failed to launch (permanently hidden behind nothing).
+        fallbackTimer = window.setTimeout(revealWindow, 1500);
+      });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fallbackTimer);
+    };
   }, []);
   // Presentation mode for the PDF viewer: hides the sidebar and BottomDocker (not just the PDF's
   // own toolbar, which PdfAnnotator hides itself) and puts the actual OS window into fullscreen,
@@ -384,10 +350,11 @@ const Dashboard = () => {
   const [videoDevices, setVideoDevices] = useState<string[]>([]);
   const [selectScreen, setSelectScreen] = useState(false);
   const [selectedScreen, setSelectedScreen] = useState("");
-   const [screenSize, setScreenSize] = useState("fullscreen");
-     const [overlayShape, setOverlayShape] = useState("rounded"); // ADD THIS
-  const [overlayPosition, setOverlayPosition] = useState("bottom_right"); // ADD THIS
-  const [overlaySize, setOverlaySize] = useState("small"); // ADD THIS
+  const [screenSize, setScreenSize] = useState("fullscreen");
+  // The webcam bubble's look, remembered between launches - see AppSettings.cameraOverlayShape.
+  const [overlayShape, setOverlayShape] = useState(() => loadSettings().cameraOverlayShape);
+  const [overlayPosition, setOverlayPosition] = useState(() => loadSettings().cameraOverlayPosition);
+  const [overlaySize, setOverlaySize] = useState(() => loadSettings().cameraOverlaySize);
   // Phone-as-camera (see src/services/phoneCamera.ts). Only the connected flag lives in React
   // state here - the stream itself is held by the service singleton, because the pairing modal,
   // the overlay preview and the recorder below all need the same one.
@@ -411,21 +378,22 @@ const Dashboard = () => {
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
   const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
-  // Opt-in, off by default every session (not persisted like includeSystemAudio above - this is a
-  // new, less-proven capture path, so it shouldn't silently carry forward as someone's default).
+  // Opt-in, off by default every session (this is a new, less-proven capture path, so it shouldn't
+  // silently carry forward as someone's default). Held in the settings so the Rust-built start
+  // request sees it, but settings_store.rs drops it at every launch - see SESSION_ONLY_KEYS.
   // When on (and exactly one camera is selected - see start_recording's own doc comment on why
   // more than one isn't supported), recording_with_output_sva writes the webcam as its own
   // second, uncomposited file alongside the main recording instead of baking it into a single
   // overlay - lets the editor's new PiP layer reposition/resize/reshape it after the fact, which
   // baked-in footage never could be. Recording with this off is byte-for-byte the same as before
   // this feature existed.
-  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(false);
-  // Opt-in, off by default every session (not persisted, same reasoning as separateWebcamCapture
+  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(() => loadSettings().separateWebcamCapture);
+  // Opt-in, off by default every session (session-only, same reasoning as separateWebcamCapture
   // above - a new, less-proven capture path). When on, start_recording installs a Windows mouse
   // hook (services/click_tracker.rs) for the duration of the recording and writes every click's
   // time+position to a "<name>.clicks.json" sidecar - the editor's own "auto zoom on click" tool
   // reads this back to suggest where to punch in. Recording with this off starts no hook at all.
-  const [trackClicks, setTrackClicks] = useState<boolean>(false);
+  const [trackClicks, setTrackClicks] = useState<boolean>(() => loadSettings().trackClicks);
   // Max output width for screen-capture record types - null means "use the backend's own default"
   // (1920px, see FormData.resolution_width's own doc comment on the Rust side), so a caller that
   // never touches this control gets byte-for-byte the same recording as before it existed. The
@@ -1716,8 +1684,8 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // hold this itself since it fully remounts on every file change via `key={selectedFile.path}`).
   const [videoAutoplayNext, setVideoAutoplayNext] = useState<boolean>(true);
   // Whether the system-wide annotation overlay is allowed to exist at all this session — see
-  // handleSettingsSaved and the effect below that creates/hides the overlay window and
-  // registers/unregisters ANNOTATION_TOGGLE_SHORTCUT whenever this changes.
+  // handleSettingsSaved and the effect below that hides the overlay window when this turns off.
+  // (Its shortcuts follow the same setting from the Rust side - services/shortcuts.rs.)
   const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
   // The "Nothing playing yet" home screen's backdrop (Settings > Appearance > "Home screen
   // background") - see the decorative block a few hundred lines down in this file's JSX.
@@ -1788,8 +1756,6 @@ useEffect(() => {
       if (overlayWindow) {
         await overlayWindow.hide();
       }
-      await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
-      await unbindShortcut(VIEW_SWITCH_SHORTCUT);
       setCanSwitchView(false);
     });
     
@@ -2164,7 +2130,6 @@ const setScreen = () => {
               Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
-        await bindShortcut(OVERLAY_TOGGLE_SHORTCUT, () => void toggleOverlayVisibility());
 
         const switchable =
           formData.record_type === 'sva' &&
@@ -2173,9 +2138,6 @@ const setScreen = () => {
         setViewMode('screen');
         viewSwitchRef.current.canSwitchView = switchable;
         viewSwitchRef.current.viewMode = 'screen';
-        if (switchable) {
-          await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
-        }
 
         // Opt-in (Settings > Recording) - see AppSettings.notifyOnRecordingStart.
         if (loadSettings().notifyOnRecordingStart) {
@@ -2294,8 +2256,6 @@ const setScreen = () => {
     if (overlayWindow) {
       await overlayWindow.hide();
     }
-    await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
-    await unbindShortcut(VIEW_SWITCH_SHORTCUT);
 
     try {
       // The finished path is shown by the completion window, so no toast repeats it here.
@@ -2456,10 +2416,12 @@ const setScreen = () => {
 
 	// Quitting Briefcast (main.rs) would end a recording in progress abruptly - its parts never
 	// assembled into a file. So while recording, quitting asks first, and "Stop and quit" saves the
-	// recording properly before letting the quit through. (Hiding to the tray never gets here.)
+	// recording properly before letting the quit through. (Hiding to the tray never gets here, and a
+	// release to the tray lets the recording carry on - Rust runs it without this page.)
 	useEffect(() => {
 		if (!isRecording) return;
-		return addCloseGuard(async () => {
+		return addCloseGuard(async (reason) => {
+			if (reason === "release") return true;
 			const stopAndQuit = await ask("A recording is in progress. Stop and save it, then quit Briefcast?", {
 				title: "Recording in progress",
 				kind: "warning",
@@ -2821,49 +2783,18 @@ const setScreen = () => {
 		}
 	}, []);
 
-	// Registers the annotation hotkey whenever the feature is enabled; unregisters it (and hides the
-	// overlay) whenever it's disabled. Independent of recording state — this feature is meant to be
-	// available any time, not just mid-recording (unlike OVERLAY_TOGGLE_SHORTCUT above).
+	// Turning the annotation tool off ends draw mode and hides its overlay. Its shortcuts are
+	// registered and dropped by Rust from the same setting (services/shortcuts.rs), and the
+	// dispatcher below ignores a press while the tool is off.
 	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
-			if (!annotationEnabled) {
-				if (annotationDrawModeRef.current) {
-					await toggleAnnotationDrawMode(true);
-				}
-				await unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
-				await unbindShortcut(BLUR_WINDOW_SHORTCUT);
-				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
-				if (overlay) await overlay.hide();
-				return;
+		if (annotationEnabled) return;
+		void (async () => {
+			if (annotationDrawModeRef.current) {
+				await toggleAnnotationDrawMode(true);
 			}
-
-			if (cancelled) return;
-			try {
-				await bindShortcut(ANNOTATION_TOGGLE_SHORTCUT, () => void toggleAnnotationDrawMode());
-			} catch (err) {
-				// Most likely cause: another already-running app has this exact combo registered
-				// as its own OS-level global hotkey, so ours is rejected - surfaced here (rather
-				// than only console.error, which nobody sees without devtools) since otherwise the
-				// symptom is just "the shortcut silently does nothing," indistinguishable from the
-				// feature being broken.
-				console.error('Failed to register annotation hotkey:', err);
-				setError(`Couldn't register the annotation shortcut (${ANNOTATION_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
-			try {
-				await bindShortcut(BLUR_WINDOW_SHORTCUT, () => {
-					invoke('screen_blur_toggle_window').catch((err) => console.error('Blur window:', err));
-				});
-			} catch (err) {
-				console.error('Failed to register blur-window hotkey:', err);
-				setError(`Couldn't register the blur shortcut (${BLUR_WINDOW_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
+			const overlay = await WebviewWindow.getByLabel('annotation-overlay');
+			if (overlay) await overlay.hide();
 		})();
-
-		return () => {
-			cancelled = true;
-		};
 	}, [annotationEnabled, toggleAnnotationDrawMode]);
 
 	// Privacy blur strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
@@ -2900,13 +2831,6 @@ const setScreen = () => {
 		};
 	}, [toggleAnnotationDrawMode]);
 
-	// Unregister on unmount so the hotkey doesn't linger after Dashboard itself goes away.
-	useEffect(() => {
-		return () => {
-			void unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
-		};
-	}, []);
-
 	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
 	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
 	// still show the state this shortcut/checkbox last left it in, not silently revert on save.
@@ -2918,44 +2842,19 @@ const setScreen = () => {
 		});
 	}, []);
 
-	// Registered once for the life of the window, unlike OVERLAY_TOGGLE_SHORTCUT (tied to an
-	// in-progress recording) or ANNOTATION_TOGGLE_SHORTCUT (tied to a Settings toggle) - this
-	// panel is visible any time the app is, so the shortcut to hide it should be too.
-	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
-			try {
-				if (!cancelled) await bindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT, toggleRecordingPanelButtons);
-			} catch (err) {
-				console.error('Failed to register panel-buttons hotkey:', err);
-				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
-		})();
-
-		return () => {
-			cancelled = true;
-			void unbindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT);
-		};
-	}, [toggleRecordingPanelButtons]);
-
-	// handleStartRecording/handleStopRecording (and every recording-setup field below) are
+	// handleStartRecording/handleStopRecording (and the bottom bar's name/format below) are
 	// recreated or reassigned on every render, so a stable (empty-deps) hotkey callback can't
 	// reference them directly without capturing a stale first-render snapshot forever - this ref
 	// is refreshed after every render instead (same pattern as selectedFileRef above) so the
 	// hotkey handler, registered once, always acts on the latest values.
 	const recordingHotkeyRef = useRef({
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
-		fileName, fileExt, recordType, audioDevice, videoDevices,
-		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
-		resolutionWidth, framerate,
+		fileName, fileExt,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
-			fileName, fileExt, recordType, audioDevice, videoDevices,
-			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
-			resolutionWidth, framerate,
+			fileName, fileExt,
 		};
 	});
 
@@ -2967,84 +2866,120 @@ const setScreen = () => {
 			return;
 		}
 		if (recordTypeOverride) setRecordType(recordTypeOverride);
-		void s.startRecording({
-			file_name: s.fileName,
-			file_ext: s.fileExt,
-			record_type: recordTypeOverride ?? s.recordType,
-			audio_device: s.audioDevice,
-			// Deliberately skips EnhancedScreenOptions' target picker - see RECORDING_TOGGLE_SHORTCUT's
-			// own doc comment for why.
-			screen_size: 'fullscreen',
-			video_devices: s.videoDevices,
-			overlay_shape: s.overlayShape,
-			overlay_position: s.overlayPosition,
-			overlay_size: s.overlaySize,
-			window_title: '',
-			include_system_audio: s.includeSystemAudio,
-			separate_webcam_capture: s.separateWebcamCapture,
-			track_clicks: s.trackClicks,
-			resolution_width: s.resolutionWidth,
-			framerate: s.framerate,
-		});
-	}, []);
-
-	// Registered once for the life of the window, same reasoning as the panel-buttons shortcut
-	// above - starting/stopping is meaningful any time the app is running, not just mid-recording.
-	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
+		void (async () => {
 			try {
-				if (!cancelled) await bindShortcut(RECORDING_TOGGLE_SHORTCUT, handleRecordingToggleHotkey);
+				// Built in Rust from the settings file (services/recording_setup.rs) - the same request
+				// a start with no window gets, so the two can't drift. It records the whole screen,
+				// skipping EnhancedScreenOptions' target picker (see the note on the record shortcut).
+				const request = await invoke<Record<string, unknown>>("get_current_setup_request", {
+					recordTypeOverride: recordTypeOverride ?? null,
+				});
+				// The name and format in the bottom bar belong to this take only and are never saved,
+				// so with a window open they win - as they always have.
+				const fileExt = s.fileExt?.toLowerCase();
+				void s.startRecording({
+					...request,
+					file_name: s.fileName || request.file_name,
+					...(fileExt && formatSuitsRecordType(fileExt, String(request.record_type)) ? { file_ext: fileExt } : {}),
+				});
 			} catch (err) {
-				console.error('Failed to register recording-toggle hotkey:', err);
-				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+				console.error("Couldn't build the recording request:", err);
+				setError(`Failed to start recording: ${err}`);
 			}
 		})();
+	}, []);
 
-		return () => {
-			cancelled = true;
-			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
-		};
-	}, [handleRecordingToggleHotkey]);
+	// Every system-wide shortcut lands here as an action (registered by Rust - see
+	// services/globalShortcuts.ts). One subscription for the window's life; the handlers are read
+	// through a ref so a press always acts on the latest render's state. Presentation cuts are
+	// handled by services/presentation.ts, which subscribes on its own.
+	const shortcutHandlersRef = useRef<Partial<Record<ShortcutAction, () => void>>>({});
+	shortcutHandlersRef.current = {
+		'record-toggle': () => handleRecordingToggleHotkey(),
+		'panel-buttons-toggle': toggleRecordingPanelButtons,
+		'snip': () => {
+			startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+		},
+		'annotation-toggle': () => {
+			if (annotationEnabled) void toggleAnnotationDrawMode();
+		},
+		'blur-window': () => {
+			if (annotationEnabled) invoke('screen_blur_toggle_window').catch((err) => console.error('Blur window:', err));
+		},
+		'overlay-toggle': () => void toggleOverlayVisibility(),
+		'view-switch': () => void switchViewRef.current('toggle'),
+	};
+	useEffect(() => onGlobalShortcut((action) => shortcutHandlersRef.current[action]?.()), []);
 
-	// The screen/camera/mic toggles are what Ctrl+Shift+R records with, so they're remembered
-	// between launches rather than resetting to Settings' default - it's the same setting. "c" is
-	// only the screenshot flow's brief detour, never a recording setup to keep.
+	// A shortcut another app holds would otherwise just silently do nothing.
+	useEffect(() => onShortcutFailures((failures) => setError(describeShortcutFailures(failures))), []);
+
+	// The live setup is what Ctrl+Shift+R, the tray and the phone remote record with - and Rust
+	// builds that start request itself (services/recording_setup.rs), so every part of it is written
+	// through to the settings file as it changes. Bottom bar and Settings are therefore one setting.
+	// "c" is only the screenshot flow's brief detour, never a recording setup to keep. Devices are
+	// saved by the pickers themselves (BottomDocker), on an explicit pick only: an automatic fallback
+	// to the first device while the usual one is unplugged must not overwrite the user's choice.
 	useEffect(() => {
-		if (!["sva", "sa", "s", "va", "v", "a"].includes(recordType)) return;
-		const settings = loadSettings();
-		if (settings.defaultRecordType !== recordType) saveSettings({ ...settings, defaultRecordType: recordType });
-	}, [recordType]);
+		updateSettings({
+			...(["sva", "sa", "s", "va", "v", "a"].includes(recordType) ? { defaultRecordType: recordType } : {}),
+			defaultIncludeSystemAudio: includeSystemAudio,
+			defaultResolutionWidth: resolutionWidth,
+			defaultFramerate: framerate,
+			cameraOverlayShape: overlayShape,
+			cameraOverlayPosition: overlayPosition,
+			cameraOverlaySize: overlaySize,
+			separateWebcamCapture,
+			trackClicks,
+		});
+	}, [recordType, includeSystemAudio, resolutionWidth, framerate, overlayShape, overlayPosition, overlaySize, separateWebcamCapture, trackClicks]);
 
 	// The tray icon's menu (services/tray.rs) - it can be used with this window hidden in the tray.
+	// Also the work Rust queued for this page (services/main_window.rs): a start that needs a page
+	// (the phone camera) or an error to show, from a shortcut/tray/remote press while no window
+	// existed. The queue is pulled once the listeners are in place - pushed events could arrive
+	// before them and be lost.
+	const mainActionRef = useRef<(payload: { action: string; recordType?: string; message?: string }) => void>(() => {});
+	mainActionRef.current = (payload) => {
+		switch (payload.action) {
+			case "record":
+				if (!recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey(payload.recordType);
+				break;
+			case "stop":
+				if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
+				break;
+			case "screenshot":
+				startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+				break;
+			case "quit":
+				void quitApp();
+				break;
+			case "error":
+				if (payload.message) setError(payload.message);
+				break;
+		}
+	};
 	useEffect(() => {
-		const unlisten = listen<{ action: string; recordType?: string }>("tray-action", ({ payload }) => {
-			switch (payload.action) {
-				case "record":
-					if (!recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey(payload.recordType);
-					break;
-				case "stop":
-					if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
-					break;
-				case "screenshot":
-					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
-					break;
-				case "quit":
-					void quitApp();
-					break;
+		let disposed = false;
+		const unlisteners: Array<() => void> = [];
+		void (async () => {
+			for (const event of ["tray-action", "main-action"]) {
+				const fn = await listen<{ action: string; recordType?: string; message?: string }>(event, ({ payload }) => mainActionRef.current(payload));
+				if (disposed) fn();
+				else unlisteners.push(fn);
 			}
-		});
+			if (disposed) return;
+			const pending = await invoke<Array<{ action: string; recordType?: string; message?: string }>>("take_main_window_actions").catch(() => []);
+			pending.forEach((payload) => mainActionRef.current(payload));
+		})();
 		return () => {
-			unlisten.then((fn) => fn());
+			disposed = true;
+			unlisteners.forEach((fn) => fn());
 		};
-	}, [handleRecordingToggleHotkey]);
+	}, []);
 
-	// The tray icon gets a red dot while recording - the only sign of it with the window hidden
-	// and the recording bar tucked away (Ctrl+Shift+H).
-	useEffect(() => {
-		invoke("tray_set_recording", { recording: isRecording }).catch(() => {});
-	}, [isRecording]);
+	// (The tray's red dot and the recording-only shortcuts are set by the recording commands
+	// themselves - services/recording_session.rs - so they're right whoever starts or stops.)
 
 	// ---- The phone app's Remote, Voice-over and Beam (phone_transfer_page.html). Phones mirror this
 	// window's state: recording (with a pause-aware elapsed snapshot the phone ticks on from, so the
@@ -3227,15 +3162,6 @@ const setScreen = () => {
 	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
 	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).
 	useEffect(() => {
-		(async () => {
-			try {
-				await bindShortcut(SNIP_SHORTCUT, () => {
-					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
-				});
-			} catch (err) {
-				console.warn(`Couldn't register ${SNIP_SHORTCUT}:`, err);
-			}
-		})();
 		const unlisten = listen<SnipResult | null>('snip-done', (event) => {
 			if (!event.payload) return;
 			const name = event.payload.path.split(/[\\/]/).pop() ?? event.payload.path;
@@ -3244,7 +3170,6 @@ const setScreen = () => {
 		});
 		return () => {
 			unlisten.then((fn) => fn());
-			void unbindShortcut(SNIP_SHORTCUT);
 		};
 	}, []);
 
@@ -3426,11 +3351,23 @@ const setScreen = () => {
 	libraryRefreshRef.current = () => void handleDirectoryFiles();
 	useEffect(() => {
 		installCloseGuards();
+		// What this page is doing that can't carry on without it - the window is kept (only hidden)
+		// in the tray while any of these is true. A plain recording isn't one: Rust runs it.
+		const stopBlocking = addReleaseBlocker(() => {
+			if (phoneCaptureRef.current) return "the phone camera is being recorded";
+			if (getPresentationState().active) return "the live display is on";
+			if (studioSilenceRef.current) return "a voice-over take is rolling";
+			return null;
+		});
 		installGlobalCloseGuard();
-		return onJobFinished((job) => {
+		const stopListening = onJobFinished((job) => {
 			libraryRefreshRef.current();
 			setMessage(`Exported ${formatFileName(job.resultPath?.split(/[\\/]/).pop() ?? job.title)}`);
 		});
+		return () => {
+			stopBlocking();
+			stopListening();
+		};
 	}, []);
 	const [shareJob, setShareJob] = useState<ExportJob | null>(null);
 

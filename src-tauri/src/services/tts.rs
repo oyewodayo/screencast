@@ -146,7 +146,7 @@ pub fn ensure_assets(app_handle: &AppHandle, cancel: &AtomicBool, emit: &dyn Fn(
         ensure_engine_dlls(&engine, cancel, CANCELLED_ERR, &|n| emit(n, total))?;
         base += ENGINE_DOWNLOAD_SIZE;
     }
-    let mut fetch = |asset: &DownloadAsset, base: &mut u64| -> Result<(), String> {
+    let fetch = |asset: &DownloadAsset, base: &mut u64| -> Result<(), String> {
         let dest = dir.join(asset.file_name);
         if !is_valid_install(&dest, asset) {
             download_asset(asset, &dest, cancel, CANCELLED_ERR, &|n| emit(*base + n, total))?;

@@ -14,7 +14,7 @@ import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { addCloseGuard } from "./closeGuards";
+import { addCloseGuard, addReleaseBlocker } from "./closeGuards";
 
 export interface ExportJobPayload {
   // export_trimmed_video's arguments, minus jobId.
@@ -222,6 +222,8 @@ export function installGlobalCloseGuard() {
   if (globalGuardInstalled) return;
   globalGuardInstalled = true;
   addCloseGuard(() => editorGuards > 0 || !hasActiveJobs() || confirmCloseWithActiveExports());
+  // Exports run in this page; the window stays (hidden) in the tray until they finish.
+  addReleaseBlocker(() => (hasActiveJobs() ? "an export is running" : null));
 }
 
 // "4:12" / "1:02:09" / "<1 min"-style countdown text.

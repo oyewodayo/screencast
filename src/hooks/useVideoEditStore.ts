@@ -13,7 +13,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { addCloseGuard } from "../utils/closeGuards";
+import { addCloseGuard, addReleaseBlocker } from "../utils/closeGuards";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipCrop, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
 import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
@@ -752,10 +752,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       return true;
     });
 
+    // The editor's own (foreground) export runs in this page.
+    const removeBlocker = addReleaseBlocker(() => (isExportingRef.current ? "a video export is running" : null));
+
     setEditorCloseGuard(true);
     return () => {
       setEditorCloseGuard(false);
       removeGuard();
+      removeBlocker();
     };
   }, [sourcePath, flushSave]);
 

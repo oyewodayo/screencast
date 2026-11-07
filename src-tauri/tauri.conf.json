@@ -7,7 +7,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "targets": [
+      "nsis",
+      "msi"
+    ],
     "createUpdaterArtifacts": true,
     "resources": [
       "binaries/ffmpeg/ffmpeg.exe",
@@ -53,6 +56,8 @@
     },
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "Briefcast",
         "width": 900,
         "height": 600,

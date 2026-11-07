@@ -387,7 +387,9 @@ fn keep_tracks(tracks: Vec<Track>, step: f64) -> Vec<Track> {
 }
 
 // Finds and follows the object through one range's frames (fed in order, `step` seconds apart from
-// `from`). Returns the appearances, in the frames' own pixels.
+// `from`). Returns the appearances, in the frames' own pixels. The app scans in pieces (scan_raw +
+// joining); the tests use this whole-range form as the reference.
+#[cfg(test)]
 pub(crate) fn scan_frames(finder: &Finder, frames: impl Iterator<Item = Vec<u8>>, aw: usize, ah: usize, from: f64, step: f64, threshold: f32, cancel: &AtomicBool, on_frame: impl FnMut(usize)) -> Result<Vec<Track>, String> {
     Ok(keep_tracks(scan_raw(finder, frames, aw, ah, from, step, threshold, cancel, on_frame)?, step))
 }

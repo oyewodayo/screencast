@@ -1,20 +1,16 @@
 // utils/recordingCountdown.ts
 //
-// The optional "3, 2, 1" before a recording starts (Settings > Recording). It runs in its own small
-// always-on-top window (the "countdown-overlay" window, components/CountdownOverlay.tsx) rather
-// than inside the main window, because the main window is often behind the app being recorded -
-// and it runs before start_recording, so none of it ends up in the video.
+// The optional "3, 2, 1" before a recording starts (Settings > Recording). Timed in Rust
+// (src-tauri/src/services/countdown.rs) so a recording started with no main window - from the
+// shortcut, tray or phone remote while Briefcast sits in the tray - gets the same countdown; this
+// is the main window's client for it. The countdown runs in its own small always-on-top window
+// (components/CountdownOverlay.tsx), because the main window is often behind the app being
+// recorded, and before start_recording, so none of it ends up in the video.
 //
-// This side owns the timing; the window only draws the number it's sent. Cancelling - a click on the
-// countdown, or pressing Record again while it runs - resolves the countdown as cancelled.
+// Cancelling - a click on the countdown, or pressing Record again while it runs - resolves the
+// countdown as cancelled.
 
-import { emit, listen } from "@tauri-apps/api/event";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
-import { PhysicalPosition } from "@tauri-apps/api/dpi";
-
-const LABEL = "countdown-overlay";
-const SIZE = 220;
+import { invoke } from "@tauri-apps/api/core";
 
 export const COUNTDOWN_TICK_EVENT = "recording-countdown-tick";
 export const COUNTDOWN_CANCEL_EVENT = "recording-countdown-cancel";
@@ -25,87 +21,30 @@ export interface CountdownTick {
   total: number;
 }
 
-let cancelRunning: (() => void) | null = null;
+// Synchronous for the Record button's "press again cancels" check. Only this window starts a
+// countdown while it exists (Rust runs one itself only when there is no main window), so a local
+// flag is exact.
+let running = false;
 
-// True while a countdown is on screen - a second Record press should cancel it rather than start a
-// second one.
 export function isCountdownRunning(): boolean {
-  return cancelRunning !== null;
+  return running;
 }
 
 export function cancelCountdown(): void {
-  cancelRunning?.();
-}
-
-async function countdownWindow(): Promise<WebviewWindow> {
-  const existing = await WebviewWindow.getByLabel(LABEL);
-  if (existing) return existing;
-  // Normally built at startup (tauri.conf.json); this covers a build without that entry.
-  const created = new WebviewWindow(LABEL, {
-    url: "/countdown",
-    width: SIZE,
-    height: SIZE,
-    resizable: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    decorations: false,
-    transparent: true,
-    shadow: false,
-    visible: false,
-    focus: false,
-  });
-  await new Promise<void>((resolve, reject) => {
-    void created.once("tauri://created", () => resolve());
-    void created.once("tauri://error", (e) => reject(e));
-  });
-  return created;
+  invoke("cancel_recording_countdown").catch((err) => console.error("Couldn't cancel the countdown:", err));
 }
 
 // Resolves true when the countdown ran to the end (start recording), false when it was cancelled.
+// A countdown that can't run never blocks the recording.
 export async function runRecordingCountdown(seconds: number): Promise<boolean> {
-  if (cancelRunning) return false;
-  const total = Math.max(1, Math.round(seconds));
-
-  let cancelled = false;
-  let wake: (() => void) | null = null;
-  cancelRunning = () => {
-    cancelled = true;
-    wake?.();
-  };
-  const unlistenCancel = await listen(COUNTDOWN_CANCEL_EVENT, () => cancelRunning?.());
-
-  let win: WebviewWindow | null = null;
+  if (running) return false;
+  running = true;
   try {
-    win = await countdownWindow();
-    // Centred on the monitor Briefcast's main window is on - placed by hand because the window
-    // capability allows set-position but not center().
-    const monitor = (await currentMonitor()) ?? (await primaryMonitor());
-    if (monitor) {
-      const side = Math.round(SIZE * monitor.scaleFactor);
-      await win.setPosition(
-        new PhysicalPosition(
-          monitor.position.x + Math.round((monitor.size.width - side) / 2),
-          monitor.position.y + Math.round((monitor.size.height - side) / 2)
-        )
-      );
-    }
-    await win.show();
-    for (let remaining = total; remaining > 0 && !cancelled; remaining--) {
-      await emit(COUNTDOWN_TICK_EVENT, { remaining, total } satisfies CountdownTick);
-      await new Promise<void>((resolve) => {
-        wake = resolve;
-        setTimeout(resolve, 1000);
-      });
-      wake = null;
-    }
+    return await invoke<boolean>("run_recording_countdown", { seconds: Math.max(1, Math.round(seconds)) });
   } catch (err) {
-    // A countdown that can't be shown must never block the recording itself.
     console.error("Recording countdown unavailable:", err);
+    return true;
   } finally {
-    unlistenCancel();
-    cancelRunning = null;
-    await emit(COUNTDOWN_TICK_EVENT, { remaining: 0, total } satisfies CountdownTick).catch(() => {});
-    await win?.hide().catch(() => {});
+    running = false;
   }
-  return !cancelled;
 }

@@ -1738,6 +1738,13 @@ pub fn warm_screen_capture(_ffmpeg_path: &Path) {
     gpu_capture::warm(_ffmpeg_path);
 }
 
+/// Connected devices for a start request built in Rust (services/recording_setup.rs). Blocks on
+/// the first probe of a session - call it off the async runtime.
+pub(crate) fn connected_devices_now(app_handle: &AppHandle) -> crate::services::recording_setup::ConnectedDevices {
+    let (video, audio) = connected_devices_cached(app_handle, recording_in_progress(app_handle));
+    crate::services::recording_setup::ConnectedDevices { audio, video }
+}
+
 pub fn warm_device_cache(app_handle: &AppHandle) {
     let app_handle = app_handle.clone();
     std::thread::spawn(move || {
@@ -1821,8 +1828,25 @@ fn resolve_recording_output_path(form_data: &FormData) -> Result<PathBuf, String
     )
 }
 
+/// Starts a recording, then runs the side effects every recording needs whoever started it - tray
+/// dot, recording-only shortcuts, the recording bar's timer (services/recording_session.rs).
 #[tauri::command]
 pub async fn start_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    form_data: FormData,
+) -> Result<String, String> {
+    let can_switch_view = crate::services::recording_session::can_switch_view(
+        &form_data.record_type,
+        form_data.separate_webcam_capture,
+        &form_data.video_devices,
+    );
+    let message = start_recording_inner(app_handle.clone(), state, form_data).await?;
+    crate::services::recording_session::on_started(&app_handle, can_switch_view);
+    Ok(message)
+}
+
+async fn start_recording_inner(
     app_handle: AppHandle,
     state: State<'_, AppState>,
     form_data: FormData,
@@ -2522,8 +2546,20 @@ pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Resu
     result
 }
 
+/// Stops the recording. The recording-wide side effects are undone as the stop begins - capture
+/// ends within a moment, while assembling the file can take minutes.
 #[tauri::command]
 pub async fn stop_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if recording_in_progress(&app_handle) {
+        crate::services::recording_session::on_stopped(&app_handle);
+    }
+    stop_recording_inner(app_handle, state).await
+}
+
+async fn stop_recording_inner(
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
