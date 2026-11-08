@@ -533,10 +533,12 @@ tests both on every push, and on Linux a real screen + microphone recording has 
 end to end (X11 capture with PulseAudio, Ubuntu 22.04); the macOS code has not yet been run on
 real hardware. On these platforms Briefcast uses the
 ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
-startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet:
-offline captions and what depends on them (editing by transcript, filler-word removal: the
-whisper.cpp engine, `binaries/whisper`, is bundled in the Windows installer only), the "remove
-noise" mode (its RNNoise model, `binaries/rnnoise`, is too), the
+startup if the ffmpeg it finds is too old or missing an encoder. The speech engine (whisper.cpp,
+which does the captions, editing by transcript and filler-word removal) is built per system by
+`scripts/build-whisper-engine.sh` and bundled in those installers, as the RNNoise model for "Remove
+noise" is on every system; the speech model itself (~150 MB) downloads the first time it's used.
+The Linux engine has been run against a real recording; the macOS one is built by the release
+workflow but has not been run on real hardware. Not available there yet: the
 screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
 auto-zoom, the live preview while recording cameras only, USB phone transfer, and email
 through a desktop mail client. Linux screen capture needs X11 (or XWayland); under a pure
@@ -567,10 +569,13 @@ sudo apt install build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev lib
 **macOS**: the Xcode command line tools (`xcode-select --install`), then
 `brew install ffmpeg libheif`.
 
-On macOS and Linux, skip the Windows binaries described below - nothing needs to be placed in
-`src-tauri/binaries/`. Those are bundled through `src-tauri/tauri.windows.conf.json`, which
-Tauri applies on Windows only. (The noise-removal model, `binaries/rnnoise/`, is among them, so
-"Remove noise" uses ffmpeg's built-in denoiser on macOS and Linux for now.)
+On macOS and Linux, skip the Windows binaries described below. Those are bundled through
+`src-tauri/tauri.windows.conf.json`, which Tauri applies on Windows only. The one thing those
+systems do need to build or test captions locally is the speech engine: run
+`scripts/build-whisper-engine.sh src-tauri/binaries/whisper` (CMake and a C++ compiler; it builds
+the same whisper.cpp version the Windows bundle uses), or put a `whisper-cli` on your PATH
+(`brew install whisper-cpp` on macOS) - Briefcast looks in both places. The RNNoise model is
+committed in `src-tauri/models/rnnoise/`, so there is nothing to download for it.
 
 On Windows, Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
 `src-tauri/binaries/ffmpeg/` rather than requiring a system-wide install — but those
@@ -626,10 +631,10 @@ pinned SHA-256) from
 into `%LOCALAPPDATA%\com.withbriefs.briefcast\whisper\`, showing download progress.
 
 The audio cleanup tool's "Remove noise" mode exports through ffmpeg's `arnndn` filter, which
-needs an RNNoise model file: download
-[`bd.rnnn`](https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn)
-(~300KB, from GregorR/rnnoise-models - trained on voice over recording noise) into
-`src-tauri/binaries/rnnoise/`. Without it, export falls back to the spectral `afftdn` filter.
+needs an RNNoise model file. It is [`bd.rnnn`](https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn)
+(~300KB, from GregorR/rnnoise-models - trained on voice over recording noise), committed in
+`src-tauri/models/rnnoise/` and bundled on every system - nothing to download. Without it, export
+would fall back to the spectral `afftdn` filter.
 
 ```bash
 npm run tauri dev
@@ -744,7 +749,7 @@ screencast/
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
 │   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs - captions and Docs voice typing (model downloaded on first use)
-│   ├── binaries/rnnoise/            # bd.rnnn RNNoise model - arnndn for the audio cleanup tool's "Remove noise" export
+│   ├── models/rnnoise/              # bd.rnnn RNNoise model - arnndn for the audio cleanup tool's "Remove noise" export (every system)
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```

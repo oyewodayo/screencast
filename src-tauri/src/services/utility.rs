@@ -196,30 +196,98 @@ pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, Stri
     Ok(thumbnailer_path)
 }
 
-// Bundled whisper.cpp CLI (binaries/whisper/) - offline speech-to-text for VideoPlayer's
-// "Generate captions from audio" action, used only when no sibling .vtt/.srt already exists for
-// the video. A plain CLI binary rather than a Rust binding (whisper-rs) deliberately - that would
-// need a C++ toolchain to even build this project, where a bundled binary needs none, exactly the
-// same tradeoff already made for ffmpeg/heif-dec above. Windows-only for now, mirroring
-// get_heif_decoder_path's own shape rather than its cross-platform support.
-pub fn get_whisper_cli_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let resource_path = "binaries/whisper/whisper-cli.exe";
+// The speech engine's file name inside binaries/whisper/.
+#[cfg(windows)]
+const WHISPER_CLI: &str = "whisper-cli.exe";
+#[cfg(not(windows))]
+const WHISPER_CLI: &str = "whisper-cli";
 
-    app_handle
-        .path()
-        .resolve(resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve whisper-cli at {}: {}", resource_path, e))
+// The speech engine: whisper.cpp's CLI, offline speech-to-text for captions, editing by transcript
+// and filler-word removal. A plain CLI binary rather than a Rust binding (whisper-rs) deliberately -
+// that would need a C++ toolchain to even build this project, where a bundled binary needs none,
+// exactly the same tradeoff already made for ffmpeg/heif-dec above.
+//
+// Every installer bundles one in binaries/whisper/: Windows the official release's build, macOS and
+// Linux the one scripts/build-whisper-engine.sh makes (the release workflow runs it). On macOS and
+// Linux a copy on the PATH is the fallback - `whisper-cli` (what whisper.cpp builds and Homebrew's
+// `whisper-cpp` installs) - for a build from source that has no bundled one.
+pub fn get_whisper_cli_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let bundled = app_handle.path().resolve(format!("binaries/whisper/{WHISPER_CLI}"), BaseDirectory::Resource).ok();
+    resolve_whisper_cli(bundled, find_on_path).ok_or_else(|| {
+        if cfg!(windows) {
+            "The speech engine (whisper-cli) is missing from this installation - reinstalling Briefcast puts it back.".to_string()
+        } else if cfg!(target_os = "macos") {
+            "The speech engine (whisper-cli) wasn't found. Install it with `brew install whisper-cpp` and try again.".to_string()
+        } else {
+            "The speech engine (whisper-cli) wasn't found. Install whisper.cpp and make sure `whisper-cli` is on your PATH.".to_string()
+        }
+    })
+}
+
+// The bundled engine when it is there, else (off Windows) one on the PATH.
+fn resolve_whisper_cli(bundled: Option<PathBuf>, on_path: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = bundled.filter(|p| p.is_file()) {
+        return Some(path);
+    }
+    #[cfg(not(windows))]
+    for name in ["whisper-cli", "whisper-cpp"] {
+        if let Some(path) = on_path(name) {
+            return Some(path);
+        }
+    }
+    #[cfg(windows)]
+    let _ = on_path;
+    None
 }
 
 // RNNoise model for arnndn ("remove noise" mode) - GregorR/rnnoise-models' beguiling-drafter,
-// trained on voice over recording-type noise.
+// trained on voice over recording-type noise. It is a plain data file, the same on every system:
+// models/rnnoise/ is committed (about 1 MB) and every installer bundles it. The second place is
+// where Windows installs and checkouts kept it before that.
 pub fn get_rnnoise_model_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
-    let resource_path = "binaries/rnnoise/bd.rnnn";
+    for resource_path in ["models/rnnoise/bd.rnnn", "binaries/rnnoise/bd.rnnn"] {
+        if let Ok(path) = app_handle.path().resolve(resource_path, BaseDirectory::Resource) {
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err("The RNNoise model (bd.rnnn) wasn't found in this installation.".to_string())
+}
 
-    app_handle
-        .path()
-        .resolve(resource_path, BaseDirectory::Resource)
-        .map_err(|e| format!("Failed to resolve RNNoise model at {}: {}", resource_path, e))
+#[cfg(test)]
+mod speech_engine_tests {
+    use super::*;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("briefcast_speech_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, b"").unwrap();
+        path
+    }
+
+    #[test]
+    fn the_bundled_engine_wins_over_one_on_the_path() {
+        let bundled = temp_file("bundled-whisper-cli");
+        let other = PathBuf::from("/usr/local/bin/whisper-cli");
+        assert_eq!(resolve_whisper_cli(Some(bundled.clone()), |_| Some(other.clone())), Some(bundled));
+    }
+
+    // Off Windows a copy on the PATH stands in for a missing bundled one - under either name.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_missing_bundled_engine_falls_back_to_the_path() {
+        let gone = Some(PathBuf::from("/definitely/not/here/whisper-cli"));
+        assert_eq!(resolve_whisper_cli(gone.clone(), |n| (n == "whisper-cli").then(|| PathBuf::from("/opt/homebrew/bin/whisper-cli"))), Some(PathBuf::from("/opt/homebrew/bin/whisper-cli")));
+        assert_eq!(resolve_whisper_cli(gone, |n| (n == "whisper-cpp").then(|| PathBuf::from("/usr/bin/whisper-cpp"))), Some(PathBuf::from("/usr/bin/whisper-cpp")));
+    }
+
+    #[test]
+    fn nothing_found_is_none_not_a_path_that_does_not_exist() {
+        assert_eq!(resolve_whisper_cli(Some(PathBuf::from("/definitely/not/here/whisper-cli")), |_| None), None);
+        assert_eq!(resolve_whisper_cli(None, |_| None), None);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
