@@ -153,6 +153,7 @@ const NOT_INSTALLED: &str = "SEPARATION_ENGINE_MISSING";
 // services/asset_download.rs.
 
 // Converted htdemucs 4-stem weights from demucs.cpp's author (Hugging Face "Retrobear/demucs.cpp").
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const MODEL_ASSET: DownloadAsset = DownloadAsset {
     file_name: DEMUCS_CPP_MODEL,
     url: "https://huggingface.co/datasets/Retrobear/demucs.cpp/resolve/main/ggml-model-htdemucs-4s-f16.bin",

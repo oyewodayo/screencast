@@ -144,7 +144,6 @@ pub(crate) mod services {
     // the frontend as a `recording-progress` event - see the module's own doc comment for why
     // this exists (win.rs deliberately nulls ffmpeg's stdout/stderr, so there was previously no
     // live signal at all). Windows-only for now, same reasoning as process_job above.
-    #[cfg(target_os = "windows")]
     pub mod progress_watch;
     // Detects a real, working hardware H.264 encoder via a trial encode, so recordings can
     // offload from the CPU instead of always using software libx264 - see the module's own doc

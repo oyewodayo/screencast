@@ -416,6 +416,8 @@ fn serve_frames(s: &Shared, listener: TcpListener, frame_bytes: usize) {
 
 // ffmpeg input arguments reading the feed - in place of the camera's own dshow input. Its frames
 // are stamped as they arrive, so the bubble stays in step with the screen and the mic.
+// The live camera background is Windows-only so far (it feeds a dshow input).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn feed_input_args(port: u16, w: u32, h: u32) -> Vec<String> {
     [
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-video_size", &format!("{w}x{h}"), "-framerate", &format!("{FEED_FPS}"),

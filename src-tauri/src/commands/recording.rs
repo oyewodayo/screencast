@@ -171,7 +171,10 @@ pub struct ViewSwitchEvent {
     pub mode: String,
 }
 
+// Some fields drive features only Windows has so far (click/pointer/key tracking, the window
+// title bar, ...) and are read only there.
 #[derive(serde::Deserialize, Debug)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct FormData {
     file_name: String,
     file_ext: String,
@@ -281,6 +284,7 @@ impl AppState {
     ///
     /// Cloning the Arc rather than lending a reference matters: the thread outlives this call and
     /// runs until ffmpeg closes its stdout.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn preview_frame_handle(&self) -> crate::services::preview_stream::PreviewFrame {
         self.preview_frame.clone()
     }
@@ -312,6 +316,8 @@ impl FormData {
 // (and, for windows, window_title) so every capture mode — take_screenshot and every
 // screen-capturing recording_with_output_* — interprets it the same way instead of each
 // reimplementing (or, as before this existed, half-implementing) its own parsing of it.
+// `hwnd` and `title_bar` are read by the Windows capture only (macOS and Linux match by title).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) enum CaptureTarget {
     FullScreen,
     Monitor {
@@ -462,6 +468,7 @@ fn bubble_sidecar_path(video_path: &Path) -> PathBuf {
     video_path.with_file_name(format!("{}.bubble.json", stem))
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn write_bubble_sidecar(video_path: &Path, form_data: &FormData, camera_count: usize) {
     let json = serde_json::json!({
         "shape": form_data.overlay_shape,
@@ -712,10 +719,7 @@ pub async fn save_phone_camera_capture(
     // duration in its header at all (it was written as a live stream). Both are re-encoded away
     // here into a plain CFR mp4, which is what the editor's seeking assumes. Hardware encoding
     // when the machine has it, for the same reason the main recording path uses it.
-    #[cfg(target_os = "windows")]
     let hw = crate::services::hw_encoder::detect(&ffmpeg_path);
-    #[cfg(not(target_os = "windows"))]
-    let hw: Option<()> = None;
 
     // Quality here is deliberately higher than the main recording's.
     //
@@ -729,7 +733,6 @@ pub async fn save_phone_camera_capture(
     // a container start_time, which the editor's PiP layer assumes is zero. Not worth trading
     // correct A/V alignment for, so the re-encode stays and simply pays for quality instead.)
     match hw {
-        #[cfg(target_os = "windows")]
         Some(encoder) => {
             args.push("-c:v".into());
             args.push(encoder.name().to_string());
@@ -1128,6 +1131,21 @@ pub(crate) fn resolved_max_width(form_data: &FormData) -> i32 {
         .resolution_width
         .map(|w| w.max(MIN_RESOLUTION_WIDTH))
         .unwrap_or(MAX_RECORDING_WIDTH)
+}
+
+// Capture framerate on the macOS and Linux backends: the user's setting, clamped to 1-60 like the
+// Windows one, else the mode's own default.
+#[allow(dead_code)] // the Windows backend resolves its framerate inside ScreenSource instead
+pub(crate) fn resolved_framerate(form_data: &FormData, default_fps: i32) -> i32 {
+    form_data.framerate.unwrap_or(default_fps).clamp(1, 60)
+}
+
+// `-vf` value that scales a screen capture down to the resolved max width, keeping its aspect
+// ratio and never enlarging. Width is forced even (and height follows with -2): H.264 in yuv420p
+// cannot encode an odd dimension, and a desktop or window can be any size.
+#[allow(dead_code)] // the Windows backend scales inside its own filter graph
+pub(crate) fn desktop_scale_filter(form_data: &FormData) -> String {
+    format!("scale='trunc(min({},iw)/2)*2':-2", resolved_max_width(form_data))
 }
 
 // libx264 defaults to a ~250-frame GOP when -g is unset, which at these recording framerates
@@ -1592,6 +1610,9 @@ pub(crate) fn hide_console_window(cmd: &mut Command) {
     cmd.creation_flags(0x08000000);
 }
 
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn hide_console_window(_cmd: &mut Command) {}
+
 // Runs ffmpeg with a hidden console window on Windows, stdin piped (every recording mode needs
 // this open for the graceful 'q'-to-stop in stop_recording), stdout/stderr discarded — the right
 // default for the long-running recording modes below, none of which read their own output.
@@ -1651,6 +1672,7 @@ pub(crate) fn sync_live_inputs(args: Vec<String>) -> Vec<String> {
 // compiled for — e.g. entirely unused in a Windows build, since win.rs doesn't call it.)
 #[allow(dead_code)]
 pub(crate) async fn spawn_recording(
+    app_handle: &AppHandle,
     state: &State<'_, AppState>,
     output_path: &PathBuf,
     ffmpeg_path: &PathBuf,
@@ -1661,7 +1683,14 @@ pub(crate) async fn spawn_recording(
         *app_state = Some(output_path.clone());
     }
 
-    let args = sync_live_inputs(args);
+    // ffmpeg writes its own `-progress` stats to a file (no pipe to drain, so no deadlock risk):
+    // start_recording waits on it to know capture has really started, and progress_watch forwards
+    // it to the recording bar as live fps / dropped frames - the same as on Windows. Without it
+    // every start here waited out the full capture-start timeout.
+    let progress_sidecar = crate::services::progress_watch::progress_sidecar_path(output_path);
+    let mut with_progress = vec!["-progress".to_string(), path_to_str(&progress_sidecar)?.to_string()];
+    with_progress.extend(args);
+    let args = sync_live_inputs(with_progress);
     log::debug!("FFmpeg args: {:?}", args);
 
     let mut cmd = silent_command(ffmpeg_path);
@@ -1672,10 +1701,12 @@ pub(crate) async fn spawn_recording(
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     crate::services::orphan_guard::after_spawn(&child);
 
+    let pid = child.id();
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    crate::services::progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -2065,9 +2096,14 @@ async fn start_recording_inner(
     // gdigrab, with GPU capture switched off for the session - a driver that won't cooperate
     // costs the user a second's delay, not a failed recording.
     let progress_path = crate::services::progress_watch::progress_sidecar_path(&output_path);
+    // Counts GPU-capture start attempts: only Windows has a second path to fall back to.
+    #[cfg(target_os = "windows")]
     let mut attempts = 0;
     let (output, early_exit_status) = loop {
-        attempts += 1;
+        #[cfg(target_os = "windows")]
+        {
+            attempts += 1;
+        }
         #[cfg(target_os = "windows")]
         gpu_capture::note_start(None);
         // A previous attempt's progress file would read as this one having started already.
@@ -3087,6 +3123,46 @@ async fn create_or_replace_rec_completed_modal(
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn form(resolution_width: Option<i32>, framerate: Option<i32>) -> FormData {
+        let mut f: serde_json::Value = serde_json::json!({
+            "file_name": "t", "file_ext": "mp4", "record_type": "s", "audio_device": "",
+            "screen_size": "fullscreen", "overlay_shape": "rounded",
+            "overlay_position": "bottom_right", "overlay_size": "small",
+        });
+        f["resolution_width"] = serde_json::json!(resolution_width);
+        f["framerate"] = serde_json::json!(framerate);
+        serde_json::from_value(f).unwrap()
+    }
+
+    #[test]
+    fn untouched_settings_keep_the_old_defaults() {
+        assert_eq!(resolved_framerate(&form(None, None), 30), 30);
+        assert_eq!(resolved_max_width(&form(None, None)), MAX_RECORDING_WIDTH);
+    }
+
+    #[test]
+    fn framerate_follows_the_setting_within_sane_bounds() {
+        assert_eq!(resolved_framerate(&form(None, Some(24)), 30), 24);
+        assert_eq!(resolved_framerate(&form(None, Some(60)), 30), 60);
+        assert_eq!(resolved_framerate(&form(None, Some(240)), 30), 60);
+        assert_eq!(resolved_framerate(&form(None, Some(0)), 30), 1);
+    }
+
+    #[test]
+    fn scale_filter_caps_width_keeps_it_even_and_never_enlarges() {
+        assert_eq!(desktop_scale_filter(&form(None, None)), "scale='trunc(min(1920,iw)/2)*2':-2");
+        assert_eq!(desktop_scale_filter(&form(Some(1280), None)), "scale='trunc(min(1280,iw)/2)*2':-2");
+        // "Native" is a very large number, which min() turns into a no-op.
+        assert_eq!(desktop_scale_filter(&form(Some(7680), None)), "scale='trunc(min(7680,iw)/2)*2':-2");
+        // Below the floor it is raised rather than trusted.
+        assert_eq!(desktop_scale_filter(&form(Some(100), None)), "scale='trunc(min(640,iw)/2)*2':-2");
+    }
 }
 
 #[cfg(test)]

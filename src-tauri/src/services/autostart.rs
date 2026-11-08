@@ -17,6 +17,7 @@ use std::path::Path;
 pub const LAUNCH_ARG: &str = crate::services::main_window::TRAY_LAUNCH_ARG;
 
 /// `"C:\path\Briefcast.exe" --tray` - quoted, since install paths contain spaces.
+#[cfg(any(target_os = "windows", test))]
 pub fn command_line(exe: &Path) -> String {
     format!("\"{}\" {}", exe.display(), LAUNCH_ARG)
 }

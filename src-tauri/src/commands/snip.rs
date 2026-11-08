@@ -54,7 +54,9 @@ pub struct SnipInfo {
     pub app_windows: Vec<SnipWindow>,
 }
 
+// The screenshot picker is Windows-only so far (snip_begin answers "unsupported" elsewhere).
 #[derive(Deserialize, Debug)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct SnipSelection {
     pub x: i32,
     pub y: i32,
@@ -423,6 +425,7 @@ pub fn snip_frame(include_app: Option<bool>) -> tauri::ipc::Response {
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn screenshot_path(file_name: &str, ext: &str) -> Result<std::path::PathBuf, String> {
     let dir = crate::services::utility::briefcast_dir()?.join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create the screenshots folder: {}", e))?;

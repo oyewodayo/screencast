@@ -19,8 +19,8 @@ use std::process::Command;
 use tauri::{AppHandle, State};
 
 use super::{
-    build_camera_overlay_filter_complex, codec_args_for_ext_hw, extract_ffmpeg_error,
-    map_overlay_size, spawn_recording, AppState, FormData, MAX_RECORDING_WIDTH,
+    audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext_hw, extract_ffmpeg_error,
+    map_overlay_size, resolved_framerate, resolved_max_width, spawn_recording, AppState, FormData,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
@@ -161,7 +161,7 @@ fn add_camera_overlay_args(
         &form_data.overlay_position,
         &form_data.overlay_size,
         form_data.video_devices.len(),
-        MAX_RECORDING_WIDTH,
+        resolved_max_width(form_data),
         crop.map(|(x, y, w, h)| (w, h, x, y)),
     );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
@@ -206,6 +206,7 @@ fn screen_capture_args(
     crop: Option<(i32, i32, i32, i32)>,
     mic_index: Option<u32>,
     system_audio_index: Option<u32>,
+    form_data: &FormData,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-f".to_string(),
@@ -213,7 +214,7 @@ fn screen_capture_args(
         "-capture_cursor".to_string(),
         "1".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        resolved_framerate(form_data, 30).to_string(),
         "-i".to_string(),
         av_input_spec(
             Some(screen_index),
@@ -389,7 +390,7 @@ pub async fn recording_with_output_sva(
             "-capture_cursor".to_string(),
             "1".to_string(),
             "-framerate".to_string(),
-            "30".to_string(),
+            resolved_framerate(form_data, 30).to_string(),
             "-i".to_string(),
             av_input_spec(Some(screen_index), None),
         ];
@@ -409,13 +410,13 @@ pub async fn recording_with_output_sva(
         }
         args
     } else {
-        screen_capture_args(screen_index, crop, audio_index, system_audio_index)
+        screen_capture_args(screen_index, crop, audio_index, system_audio_index, form_data)
     };
 
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Screen and audio
@@ -441,13 +442,16 @@ pub async fn recording_with_output_sa(
         None
     };
 
-    let mut args = screen_capture_args(screen_index, crop, audio_index, system_audio_index);
+    let mut args = screen_capture_args(screen_index, crop, audio_index, system_audio_index, form_data);
+    // The container's codec table, as the other screen mode (sva) and Windows already apply: a
+    // fragmented mp4 so a force-killed recording stays playable, and a pixel format players decode.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ]);
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Video (camera) only
@@ -480,7 +484,7 @@ pub async fn recording_with_output_v(
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Audio only
@@ -495,16 +499,17 @@ pub async fn recording_with_output_a(
     let audio_index = find_index(&audio_devices, &form_data.audio_device)
         .ok_or_else(|| format!("Audio device '{}' not found", form_data.audio_device))?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "avfoundation".to_string(),
         "-i".to_string(),
         av_input_spec(None, Some(audio_index)),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Explicit audio codec and bitrate for the chosen container, as Windows does.
+    args.extend(audio_codec_args_for_ext(&form_data.file_ext));
+    args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Video (camera) and audio
@@ -537,7 +542,7 @@ pub async fn recording_with_output_va(
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Screen only
@@ -564,13 +569,14 @@ pub async fn recording_with_output_s(
         None
     };
 
-    let mut args = screen_capture_args(screen_index, crop, None, system_audio_index);
+    let mut args = screen_capture_args(screen_index, crop, None, system_audio_index, form_data);
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ]);
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 // A real instant screenshot: `-frames:v 1` tells ffmpeg to grab exactly one frame and exit on

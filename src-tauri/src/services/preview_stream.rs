@@ -13,6 +13,11 @@
 // asks for that buffer. Nothing touches the disk, nothing can tear, nothing is left behind, and a
 // frame is available the instant ffmpeg emits it.
 
+// The camera-only live preview is built on Windows' recording filter graph (win.rs's
+// camera_only_filter_complex); macOS and Linux don't produce the MJPEG stream yet, so nothing there
+// calls `pump`. Kept compiled everywhere so the frame splitter's unit tests run on every platform.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 

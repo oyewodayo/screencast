@@ -44,7 +44,12 @@
 // (utility.rs) for why mixing in Tauri's JS-side window geometry gave wrong positions at 250%.
 use serde::{Deserialize, Serialize};
 
+// Pure pixel / text logic with its own unit tests: compiled for the tests everywhere, used by the
+// Windows implementation only (OCR and the composition windows are Windows' own).
+#[cfg(any(target_os = "windows", test))]
 pub mod layout;
+// TextRules (below) is part of the configure command's input on every platform, so this compiles
+// everywhere; the detection itself is only driven by Windows' OCR.
 pub mod sensitive;
 #[cfg(target_os = "windows")]
 mod ocr;
@@ -92,6 +97,7 @@ pub struct WhatsAppParts {
 // a missing field keeps its current value.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct BlurConfig {
     // 0..100: 0 is the host backdrop's own blur (already unreadable); up from there adds Gaussian
     // blur and frost.
@@ -105,6 +111,7 @@ pub struct BlurConfig {
 // What a drag is doing - the corner is the one under the pointer (the opposite one stays put).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "mode")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub enum GestureMode {
     New,
     Move,
@@ -120,6 +127,7 @@ pub enum Corner {
     Se,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub const CHANGED_EVENT: &str = "screen-blur-changed";
 
 #[cfg(target_os = "windows")]

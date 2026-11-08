@@ -120,6 +120,7 @@ pub fn get_ffprobe_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
 // get_ffmpeg_path's shape rather than its cross-platform support - there's no macOS/Linux binary
 // bundled because that fallback path is never reached on those platforms in the first place (see
 // main.rs's cfg-gating of the heic_windows/heif_tool modules).
+#[cfg(target_os = "windows")]
 pub fn get_heif_decoder_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let resource_path = "binaries/heif/heif-dec.exe";
 
@@ -144,6 +145,7 @@ pub fn get_heif_decoder_path(app_handle: &AppHandle) -> Result<PathBuf, String> 
 // swapping the file name sidesteps that entirely, and is arguably more correct anyway: the two
 // tools are always co-located by construction (README's bundling instructions), so "wherever
 // heif-dec.exe actually resolved to" is a more reliable source of truth than a second lookup.
+#[cfg(target_os = "windows")]
 pub fn get_heif_thumbnailer_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let decoder_path = get_heif_decoder_path(app_handle)?;
     let thumbnailer_path = decoder_path.with_file_name("heif-thumbnailer.exe");

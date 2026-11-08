@@ -498,6 +498,7 @@ fn record(hub: &Arc<Hub>, app: &AppHandle, entry: HistoryEntry) {
 
 // For transfers that don't go through this server (usb_phone.rs) but belong in the same record.
 // A USB cable is a direct physical link, so those count as secure.
+#[cfg(target_os = "windows")]
 pub(crate) fn record_local(app: &AppHandle, kind: &str, device: &str, name: &str, size: u64) {
     let state = app.state::<PhoneTransferState>();
     let hub = state.hub.clone();

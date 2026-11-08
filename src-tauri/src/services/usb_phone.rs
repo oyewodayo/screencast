@@ -15,13 +15,19 @@
 // them and runs jobs one at a time; when idle it polls for phones every couple of seconds. Commands
 // only post jobs and listen for events, so nothing here can block the UI or the async runtime.
 
+// Everything below the commands is the Windows worker (WPD). The types and helpers still compile
+// everywhere so the commands can register on every platform; off Windows nothing constructs them.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
+#[cfg(target_os = "windows")]
+use tauri::Emitter;
 
 #[derive(Clone, Serialize, PartialEq)]
 pub struct UsbPhone {
