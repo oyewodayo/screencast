@@ -112,7 +112,14 @@ mod platform {
                 .get_image(ImageFormat::Z_PIXMAP, root, gx as i16, gy as i16, gw as u16, gh as u16, !0)
                 .map_err(|e| format!("Screen read failed: {e}"))?
                 .reply()
-                .map_err(|e| format!("Screen read failed: {e}"))?;
+                .map_err(|e| match e {
+                    // XWayland (a Wayland desktop's X11 layer) has no readable root window: the standard
+                    // screenshot tools get the same error. Say what that means, not the protocol's words.
+                    x11rb::errors::ReplyError::X11Error(ref x) if x.error_kind == x11rb::protocol::ErrorKind::Match => {
+                        "Picking a colour from the screen isn't possible here: this display doesn't let a program read the screen (it looks like a Wayland desktop) - sign in with an X11 session to use it".to_string()
+                    }
+                    other => format!("Screen read failed: {other}"),
+                })?;
             let bpp = conn.setup().pixmap_formats.iter().find(|f| f.depth == image.depth).map(|f| f.bits_per_pixel).unwrap_or(0);
             if bpp != 32 && bpp != 24 {
                 return Err(format!("Screen read failed: this display uses {bpp} bits per pixel"));
