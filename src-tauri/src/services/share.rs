@@ -421,6 +421,30 @@ end run"#;
     mod tests {
         use super::*;
 
+        // Needs a display and xclip: what is put on the clipboard is what another program reads - the
+        // text, and a file as a URI list a file manager or chat app accepts. Run with
+        // `cargo test --lib the_clipboard_ -- --ignored`.
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore]
+        fn the_clipboard_holds_text_and_files_for_other_programs() {
+            let read = |target: &str| {
+                let out = Command::new("xclip").args(["-o", "-selection", "clipboard", "-t", target]).output().unwrap();
+                String::from_utf8_lossy(&out.stdout).to_string()
+            };
+            set_clipboard_text("Briefcast beam").unwrap();
+            assert_eq!(read("UTF8_STRING").trim(), "Briefcast beam");
+            assert_eq!(clipboard_text().as_deref(), Some("Briefcast beam"));
+
+            let file = std::env::temp_dir().join(format!("briefcast clip test {}.txt", std::process::id()));
+            std::fs::write(&file, b"x").unwrap();
+            copy_file(&file).unwrap();
+            let uris = read("text/uri-list");
+            assert!(uris.contains("file://") && uris.contains("briefcast%20clip%20test"), "got {uris:?}");
+            assert_eq!(clipboard_files(), vec![file.to_string_lossy().to_string()]);
+            let _ = std::fs::remove_file(&file);
+        }
+
         #[test]
         fn a_desktop_file_becomes_a_name() {
             assert_eq!(friendly_name("org.mozilla.Thunderbird.desktop"), "Thunderbird");
