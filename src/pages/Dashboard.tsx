@@ -86,6 +86,8 @@ import { useStableCallbacks } from "../hooks/useStableCallbacks";
 import { FileEntry, GALLERY_CATEGORIES, SidebarTab, TrashEntry } from "../utils/libraryEntries";
 import { setEditorIntent, type EditorIntent } from "../utils/editorIntent";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
+import ProjectPrepOverlay from "../components/video/ProjectPrepOverlay";
+import { endPrep, getPrep, setWarm, startPrep, updatePrep } from "../utils/projectPrep";
 import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
 import PhonePreviewLayer from "../components/video/PhonePreviewLayer";
 import SplitArrangeBar from "../components/video/SplitArrangeBar";
@@ -1656,26 +1658,38 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
       .finally(settled);
   };
-  // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
-  // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
-  // already prepared is a cached promise - only newly added images do any work.
+  // Prepares every image clip's preview proxy, so playback crossing into a photo never stalls on its
+  // first encode and transitions have the pictures they need. Two at a time - measured fastest with
+  // full-size phone photos (2-3 at once; more only slow each other down) - which leaves the backend's
+  // third slot (get_image_clip_proxy) for the photo actually under the playhead. Re-runs on every
+  // edit, but anything already prepared is a cached promise - only newly added photos do any work.
+  // Reports how far it is (utils/projectPrep.ts), which the "Making your video" screen waits on.
+  // The canvas is a dependency: its size and Blur background decide which proxy each photo needs.
   useEffect(() => {
     const primaryPath = selectedFile?.sourcePath;
     if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
     const imagePaths = Array.from(new Set(editStore.playbackClips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    const total = imagePaths.length;
     let cancelled = false;
-    (async () => {
-      for (const imagePath of imagePaths) {
+    let done = 0;
+    setWarm({ primaryPath, done, total });
+    const queue = [...imagePaths];
+    const worker = async () => {
+      for (let imagePath = queue.shift(); imagePath; imagePath = queue.shift()) {
         if (cancelled) return;
         // eslint-disable-next-line no-await-in-loop
         await resolveImageClipProxyUrl(imagePath, primaryPath).catch((error) => console.error("Failed to prepare image clip preview", imagePath, error));
+        if (cancelled) return;
+        done += 1;
+        setWarm({ primaryPath, done, total });
       }
-    })();
+    };
+    void Promise.all([worker(), worker()]);
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl]);
+  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl, canvasBlur, editStore.canvas?.width, editStore.canvas?.height]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -3239,23 +3253,70 @@ const setScreen = () => {
 	// seeded with one clip per picked image (or none, for a blank timeline), opened straight into
 	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
 	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
+	// The "Making your video" screen (ProjectPrepOverlay) - its progress lives in utils/projectPrep.ts,
+	// so only whether it's up is Dashboard state. While it's up the dialog is hidden but kept, so a
+	// failure brings it back with every choice in place.
+	const [isMakingVideo, setIsMakingVideo] = useState(false);
+	const [isNewVideoDialogHidden, setIsNewVideoDialogHidden] = useState(false);
 	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
-		const state = request.state ?? createProjectState(request.imagePaths, request.options);
-		const projectPath = await invoke<string>("create_video_project", {
-			name: request.name,
-			width: request.frame.width,
-			height: request.frame.height,
-			editStateJson: JSON.stringify(state),
-		});
-		setIsNewVideoProjectOpen(false);
-		// The library re-listing waits until the editor is up - run alongside, its re-render of the
-		// whole library competed with opening the project and made Create feel slow.
+		const runId = crypto.randomUUID();
+		const started = performance.now();
+		// Each step's time goes to app.log, so a slow machine's report says where the time went.
+		const logStep = (label: string) =>
+			void invoke("report_frontend_event", { message: `create video: ${label} at ${Math.round(performance.now() - started)}ms` }).catch(() => {});
+		// The screen opens now - before anything slow - and the dialog steps aside.
+		startPrep({ id: runId, name: request.name, thumbs: request.thumbs ?? [] });
+		setIsMakingVideo(true);
+		setIsNewVideoDialogHidden(true);
+		let projectPath: string;
+		let state;
 		try {
+			state = request.prepare
+				? ((await request.prepare((step, done = 0, total = 0) => updatePrep(runId, { step, done, total }))) ?? createProjectState(request.imagePaths, request.options))
+				: createProjectState(request.imagePaths, request.options);
+			logStep("project built");
+			updatePrep(runId, { step: "Saving the project…", done: 0, total: 0 });
+			projectPath = await invoke<string>("create_video_project", {
+				name: request.name,
+				width: request.frame.width,
+				height: request.frame.height,
+				editStateJson: JSON.stringify(state),
+			});
+		} catch (error) {
+			// Back to the dialog, everything still chosen, with the reason shown there.
+			endPrep(runId);
+			setIsMakingVideo(false);
+			setIsNewVideoDialogHidden(false);
+			throw error;
+		}
+		setIsNewVideoProjectOpen(false);
+		setIsNewVideoDialogHidden(false);
+		// What "ready" waits for: every distinct photo on the new timeline prepared to play (the
+		// preparation effect below reports that for whatever timeline is open).
+		const expectedPhotos = new Set(state.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)).size;
+		updatePrep(runId, { step: "Opening the editor…", primaryPath: projectPath, expectedPhotos });
+		try {
+			// Opens underneath the screen, which stays until the photos are ready (or "Start editing now").
 			await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+			logStep("editor open");
+		} catch (error) {
+			endPrep(runId);
+			setIsMakingVideo(false);
+			setError(`The video was made, but couldn't be opened: ${error instanceof Error ? error.message : error}`);
 		} finally {
+			// The library re-listing waits until the editor is up - its re-render of the whole library
+			// competed with opening the project and made Create feel slow.
 			void handleDirectoryFiles();
 		}
 	};
+	const handleMakingVideoFinished = useCallback(() => {
+		const run = getPrep();
+		if (run) {
+			void invoke("report_frontend_event", { message: `create video: screen closed (photos ${run.expectedPhotos})` }).catch(() => {});
+			endPrep(run.id);
+		}
+		setIsMakingVideo(false);
+	}, []);
 	// Back to where the user was after a reload (sleep/wake, a recovered WebView, Ctrl+R) rather
 	// than the home screen - see sessionRestore.ts. Restored once on mount; saving only starts
 	// after that attempt, so the empty first render can't overwrite what's about to be restored.
@@ -5133,8 +5194,10 @@ const setScreen = () => {
               resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
               onCreate={handleCreateVideoProject}
               onClose={() => setIsNewVideoProjectOpen(false)}
+              hidden={isNewVideoDialogHidden}
             />
           )}
+          {isMakingVideo && <ProjectPrepOverlay onFinished={handleMakingVideoFinished} />}
           {videoEditorScreen?.mode === "home" ? (
             <VideoEditorHome
               videos={libraryVideoFiles}

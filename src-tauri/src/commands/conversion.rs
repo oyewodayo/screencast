@@ -953,14 +953,40 @@ pub async fn get_image_clip_proxy(
     }
     let source = still_image_source(&app_handle, &window, &state, &image_path).await?;
     let ffmpeg_path = get_ffmpeg_path(&app_handle)?;
-    let args: Vec<String> = vec![
-        "-loop".into(), "1".into(),
-        // One frame every 10s: every frame is the same picture, and encode time scales with frame
-        // count (measured: 600 frames took ~15s at 1080p, 60 frames ~2.4s, for the same file).
-        "-framerate".into(), "0.1".into(),
+    let args = image_clip_proxy_args(source, w, h, blur);
+    // Each encode holds a decoded full-size photo (a 64-megapixel phone photo is ~190 MB) and
+    // several threads; past a few at once they only slow each other down (measured with 8 phone
+    // photos: 2-3 at once 2.7-2.9s, 4 at once 3.4s, 6 at once 17s).
+    let _permit = IMAGE_PROXY_ENCODES.acquire().await.map_err(|e| e.to_string())?;
+    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+}
+
+// Concurrent image-proxy encodes. The editor's background preparation keeps two going, which
+// leaves one for the photo actually under the playhead.
+static IMAGE_PROXY_ENCODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+
+// One frame every 10s: every frame is the same picture, and encode time scales with frame count.
+const IMAGE_CLIP_PROXY_FRAME_SECONDS: u32 = 10;
+
+// The proxy's ffmpeg arguments. The photo is decoded and fitted ONCE, then that one frame is
+// repeated (the `loop` filter) and spaced out (setpts) - not looped as an input (`-loop 1`), which
+// decodes and scales the whole photo again for every output frame. With phone photos that was the
+// entire cost: a 64-megapixel JPEG took 26-32s per proxy that way and ~0.8s this way, for a
+// bit-identical file (same size, frame count, duration and picture - checked with ffprobe and PSNR).
+fn image_clip_proxy_args(source: String, w: u32, h: u32, blur: bool) -> Vec<String> {
+    let frames = IMAGE_CLIP_PROXY_SECONDS / IMAGE_CLIP_PROXY_FRAME_SECONDS;
+    let fit = if blur { frame_fit_blur_chain(w as i64, h as i64, true, "p") } else { frame_fit_chain(w as i64, h as i64, true) };
+    let filter = format!(
+        "{},loop=loop={}:size=1:start=0,setpts=N*{}/TB",
+        &fit[1..],
+        frames - 1,
+        IMAGE_CLIP_PROXY_FRAME_SECONDS
+    );
+    vec![
         "-i".into(), source,
+        "-vf".into(), filter,
+        "-r".into(), format!("1/{}", IMAGE_CLIP_PROXY_FRAME_SECONDS),
         "-t".into(), IMAGE_CLIP_PROXY_SECONDS.to_string(),
-        "-vf".into(), if blur { frame_fit_blur_chain(w as i64, h as i64, true, "p")[1..].to_string() } else { frame_fit_chain(w as i64, h as i64, true)[1..].to_string() },
         "-c:v".into(), "libx264".into(),
         "-preset".into(), "ultrafast".into(),
         "-tune".into(), "stillimage".into(),
@@ -969,8 +995,7 @@ pub async fn get_image_clip_proxy(
         "-g".into(), "60".into(),
         "-an".into(),
         "-movflags".into(), "+faststart".into(),
-    ];
-    encode_preview_proxy(ffmpeg_path, args, cache_path).await
+    ]
 }
 
 // The "primary file" a video project plays while no clip is under the playhead (an empty
@@ -983,6 +1008,8 @@ pub async fn get_image_clip_proxy(
 // the picture ever jumping back to the start (a seek the timeline's clock would stall on). Made
 // in a moment however long: one hour encoded (one frame every 10 s - it's all black), then
 // repeated by stream copy, and the whole file is a few hundred KB.
+// Serialises canvas builds - see get_video_canvas_proxy.
+static CANVAS_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const VIDEO_CANVAS_SECONDS: u32 = 100 * 3600;
 const CANVAS_BASE_SECONDS: u32 = 3600;
 
@@ -991,6 +1018,14 @@ pub async fn get_video_canvas_proxy(app_handle: AppHandle, width: u32, height: u
     let (w, h) = ((width.max(2) / 2) * 2, (height.max(2) / 2) * 2);
     let dir = std::env::temp_dir().join("briefcast_preview_cache").join("video_canvas_v3");
     let cache_path = dir.join(format!("{}x{}.mp4", w, h));
+    if cache_path.exists() {
+        return path_to_str(&cache_path).map(|s| s.to_string());
+    }
+    // One build at a time. The Create dialog asks for its canvas in the background the moment it
+    // opens (first use of a size costs several seconds), so the editor asking again on Create would
+    // otherwise run a second build of the same file into the same temporary paths. The second caller
+    // waits here and then finds the finished file.
+    let _build = CANVAS_BUILD.lock().await;
     if cache_path.exists() {
         return path_to_str(&cache_path).map(|s| s.to_string());
     }
@@ -9923,6 +9958,29 @@ mod tests {
     }
 
     use super::*;
+
+    // The proxy must decode the photo once: no `-loop` input (which re-decodes the whole photo for
+    // every frame - 26-32s per 64-megapixel phone photo, against ~0.8s), and the repeat done by the
+    // `loop` filter after the fit, so it repeats the small fitted frame.
+    #[test]
+    fn image_clip_proxy_decodes_the_photo_once() {
+        for blur in [false, true] {
+            let args = image_clip_proxy_args("photo.jpg".into(), 1920, 1080, blur);
+            assert!(!args.iter().any(|a| a == "-loop"), "no looped input: {args:?}");
+            let i = args.iter().position(|a| a == "-i").unwrap();
+            assert_eq!(args[i + 1], "photo.jpg");
+            let vf = &args[args.iter().position(|a| a == "-vf").unwrap() + 1];
+            let fit_end = vf.find("format=yuv420p").expect("fitted first");
+            let repeat = vf.find("loop=loop=59:size=1:start=0").expect("then repeated");
+            assert!(repeat > fit_end, "the repeat comes after the fit: {vf}");
+            assert!(vf.ends_with("setpts=N*10/TB"), "{vf}");
+            // Same shape of file as before: 600s at one frame every 10s.
+            let r = args.iter().position(|a| a == "-r").unwrap();
+            assert_eq!(args[r + 1], "1/10");
+            let t = args.iter().position(|a| a == "-t").unwrap();
+            assert_eq!(args[t + 1], "600");
+        }
+    }
 
     // Bare-minimum KeepSegment with every optional field off - individual tests override just the
     // field(s) they care about via struct-update syntax (`..base_segment()`), so adding a new field

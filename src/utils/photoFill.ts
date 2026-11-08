@@ -5,7 +5,7 @@
 // bars. Drawn here once at the frame's full resolution and stored as a still in the derived-media
 // cache (store_derived_still, derived_images.rs), so it then previews, keyframes and exports like
 // any other picture clip. The same drawing (drawPhotoFill) is what the Create dialog's stage shows.
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getFileExtension } from "./fileCategory";
 import type { VideoProjectFrame } from "./videoEditTypes";
 
@@ -35,17 +35,35 @@ export function drawPhotoFill(ctx: CanvasRenderingContext2D, img: CanvasImageSou
   ctx.restore();
 }
 
-// The photo, decoded from the file itself (a data URL, so the canvas stays readable; HEIC through
-// its cached preview).
-async function loadFullPhoto(path: string): Promise<HTMLImageElement> {
+// The photo, decoded from the file itself (HEIC through its cached preview). `direct`: straight from
+// its asset URL, read cross-origin so the canvas stays readable - instead of a data URL, which turned
+// a phone photo (20 MB) into a ~27 MB base64 string carried across IPC and parsed on the page's main
+// thread before decoding could even start. The data URL remains as the fallback.
+async function loadFullPhoto(path: string, direct: boolean): Promise<HTMLImageElement> {
   const source = ["heic", "heif"].includes(getFileExtension(path)) ? await invoke<string>("get_heic_preview", { inputPath: path }) : path;
-  const url = await invoke<string>("read_image_data_url", { path: source });
+  const url = direct ? convertFileSrc(source) : await invoke<string>("read_image_data_url", { path: source });
   return new Promise((resolve, reject) => {
     const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.decoding = "async";
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error(`Couldn't open ${path}`));
     img.src = url;
   });
+}
+
+// The fill drawn at the frame's size, as JPEG base64 - null when the photo needs none. Throws if the
+// canvas can't be read (a photo the browser treats as foreign), which the caller retries via a data URL.
+async function renderFill(path: string, frame: VideoProjectFrame, direct: boolean): Promise<string | null> {
+  const img = await loadFullPhoto(path, direct);
+  if (!needsPhotoFill(img.naturalWidth / img.naturalHeight, frame)) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = frame.width;
+  canvas.height = frame.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  drawPhotoFill(ctx, img, frame.width, frame.height);
+  return canvas.toDataURL("image/jpeg", 0.93).split(",")[1];
 }
 
 // A still of `path` filling `frame` (made once, then found in the cache) - or `path` itself when
@@ -55,14 +73,13 @@ export async function photoFillPath(path: string, frame: VideoProjectFrame, aspe
   const key = `${frame.width}x${frame.height}|v${FILL_VERSION}`;
   const stored = await invoke<string | null>("store_derived_still", { sourcePath: path, kind: "fill", key, jpegBase64: null });
   if (stored) return stored;
-  const img = await loadFullPhoto(path);
-  if (!needsPhotoFill(img.naturalWidth / img.naturalHeight, frame)) return path;
-  const canvas = document.createElement("canvas");
-  canvas.width = frame.width;
-  canvas.height = frame.height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return path;
-  drawPhotoFill(ctx, img, frame.width, frame.height);
-  const jpeg = canvas.toDataURL("image/jpeg", 0.93).split(",")[1];
+  let jpeg: string | null;
+  try {
+    jpeg = await renderFill(path, frame, true);
+  } catch {
+    // The direct load failed or left the canvas unreadable - the slower data URL always works.
+    jpeg = await renderFill(path, frame, false);
+  }
+  if (!jpeg) return path;
   return (await invoke<string | null>("store_derived_still", { sourcePath: path, kind: "fill", key, jpegBase64: jpeg })) ?? path;
 }
