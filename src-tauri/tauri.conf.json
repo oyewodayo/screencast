@@ -21,7 +21,7 @@
   },
   "productName": "Briefcast",
   "mainBinaryName": "Briefcast",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.withbriefs.briefcast",
   "plugins": {
     "updater": {
