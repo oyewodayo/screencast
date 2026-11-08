@@ -53,11 +53,18 @@ describe("expressions as people write them", () => {
 
   it("evaluates fast enough to sample curves every frame", () => {
     const { fn } = parseExpr("sin(3x)e^(-x/4) + 0.2cos(7x - t)");
-    const t0 = performance.now();
-    let s = 0;
-    for (let i = 0; i < 200_000; i++) s += fn({ x: i * 1e-4, t: 1 });
-    const ms = performance.now() - t0;
-    expect(Number.isFinite(s)).toBe(true);
-    expect(ms).toBeLessThan(200);
+    const pass = (n: number): number => {
+      const t0 = performance.now();
+      let s = 0;
+      for (let i = 0; i < n; i++) s += fn({ x: i * 1e-4, t: 1 });
+      expect(Number.isFinite(s)).toBe(true);
+      return performance.now() - t0;
+    };
+    // A wall-clock guard on a shared machine: a warm-up so the JIT has compiled it, then the best of
+    // three, so a build running alongside (or a GC pause) can't fail it. The 200ms limit - 1us per
+    // evaluation, what sampling a curve every frame needs - is unchanged.
+    pass(20_000);
+    const best = Math.min(pass(200_000), pass(200_000), pass(200_000));
+    expect(best).toBeLessThan(200);
   });
 });

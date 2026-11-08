@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { testFfmpeg } from "../test/ffmpeg";
 import { audioChannelKey, compressorCurveDb, eqResponseDb, fxForExport, HIGH_SHELF_HZ, isNeutralFx, LOW_SHELF_HZ, tidyFx, type AudioFx } from "./audioFx";
 
 // The preview's worklet core, loaded the way the browser does (a plain script) - so the code under
@@ -96,9 +97,9 @@ describe("audio effects", () => {
   });
 
   // The export runs ffmpeg's filters (services/audio_fx.rs builds this same chain); the preview runs
-  // the worklet. They must agree sample for sample. Needs the bundled ffmpeg (src-tauri/binaries).
-  const ffmpeg = join(__dirname, "../../src-tauri/binaries/ffmpeg/ffmpeg.exe");
-  it.skipIf(!existsSync(ffmpeg))("matches ffmpeg's filters", () => {
+  // the worklet. They must agree sample for sample. Needs a runnable ffmpeg (test/ffmpeg.ts).
+  const ffmpeg = testFfmpeg() ?? "";
+  it.skipIf(!ffmpeg)("matches ffmpeg's filters", () => {
     const dir = mkdtempSync(join(tmpdir(), "briefcast-fx-"));
     try {
       const [l, r] = programme(2);
