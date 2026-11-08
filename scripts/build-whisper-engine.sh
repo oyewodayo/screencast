@@ -20,7 +20,7 @@
 #
 # Usage: scripts/build-whisper-engine.sh <output-dir> [work-dir]
 # Output: <output-dir>/whisper-cli (plus lib*.so files on Linux) - src-tauri/binaries/whisper,
-# which tauri.macos.conf.json / tauri.linux.conf.json bundle. The speech model itself is not part
+# which the release workflow bundles (through a config overlay, only when this succeeded). The speech model itself is not part
 # of it: the app downloads it the first time it is needed (services/whisper_model.rs).
 set -euo pipefail
 

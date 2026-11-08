@@ -205,18 +205,21 @@ jobs:
             libfuse2 xdg-utils
       # The speech engine (whisper.cpp), built for this system by scripts/build-whisper-engine.sh -
       # whisper.cpp publishes no macOS or Linux binaries. If it fails the installer is still built,
-      # just without it: captions and transcript editing then need a whisper-cli on the user's
-      # PATH, and the run says so below.
+      # just without it: captions and transcript editing then need a whisper-cli on the user's PATH.
       - name: Build the speech engine
         id: whisper
         continue-on-error: true
         run: bash scripts/build-whisper-engine.sh src-tauri/binaries/whisper "$RUNNER_TEMP/whisper-build"
-      - name: Speech engine status
+      # Bundled through a config overlay rather than the committed config: tauri-build refuses a
+      # resource pattern that matches no file, and binaries/whisper only exists once it is built.
+      - name: Bundle the speech engine
+        id: speech
         run: |
-          mkdir -p src-tauri/binaries/whisper
-          if [ "${{ steps.whisper.outcome }}" != "success" ]; then
+          if [ "${{ steps.whisper.outcome }}" = "success" ]; then
+            printf '%s' '{"bundle":{"resources":["licenses/*","models/rnnoise/*","binaries/whisper/*"]}}' > src-tauri/tauri.speech.conf.json
+            echo "args=--config src-tauri/tauri.speech.conf.json" >> "$GITHUB_OUTPUT"
+          else
             echo "::warning::The speech engine failed to build - this installer has no captions or transcript editing."
-            echo "This installer was built without the speech engine." > src-tauri/binaries/whisper/NO-SPEECH-ENGINE.txt
           fi
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -240,6 +243,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+          args: ${{ steps.speech.outputs.args }}
 
   macos:
     needs: [prepare, windows, linux]
@@ -284,18 +288,21 @@ jobs:
           } >> "$GITHUB_ENV"
       # The speech engine (whisper.cpp), built for this system by scripts/build-whisper-engine.sh -
       # whisper.cpp publishes no macOS or Linux binaries. If it fails the installer is still built,
-      # just without it: captions and transcript editing then need a whisper-cli on the user's
-      # PATH, and the run says so below.
+      # just without it: captions and transcript editing then need a whisper-cli on the user's PATH.
       - name: Build the speech engine
         id: whisper
         continue-on-error: true
         run: bash scripts/build-whisper-engine.sh src-tauri/binaries/whisper "$RUNNER_TEMP/whisper-build"
-      - name: Speech engine status
+      # Bundled through a config overlay rather than the committed config: tauri-build refuses a
+      # resource pattern that matches no file, and binaries/whisper only exists once it is built.
+      - name: Bundle the speech engine
+        id: speech
         run: |
-          mkdir -p src-tauri/binaries/whisper
-          if [ "${{ steps.whisper.outcome }}" != "success" ]; then
+          if [ "${{ steps.whisper.outcome }}" = "success" ]; then
+            printf '%s' '{"bundle":{"resources":["licenses/*","models/rnnoise/*","binaries/whisper/*"]}}' > src-tauri/tauri.speech.conf.json
+            echo "args=--config src-tauri/tauri.speech.conf.json" >> "$GITHUB_OUTPUT"
+          else
             echo "::warning::The speech engine failed to build - this installer has no captions or transcript editing."
-            echo "This installer was built without the speech engine." > src-tauri/binaries/whisper/NO-SPEECH-ENGINE.txt
           fi
       # One universal app (Apple Silicon and Intel in a single .dmg).
       - uses: tauri-apps/tauri-action@v0
@@ -320,4 +327,4 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target universal-apple-darwin
+          args: --target universal-apple-darwin ${{ steps.speech.outputs.args }}

@@ -17,11 +17,6 @@
           "libheif-examples"
         ]
       }
-    },
-    "resources": [
-      "licenses/*",
-      "models/rnnoise/*",
-      "binaries/whisper/*"
-    ]
+    }
   }
 }
