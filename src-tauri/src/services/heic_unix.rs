@@ -54,6 +54,12 @@ fn failure_message(tool: &str, stderr: &str) -> String {
     }
 }
 
+// The tool by its full path when it can be found (Homebrew's folder is not on the PATH of an app
+// started from Finder), else its bare name - the shell-style lookup then fails with a clear error.
+fn tool_path(name: &str) -> PathBuf {
+    crate::services::utility::find_on_path(name).unwrap_or_else(|| PathBuf::from(name))
+}
+
 fn run(mut cmd: Command, tool: &str) -> Result<std::process::Output, String> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -69,7 +75,7 @@ fn run(mut cmd: Command, tool: &str) -> Result<std::process::Output, String> {
 }
 
 fn decode_blocking(input_path: &Path, output_path: &Path) -> Result<(), String> {
-    let mut cmd = Command::new("heif-convert");
+    let mut cmd = Command::new(tool_path("heif-convert"));
     cmd.arg(path_to_str(input_path)?);
     cmd.arg(path_to_str(output_path)?);
 
@@ -97,7 +103,7 @@ fn extract_thumbnail_blocking(
     output_path: &Path,
     size: u32,
 ) -> Result<(), String> {
-    let mut cmd = Command::new("heif-thumbnailer");
+    let mut cmd = Command::new(tool_path("heif-thumbnailer"));
     cmd.arg("-s").arg(size.to_string());
     cmd.arg(path_to_str(input_path)?);
     cmd.arg(path_to_str(output_path)?);

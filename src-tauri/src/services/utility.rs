@@ -22,24 +22,41 @@ pub fn get_platform() -> &'static str {
     std::env::consts::OS
 }
 
-// Finds `name` on the PATH, the way a shell would.
-//
-// Deliberately hand-rolled rather than pulling in a `which` crate for one short function: the
-// rule is simple and the dependency wouldn't be.
-pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = env::var_os("PATH")?;
+// Where Homebrew, MacPorts, Linuxbrew and snap put command-line tools. They are not on the PATH of
+// an app started from Finder, the Dock or a desktop menu - those get only the system's own
+// (/usr/bin:/bin:/usr/sbin:/sbin on macOS) - so a Homebrew ffmpeg that works in any terminal would
+// read as "not installed" in the packaged app. Searched after the PATH.
+#[cfg(not(windows))]
+const EXTRA_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/home/linuxbrew/.linuxbrew/bin", "/snap/bin"];
+
+// The first directory in `dirs` that holds a file called `name` (with `.exe` tried on Windows).
+fn find_in_dirs(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     // Windows needs the extension appended; Unix uses the bare name.
     #[cfg(windows)]
     let candidates = [format!("{name}.exe"), name.to_string()];
     #[cfg(not(windows))]
     let candidates = [name.to_string()];
 
-    env::split_paths(&path_var).find_map(|dir| {
+    dirs.into_iter().find_map(|dir| {
         candidates.iter().find_map(|candidate| {
             let full = dir.join(candidate);
             full.is_file().then_some(full)
         })
     })
+}
+
+// Finds `name` on the PATH, the way a shell would - then, off Windows, in the usual places package
+// managers install to (EXTRA_TOOL_DIRS).
+//
+// Deliberately hand-rolled rather than pulling in a `which` crate for one short function: the
+// rule is simple and the dependency wouldn't be.
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
+    let on_path = env::var_os("PATH").map(|p| env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    #[cfg(not(windows))]
+    let extra = EXTRA_TOOL_DIRS.iter().map(PathBuf::from);
+    #[cfg(windows)]
+    let extra = std::iter::empty::<PathBuf>();
+    find_in_dirs(name, on_path.into_iter().chain(extra))
 }
 
 // Resolves one of the ffmpeg-suite tools, preferring the copy bundled with the app and falling
@@ -102,6 +119,27 @@ mod tool_path_tests {
     #[test]
     fn returns_none_for_something_that_is_not_there() {
         assert!(find_on_path("briefcast_definitely_not_a_real_binary_xyz").is_none());
+    }
+
+    #[test]
+    fn searches_the_directories_in_order_and_skips_ones_without_the_file() {
+        let root = std::env::temp_dir().join(format!("briefcast_find_{}", std::process::id()));
+        let (first, second) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = if cfg!(windows) { "tool.exe" } else { "tool" };
+        std::fs::write(second.join(file), b"").unwrap();
+        assert_eq!(find_in_dirs("tool", [first.clone(), second.clone()]), Some(second.join(file)));
+        std::fs::write(first.join(file), b"").unwrap();
+        assert_eq!(find_in_dirs("tool", [first.clone(), second]), Some(first.join(file)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Homebrew's folder is what a Finder-launched app needs for ffmpeg - Apple Silicon's and Intel's.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_package_manager_folders_are_searched_too() {
+        assert!(EXTRA_TOOL_DIRS.contains(&"/opt/homebrew/bin") && EXTRA_TOOL_DIRS.contains(&"/usr/local/bin"));
     }
 }
 

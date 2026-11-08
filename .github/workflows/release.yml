@@ -1,6 +1,6 @@
 name: Release
 
-# Builds the Windows installers and publishes them to a DRAFT GitHub Release.
+# Builds the Windows, macOS and Linux installers and publishes them to one DRAFT GitHub Release.
 #
 #   1. Bump "version" in src-tauri/tauri.conf.json (+ Cargo.toml / package.json to match).
 #   2. git tag v<that version> && git push origin v<that version>
@@ -29,6 +29,18 @@ name: Release
 #   AZURE_SIGNING_ACCOUNT               the Trusted Signing account name
 #   AZURE_SIGNING_PROFILE               the certificate profile name
 # Without the AZURE_* values the installers are built unsigned (SmartScreen will warn on install).
+#   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD (an app-specific password), APPLE_TEAM_ID
+#                                       optional - sign and notarize the macOS app. Without them it
+#                                       is built unsigned: macOS asks the user to right-click >
+#                                       Open the first time.
+#
+# The three builds run one after another, not side by side: each adds its platform to the release's
+# one latest.json (what the in-app updater reads), and two writing it at once can drop the other's
+# entry - Windows' would break auto-update for everyone already installed. A build that fails does
+# not stop the next; the draft just lacks that platform, and you can see which in the Actions run.
+# macOS and Linux installers do not bundle ffmpeg: Briefcast uses the one installed on the system
+# and says so at startup if it is missing or older than 5.1 (services/ffmpeg_check.rs).
 
 on:
   push:
@@ -38,20 +50,53 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  # The tag check and the release notes, once, for every platform's build.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      body: ${{ steps.notes.outputs.body }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Tag matches app version
         if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
         run: |
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
           if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match tauri.conf.json version ${version}"
             exit 1
           fi
+
+      # The release's notes: release-notes/<tag>.md (e.g. release-notes/v0.1.2.md) when there is
+      # one, then the install lines. The website's release notes page renders this same body.
+      - name: Release notes
+        id: notes
+        run: |
+          file="release-notes/${GITHUB_REF_NAME}.md"
+          [ -f "$file" ] || echo "::warning::No $file - the release has only the install instructions."
+          {
+            echo "body<<BRIEFCAST_RELEASE_NOTES_EOF"
+            if [ -f "$file" ]; then
+              cat "$file"
+              echo
+              echo "---"
+              echo
+            fi
+            echo "**To install**"
+            echo
+            echo "- **Windows** - download the file ending in **x64-setup.exe**."
+            echo "- **macOS** - download the **.dmg** (Apple Silicon and Intel). The first time, right-click Briefcast and choose Open, because the app isn't notarized yet. Briefcast uses the ffmpeg on your Mac: \`brew install ffmpeg\`."
+            echo "- **Linux** - download the **.AppImage** (make it executable and run it) or the **.deb** (\`sudo apt install ./Briefcast_*.deb\`). Briefcast uses the ffmpeg on your system, version 5.1 or newer."
+            echo
+            echo "Already installed? Briefcast will offer this update on its next launch."
+            echo "BRIEFCAST_RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
@@ -107,27 +152,6 @@ jobs:
           EOF
           echo "args=--config src-tauri/tauri.signing.conf.json" >> "$GITHUB_OUTPUT"
 
-      # The release's notes: release-notes/<tag>.md (e.g. release-notes/v0.1.2.md) when there is
-      # one, then the install line. The website's release notes page renders this same body.
-      - name: Release notes
-        id: notes
-        shell: bash
-        run: |
-          file="release-notes/${GITHUB_REF_NAME}.md"
-          [ -f "$file" ] || echo "::warning::No $file - the release has only the install instructions."
-          {
-            echo "body<<BRIEFCAST_RELEASE_NOTES_EOF"
-            if [ -f "$file" ]; then
-              cat "$file"
-              echo
-              echo "---"
-              echo
-            fi
-            echo "To install, download the file ending in **x64-setup.exe** below."
-            echo "Already installed? Briefcast will offer this update on its next launch."
-            echo "BRIEFCAST_RELEASE_NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -149,9 +173,123 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Briefcast v__VERSION__
-          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseBody: ${{ needs.prepare.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: ${{ steps.signing.outputs.args }}
+
+  linux:
+    needs: [prepare, windows]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    # The oldest runner Tauri v2 supports (webkit2gtk 4.1): an AppImage built here runs on
+    # newer systems too, not the other way round.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev build-essential curl wget file \
+            libfuse2 xdg-utils
+      # No binaries to fetch: the Windows-only resources live in tauri.windows.conf.json, and the
+      # .deb declares its ffmpeg dependency in tauri.linux.conf.json.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Read at compile time (option_env!) - unset means telemetry is compiled out entirely.
+          BRIEFCAST_POSTHOG_KEY: ${{ secrets.BRIEFCAST_POSTHOG_KEY }}
+          # Only for an EU PostHog project: set the variable to https://eu.i.posthog.com
+          BRIEFCAST_POSTHOG_HOST: ${{ vars.BRIEFCAST_POSTHOG_HOST }}
+          BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
+          # Phone transfer's trusted HTTPS certificates (server/lan-certs) - unset compiles it out.
+          BRIEFCAST_LAN_TLS_API: ${{ vars.BRIEFCAST_LAN_TLS_API }}
+          # Share -> YouTube / Drive sign-in, read at compile time (option_env!) - unset disables it.
+          BRIEFCAST_GOOGLE_CLIENT_ID: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_ID }}
+          BRIEFCAST_GOOGLE_CLIENT_SECRET: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_SECRET }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Briefcast v__VERSION__
+          releaseBody: ${{ needs.prepare.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+
+  macos:
+    needs: [prepare, windows, linux]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+
+      # Signing and notarization, only when the Apple secrets exist: written into the environment
+      # for the build step, so without them the app is simply built unsigned.
+      - name: Apple signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::notice::No APPLE_CERTIFICATE - the macOS app is built unsigned."
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
+      # One universal app (Apple Silicon and Intel in a single .dmg).
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Read at compile time (option_env!) - unset means telemetry is compiled out entirely.
+          BRIEFCAST_POSTHOG_KEY: ${{ secrets.BRIEFCAST_POSTHOG_KEY }}
+          # Only for an EU PostHog project: set the variable to https://eu.i.posthog.com
+          BRIEFCAST_POSTHOG_HOST: ${{ vars.BRIEFCAST_POSTHOG_HOST }}
+          BRIEFCAST_SENTRY_DSN: ${{ secrets.BRIEFCAST_SENTRY_DSN }}
+          # Phone transfer's trusted HTTPS certificates (server/lan-certs) - unset compiles it out.
+          BRIEFCAST_LAN_TLS_API: ${{ vars.BRIEFCAST_LAN_TLS_API }}
+          # Share -> YouTube / Drive sign-in, read at compile time (option_env!) - unset disables it.
+          BRIEFCAST_GOOGLE_CLIENT_ID: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_ID }}
+          BRIEFCAST_GOOGLE_CLIENT_SECRET: ${{ secrets.BRIEFCAST_GOOGLE_CLIENT_SECRET }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Briefcast v__VERSION__
+          releaseBody: ${{ needs.prepare.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target universal-apple-darwin

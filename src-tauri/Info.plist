@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS app's Info.plist (Tauri does this for src-tauri/Info.plist). macOS shows
+     these sentences in its permission prompts, and an app without them is refused camera and
+     microphone access outright. Screen recording needs no key: macOS asks the first time. -->
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Briefcast uses the camera to record your webcam alongside your screen.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Briefcast uses the microphone to record your voice, voice-overs and narration.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Briefcast talks to your phone over your local network to send it videos, use it as a camera and as a remote.</string>
+</dict>
+</plist>
