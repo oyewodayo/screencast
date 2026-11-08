@@ -293,6 +293,12 @@ export function duplicateClips(clips: Clip[], ids: string[], makeId: () => strin
 // Moves the clip at `fromIndex` to sit at `toIndex` in the array - i.e. changes its playback
 // position without touching its own source start/end. Both indices are clamped into range so a
 // drag that overshoots either end of the track just lands at that end instead of erroring.
+// A drop slot (insert before clip `slot`, or `clips.length` for the end) as reorderClip's target index:
+// reorderClip takes the clip out first, so a slot to its right is one fewer once it's gone. Without
+// this, dragging right overshot by one - a small nudge swapped a clip with its neighbour, and dragging
+// just past the neighbour moved it two places.
+export const reorderTarget = (from: number, slot: number): number => (slot > from ? slot - 1 : slot);
+
 export function reorderClip(clips: Clip[], fromIndex: number, toIndex: number): Clip[] {
   if (fromIndex === toIndex || fromIndex < 0 || fromIndex >= clips.length) return clips;
   const clamped = Math.max(0, Math.min(toIndex, clips.length - 1));

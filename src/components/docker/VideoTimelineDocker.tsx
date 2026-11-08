@@ -1,5 +1,5 @@
 // components/docker/VideoTimelineDocker.tsx
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { analyzeReframe, anchorKnots } from "../../utils/reframeAnalysis";
 import { fillWindow } from "../../utils/reframeTrack";
 import type { ReframePreview } from "../video/ReframePreviewLayer";
@@ -56,7 +56,7 @@ import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
-import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import ElementsGallery from "../video/ElementsGallery";
@@ -178,6 +178,33 @@ const NICE_TICK_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600, 900, 180
 const MIN_TICK_SPACING_PX = 70;
 const MIN_CLIP_LENGTH = 0.05;
 const MIN_OVERLAY_DURATION = 0.1; // matches videoEditHandlers.ts's own MIN_OVERLAY_DURATION
+
+// The clip lane's look. A hairline gap between clips (half each side), and a trim handle's invisible
+// grab area - wider than what's drawn, so grabbing an edge stays easy without a thick bar on every cut.
+const CLIP_GAP = 2;
+const HANDLE_GRAB_PX = 10;
+// Handles show on the clip's hover, their own hover, or the selected clip (data-on) - and never while a
+// clip is being dragged. A grip: a slim white pill. A bracket: the selected clip's yellow edge, with
+// two notches to read as something to pull.
+const TIMELINE_LANE_CSS = `
+.tl-lane .tl-h { opacity: 0; transition: opacity 120ms ease-out; }
+.tl-lane .tl-clip:hover + .tl-h, .tl-lane .tl-clip:hover + .tl-h + .tl-h, .tl-lane .tl-h:hover, .tl-lane .tl-h[data-on="true"] { opacity: 1; }
+.tl-lane.tl-lane-dragging .tl-h { opacity: 0 !important; }
+.tl-grip { width: 3px; height: 45%; border-radius: 9999px; background: rgba(255,255,255,0.92); box-shadow: 0 0 0 1px rgba(0,0,0,0.35); }
+.tl-h:hover .tl-grip { height: 60%; }
+.tl-bracket { position: relative; width: 7px; height: 100%; background: #fbbf24; }
+.tl-bracket-start { border-radius: 6px 0 0 6px; }
+.tl-bracket-end { border-radius: 0 6px 6px 0; }
+.tl-bracket::before, .tl-bracket::after { content: ""; position: absolute; left: 50%; width: 1px; height: 22%; background: rgba(0,0,0,0.55); transform: translateX(-50%); }
+.tl-bracket::before { top: 28%; }
+.tl-bracket::after { bottom: 28%; }
+`;
+// "4.5s", or "1:05" from a minute up - the selected clip's length on its corner.
+const formatClipLength = (seconds: number): string => {
+  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  return `${m}:${String(Math.round(seconds - m * 60)).padStart(2, "0")}`;
+};
 // How close (in on-screen pixels, not seconds - so the snap "feels" equally sticky regardless of
 // zoom level) a dragged overlay edge/position needs to land next to a snap target before it's
 // pulled onto it exactly. Applied to the RAW (pre-clamp) candidate value in every overlay drag/
@@ -1652,6 +1679,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     index: number;
     clip: Clip;
     startClientX: number;
+    // Where the pointer is now - the lifted clip follows it.
+    currentClientX: number;
     isDragging: boolean;
     overIndex: number;
   }>(null);
@@ -1698,6 +1727,54 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     }
   }
   const totalOutputDuration = clipDurations.reduce((a, b) => a + b, 0);
+
+  // ---- The clip lane's motion -------------------------------------------------------------------------
+  // While a clip is dragged, every other clip glides to where it will be if it's dropped now - the
+  // reorder the drop will make (reorderClipOrder, the same function), so what you see is what you get.
+  const dragPreviewShift: Map<string, number> | null = (() => {
+    if (!clipDrag?.isDragging) return null;
+    const order = reorderClipOrder(renderClips, clipDrag.index, reorderTarget(clipDrag.index, clipDrag.overIndex));
+    const shift = new Map<string, number>();
+    let acc = 0;
+    for (const c of order) {
+      const was = renderClips.indexOf(c);
+      shift.set(c.id, (acc - outputStarts[was]) * pxPerSec);
+      acc += clipDurations[was];
+    }
+    return shift;
+  })();
+  // And whenever the clips change order or membership - a drop, undo/redo, delete, duplicate, paste -
+  // each one settles from where it was to where it now is, and a new one grows in, instead of the
+  // lane snapping. Not on a zoom or a trim (positions move with the pointer there, and animating them
+  // would lag behind it). Web Animations, not React state: no re-render per frame, and nothing for the
+  // drag's own transforms to fight with.
+  const clipElsRef = useRef(new Map<string, HTMLDivElement>());
+  const laneLayoutRef = useRef<{ order: string; pxPerSec: number; lefts: Map<string, number> } | null>(null);
+  const dropVisualRef = useRef<Map<string, number> | null>(null);
+  useLayoutEffect(() => {
+    const lefts = new Map(laneClips.map((c, i) => [c.id, outputStarts[i] * pxPerSec] as const));
+    const order = laneClips.map((c) => c.id).join("|");
+    const prev = laneLayoutRef.current;
+    const visual = dropVisualRef.current;
+    laneLayoutRef.current = { order, pxPerSec, lefts };
+    dropVisualRef.current = null;
+    if (!prev || prev.order === order || prev.pxPerSec !== pxPerSec || resizeDrag) return;
+    // The placeholder lane while a timeline loads isn't a change anyone made.
+    if (prev.order === "" || prev.order.includes("__pending__")) return;
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    for (const [id, left] of lefts) {
+      const el = clipElsRef.current.get(id);
+      if (!el || typeof el.animate !== "function") continue;
+      const from = visual?.get(id) ?? prev.lefts.get(id);
+      if (from === undefined) {
+        el.animate([{ opacity: 0, transform: "scale(0.94)" }, { opacity: 1, transform: "none" }], { duration: 220, easing: "cubic-bezier(.2,.8,.2,1)" });
+        continue;
+      }
+      const dx = from - left;
+      if (Math.abs(dx) < 0.5) continue;
+      el.animate([{ transform: `translateX(${dx}px)` }, { transform: "translateX(0)" }], { duration: 260, easing: "cubic-bezier(.2,.8,.2,1)" });
+    }
+  });
 
   // The filmstrip tiles in the drawn window, each asking the capture loop for a frame inside its
   // own stretch of source (none finer than a quarter second) - nearest the middle of the view
@@ -2697,23 +2774,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     editStore.resizeClipEdge(id, edge, liveValue);
   };
 
-  // Which slot the pointer is currently over, for reorder purposes - the first clip whose
-  // midpoint sits to the right of the pointer (dropping past every midpoint lands after the last
-  // clip). Matches reorderClip's splice-based semantics: dropping at index i means "insert before
-  // whatever is currently at i".
+  // The slot the pointer is over: insert before clip i, where i is the first clip whose midpoint sits
+  // to the right of the pointer - or after the last clip (renderClips.length) past every midpoint.
+  // A file dropped from the library goes straight in at that slot (insertClip). It used to stop at
+  // the last index, so a file dropped after the last clip landed before it.
   const computeOverIndex = (clientX: number): number => {
     const outputPx = outputTimeFromClientX(clientX) * pxPerSec;
     for (let i = 0; i < renderClips.length; i++) {
       const midPx = (outputStarts[i] + clipDurations[i] / 2) * pxPerSec;
       if (outputPx < midPx) return i;
     }
-    return renderClips.length - 1;
+    return renderClips.length;
   };
 
   const beginClipDrag = (clip: Clip, index: number) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
-    setClipDrag({ index, clip, startClientX: e.clientX, isDragging: false, overIndex: index });
+    setClipDrag({ index, clip, startClientX: e.clientX, currentClientX: e.clientX, isDragging: false, overIndex: index });
   };
 
   // Razor mode's own pointerdown on a clip block - splits right where the click landed instead of
@@ -2744,7 +2821,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     e.stopPropagation();
     const moved = Math.abs(e.clientX - clipDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
     setClipDrag((prev) =>
-      prev ? { ...prev, isDragging: prev.isDragging || moved, overIndex: computeOverIndex(e.clientX) } : prev
+      prev ? { ...prev, currentClientX: e.clientX, isDragging: prev.isDragging || moved, overIndex: computeOverIndex(e.clientX) } : prev
     );
   };
   const endClipDrag = (e: React.PointerEvent) => {
@@ -2752,7 +2829,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     const { index, clip, isDragging, overIndex } = clipDrag;
     setClipDrag(null);
     if (isDragging) {
-      editStore.reorderClip(index, overIndex);
+      // Where every clip is on screen right now (the lifted one under the pointer, the others already
+      // slid aside) - the settle animation starts from here, so nothing jumps on release.
+      const visual = new Map<string, number>();
+      laneClips.forEach((c, i) => visual.set(c.id, outputStarts[i] * pxPerSec + (dragPreviewShift?.get(c.id) ?? 0)));
+      visual.set(clip.id, outputStarts[index] * pxPerSec + (e.clientX - clipDrag.startClientX));
+      dropVisualRef.current = visual;
+      editStore.reorderClip(index, reorderTarget(index, overIndex));
     } else if (e.ctrlKey || e.metaKey) {
       // Ctrl-click toggles this clip in or out of the selection.
       setSelectedClipIds(selectedClipIds.includes(clip.id) ? selectedClipIds.filter((id) => id !== clip.id) : [...selectedClipIds, clip.id]);
@@ -5099,7 +5182,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 pendingTimelineInsert's doc comment above. */}
             <div
               data-timeline-track="true"
-              className={`h-16 relative py-1 cursor-pointer ${draggingLibraryFile ? "bg-blue-500/10 outline-dashed outline-2 outline-blue-400 -outline-offset-2" : ""}`}
+              className={`tl-lane h-16 relative py-1 cursor-pointer ${clipDrag?.isDragging ? "tl-lane-dragging" : ""} ${draggingLibraryFile ? "bg-blue-500/10 outline-dashed outline-2 outline-blue-400 -outline-offset-2" : ""}`}
               onPointerDown={handleScrubPointerDown}
               onPointerMove={handleScrubPointerMove}
               onDragOver={handleTrackDragOver}
@@ -5149,13 +5232,22 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   </span>
                 </div>
               )}
+              {/* Trim handles show when they're wanted - hovering a clip or the handle, or on the selected
+                  clip - in pure CSS (the handles follow their clip in the DOM), so moving the pointer
+                  across the lane never re-renders it. */}
+              <style>{TIMELINE_LANE_CSS}</style>
               {laneClips.map((clip, i) => {
                 const isPending = clip.id === "__pending__";
                 const left = outputStarts[i] * pxPerSec;
                 const width = Math.max(1, clipDurations[i] * pxPerSec);
                 const isSelected = selectedClipIds.includes(clip.id);
                 const isDragging = clipDrag?.index === i && clipDrag.isDragging;
-                const isDragOver = clipDrag?.isDragging && clipDrag.overIndex === i && clipDrag.index !== i;
+                // Lifted and under the pointer while dragged; gliding aside for it otherwise.
+                const motion: React.CSSProperties = isDragging
+                  ? { transform: `translate(${clipDrag!.currentClientX - clipDrag!.startClientX}px, -3px) scale(1.03)`, zIndex: 40, transition: "box-shadow 160ms ease-out" }
+                  : dragPreviewShift
+                    ? { transform: `translateX(${dragPreviewShift.get(clip.id) ?? 0}px)`, transition: "transform 200ms cubic-bezier(.2,.8,.2,1)" }
+                    : {};
                 // Fixed-width tiles (video aspect at THUMB_TILE_HEIGHT), each showing the cached
                 // frame nearest the source time at its own center - so tile count, and therefore
                 // how many distinct shots are visible, grows with zoom instead of stretching a
@@ -5173,22 +5265,23 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 });
                 const tileSpacer = firstTile > 0 ? <div className="shrink-0" style={{ width: firstTile * tileWidth }} /> : null;
                 return (
+                  <React.Fragment key={clip.id}>
                   <div
-                    key={clip.id}
+                    ref={(el) => {
+                      if (el) clipElsRef.current.set(clip.id, el);
+                      else clipElsRef.current.delete(clip.id);
+                    }}
                     onPointerDown={isPending ? undefined : handleClipPointerDown(baseClips[i], i)}
                     onContextMenu={isPending ? undefined : openClipMenu(baseClips[i])}
                     onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
                     onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
                     onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
                     title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`}
-                    className={`absolute inset-y-1 rounded overflow-hidden border-2 bg-black flex ${
-                      isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"
-                    } ${isSelected ? "border-dashed border-white" : "border-teal-500"} ${isDragging ? "opacity-40" : ""} ${
-                      mergingIds?.includes(clip.id) ? "animate-pulse" : ""
-                    } ${
-                      isDragOver ? "ring-2 ring-blue-400" : ""
-                    }`}
-                    style={{ left, width }}
+                    className={`tl-clip group/clip absolute inset-y-1 rounded-md overflow-hidden bg-neutral-900 flex ${
+                      isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : isDragging ? "cursor-grabbing shadow-[0_10px_24px_rgba(0,0,0,0.55)]" : "cursor-grab"
+                    } ${mergingIds?.includes(clip.id) ? "animate-pulse" : ""}`}
+                    // A hairline gap either side: clips read as separate pictures, not one band.
+                    style={{ left: left + CLIP_GAP / 2, width: Math.max(1, width - CLIP_GAP), ...motion }}
                   >
                     {isImageClipPath(clip.sourcePath) ? (
                       <>
@@ -5253,7 +5346,54 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         visible={[drawWindow.from - left, drawWindow.to - left]}
                       />
                     )}
+                    {/* The edge, drawn over the pictures (an inset outline on the clip itself would
+                        sit under them): a faint line normally, brighter on hover, yellow selected. */}
+                    <span
+                      className={`pointer-events-none absolute inset-0 z-[7] rounded-md ring-inset transition-shadow duration-150 ${
+                        isSelected || isDragging ? "ring-2 ring-amber-400" : "ring-1 ring-white/10 group-hover/clip:ring-white/35"
+                      }`}
+                    />
+                    {/* The selected clip's length, where it doesn't crowd the pictures. */}
+                    {isSelected && !isPending && width >= 56 && (
+                      <span className="pointer-events-none absolute bottom-1 right-2 z-[7] px-1 rounded-sm bg-black/70 text-[9px] leading-[13px] font-semibold tabular-nums text-amber-300">
+                        {formatClipLength(clipDurations[i])}
+                      </span>
+                    )}
                   </div>
+                  {!isPending && (
+                    <>
+                      {/* Trim handles - siblings right after their clip (not inside it, so grabbing one
+                          can't start the clip's reorder drag; and right after it, so CSS can reveal them
+                          on the clip's hover). A wide, invisible grab area; what shows is a slim grip on
+                          hover, or a yellow bracket on the selected clip. */}
+                      <div
+                        onPointerDown={beginResizeDrag(baseClips[i], i, "start")}
+                        onPointerMove={handleResizeDragMove}
+                        onPointerUp={endResizeDrag}
+                        onPointerCancel={endResizeDrag}
+                        title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's start"}
+                        data-on={isSelected ? "true" : undefined}
+                        // Selected, above the cut's transition button: pulling the edge is what matters then.
+                        className={`tl-h absolute inset-y-1 ${isSelected ? "z-[12]" : "z-10"} flex items-center justify-start cursor-ew-resize`}
+                        style={{ left: left + CLIP_GAP / 2, width: HANDLE_GRAB_PX }}
+                      >
+                        <span className={isSelected ? "tl-bracket tl-bracket-start" : "tl-grip ml-[3px]"} />
+                      </div>
+                      <div
+                        onPointerDown={beginResizeDrag(baseClips[i], i, "end")}
+                        onPointerMove={handleResizeDragMove}
+                        onPointerUp={endResizeDrag}
+                        onPointerCancel={endResizeDrag}
+                        title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's end"}
+                        data-on={isSelected ? "true" : undefined}
+                        className={`tl-h absolute inset-y-1 ${isSelected ? "z-[12]" : "z-10"} flex items-center justify-end cursor-ew-resize`}
+                        style={{ left: left + width - CLIP_GAP / 2 - HANDLE_GRAB_PX, width: HANDLE_GRAB_PX }}
+                      >
+                        <span className={isSelected ? "tl-bracket tl-bracket-end" : "tl-grip mr-[3px]"} />
+                      </div>
+                    </>
+                  )}
+                  </React.Fragment>
                 );
               })}
 
@@ -5286,23 +5426,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 const seconds = transitionDuration(clip);
                 return (
                   <React.Fragment key={`transition-${clip.id}`}>
+                    {/* The stretch it plays over, as a soft light on the incoming clip. */}
                     <div
-                      className="absolute inset-y-1 rounded-r pointer-events-none z-[5] bg-gradient-to-r from-blue-400/45 to-blue-400/0"
+                      className="absolute inset-y-1 rounded-r pointer-events-none z-[5] bg-gradient-to-r from-white/20 to-white/0"
                       style={{ left, width: seconds * pxPerSec }}
                     />
+                    {/* A small white button on the cut itself. */}
                     <div
                       title={`${label} · ${seconds.toFixed(1)}s`}
-                      className="absolute inset-y-1 w-4 -ml-2 flex items-center justify-center rounded bg-blue-500/80 z-10 pointer-events-none"
+                      className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-[18px] h-[18px] flex items-center justify-center rounded-full bg-white shadow-[0_1px_4px_rgba(0,0,0,0.5)] ring-1 ring-black/30 z-[11] pointer-events-none"
                       style={{ left }}
                     >
-                      <IoSwapHorizontalOutline size={10} className="text-white" />
+                      <IoSwapHorizontalOutline size={10} className="text-neutral-800" />
                     </div>
                     <button
                       type="button"
                       title={`${label} · ${seconds.toFixed(1)}s - click to change`}
                       onPointerDown={(e) => e.stopPropagation()}
                       onClick={(e) => openClipMenu(baseClips[i])(e)}
-                      className="absolute z-20 -translate-x-1/2 px-1 rounded-sm bg-blue-600 text-[9px] leading-[13px] font-medium text-white whitespace-nowrap shadow ring-1 ring-black/40 hover:bg-blue-500"
+                      className="absolute z-20 -translate-x-1/2 px-1.5 rounded-full bg-neutral-800/95 text-[9px] leading-[13px] font-medium text-neutral-100 whitespace-nowrap shadow ring-1 ring-white/10 hover:bg-neutral-700"
                       style={{ left, bottom: -6 }}
                     >
                       {label}
@@ -5339,40 +5481,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   );
                 })}
 
-              {/* Resize handles - two per real clip (start/end edges), kept as separate overlay
-                  elements (not nested inside the draggable clip block above) so interacting with
-                  them can't accidentally trigger that block's native drag-to-reorder. */}
-              {laneClips.map((clip, i) => {
-                if (clip.id === "__pending__") return null;
-                const left = outputStarts[i] * pxPerSec;
-                const width = clipDurations[i] * pxPerSec;
-                return (
-                  <React.Fragment key={`resize-${clip.id}`}>
-                    {/* Each handle sits just inside its own clip's edge rather than centred on it -
-                        centred, a clip's end handle and the next clip's start handle covered the
-                        same pixels and the later one always won, so only the last clip's end could
-                        ever be dragged out to lengthen it. */}
-                    <div
-                      onPointerDown={beginResizeDrag(baseClips[i], i, "start")}
-                      onPointerMove={handleResizeDragMove}
-                      onPointerUp={endResizeDrag}
-                      onPointerCancel={endResizeDrag}
-                      title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's start"}
-                      className="absolute inset-y-1 w-2 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ left }}
-                    />
-                    <div
-                      onPointerDown={beginResizeDrag(baseClips[i], i, "end")}
-                      onPointerMove={handleResizeDragMove}
-                      onPointerUp={endResizeDrag}
-                      onPointerCancel={endResizeDrag}
-                      title={isImageClipPath(clip.sourcePath) ? "Drag to change how long this image shows" : "Drag to trim this clip's end"}
-                      className="absolute inset-y-1 w-2 -ml-2 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ left: left + width }}
-                    />
-                  </React.Fragment>
-                );
-              })}
             </div>
 
             {/* Text-overlay lane - chips positioned/sized by time (not source-time, since
