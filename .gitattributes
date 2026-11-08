@@ -1,0 +1,5 @@
+# The RNNoise model is a text file that ffmpeg's arnndn filter parses: never rewrite its line endings.
+*.rnnn -text
+
+# Shell scripts run on Linux and macOS runners and in Git Bash: LF only.
+*.sh text eol=lf
