@@ -37,6 +37,14 @@ import {
   resolveImageCrop,
   resolveSeriesData,
   resolveTableGrid,
+  resolveNodeFill,
+  resolveFillType,
+  resolveGradientStops,
+  DEFAULT_FILL_PATTERN_SPACING,
+  DEFAULT_FILL_PATTERN_OPACITY,
+  DEFAULT_GRADIENT_ANGLE,
+  WhiteboardFillPattern,
+  AxisPlacement,
 } from "../utils/whiteboardTypes";
 import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../utils/whiteboardImageCache";
 // Not a component import in spirit - latticeRenderOnDemand is a plain module-level Map, not React
@@ -46,6 +54,54 @@ import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../utils/white
 import { latticeRenderOnDemand } from "../components/whiteboard/LatticeGaugeWidget";
 
 // ---- Node geometry ----------------------------------------------------------------------------
+
+export const DEFAULT_SHADOW_COLOR = "#000000";
+export const DEFAULT_SHADOW_BLUR = 12;
+export const DEFAULT_SHADOW_OFFSET_X = 0;
+export const DEFAULT_SHADOW_OFFSET_Y = 4;
+export const DEFAULT_SHADOW_OPACITY = 0.25;
+
+export function hexToRgba(color: string, alpha: number): string {
+  const c = color.trim();
+  if (c.startsWith("rgba")) {
+    return c.replace(/[\d.]+\)$/g, `${alpha})`);
+  }
+  if (c.startsWith("rgb")) {
+    return c.replace("rgb", "rgba").replace(")", `, ${alpha})`);
+  }
+  const clean = c.replace("#", "");
+  const num = parseInt(clean.length === 3 ? clean.split("").map((ch) => ch + ch).join("") : clean, 16);
+  if (isNaN(num)) return `rgba(0,0,0,${alpha})`;
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+export function nodeDropShadowCSS(item: {
+  shadowEnabled?: boolean;
+  shadowColor?: string;
+  shadowOpacity?: number;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+}): string | undefined {
+  if (!item.shadowEnabled) return undefined;
+  const opacity = Math.max(0, Math.min(1, item.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+  if (opacity <= 0) return undefined;
+  const color = item.shadowColor ?? DEFAULT_SHADOW_COLOR;
+  const blur = Math.max(0, item.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+  const ox = item.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+  const oy = item.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  const rgba = hexToRgba(color, opacity);
+  return `drop-shadow(${ox}px ${oy}px ${blur}px ${rgba})`;
+}
+
+export function dashArrayFor(strokeStyle?: "solid" | "dashed" | "dotted", strokeWidth: number = 2): string | undefined {
+  if (!strokeStyle || strokeStyle === "solid") return undefined;
+  if (strokeStyle === "dotted") return `${Math.max(1, strokeWidth * 0.4)},${Math.max(3, strokeWidth * 1.6 + 3)}`;
+  return "8,6";
+}
 
 export function nodeCenter(node: WhiteboardNode): { x: number; y: number } {
   return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
@@ -140,6 +196,130 @@ export function nudgeEdgeBy(edge: WhiteboardEdge, dx: number, dy: number): White
     source: nudgeEndpoint(edge.source),
     target: nudgeEndpoint(edge.target),
     waypoints: edge.waypoints?.map((wp) => ({ x: wp.x + dx, y: wp.y + dy })),
+  };
+}
+
+// Mirrors an edge's free-floating endpoints and waypoints across its own bounding center along
+// the horizontal (left<->right) or vertical (top<->bottom) axis. If both endpoints are attached to
+// nodes, flipping swaps source and target.
+export function flipEdge(
+  edge: WhiteboardEdge,
+  axis: "horizontal" | "vertical",
+  nodesById: Map<string, WhiteboardNode> = new Map()
+): WhiteboardEdge {
+  if (edge.source.nodeId && edge.target.nodeId) {
+    return {
+      ...edge,
+      source: edge.target,
+      target: edge.source,
+      waypoints: edge.waypoints ? [...edge.waypoints].reverse() : undefined,
+      curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+    };
+  }
+  const { source, target } = resolveEdgeEndpoints(edge, nodesById);
+  const pts = [source, target, ...(edge.waypoints ?? [])];
+  const minX = Math.min(...pts.map((p) => p.x));
+  const maxX = Math.max(...pts.map((p) => p.x));
+  const minY = Math.min(...pts.map((p) => p.y));
+  const maxY = Math.max(...pts.map((p) => p.y));
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const mirrorPt = (p: { x: number; y: number }) =>
+    axis === "horizontal" ? { x: 2 * cx - p.x, y: p.y } : { x: p.x, y: 2 * cy - p.y };
+  const flipEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => {
+    if (ep.nodeId) return ep;
+    const m = mirrorPt({ x: ep.x ?? 0, y: ep.y ?? 0 });
+    return { ...ep, x: m.x, y: m.y };
+  };
+  return {
+    ...edge,
+    source: flipEndpoint(edge.source),
+    target: flipEndpoint(edge.target),
+    waypoints: edge.waypoints?.map(mirrorPt),
+    curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+  };
+}
+
+// Mirrors a selection of nodes and edges across the center of their combined bounding box - the
+// on-screen "flip" of a multi-selection (or a single shape, mirrored in place). Each node toggles
+// its own flip flag and negates its rotation (a mirrored rotated shape turns the other way); each
+// edge mirrors its free endpoints and waypoints across the same center and negates curveBow. An
+// endpoint attached to a node is left alone - it follows that node to its mirrored position.
+export function flipItems(
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[],
+  axis: "horizontal" | "vertical",
+  nodesById: Map<string, WhiteboardNode>
+): { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const n of nodes) xs.push(n.x, n.x + n.width), ys.push(n.y, n.y + n.height);
+  for (const e of edges) {
+    const { source, target } = resolveEdgeEndpoints(e, nodesById);
+    for (const p of [source, target, ...(e.waypoints ?? [])]) xs.push(p.x), ys.push(p.y);
+  }
+  if (xs.length === 0) return { nodes, edges };
+  const sumX = Math.min(...xs) + Math.max(...xs);
+  const sumY = Math.min(...ys) + Math.max(...ys);
+  const horizontal = axis === "horizontal";
+  const mirrorPt = (p: { x: number; y: number }) => (horizontal ? { x: sumX - p.x, y: p.y } : { x: p.x, y: sumY - p.y });
+  const flippedNodes = nodes.map((n) => {
+    const rotation = n.rotation ? (360 - n.rotation) % 360 || undefined : undefined;
+    return horizontal
+      ? { ...n, rotation, flipHorizontal: !(n.flipHorizontal ?? false) || undefined, x: sumX - n.x - n.width }
+      : { ...n, rotation, flipVertical: !(n.flipVertical ?? false) || undefined, y: sumY - n.y - n.height };
+  });
+  const flippedEdges = edges.map((e) => {
+    const flipEndpoint = (ep: WhiteboardEndpoint): WhiteboardEndpoint => (ep.nodeId ? ep : { ...ep, ...mirrorPt({ x: ep.x ?? 0, y: ep.y ?? 0 }) });
+    return {
+      ...e,
+      source: flipEndpoint(e.source),
+      target: flipEndpoint(e.target),
+      waypoints: e.waypoints?.map(mirrorPt),
+      curveBow: e.curveBow !== undefined ? -e.curveBow : undefined,
+    };
+  });
+  return { nodes: flippedNodes, edges: flippedEdges };
+}
+
+// Reverses a connector's direction (swapping source and target endpoints, reversing any manual
+// waypoints, and flipping curveBow so a curved connector traces the exact same arc).
+export function reverseEdgeDirection(edge: WhiteboardEdge): WhiteboardEdge {
+  return {
+    ...edge,
+    source: edge.target,
+    target: edge.source,
+    waypoints: edge.waypoints ? [...edge.waypoints].reverse() : undefined,
+    curveBow: edge.curveBow !== undefined ? -edge.curveBow : undefined,
+    labelPosition: edge.labelPosition !== undefined ? +(1 - edge.labelPosition).toFixed(4) : undefined,
+  };
+}
+
+// Scales a free-floating edge's length around its midpoint while preserving its angle.
+export function scaleEdgeLength(edge: WhiteboardEdge, nextLength: number): WhiteboardEdge {
+  if (edge.source.nodeId || edge.target.nodeId) return edge;
+  const sx = edge.source.x ?? 0;
+  const sy = edge.source.y ?? 0;
+  const tx = edge.target.x ?? 0;
+  const ty = edge.target.y ?? 0;
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const curLen = Math.hypot(dx, dy);
+  const safeNext = Math.max(1, nextLength);
+  const mx = (sx + tx) / 2;
+  const my = (sy + ty) / 2;
+  const ux = curLen > 1e-6 ? dx / curLen : 1;
+  const uy = curLen > 1e-6 ? dy / curLen : 0;
+  const half = safeNext / 2;
+  const ratio = curLen > 1e-6 ? safeNext / curLen : 1;
+  return {
+    ...edge,
+    source: { ...edge.source, x: mx - ux * half, y: my - uy * half },
+    target: { ...edge.target, x: mx + ux * half, y: my + uy * half },
+    waypoints: edge.waypoints?.map((wp) => ({
+      x: mx + (wp.x - mx) * ratio,
+      y: my + (wp.y - my) * ratio,
+    })),
   };
 }
 
@@ -328,23 +508,80 @@ function smoothPolylineD(points: { x: number; y: number }[]): string {
   return d;
 }
 
-// Builds the SVG path `d` string for an edge between two resolved endpoints. `waypoints` (manual
-// bend points a user dragged onto the line - see WhiteboardEdge.waypoints's own doc comment) take
-// priority when present: "curved" smooths a spline through source->waypoints->target,
-// straight/orthogonal both connect them with sharp segments - orthogonal's own auto right-angle
-// routing below only runs when there are none. Otherwise: "straight" is a single segment;
-// "orthogonal" (draw.io's default connector look) inserts one or two right-angle bends depending
-// on which sides the two ends leave from; "curved" is a cubic bezier through curveControlPoints -
-// see its own doc comment for why it always actually curves, never silently degrading to a
-// straight line when neither end is anchored to a shape. `bow` (only consulted when at least one
-// end is free-floating AND there are no waypoints) defaults to DEFAULT_CURVE_BOW's fixed direction
-// when omitted; pass the edge's own WhiteboardEdge.curveBow to bow the curve the way it was
-// actually drawn instead.
-export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, routing: EdgeRouting, bow: number = DEFAULT_CURVE_BOW, waypoints: { x: number; y: number }[] = []): string {
+// Connects an open polyline of points, optionally rounding interior bends with radius `cornerRadius`.
+function roundedOpenPolylineD(points: { x: number; y: number }[], cornerRadius: number = 0): string {
+  if (points.length === 0) return "";
+  if (points.length < 3 || cornerRadius <= 0) {
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  }
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+    const inDx = prev.x - curr.x;
+    const inDy = prev.y - curr.y;
+    const outDx = next.x - curr.x;
+    const outDy = next.y - curr.y;
+    const inLen = Math.hypot(inDx, inDy);
+    const outLen = Math.hypot(outDx, outDy);
+    const r = Math.min(cornerRadius, inLen / 2, outLen / 2);
+    if (r < 0.5) {
+      d += ` L ${curr.x} ${curr.y}`;
+    } else {
+      const sx = curr.x + (inDx / inLen) * r;
+      const sy = curr.y + (inDy / inLen) * r;
+      const ex = curr.x + (outDx / outLen) * r;
+      const ey = curr.y + (outDy / outLen) * r;
+      d += ` L ${sx} ${sy} Q ${curr.x} ${curr.y} ${ex} ${ey}`;
+    }
+  }
+  const last = points[points.length - 1];
+  d += ` L ${last.x} ${last.y}`;
+  return d;
+}
+
+function orthogonalPolylinePoints(source: ResolvedPoint, target: ResolvedPoint): { x: number; y: number }[] {
+  if (!source.side && !target.side) {
+    if (Math.abs(source.x - target.x) < 0.5 || Math.abs(source.y - target.y) < 0.5) {
+      return [{ x: source.x, y: source.y }, { x: target.x, y: target.y }];
+    }
+    if (Math.abs(target.x - source.x) >= Math.abs(target.y - source.y)) {
+      const midX = (source.x + target.x) / 2;
+      return [{ x: source.x, y: source.y }, { x: midX, y: source.y }, { x: midX, y: target.y }, { x: target.x, y: target.y }];
+    }
+    const midY = (source.y + target.y) / 2;
+    return [{ x: source.x, y: source.y }, { x: source.x, y: midY }, { x: target.x, y: midY }, { x: target.x, y: target.y }];
+  }
+  const sourceHorizontal = source.side ? source.side === "left" || source.side === "right" : Math.abs(target.x - source.x) >= Math.abs(target.y - source.y);
+  const targetHorizontal = target.side ? target.side === "left" || target.side === "right" : sourceHorizontal;
+
+  if (sourceHorizontal && targetHorizontal) {
+    const midX = (source.x + target.x) / 2;
+    return [{ x: source.x, y: source.y }, { x: midX, y: source.y }, { x: midX, y: target.y }, { x: target.x, y: target.y }];
+  }
+  if (!sourceHorizontal && !targetHorizontal) {
+    const midY = (source.y + target.y) / 2;
+    return [{ x: source.x, y: source.y }, { x: source.x, y: midY }, { x: target.x, y: midY }, { x: target.x, y: target.y }];
+  }
+  if (sourceHorizontal) {
+    return [{ x: source.x, y: source.y }, { x: target.x, y: source.y }, { x: target.x, y: target.y }];
+  }
+  return [{ x: source.x, y: source.y }, { x: source.x, y: target.y }, { x: target.x, y: target.y }];
+}
+
+export function buildEdgePath(
+  source: ResolvedPoint,
+  target: ResolvedPoint,
+  routing: EdgeRouting,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = [],
+  cornerRadius: number = 0
+): string {
   if (waypoints.length > 0) {
     const points = [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }];
     if (routing === "curved") return smoothPolylineD(points);
-    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+    return roundedOpenPolylineD(points, cornerRadius);
   }
 
   if (routing === "curved") {
@@ -352,38 +589,69 @@ export function buildEdgePath(source: ResolvedPoint, target: ResolvedPoint, rout
     return `M ${source.x} ${source.y} C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${target.x} ${target.y}`;
   }
 
-  if (routing === "straight" || !source.side || !target.side) {
+  if (routing === "straight") {
     return `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
   }
-  const sourceHorizontal = source.side === "left" || source.side === "right";
-  const targetHorizontal = target.side === "left" || target.side === "right";
 
-  if (sourceHorizontal && targetHorizontal) {
-    const midX = (source.x + target.x) / 2;
-    return `M ${source.x} ${source.y} L ${midX} ${source.y} L ${midX} ${target.y} L ${target.x} ${target.y}`;
-  }
-  if (!sourceHorizontal && !targetHorizontal) {
-    const midY = (source.y + target.y) / 2;
-    return `M ${source.x} ${source.y} L ${source.x} ${midY} L ${target.x} ${midY} L ${target.x} ${target.y}`;
-  }
-  // Mixed: one leaves horizontally, the other vertically - a single bend at the corner that keeps
-  // each end perpendicular to the side it left from.
-  if (sourceHorizontal) {
-    return `M ${source.x} ${source.y} L ${target.x} ${source.y} L ${target.x} ${target.y}`;
-  }
-  return `M ${source.x} ${source.y} L ${source.x} ${target.y} L ${target.x} ${target.y}`;
+  return roundedOpenPolylineD(orthogonalPolylinePoints(source, target), cornerRadius);
 }
 
-// The path's final segment direction, in degrees (SVG marker-friendly: 0 = pointing +x) - what an
-// arrowhead marker's orient should follow so it points the way the line is actually arriving,
-// rather than the straight source->target direction (wrong for an orthogonal/curved path's last
-// leg). "curved" uses the exact same cubic-bezier control points buildEdgePath drew the curve
-// through (see curveControlPoints) to find each end's real tangent direction - using the straight
-// source->target direction instead (as this used to) is only correct when the curve doesn't
-// actually bow away from that line, which free-floating ends now deliberately do. "orthogonal"
-// leaves/arrives along the anchored side's own normal; only "straight" (or an orthogonal edge with
-// neither end anchored, which buildEdgePath already renders as a plain line) falls back to the
-// literal source->target direction.
+// Computes the (x, y) point at fraction `t` (0 = source, 0.5 = midpoint, 1 = target) along the
+// edge's rendered path - used to position the connector's text label.
+export function edgePointAtFraction(
+  source: ResolvedPoint,
+  target: ResolvedPoint,
+  routing: EdgeRouting,
+  bow: number = DEFAULT_CURVE_BOW,
+  waypoints: { x: number; y: number }[] = [],
+  t: number = 0.5
+): { x: number; y: number } {
+  const clampedT = Math.max(0, Math.min(1, Number.isFinite(t) ? t : 0.5));
+  if (routing === "curved" && waypoints.length === 0) {
+    const { c1, c2 } = curveControlPoints(source, target, bow);
+    const u = 1 - clampedT;
+    const x =
+      u * u * u * source.x +
+      3 * u * u * clampedT * c1.x +
+      3 * u * clampedT * clampedT * c2.x +
+      clampedT * clampedT * clampedT * target.x;
+    const y =
+      u * u * u * source.y +
+      3 * u * u * clampedT * c1.y +
+      3 * u * clampedT * clampedT * c2.y +
+      clampedT * clampedT * clampedT * target.y;
+    return { x, y };
+  }
+  const poly =
+    waypoints.length > 0
+      ? [{ x: source.x, y: source.y }, ...waypoints, { x: target.x, y: target.y }]
+      : routing === "orthogonal"
+        ? orthogonalPolylinePoints(source, target)
+        : [{ x: source.x, y: source.y }, { x: target.x, y: target.y }];
+  if (poly.length < 2) return { x: source.x, y: source.y };
+  const segLengths: number[] = [];
+  let total = 0;
+  for (let i = 0; i < poly.length - 1; i++) {
+    const len = Math.hypot(poly[i + 1].x - poly[i].x, poly[i + 1].y - poly[i].y);
+    segLengths.push(len);
+    total += len;
+  }
+  if (total <= 1e-6) return { x: source.x, y: source.y };
+  let targetDist = clampedT * total;
+  for (let i = 0; i < segLengths.length; i++) {
+    const segLen = segLengths[i];
+    if (targetDist <= segLen || i === segLengths.length - 1) {
+      const f = segLen > 1e-6 ? targetDist / segLen : 0;
+      return {
+        x: poly[i].x + (poly[i + 1].x - poly[i].x) * f,
+        y: poly[i].y + (poly[i + 1].y - poly[i].y) * f,
+      };
+    }
+    targetDist -= segLen;
+  }
+  return { x: target.x, y: target.y };
+}
+
 export function edgeEndAngleDeg(
   source: { x: number; y: number },
   target: { x: number; y: number },
@@ -394,9 +662,6 @@ export function edgeEndAngleDeg(
   waypoints: { x: number; y: number }[] = []
 ): { startDeg: number; endDeg: number } {
   if (waypoints.length > 0) {
-    // Approximates each end's tangent as the direction from its nearest waypoint - exact for the
-    // straight/orthogonal (sharp-segment) case, a reasonable stand-in for "curved" (the true
-    // tangent at a quadratic spline's very end point is this same direction anyway).
     const nearStart = waypoints[0];
     const nearEnd = waypoints[waypoints.length - 1];
     const startDeg = (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
@@ -409,14 +674,24 @@ export function edgeEndAngleDeg(
     const startDeg = (Math.atan2(source.y - c1.y, source.x - c1.x) * 180) / Math.PI;
     return { startDeg, endDeg };
   }
-  if (routing === "orthogonal" && (sourceSide || targetSide)) {
-    const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
-    // A marker-end arrow points in the direction of travel AT arrival, i.e. the side's outward
-    // normal reversed (arriving INTO the shape) - so target uses sideDeg+180, while a marker-start
-    // arrow (pointing back out along departure) uses the source side's own outward angle directly.
-    const endDeg = targetSide ? sideDeg(targetSide) + 180 : (Math.atan2(target.y - source.y, target.x - source.x) * 180) / Math.PI;
-    const startDeg = sourceSide ? sideDeg(sourceSide) : (Math.atan2(source.y - target.y, source.x - target.x) * 180) / Math.PI;
-    return { startDeg, endDeg };
+  if (routing === "orthogonal") {
+    if (sourceSide || targetSide) {
+      const sideDeg = (side: "top" | "right" | "bottom" | "left") => (side === "left" ? 180 : side === "right" ? 0 : side === "top" ? -90 : 90);
+      const poly = orthogonalPolylinePoints({ ...source, side: sourceSide }, { ...target, side: targetSide });
+      const nearStart = poly[1] ?? target;
+      const nearEnd = poly[poly.length - 2] ?? source;
+      const endDeg = targetSide ? sideDeg(targetSide) + 180 : (Math.atan2(target.y - nearEnd.y, target.x - nearEnd.x) * 180) / Math.PI;
+      const startDeg = sourceSide ? sideDeg(sourceSide) : (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
+      return { startDeg, endDeg };
+    }
+    const poly = orthogonalPolylinePoints({ ...source, side: null }, { ...target, side: null });
+    if (poly.length >= 2) {
+      const nearStart = poly[1];
+      const nearEnd = poly[poly.length - 2];
+      const startDeg = (Math.atan2(source.y - nearStart.y, source.x - nearStart.x) * 180) / Math.PI;
+      const endDeg = (Math.atan2(target.y - nearEnd.y, target.x - nearEnd.x) * 180) / Math.PI;
+      return { startDeg, endDeg };
+    }
   }
   const dx = target.x - source.x;
   const dy = target.y - source.y;
@@ -516,7 +791,10 @@ export interface ChartLabel {
 //              whiteboardTypes.ts's ChartAnnotation), which carries its own color independent of
 //              both the node's stroke and any series palette.
 export type ChartPart =
-  | { d: string; role: "fill" | "stroke" | "axis" | "marker" | "grid" }
+  | { d: string; role: "fill" | "stroke" | "marker" }
+  // `color`/`opacity`/`width` override the fixed neutral look - see resolvePlotAxisStyle. Absent -
+  // the original gray axis (#9ca3af, 1px) / pale grid (#e5e7eb).
+  | { d: string; role: "axis" | "grid"; color?: string; opacity?: number; width?: number }
   | { d: string; role: "slice"; color: string }
   | { d: string; role: "series"; color: string; width: number }
   | { d: string; role: "seriesFill"; color: string }
@@ -597,6 +875,18 @@ export interface ShapeOutlineOptions {
   tableCols?: number; // "table" only
   tableColWidths?: number[]; // "table" only - fractions, length === tableCols
   tableRowHeights?: number[]; // "table" only - fractions, length === tableRows
+  // "graph"/"functionPlot" axis styling - see whiteboardTypes.ts's WhiteboardNode.axisPlacement.
+  axisPlacement?: AxisPlacement;
+  xLabelSide?: WhiteboardNode["xLabelSide"];
+  yLabelSide?: WhiteboardNode["yLabelSide"];
+  tickMarks?: WhiteboardNode["tickMarks"];
+  axisColor?: string;
+  gridColor?: string;
+  gridOpacity?: number;
+  // Any straight-edged "polygon" outline - see roundOutlineCorners. Rectangles round through their
+  // own "rect" body instead, so this never reaches them.
+  cornerRadius?: number;
+  cornerRadii?: (number | null)[];
 }
 
 // A regular n-gon inscribed in the w×h box, flat vertex at top (angle -90°) - standard parametric
@@ -1546,11 +1836,6 @@ function tickValuesByInterval(lo: number, hi: number, interval: number): number[
   return ticks;
 }
 
-// Picks tickValuesByInterval when the node has an explicit interval set, else falls back to the
-// auto 5-evenly-spaced-ticks behavior.
-function functionPlotTicks(lo: number, hi: number, intervalInput: number | undefined): number[] {
-  return intervalInput && intervalInput > 0 ? tickValuesByInterval(lo, hi, intervalInput) : tickValues(lo, hi, 5);
-}
 
 // Sine/cosine get a direct "how many periods" domain (see WhiteboardNode.plotCycles's own doc
 // comment); every other function keeps using plotDomainScale as a plain multiplier on its own
@@ -1582,7 +1867,8 @@ function functionPlotOutline(
   yTickInterval?: number,
   showLabels = true,
   cyclesInput?: number,
-  showGrid = false
+  showGrid = false,
+  axisOpts: ShapeOutlineOptions = {}
 ): { parts: ChartPart[]; labels: ChartLabel[] } {
   const [xMin, xMax] = functionPlotDomain(type, domainScaleInput, cyclesInput);
   // More samples for a wider (zoomed-out) domain, same "keep point density roughly constant"
@@ -1597,54 +1883,13 @@ function functionPlotOutline(
   const yMin = Math.min(...raw.map((p) => p.y));
   const yMax = Math.max(...raw.map((p) => p.y));
   const yRange = Math.max(yMax - yMin, 1e-6);
-  const padX = w * 0.08;
-  const padY = h * 0.08;
-  const plotW = w - padX * 2;
-  const plotH = h - padY * 2;
-  const mapX = (x: number) => padX + ((x - xMin) / (xMax - xMin)) * plotW;
-  const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
+  const range = { xMin, xMax, yMin, yMax: yMin + yRange };
+  const layout = plotAxisLayout(w, h, range, xTickInterval, yTickInterval, showLabels, axisOpts);
+  const { mapX, mapY } = layout.mapper;
   const curve = raw.map((p) => ({ x: mapX(p.x), y: mapY(p.y) }));
-  const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
-  const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
-  const parts: ChartPart[] = [];
-  // Grid drawn BEFORE the axis/curve so it always sits visually behind them, not on top.
-  if (showGrid) {
-    const gridXTicks = functionPlotTicks(xMin, xMax, xTickInterval);
-    const gridYTicks = functionPlotTicks(yMin, yMax, yTickInterval);
-    const gridLines = [
-      ...gridXTicks.map((tx) => openPathD([{ x: mapX(tx), y: padY }, { x: mapX(tx), y: padY + plotH }])),
-      ...gridYTicks.map((ty) => openPathD([{ x: padX, y: mapY(ty) }, { x: padX + plotW, y: mapY(ty) }])),
-    ];
-    if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
-  }
-  parts.push(
-    { d: openPathD(curve), role: "stroke" },
-    {
-      d: [
-        openPathD([{ x: padX, y: yAxisY }, { x: padX + plotW, y: yAxisY }]),
-        openPathD([{ x: xAxisX, y: padY }, { x: xAxisX, y: padY + plotH }]),
-      ].join(" "),
-      role: "axis",
-    }
-  );
-  if (!showLabels) return { parts, labels: [] };
-  // Each axis's numbers sit on whichever side of its own line has room, flipping to the other side
-  // rather than running off the box when the line itself sits near an edge (e.g. sqrt/logarithm,
-  // whose domain never goes negative, put the y-axis right at the plot's left edge).
-  const xLabelY = yAxisY < padY + plotH - 20 ? yAxisY + 12 : yAxisY - 8;
-  const yLabelNearLeft = xAxisX > padX + 20;
-  const yLabelX = yLabelNearLeft ? xAxisX - 4 : xAxisX + 4;
-  const yLabelAnchor: ChartLabel["anchor"] = yLabelNearLeft ? "end" : "start";
-  // Both axes crossing through the plotted window means their "0" ticks land on the exact same
-  // point (the origin) - keep only the y-axis's copy so the origin isn't double-labeled.
-  const originVisible = xMin <= 0 && xMax >= 0 && yMin <= 0 && yMax >= 0;
-  const xTicks = functionPlotTicks(xMin, xMax, xTickInterval).filter((t) => !originVisible || Math.abs(t) > 1e-9);
-  const yTicks = functionPlotTicks(yMin, yMax, yTickInterval);
-  const labels: ChartLabel[] = [
-    ...xTicks.map((tx) => ({ x: mapX(tx), y: Math.max(2, Math.min(xLabelY, h - 2)), text: formatTick(tx), anchor: "middle" as const })),
-    ...yTicks.map((ty) => ({ x: Math.max(2, Math.min(yLabelX, w - 2)), y: mapY(ty), text: formatTick(ty), anchor: yLabelAnchor })),
-  ];
-  return { parts, labels };
+  // Grid first so it always sits behind the curve; axis lines last, on top of it.
+  const deco = plotAxisDecorations(layout, range, showLabels, showGrid);
+  return { parts: [...deco.gridParts, { d: openPathD(curve), role: "stroke" }, ...deco.axisParts], labels: deco.labels };
 }
 
 // ---- "graph" shape - a user-typed formula, plotted over an explicit x/y window --------------------
@@ -1912,18 +2157,28 @@ function robustGraphYRange(values: number[]): [number, number] {
 // (rendering WhiteboardNode.graphPoints' current pixel position, and inverse-mapping a drag/
 // double-click pixel back into data-space) so both always agree on exactly where a given data
 // point sits, with no risk of two independent reimplementations of the same formula drifting apart.
-export function graphCoordinateMapper(w: number, h: number, xMin: number, xMax: number, yMin: number, yMax: number) {
-  const padX = w * 0.08;
-  const padY = h * 0.08;
-  const plotW = w - padX * 2;
-  const plotH = h - padY * 2;
+export function graphCoordinateMapper(
+  w: number,
+  h: number,
+  xMin: number,
+  xMax: number,
+  yMin: number,
+  yMax: number,
+  // Extra room beyond the standard 8% padding on each side - reserved for tick numbers drawn outside
+  // the plot box (see plotLabelGutters). padX/padY stay the LEFT/TOP offsets of the plot box.
+  gutters: { left: number; right: number; top: number; bottom: number } = { left: 0, right: 0, top: 0, bottom: 0 }
+) {
+  const padX = w * 0.08 + gutters.left;
+  const padY = h * 0.08 + gutters.top;
+  const plotW = Math.max(1, w - w * 0.16 - gutters.left - gutters.right);
+  const plotH = Math.max(1, h - h * 0.16 - gutters.top - gutters.bottom);
   const xRange = xMax - xMin || 1;
   const yRange = yMax - yMin || 1;
   const mapX = (x: number) => padX + ((x - xMin) / xRange) * plotW;
   const mapY = (y: number) => padY + plotH - ((y - yMin) / yRange) * plotH;
   const invMapX = (px: number) => xMin + ((px - padX) / plotW) * xRange;
   const invMapY = (py: number) => yMin + (1 - (py - padY) / plotH) * yRange;
-  return { padX, padY, plotW, plotH, mapX, mapY, invMapX, invMapY };
+  return { padX, padY, plotW, plotH, mapX, mapY, invMapX, invMapY, w, h };
 }
 
 // The x/y-range WhiteboardCanvas.tsx's own manual-point handles resolve a "graph" node's axes to -
@@ -1970,7 +2225,8 @@ function graphOutline(
   yTickInterval: number | undefined,
   showLabels = true,
   showGrid = true,
-  manualPoints: { x: number; y: number }[] = []
+  manualPoints: { x: number; y: number }[] = [],
+  axisOpts: ShapeOutlineOptions = {}
 ): { parts: ChartPart[]; labels: ChartLabel[] } {
   let xMin = xMinInput ?? DEFAULT_GRAPH_X_MIN;
   let xMax = xMaxInput ?? DEFAULT_GRAPH_X_MAX;
@@ -1998,7 +2254,9 @@ function graphOutline(
   }
   if (yMax <= yMin) yMax = yMin + 1;
   const yRange = yMax - yMin;
-  const { padX, padY, plotW, plotH, mapX, mapY } = graphCoordinateMapper(w, h, xMin, xMax, yMin, yMax);
+  const range = { xMin, xMax, yMin, yMax };
+  const layout = plotAxisLayout(w, h, range, xTickInterval, yTickInterval, showLabels, axisOpts);
+  const { mapX, mapY } = layout.mapper;
 
   let curveD = "";
   if (hasExpression) {
@@ -2025,45 +2283,212 @@ function graphOutline(
     curveD = subpaths.map((pts) => openPathD(pts)).join(" ");
   }
 
-  const yAxisY = yMin <= 0 && yMax >= 0 ? mapY(0) : padY + plotH;
-  const xAxisX = xMin <= 0 && xMax >= 0 ? mapX(0) : padX;
-  const xTicksFor = (interval: number | undefined, lo: number, hi: number) => (interval && interval > 0 ? tickValuesByInterval(lo, hi, interval) : tickValues(lo, hi, 5));
-  const parts: ChartPart[] = [];
-  if (showGrid) {
-    const gridXTicks = xTicksFor(xTickInterval, xMin, xMax);
-    const gridYTicks = xTicksFor(yTickInterval, yMin, yMax);
-    const gridLines = [
-      ...gridXTicks.map((tx) => openPathD([{ x: mapX(tx), y: padY }, { x: mapX(tx), y: padY + plotH }])),
-      ...gridYTicks.map((ty) => openPathD([{ x: padX, y: mapY(ty) }, { x: padX + plotW, y: mapY(ty) }])),
-    ];
-    if (gridLines.length > 0) parts.push({ d: gridLines.join(" "), role: "grid" });
-  }
+  const deco = plotAxisDecorations(layout, range, showLabels, showGrid);
+  const parts: ChartPart[] = [...deco.gridParts];
   if (curveD) parts.push({ d: curveD, role: "stroke" });
   if (manualPoints.length >= 2) {
     parts.push({ d: openPathD(manualPoints.map((p) => ({ x: mapX(p.x), y: mapY(p.y) }))), role: "stroke" });
   } else if (manualPoints.length === 1) {
     parts.push({ d: dotPathD(mapX(manualPoints[0].x), mapY(manualPoints[0].y), 3.5), role: "marker" });
   }
-  parts.push({
-    d: [
-      openPathD([{ x: padX, y: yAxisY }, { x: padX + plotW, y: yAxisY }]),
-      openPathD([{ x: xAxisX, y: padY }, { x: xAxisX, y: padY + plotH }]),
-    ].join(" "),
-    role: "axis",
-  });
-  if (!showLabels) return { parts, labels: [] };
-  const xLabelY = yAxisY < padY + plotH - 20 ? yAxisY + 12 : yAxisY - 8;
-  const yLabelNearLeft = xAxisX > padX + 20;
-  const yLabelX = yLabelNearLeft ? xAxisX - 4 : xAxisX + 4;
-  const yLabelAnchor: ChartLabel["anchor"] = yLabelNearLeft ? "end" : "start";
-  const originVisible = xMin <= 0 && xMax >= 0 && yMin <= 0 && yMax >= 0;
-  const xTicks = xTicksFor(xTickInterval, xMin, xMax).filter((t) => !originVisible || Math.abs(t) > 1e-9);
-  const yTicks = xTicksFor(yTickInterval, yMin, yMax);
+  parts.push(...deco.axisParts);
+  return { parts, labels: deco.labels };
+}
+
+// ---- Plot axes (graph / functionPlot) -----------------------------------------------------------
+//
+// How a plot's scaffolding is drawn - axis lines, tick marks, tick numbers, gridlines - resolved
+// from the node's axis-style fields (see whiteboardTypes.ts's WhiteboardNode.axisPlacement and
+// neighbors). One builder shared by "graph" and "functionPlot" so the two plot shapes can't drift
+// apart, and so the layout (including the label gutters below) is computed in exactly one place.
+
+export interface PlotAxisStyle {
+  placement: AxisPlacement;
+  xLabelSide: "bottom" | "top" | "axis";
+  yLabelSide: "left" | "right" | "axis";
+  tickMarks: "none" | "outside" | "inside";
+  axisColor: string;
+  axisWidth: number;
+  gridColor: string;
+  gridOpacity: number;
+  fontSize: number;
+}
+
+export const DEFAULT_AXIS_COLOR = "#9ca3af";
+export const DEFAULT_FRAME_AXIS_COLOR = "#374151";
+export const DEFAULT_GRID_COLOR = "#e5e7eb";
+const TICK_MARK_LENGTH = 5;
+const LABEL_GAP = 4;
+
+// "auto" sides follow the axis line when the axes cross at the origin (the classic math-class look)
+// and sit outside the plot box otherwise (the journal-figure look). Frame placements default to
+// outward tick marks and a darker axis, since there the axes ARE the figure's border rather than
+// faint reference lines through its middle.
+export function resolvePlotAxisStyle(opts: ShapeOutlineOptions): PlotAxisStyle {
+  const placement = opts.axisPlacement ?? "origin";
+  const framed = placement !== "origin";
+  const xSide = opts.xLabelSide ?? "auto";
+  const ySide = opts.yLabelSide ?? "auto";
+  return {
+    placement,
+    xLabelSide: xSide === "auto" ? (framed ? "bottom" : "axis") : xSide,
+    yLabelSide: ySide === "auto" ? (framed ? "left" : "axis") : ySide,
+    tickMarks: opts.tickMarks ?? (framed && placement !== "none" ? "outside" : "none"),
+    axisColor: opts.axisColor ?? (framed ? DEFAULT_FRAME_AXIS_COLOR : DEFAULT_AXIS_COLOR),
+    axisWidth: framed ? 1.25 : 1,
+    gridColor: opts.gridColor ?? DEFAULT_GRID_COLOR,
+    gridOpacity: Math.max(0, Math.min(1, opts.gridOpacity ?? 1)),
+    fontSize: opts.fontSize ?? 16,
+  };
+}
+
+// Extra room (beyond the plot's standard 8% padding) that outside-the-box tick numbers need, so a
+// label column on the left or a row along the bottom never runs off the node. Zero whenever labels
+// ride the axis lines - which keeps every pre-existing graph laid out exactly as before.
+function plotLabelGutters(style: PlotAxisStyle, w: number, h: number, yLabelTexts: string[], showLabels: boolean) {
+  const gutters = { left: 0, right: 0, top: 0, bottom: 0 };
+  if (!showLabels) return gutters;
+  const tick = style.tickMarks === "outside" ? TICK_MARK_LENGTH : 0;
+  const rowNeed = tick + LABEL_GAP + style.fontSize * 1.15;
+  const widest = Math.max(0, ...yLabelTexts.map((t) => estimatedTextWidth(t, style.fontSize)));
+  const colNeed = tick + LABEL_GAP + widest + 2;
+  if (style.xLabelSide === "bottom") gutters.bottom = Math.max(0, rowNeed - h * 0.08);
+  if (style.xLabelSide === "top") gutters.top = Math.max(0, rowNeed - h * 0.08);
+  if (style.yLabelSide === "left") gutters.left = Math.min(w * 0.4, Math.max(0, colNeed - w * 0.08));
+  if (style.yLabelSide === "right") gutters.right = Math.min(w * 0.4, Math.max(0, colNeed - w * 0.08));
+  return gutters;
+}
+
+// With no explicit interval, ticks land on round numbers - a 1, 2 or 5 times a power of ten, the
+// step every plotting library picks - aiming for about five per axis. Splitting the range into five
+// equal parts instead labeled an auto-fit axis "-2.03, -0.76, 0.51", which no figure should show.
+function niceTicks(lo: number, hi: number, target = 5): number[] {
+  const range = hi - lo;
+  if (!(range > 0) || !Number.isFinite(range)) return [lo];
+  const rough = range / Math.max(1, target - 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  return tickValuesByInterval(lo, hi, step).map((t) => +t.toPrecision(12));
+}
+
+function ticksFor(interval: number | undefined, lo: number, hi: number): number[] {
+  return interval && interval > 0 ? tickValuesByInterval(lo, hi, interval) : niceTicks(lo, hi);
+}
+
+// Everything a plot's layout depends on, in one call: the ticks on each axis, the axis style, and
+// the data<->pixel mapper with label gutters already applied. Used by the outline builders AND by
+// annotationCoordinateMapper (the canvas's draggable point handles), so both agree to the pixel.
+export function plotAxisLayout(
+  w: number,
+  h: number,
+  range: { xMin: number; xMax: number; yMin: number; yMax: number },
+  xTickInterval: number | undefined,
+  yTickInterval: number | undefined,
+  showLabels: boolean,
+  opts: ShapeOutlineOptions
+) {
+  const style = resolvePlotAxisStyle(opts);
+  const xTicks = ticksFor(xTickInterval, range.xMin, range.xMax);
+  const yTicks = ticksFor(yTickInterval, range.yMin, range.yMax);
+  const gutters = plotLabelGutters(style, w, h, yTicks.map(formatTick), showLabels);
+  const mapper = graphCoordinateMapper(w, h, range.xMin, range.xMax, range.yMin, range.yMax, gutters);
+  return { style, xTicks, yTicks, mapper };
+}
+
+// Every Nth label, N chosen so neighbors never overlap - the "smart" half of tick labeling. A dense
+// interval or a large font used to print numbers on top of each other ("-9-7.5-6-4.5..."); thinning
+// keeps the ticks/gridlines at the requested interval while labeling only as many as fit. Thinned
+// from zero outward when zero is a tick, so the origin's neighbors stay symmetric.
+function thinTicks(ticks: number[], pixelOf: (t: number) => number, sizeOf: (t: number) => number, gap: number): number[] {
+  if (ticks.length < 2) return ticks;
+  const spacing = Math.abs(pixelOf(ticks[1]) - pixelOf(ticks[0]));
+  if (spacing <= 0) return ticks.slice(0, 1);
+  const need = Math.max(...ticks.map(sizeOf)) + gap;
+  const step = Math.max(1, Math.ceil(need / spacing));
+  if (step === 1) return ticks;
+  const zeroIndex = ticks.findIndex((t) => Math.abs(t) < 1e-9);
+  const anchor = zeroIndex >= 0 ? zeroIndex : 0;
+  return ticks.filter((_, i) => (i - anchor) % step === 0);
+}
+
+// Axis lines, tick marks, gridlines and tick numbers for a plot laid out by plotAxisLayout.
+function plotAxisDecorations(
+  layout: ReturnType<typeof plotAxisLayout>,
+  range: { xMin: number; xMax: number; yMin: number; yMax: number },
+  showLabels: boolean,
+  showGrid: boolean
+): { gridParts: ChartPart[]; axisParts: ChartPart[]; labels: ChartLabel[] } {
+  const { style, xTicks, yTicks, mapper } = layout;
+  const { padX, padY, plotW, plotH, mapX, mapY } = mapper;
+  const { xMin, xMax, yMin, yMax } = range;
+  const left = padX;
+  const right = padX + plotW;
+  const top = padY;
+  const bottom = padY + plotH;
+  const origin = style.placement === "origin";
+  const zeroYVisible = yMin <= 0 && yMax >= 0;
+  const zeroXVisible = xMin <= 0 && xMax >= 0;
+  // Where each axis line runs: through zero for "origin" (falling back to the box edge when zero is
+  // out of view), along the box edge for every frame placement.
+  const xAxisY = origin && zeroYVisible ? mapY(0) : bottom;
+  const yAxisX = origin && zeroXVisible ? mapX(0) : left;
+
+  const gridParts: ChartPart[] = [];
+  if (showGrid && style.gridOpacity > 0) {
+    const lines = [
+      ...xTicks.map((tx) => openPathD([{ x: mapX(tx), y: top }, { x: mapX(tx), y: bottom }])),
+      ...yTicks.map((ty) => openPathD([{ x: left, y: mapY(ty) }, { x: right, y: mapY(ty) }])),
+    ];
+    if (lines.length > 0) gridParts.push({ d: lines.join(" "), role: "grid", color: style.gridColor, opacity: style.gridOpacity });
+  }
+
+  const axisLines: string[] = [];
+  if (style.placement === "origin" || style.placement === "edge") {
+    axisLines.push(openPathD([{ x: left, y: xAxisY }, { x: right, y: xAxisY }]), openPathD([{ x: yAxisX, y: top }, { x: yAxisX, y: bottom }]));
+  } else if (style.placement === "box") {
+    axisLines.push(openPathD([{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }, { x: left, y: bottom }, { x: left, y: top }]));
+  }
+
+  // The line each axis's numbers (and tick marks) attach to.
+  const xLabelLineY = style.xLabelSide === "top" ? top : style.xLabelSide === "bottom" ? bottom : xAxisY;
+  const yLabelLineX = style.yLabelSide === "right" ? right : style.yLabelSide === "left" ? left : yAxisX;
+  // Which way is "away from the plot" for each label line - numbers and outside ticks go that way.
+  // On an origin axis that's "below"/"left" unless the line sits too near that edge for the labels
+  // to fit, in which case they flip to the other side rather than running off the box.
+  const xOut = style.xLabelSide === "top" ? -1 : style.xLabelSide === "bottom" ? 1 : xAxisY < bottom - 20 ? 1 : -1;
+  const yOut = style.yLabelSide === "right" ? 1 : style.yLabelSide === "left" ? -1 : yAxisX > left + 20 ? -1 : 1;
+
+  if (style.tickMarks !== "none" && style.placement !== "none") {
+    const len = TICK_MARK_LENGTH;
+    // On an axis through the middle of the plot "outside" has no meaning, so ticks straddle it.
+    const span = (out: number): [number, number] =>
+      style.tickMarks === "inside" ? [0, -out * len] : style.xLabelSide === "axis" && origin ? [-len / 2, len / 2] : [0, out * len];
+    const [xa, xb] = span(xOut);
+    for (const tx of xTicks) axisLines.push(openPathD([{ x: mapX(tx), y: xLabelLineY + xa }, { x: mapX(tx), y: xLabelLineY + xb }]));
+    const [ya, yb] = span(yOut);
+    for (const ty of yTicks) axisLines.push(openPathD([{ x: yLabelLineX + ya, y: mapY(ty) }, { x: yLabelLineX + yb, y: mapY(ty) }]));
+  }
+  const axisParts: ChartPart[] = axisLines.length > 0 ? [{ d: axisLines.join(" "), role: "axis", color: style.axisColor, width: style.axisWidth }] : [];
+
+  if (!showLabels) return { gridParts, axisParts, labels: [] };
+  const fs = style.fontSize;
+  const outward = style.tickMarks === "outside" ? TICK_MARK_LENGTH : 0;
+  // Both axes crossing through the window on axis-riding labels lands both "0"s on the origin - keep
+  // only the y-axis's copy. Frame labels sit apart, so both zeros are legitimately separate there.
+  const dropXZero = style.xLabelSide === "axis" && style.yLabelSide === "axis" && origin && zeroXVisible && zeroYVisible;
+  // Thinned BEFORE the origin's 0 is dropped, so the kept labels stay symmetric about zero.
+  const xLabelTicks = thinTicks(xTicks, mapX, (t) => estimatedTextWidth(formatTick(t), fs), fs * 0.6).filter((t) => !dropXZero || Math.abs(t) > 1e-9);
+  const yLabelTicks = thinTicks(yTicks, mapY, () => fs, fs * 0.25);
+  const xLabelY = xLabelLineY + xOut * (outward + LABEL_GAP + fs * 0.55);
+  const yLabelX = yLabelLineX + yOut * (outward + LABEL_GAP);
+  const clampX = (x: number) => (style.yLabelSide === "axis" ? Math.max(2, Math.min(x, mapper.w - 2)) : x);
+  const clampY = (y: number) => (style.xLabelSide === "axis" ? Math.max(2, Math.min(y, mapper.h - 2)) : y);
   const labels: ChartLabel[] = [
-    ...xTicks.map((tx) => ({ x: mapX(tx), y: Math.max(2, Math.min(xLabelY, h - 2)), text: formatTick(tx), anchor: "middle" as const })),
-    ...yTicks.map((ty) => ({ x: Math.max(2, Math.min(yLabelX, w - 2)), y: mapY(ty), text: formatTick(ty), anchor: yLabelAnchor })),
+    ...xLabelTicks.map((tx) => ({ x: mapX(tx), y: clampY(xLabelY), text: formatTick(tx), anchor: "middle" as const })),
+    ...yLabelTicks.map((ty) => ({ x: clampX(yLabelX), y: mapY(ty), text: formatTick(ty), anchor: (yOut < 0 ? "end" : "start") as ChartLabel["anchor"] })),
   ];
-  return { parts, labels };
+  return { gridParts, axisParts, labels };
 }
 
 // ---- Multi-series / waterfall -------------------------------------------------------------------
@@ -2296,14 +2721,13 @@ export function annotationCoordinateMapper(shapeType: WhiteboardShapeType, w: nu
   const margins = chartMargins(shapeType, w, h, opts);
   const innerW = Math.max(1, w - margins.left);
   const innerH = Math.max(1, h - margins.top - margins.bottom);
-  const range =
-    shapeType === "waterfallChart"
-      ? (() => {
-          const r = resolveSeriesData(opts);
-          return { xMin: r.xMin, xMax: r.xMax, yMin: r.stackedYMin, yMax: r.stackedYMax };
-        })()
-      : resolveGraphAxisRange(opts);
-  return { ...graphCoordinateMapper(innerW, innerH, range.xMin, range.xMax, range.yMin, range.yMax), offsetX: margins.left, offsetY: margins.top };
+  if (shapeType !== "waterfallChart") {
+    // Same layout graphOutline uses, label gutters included, so handles land on the drawn points.
+    const layout = plotAxisLayout(innerW, innerH, resolveGraphAxisRange(opts), opts.graphXTickInterval, opts.graphYTickInterval, opts.showChartLabels ?? true, opts);
+    return { ...layout.mapper, offsetX: margins.left, offsetY: margins.top };
+  }
+  const r = resolveSeriesData(opts);
+  return { ...graphCoordinateMapper(innerW, innerH, r.xMin, r.xMax, r.stackedYMin, r.stackedYMax), offsetX: margins.left, offsetY: margins.top };
 }
 
 // The marker glyph + label for each data-space callout on a chart (see whiteboardTypes.ts's
@@ -2636,7 +3060,8 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
           opts?.plotYTickInterval,
           opts?.showChartLabels ?? true,
           opts?.plotCycles,
-          opts?.plotShowGrid ?? false
+          opts?.plotShowGrid ?? false,
+          opts
         ),
       };
     case "graph":
@@ -2654,7 +3079,8 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
           opts?.graphYTickInterval,
           opts?.showChartLabels ?? true,
           opts?.graphShowGrid ?? true,
-          opts?.graphPoints ?? []
+          opts?.graphPoints ?? [],
+          opts
         ),
       };
     case "waterfallChart":
@@ -2708,6 +3134,181 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
   }
 }
 
+// ---- Corner rounding --------------------------------------------------------------------------
+
+// A closed polygon with every vertex replaced by a quadratic curve whose control point is the
+// original vertex - the same fillet construction design tools use for "corner radius" on arbitrary
+// polygons. Each corner's cut-back distance is r / tan(halfAngle) (what a true circular fillet of
+// radius r tangent to both edges would need), clamped to half of each adjoining edge so two
+// neighboring fillets can never overlap; that clamp is what keeps a star's needle-sharp tips and a
+// tiny triangle well-formed at any radius instead of looping back on themselves. Concave vertices
+// (a star's inner points, a cross's inside corners) round the same way.
+export function roundedPolygonD(points: [number, number][], radius: number, cornerRadii?: (number | null | undefined)[]): string {
+  const n = points.length;
+  const radii = points.map((_, i) => Math.max(0, cornerRadii?.[i] ?? radius ?? 0));
+  if (n < 3 || radii.every((r) => r <= 0)) return `M${points.map(([x, y]) => `${x},${y}`).join(" L")} Z`;
+  const corners = points.map((p, i) => {
+    const r = radii[i];
+    const prev = points[(i - 1 + n) % n];
+    const next = points[(i + 1) % n];
+    const ax = prev[0] - p[0];
+    const ay = prev[1] - p[1];
+    const bx = next[0] - p[0];
+    const by = next[1] - p[1];
+    const la = Math.hypot(ax, ay) || 1;
+    const lb = Math.hypot(bx, by) || 1;
+    const cos = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)));
+    const half = Math.acos(cos) / 2;
+    const ideal = r > 0 && half > 1e-4 ? r / Math.tan(half) : 0;
+    const t = Math.min(ideal, la / 2, lb / 2);
+    return {
+      start: [p[0] + (ax / la) * t, p[1] + (ay / la) * t] as const,
+      end: [p[0] + (bx / lb) * t, p[1] + (by / lb) * t] as const,
+      vertex: p,
+      rounded: t > 1e-4,
+    };
+  });
+  const f = (v: number) => +v.toFixed(2);
+  let d = `M${f(corners[0].end[0])},${f(corners[0].end[1])}`;
+  for (let i = 1; i <= n; i++) {
+    const c = corners[i % n];
+    if (c.rounded) {
+      d += ` L${f(c.start[0])},${f(c.start[1])} Q${f(c.vertex[0])},${f(c.vertex[1])} ${f(c.end[0])},${f(c.end[1])}`;
+    } else {
+      d += ` L${f(c.vertex[0])},${f(c.vertex[1])}`;
+    }
+  }
+  return `${d} Z`;
+}
+
+// Resolves a 4-corner box's [top-left, top-right, bottom-right, bottom-left] radii, clamped to half
+// the shorter side so neither CSS border-radius nor Canvas2D/SVG arc paths ever overlap.
+export function resolveBoxCornerRadii(
+  node: Pick<WhiteboardNode, "width" | "height" | "cornerRadius" | "cornerRadii">
+): [number, number, number, number] {
+  const maxR = Math.max(0, Math.min(node.width, node.height) / 2);
+  const base = node.cornerRadius ?? 0;
+  return [
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[0] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[1] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[2] ?? base)),
+    Math.max(0, Math.min(maxR, node.cornerRadii?.[3] ?? base)),
+  ];
+}
+
+// SVG path `d` for a w x h rectangle with independent [tl, tr, br, bl] circular corner radii -
+// used when a rectangle/equation carries a gradient, image, or pattern fill alongside per-corner
+// radii (SVG's <rect> only accepts a single uniform rx/ry).
+export function roundedRectSvgD(w: number, h: number, radii: [number, number, number, number]): string {
+  const maxR = Math.max(0, Math.min(w, h) / 2);
+  const [tl, tr, br, bl] = radii.map((r) => Math.max(0, Math.min(maxR, r)));
+  const f = (v: number) => +v.toFixed(2);
+  return [
+    `M${f(tl)},0`,
+    `L${f(w - tr)},0`,
+    tr > 0 ? `A${f(tr)},${f(tr)} 0 0,1 ${f(w)},${f(tr)}` : "",
+    `L${f(w)},${f(h - br)}`,
+    br > 0 ? `A${f(br)},${f(br)} 0 0,1 ${f(w - br)},${f(h)}` : "",
+    `L${f(bl)},${f(h)}`,
+    bl > 0 ? `A${f(bl)},${f(bl)} 0 0,1 0,${f(h - bl)}` : "",
+    `L0,${f(tl)}`,
+    tl > 0 ? `A${f(tl)},${f(tl)} 0 0,1 ${f(tl)},0` : "",
+    "Z",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+export interface DetectedShapeCorner {
+  index: number;
+  label: string;
+  point: [number, number];
+}
+
+function cornerDirectionLabel(nx: number, ny: number): string {
+  const dx = nx - 0.5;
+  const dy = ny - 0.5;
+  if (Math.hypot(dx, dy) < 0.12) return "Center";
+  if (Math.abs(dx) <= 0.12) return dy < 0 ? "Top" : "Bottom";
+  if (Math.abs(dy) <= 0.12) return dx < 0 ? "Left" : "Right";
+  const v = dy < 0 ? "Top" : "Bottom";
+  const h = dx < 0 ? "left" : "right";
+  return `${v}-${h}`;
+}
+
+// Detects the roundable corners of any shape that supports corner radius and names each vertex by
+// its position on the shape (e.g. "Top", "Bottom-right", "Bottom-left" for a triangle; "Top-left",
+// "Top-right", "Bottom-right", "Bottom-left" for a rectangle; "Top", "Right", "Bottom", "Left" for
+// a diamond; etc.), accounting for horizontal/vertical flips so labels match the on-screen corners.
+export function detectShapeCorners(node: WhiteboardNode): DetectedShapeCorner[] {
+  if (!supportsCornerRadius(node)) return [];
+  const { width: w, height: h } = node;
+  let points: [number, number][];
+  if (node.shapeType === "rectangle" || node.shapeType === "equation" || node.shapeType === "image") {
+    points = [
+      [0, 0],
+      [w, 0],
+      [w, h],
+      [0, h],
+    ];
+  } else {
+    const outline = baseShapeOutline(node.shapeType, w, h, outlineOptionsFor(node));
+    if (outline.kind !== "polygon") return [];
+    points = outline.points;
+  }
+
+  const baseLabels = points.map((p, i) => {
+    const rawNx = w > 0 ? p[0] / w : 0.5;
+    const rawNy = h > 0 ? p[1] / h : 0.5;
+    const nx = node.flipHorizontal ? 1 - rawNx : rawNx;
+    const ny = node.flipVertical ? 1 - rawNy : rawNy;
+    const dir = cornerDirectionLabel(nx, ny);
+    if (node.shapeType === "star" && i % 2 === 1) {
+      return `Inner ${dir.toLowerCase()}`;
+    }
+    return dir;
+  });
+
+  const counts = new Map<string, number>();
+  for (const lbl of baseLabels) counts.set(lbl, (counts.get(lbl) ?? 0) + 1);
+  const seen = new Map<string, number>();
+
+  return points.map((point, index) => {
+    const base = baseLabels[index];
+    if ((counts.get(base) ?? 0) > 1) {
+      const next = (seen.get(base) ?? 0) + 1;
+      seen.set(base, next);
+      return { index, label: `${base} ${next}`, point };
+    }
+    return { index, label: base, point };
+  });
+}
+
+// Only plain closed polygons round - one with inner lines/circles (cube spokes, a note's crease, a
+// table grid, benzene's ring) has strokes that land exactly on its vertices, and rounding the outline
+// out from under them would leave those strokes poking past the new edge.
+function roundOutlineCorners(
+  shapeType: WhiteboardShapeType,
+  outline: ShapeOutline,
+  radius: number | undefined,
+  cornerRadii?: (number | null | undefined)[]
+): ShapeOutline {
+  const hasRadius = (radius !== undefined && radius > 0) || (cornerRadii?.some((r) => r !== null && r !== undefined && r > 0) ?? false);
+  if (!hasRadius || outline.kind !== "polygon" || outline.innerLines || outline.innerCircle || shapeType === "table") return outline;
+  return { kind: "path", d: roundedPolygonD(outline.points, radius ?? 0, cornerRadii) };
+}
+
+// Whether the style panel's Corner radius control does anything for this node - rectangles and
+// equation cards (their own rounded "rect" body), "rounded"-mask images, and every plain polygon
+// outline roundOutlineCorners accepts.
+export function supportsCornerRadius(node: WhiteboardNode): boolean {
+  if (node.shapeType === "rectangle" || node.shapeType === "equation") return true;
+  if (node.shapeType === "image") return (node.imageMask ?? "rect") === "rounded";
+  if (node.shapeType === "table") return false;
+  const outline = baseShapeOutline(node.shapeType, node.width, node.height, outlineOptionsFor(node));
+  return outline.kind === "polygon" && !outline.innerLines && !outline.innerCircle;
+}
+
 // Every shape's outline, in node-local coordinates. For the chart shapes this additionally reserves
 // margins for whatever title captions are set (shrinking the plot box to fit, rather than letting a
 // caption overlap the data) and projects any data-space annotations through the same coordinate
@@ -2720,7 +3321,9 @@ export function shapeOutlineFor(shapeType: WhiteboardShapeType, w: number, h: nu
   const annotations = CHART_ANNOTATION_SHAPES.has(shapeType) ? opts?.chartAnnotations ?? [] : [];
   const margins = CHART_AXIS_TITLE_SHAPES.has(shapeType) ? chartMargins(shapeType, w, h, opts ?? {}) : { left: 0, top: 0, bottom: 0, labels: [] as ChartLabel[] };
   const hasMargins = margins.left > 0 || margins.top > 0 || margins.bottom > 0;
-  if (!hasMargins && annotations.length === 0) return baseShapeOutline(shapeType, w, h, opts);
+  if (!hasMargins && annotations.length === 0) {
+    return roundOutlineCorners(shapeType, baseShapeOutline(shapeType, w, h, opts), opts?.cornerRadius, opts?.cornerRadii);
+  }
 
   const innerW = Math.max(1, w - margins.left);
   const innerH = Math.max(1, h - margins.top - margins.bottom);
@@ -2818,6 +3421,15 @@ export function outlineOptionsFor(node: WhiteboardNode): ShapeOutlineOptions {
     tableCols: node.tableCols,
     tableColWidths: node.tableColWidths,
     tableRowHeights: node.tableRowHeights,
+    cornerRadius: node.cornerRadius,
+    cornerRadii: node.cornerRadii,
+    axisPlacement: node.axisPlacement,
+    xLabelSide: node.xLabelSide,
+    yLabelSide: node.yLabelSide,
+    tickMarks: node.tickMarks,
+    axisColor: node.axisColor,
+    gridColor: node.gridColor,
+    gridOpacity: node.gridOpacity,
   };
 }
 
@@ -2913,11 +3525,7 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
     return path;
   }
   if (mask === "rounded") {
-    // Clamped to half the shorter side - a radius past that is geometrically meaningless and
-    // renders as a malformed path rather than a rounder box.
-    const r = Math.max(0, Math.min(node.cornerRadius ?? 0, Math.min(w, h) / 2));
-    path.roundRect(0, 0, w, h, r);
-    return path;
+    return roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii);
   }
   path.rect(0, 0, w, h);
   return path;
@@ -2932,10 +3540,10 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
 export function paintImageNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, image: CanvasImageSource | null, sourceW: number, sourceH: number): void {
   const maskPath = imageMaskPath(node);
 
-  if (node.fillColor) {
+  if (resolveNodeFill(node)) {
     ctx.save();
     ctx.clip(maskPath);
-    ctx.fillStyle = node.fillColor;
+    ctx.fillStyle = resolveNodeFill(node)!;
     ctx.fillRect(0, 0, node.width, node.height);
     ctx.restore();
   }
@@ -3172,14 +3780,25 @@ export function applyCommand(page: WhiteboardPage, command: WhiteboardCommand): 
       return { ...page, edges: page.edges.filter((e) => e.id !== command.item.id) };
     case "edit-edge":
       return { ...page, edges: page.edges.map((e) => (e.id === command.after.id ? command.after : e)) };
+    case "batch-edit-edges": {
+      const afterById = new Map(command.after.map((e) => [e.id, e]));
+      return { ...page, edges: page.edges.map((e) => afterById.get(e.id) ?? e) };
+    }
     case "reorder-nodes":
       return { ...page, nodes: command.after };
+    case "reorder-items":
+      return { ...page, nodes: command.afterNodes, edges: command.afterEdges };
     case "paste-items":
       return { ...page, nodes: [...page.nodes, ...command.nodes], edges: [...page.edges, ...command.edges] };
     case "delete-items": {
       const nodeIds = new Set(command.nodes.map((n) => n.id));
       const edgeIds = new Set(command.edges.map((e) => e.id));
       return { ...page, nodes: page.nodes.filter((n) => !nodeIds.has(n.id)), edges: page.edges.filter((e) => !edgeIds.has(e.id)) };
+    }
+    case "batch-edit-items": {
+      const nodesById = new Map(command.afterNodes.map((n) => [n.id, n]));
+      const edgesById = new Map(command.afterEdges.map((e) => [e.id, e]));
+      return { ...page, nodes: page.nodes.map((n) => nodesById.get(n.id) ?? n), edges: page.edges.map((e) => edgesById.get(e.id) ?? e) };
     }
   }
 }
@@ -3209,8 +3828,18 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
       return { type: "add-edge", item: command.item };
     case "edit-edge":
       return { type: "edit-edge", before: command.after, after: command.before };
+    case "batch-edit-edges":
+      return { type: "batch-edit-edges", before: command.after, after: command.before };
     case "reorder-nodes":
       return { type: "reorder-nodes", before: command.after, after: command.before };
+    case "reorder-items":
+      return {
+        type: "reorder-items",
+        beforeNodes: command.afterNodes,
+        afterNodes: command.beforeNodes,
+        beforeEdges: command.afterEdges,
+        afterEdges: command.beforeEdges,
+      };
     // Exact mirror of each other - no special-casing needed in useWhiteboardStore's undo()/redo()
     // the way "delete-node" needs (see undoDeleteNode's own doc comment): both directions of a
     // paste/un-paste are already fully expressible as one one of these two command types.
@@ -3218,7 +3847,94 @@ export function invertCommand(command: WhiteboardCommand): WhiteboardCommand {
       return { type: "delete-items", nodes: command.nodes, edges: command.edges };
     case "delete-items":
       return { type: "paste-items", nodes: command.nodes, edges: command.edges };
+    case "batch-edit-items":
+      return { type: "batch-edit-items", beforeNodes: command.afterNodes, afterNodes: command.beforeNodes, beforeEdges: command.afterEdges, afterEdges: command.beforeEdges };
   }
+}
+
+// Resolves a unified layer rank (0 .. N+E-1, higher = further in front) across all nodes and edges
+// on a page. Items without an explicit `zIndex` default to nodes in `page.nodes` order followed by
+// edges in `page.edges` order, so freshly drawn lines sit above shapes until explicitly reordered.
+export function resolvePageLayerOrder(page: { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] }): Map<string, number> {
+  const entries: { id: string; z: number; fallback: number }[] = [];
+  let maxExplicitZ = -1;
+  page.nodes.forEach((n) => {
+    if (typeof n.zIndex === "number" && Number.isFinite(n.zIndex)) maxExplicitZ = Math.max(maxExplicitZ, n.zIndex);
+  });
+  page.edges.forEach((e) => {
+    if (typeof e.zIndex === "number" && Number.isFinite(e.zIndex)) maxExplicitZ = Math.max(maxExplicitZ, e.zIndex);
+  });
+  const baseUnset = maxExplicitZ >= 0 ? maxExplicitZ + 1 : 0;
+  page.nodes.forEach((n, i) => {
+    const fallback = i;
+    const z = typeof n.zIndex === "number" && Number.isFinite(n.zIndex) ? n.zIndex : baseUnset + fallback;
+    entries.push({ id: n.id, z, fallback });
+  });
+  page.edges.forEach((e, i) => {
+    const fallback = page.nodes.length + i;
+    const z = typeof e.zIndex === "number" && Number.isFinite(e.zIndex) ? e.zIndex : baseUnset + fallback;
+    entries.push({ id: e.id, z, fallback });
+  });
+  entries.sort((a, b) => (a.z !== b.z ? a.z - b.z : a.fallback - b.fallback));
+  const map = new Map<string, number>();
+  entries.forEach((entry, rank) => map.set(entry.id, rank));
+  return map;
+}
+
+export type LayerReorderAction = "front" | "back" | "forward" | "backward";
+
+// Reorders any selection of nodes and/or edges in the unified page layer stack ("front" = top of
+// stack, "back" = bottom of stack, "forward" = one step up, "backward" = one step down), assigning
+// contiguous `zIndex` values and updating array order to match.
+export function reorderPageItems(
+  page: { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] },
+  selectedIds: ReadonlySet<string>,
+  action: LayerReorderAction
+): { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } {
+  if (selectedIds.size === 0) return { nodes: page.nodes, edges: page.edges };
+  const ranks = resolvePageLayerOrder(page);
+  type TaggedItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
+  const unified: TaggedItem[] = [
+    ...page.nodes.map((item): TaggedItem => ({ kind: "node", item })),
+    ...page.edges.map((item): TaggedItem => ({ kind: "edge", item })),
+  ].sort((a, b) => (ranks.get(a.item.id) ?? 0) - (ranks.get(b.item.id) ?? 0));
+
+  if (action === "front") {
+    const rest = unified.filter((x) => !selectedIds.has(x.item.id));
+    const sel = unified.filter((x) => selectedIds.has(x.item.id));
+    unified.splice(0, unified.length, ...rest, ...sel);
+  } else if (action === "back") {
+    const sel = unified.filter((x) => selectedIds.has(x.item.id));
+    const rest = unified.filter((x) => !selectedIds.has(x.item.id));
+    unified.splice(0, unified.length, ...sel, ...rest);
+  } else if (action === "forward") {
+    for (let i = unified.length - 2; i >= 0; i--) {
+      if (selectedIds.has(unified[i].item.id) && !selectedIds.has(unified[i + 1].item.id)) {
+        const tmp = unified[i];
+        unified[i] = unified[i + 1];
+        unified[i + 1] = tmp;
+      }
+    }
+  } else if (action === "backward") {
+    for (let i = 1; i < unified.length; i++) {
+      if (selectedIds.has(unified[i].item.id) && !selectedIds.has(unified[i - 1].item.id)) {
+        const tmp = unified[i];
+        unified[i] = unified[i - 1];
+        unified[i - 1] = tmp;
+      }
+    }
+  }
+
+  const nextNodes: WhiteboardNode[] = [];
+  const nextEdges: WhiteboardEdge[] = [];
+  unified.forEach((entry, zIndex) => {
+    if (entry.kind === "node") {
+      nextNodes.push({ ...entry.item, zIndex });
+    } else {
+      nextEdges.push({ ...entry.item, zIndex });
+    }
+  });
+  return { nodes: nextNodes, edges: nextEdges };
 }
 
 // Re-adds a deleted node's cascade-deleted edges too, in one shot - invertCommand alone can't
@@ -3253,18 +3969,27 @@ function freehandPath2D(node: WhiteboardNode): Path2D {
   return path;
 }
 
-function roundedRectPath2D(w: number, h: number, radius: number): Path2D {
+function roundedRectPath2D(w: number, h: number, radius: number, cornerRadii?: (number | null | undefined)[]): Path2D {
   const path = new Path2D();
-  const r = Math.max(0, Math.min(radius, w / 2, h / 2));
-  if (r <= 0) {
+  const [tl, tr, br, bl] = resolveBoxCornerRadii({
+    width: w,
+    height: h,
+    cornerRadius: radius,
+    cornerRadii: cornerRadii as (number | null)[] | undefined,
+  });
+  if (tl <= 0 && tr <= 0 && br <= 0 && bl <= 0) {
     path.rect(0, 0, w, h);
     return path;
   }
-  path.moveTo(r, 0);
-  path.arcTo(w, 0, w, h, r);
-  path.arcTo(w, h, 0, h, r);
-  path.arcTo(0, h, 0, 0, r);
-  path.arcTo(0, 0, w, 0, r);
+  path.moveTo(tl, 0);
+  path.lineTo(w - tr, 0);
+  if (tr > 0) path.arcTo(w, 0, w, h, tr);
+  path.lineTo(w, h - br);
+  if (br > 0) path.arcTo(w, h, 0, h, br);
+  path.lineTo(bl, h);
+  if (bl > 0) path.arcTo(0, h, 0, 0, bl);
+  path.lineTo(0, tl);
+  if (tl > 0) path.arcTo(0, 0, w, 0, tl);
   path.closePath();
   return path;
 }
@@ -3276,28 +4001,192 @@ function polygonPath2D(points: [number, number][]): Path2D {
   return path;
 }
 
+// ---- Fill paint (gradient / image / pattern) ----------------------------------------------------
+//
+// One geometry definition per fill feature, shared by the live SVG canvas (WhiteboardCanvas.tsx's
+// NodeFillDefs) and the Canvas2D export below, so a gradient's direction, an image's fit and a
+// grid's line positions land on the same pixels in both.
+
+// A linear gradient's endpoints in node-local space. Uses CSS's own gradient-line length
+// (|w*cos| + |h*sin|) so the first and last stops sit exactly on the box's extreme corners at every
+// angle - the same result `linear-gradient(<angle>)` gives, which is what users expect from every
+// design tool.
+export function linearGradientPoints(w: number, h: number, angleDeg: number): { x1: number; y1: number; x2: number; y2: number } {
+  const a = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(a);
+  const dy = Math.sin(a);
+  const half = (Math.abs(w * dx) + Math.abs(h * dy)) / 2;
+  return { x1: w / 2 - dx * half, y1: h / 2 - dy * half, x2: w / 2 + dx * half, y2: h / 2 + dy * half };
+}
+
+// One tile of a fill pattern, `spacing` units square, anchored at the node's own top-left corner.
+// Lines are offset half a unit so a 1-unit stroke lands fully inside the tile rather than being
+// split across two tiles (which renders as a faint double line on some GPUs).
+export function fillPatternTile(pattern: WhiteboardFillPattern, spacing: number): { d: string; dots: boolean } {
+  const s = spacing;
+  switch (pattern) {
+    case "grid":
+      return { d: `M0.5,0 V${s} M0,0.5 H${s}`, dots: false };
+    case "lines":
+      return { d: `M0,0.5 H${s}`, dots: false };
+    case "diagonal":
+      return { d: `M0,${s} L${s},0 M${-s / 2},${s / 2} L${s / 2},${-s / 2} M${s / 2},${s * 1.5} L${s * 1.5},${s / 2}`, dots: false };
+    case "dots": {
+      const r = Math.max(0.9, s * 0.07);
+      return { d: dotPathD(s / 2, s / 2, r), dots: true };
+    }
+    default:
+      return { d: "", dots: false };
+  }
+}
+
+// The URL an "image"-type fill is served from. Reuses the caller's ImageSrcResolver (built for
+// image nodes' own assetFileName) by presenting the fill asset under that field, rather than
+// threading a second resolver through every renderer.
+export function fillImageSrc(node: WhiteboardNode, imageSrcFor?: ImageSrcResolver): string | null {
+  if (!imageSrcFor || resolveFillType(node) !== "image" || !node.fillImageAsset) return null;
+  return imageSrcFor({ ...node, assetFileName: node.fillImageAsset });
+}
+
+// Where an image fill's bitmap lands inside the node's w x h box for each fit mode, plus optional
+// pan offsets (fractions of w/h) and zoom scale multiplier.
+export function fillImageRect(
+  fit: WhiteboardNode["fillImageFit"],
+  w: number,
+  h: number,
+  iw: number,
+  ih: number,
+  offsetX = 0,
+  offsetY = 0,
+  scale = 1
+): { x: number; y: number; w: number; h: number } {
+  const s = Math.max(0.1, scale);
+  if (fit === "fill" || iw <= 0 || ih <= 0) {
+    const dw = w * s;
+    const dh = h * s;
+    return { x: (w - dw) / 2 + offsetX * w, y: (h - dh) / 2 + offsetY * h, w: dw, h: dh };
+  }
+  const baseScale = fit === "contain" ? Math.min(w / iw, h / ih) : Math.max(w / iw, h / ih);
+  const dw = iw * baseScale * s;
+  const dh = ih * baseScale * s;
+  return { x: (w - dw) / 2 + offsetX * w, y: (h - dh) / 2 + offsetY * h, w: dw, h: dh };
+}
+
+// Paints a node's interior - solid, gradient, or image - then its pattern overlay, clipped to
+// `path`. The Canvas2D twin of WhiteboardCanvas.tsx's NodeFillDefs.
+function paintNodeFill(ctx: CanvasRenderingContext2D, node: WhiteboardNode, path: Path2D, imageSrcFor?: ImageSrcResolver): void {
+  const { width: w, height: h } = node;
+  const type = resolveFillType(node);
+  const opacity = Math.max(0, Math.min(1, node.fillOpacity ?? 1));
+  if (type === "solid") {
+    const solid = resolveNodeFill(node);
+    if (solid) {
+      ctx.fillStyle = solid;
+      ctx.fill(path);
+    }
+  } else if (opacity > 0) {
+    ctx.save();
+    ctx.globalAlpha *= opacity;
+    if (type === "linear") {
+      const { x1, y1, x2, y2 } = linearGradientPoints(w, h, node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE);
+      const g = ctx.createLinearGradient(x1, y1, x2, y2);
+      for (const stop of resolveGradientStops(node)) g.addColorStop(stop.offset, stop.color);
+      ctx.fillStyle = g;
+      ctx.fill(path);
+    } else if (type === "radial") {
+      // Elliptical, fitted to the box's sides (SVG's objectBoundingBox r=0.5): drawn as a unit
+      // circle under a non-uniform scale, clipped to the real outline first.
+      ctx.clip(path);
+      ctx.translate(w / 2, h / 2);
+      ctx.scale(Math.max(w, 1e-3) / 2, Math.max(h, 1e-3) / 2);
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+      for (const stop of resolveGradientStops(node)) g.addColorStop(stop.offset, stop.color);
+      ctx.fillStyle = g;
+      ctx.fillRect(-2, -2, 4, 4);
+    } else if (type === "image") {
+      const src = fillImageSrc(node, imageSrcFor);
+      const img = src ? getCachedWhiteboardImage(src) : null;
+      ctx.clip(path);
+      if (img) {
+        if (node.fillImageFit === "contain" && node.fillColor) {
+          ctx.fillStyle = node.fillColor;
+          ctx.fillRect(0, 0, w, h);
+        }
+        const r = fillImageRect(
+          node.fillImageFit,
+          w,
+          h,
+          img.naturalWidth,
+          img.naturalHeight,
+          node.fillImageOffsetX ?? 0,
+          node.fillImageOffsetY ?? 0,
+          node.fillImageScale ?? 1
+        );
+        ctx.drawImage(img, r.x, r.y, r.w, r.h);
+      } else if (node.fillColor) {
+        ctx.fillStyle = node.fillColor;
+        ctx.fillRect(0, 0, w, h);
+      }
+    }
+    ctx.restore();
+  }
+
+  const pattern = node.fillPattern ?? "none";
+  if (pattern === "none") return;
+  const spacing = Math.max(4, node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING);
+  const tile = fillPatternTile(pattern, spacing);
+  const tilePath = new Path2D(tile.d);
+  const color = node.fillPatternColor ?? node.strokeColor;
+  ctx.save();
+  ctx.clip(path);
+  ctx.globalAlpha *= Math.max(0, Math.min(1, node.fillPatternOpacity ?? DEFAULT_FILL_PATTERN_OPACITY));
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  // Stepping the tile across the box (rather than createPattern on an offscreen canvas) keeps the
+  // lines vector-sharp at any export scale.
+  for (let ty = 0; ty < h; ty += spacing) {
+    for (let tx = 0; tx < w; tx += spacing) {
+      ctx.save();
+      ctx.translate(tx, ty);
+      if (tile.dots) ctx.fill(tilePath);
+      else ctx.stroke(tilePath);
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
 // Fills+strokes one node's shape body in the ctx's CURRENT coordinate space - callers
 // ctx.translate(node.x, node.y) first, matching shapeOutlineFor's node-local convention (see this
 // file's own ShapeOutline doc comment), so nothing here ever touches node.x/y again.
-function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
+function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode, imageSrcFor?: ImageSrcResolver): void {
   const { width: w, height: h } = node;
   const outline = shapeOutlineFor(node.shapeType, w, h, outlineOptionsFor(node));
 
   const fillAndStroke = (path: Path2D) => {
-    if (node.fillColor) {
-      ctx.fillStyle = node.fillColor;
-      ctx.fill(path);
-    }
+    paintNodeFill(ctx, node, path, imageSrcFor);
     if (node.strokeWidth > 0) {
       ctx.lineWidth = node.strokeWidth;
-      ctx.strokeStyle = node.strokeColor;
+      const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+        ? hexToRgba(node.strokeColor, node.strokeOpacity)
+        : node.strokeColor;
+      ctx.strokeStyle = strokeColor;
+      if (node.strokeStyle === "dashed") {
+        ctx.setLineDash([8, 6]);
+      } else if (node.strokeStyle === "dotted") {
+        ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+      } else {
+        ctx.setLineDash([]);
+      }
       ctx.stroke(path);
+      ctx.setLineDash([]);
     }
   };
 
   switch (outline.kind) {
     case "rect":
-      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0));
+      fillAndStroke(roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii));
       return;
     case "ellipse": {
       const p = new Path2D();
@@ -3388,8 +4277,8 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
       for (const part of outline.parts) {
         const path = new Path2D(part.d);
         if (part.role === "fill") {
-          if (node.fillColor) {
-            ctx.fillStyle = node.fillColor;
+          if (resolveNodeFill(node)) {
+            ctx.fillStyle = resolveNodeFill(node)!;
             ctx.fill(path);
           }
         } else if (part.role === "marker") {
@@ -3422,13 +4311,23 @@ function paintShapeBody(ctx: CanvasRenderingContext2D, node: WhiteboardNode): vo
           ctx.strokeStyle = part.color;
           ctx.stroke(path);
         } else if (part.role === "grid") {
+          ctx.save();
+          ctx.globalAlpha *= part.opacity ?? 1;
           ctx.lineWidth = 0.5;
-          ctx.strokeStyle = "#e5e7eb";
+          ctx.strokeStyle = part.color ?? "#e5e7eb";
           ctx.stroke(path);
+          ctx.restore();
+        } else if (part.role === "axis") {
+          ctx.save();
+          ctx.globalAlpha *= part.opacity ?? 1;
+          ctx.lineWidth = part.width ?? 1;
+          ctx.strokeStyle = part.color ?? "#9ca3af";
+          ctx.lineCap = "square";
+          ctx.stroke(path);
+          ctx.restore();
         } else {
-          // "stroke" and "axis"
-          ctx.lineWidth = part.role === "axis" ? 1 : Math.max(1, node.strokeWidth);
-          ctx.strokeStyle = part.role === "axis" ? "#9ca3af" : node.strokeColor;
+          ctx.lineWidth = Math.max(1, node.strokeWidth);
+          ctx.strokeStyle = node.strokeColor;
           ctx.stroke(path);
         }
       }
@@ -3559,7 +4458,7 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
       const merge = mergeAt.get(`${r}-${c}`);
       const spanRows = merge?.rowSpan ?? 1;
       const spanCols = merge?.colSpan ?? 1;
-      const fill = grid.cellFill[r][c] ?? node.fillColor;
+      const fill = grid.cellFill[r][c] ?? resolveNodeFill(node);
       if (fill) {
         ctx.fillStyle = fill;
         ctx.fillRect(colBounds[c], rowBounds[r], colBounds[c + spanCols] - colBounds[c], rowBounds[r + spanRows] - rowBounds[r]);
@@ -3680,13 +4579,35 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     if (node.flipHorizontal || node.flipVertical) ctx.scale(node.flipHorizontal ? -1 : 1, node.flipVertical ? -1 : 1);
     ctx.translate(-node.width / 2, -node.height / 2);
   }
+  if (node.opacity !== undefined && node.opacity < 1) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, node.opacity));
+  }
+  if (node.shadowEnabled) {
+    const shadowColor = node.shadowColor ?? DEFAULT_SHADOW_COLOR;
+    const shadowOpacity = Math.max(0, Math.min(1, node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+    ctx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+    ctx.shadowBlur = Math.max(0, node.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+    ctx.shadowOffsetX = node.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+    ctx.shadowOffsetY = node.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  }
   if (node.shapeType === "freehand") {
     const path = freehandPath2D(node);
     ctx.lineWidth = node.strokeWidth;
-    ctx.strokeStyle = node.strokeColor;
+    const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
+      ? hexToRgba(node.strokeColor, node.strokeOpacity)
+      : node.strokeColor;
+    ctx.strokeStyle = strokeColor;
+    if (node.strokeStyle === "dashed") {
+      ctx.setLineDash([8, 6]);
+    } else if (node.strokeStyle === "dotted") {
+      ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+    } else {
+      ctx.setLineDash([]);
+    }
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
     ctx.stroke(path);
+    ctx.setLineDash([]);
     // A "Freehand Arrow" (see whiteboardTypes.ts's WhiteboardNode.endArrowType doc comment) caps
     // one or both ends with a marker, angled off the stroke's own final two points (a close-enough
     // stand-in for the smoothed curve's true end tangent - freehandPath2D's own last segment is a
@@ -3706,7 +4627,7 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     // Card/background/border first (shapeOutlineFor already resolves "equation" to the same plain
     // "rect" kind as "rectangle"/"text" - see its own doc comment), THEN the typeset formula drawn
     // on top - matches WhiteboardCanvas.tsx's own div-then-EquationDisplay stacking order.
-    paintShapeBody(ctx, node);
+    paintShapeBody(ctx, node, imageSrcFor);
     await paintEquation(ctx, node);
   } else if (node.shapeType === "vector") {
     // A plain horizontal line spanning the node's own width (length = magnitude - see the
@@ -3755,7 +4676,7 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     const decoded = src ? getCachedWhiteboardImage(src) : null;
     paintImageNode(ctx, node, decoded, decoded?.naturalWidth ?? 0, decoded?.naturalHeight ?? 0);
   } else {
-    if (node.shapeType !== "text") paintShapeBody(ctx, node);
+    if (node.shapeType !== "text") paintShapeBody(ctx, node, imageSrcFor);
     paintNodeText(ctx, node);
   }
   ctx.restore();
@@ -3839,10 +4760,29 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   const { source, target } = resolveEdgeEndpoints(edge, nodesById);
   const bow = edge.curveBow ?? DEFAULT_CURVE_BOW;
   const waypoints = edge.waypoints ?? [];
-  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow, waypoints));
+  const cornerRadius = edge.cornerRadius ?? 0;
+  const path = new Path2D(buildEdgePath(source, target, edge.routing, bow, waypoints, cornerRadius));
+
+  ctx.save();
+  if (edge.opacity !== undefined && edge.opacity < 1) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, edge.opacity));
+  }
+  if (edge.shadowEnabled) {
+    const shadowColor = edge.shadowColor ?? DEFAULT_SHADOW_COLOR;
+    const shadowOpacity = Math.max(0, Math.min(1, edge.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
+    ctx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+    ctx.shadowBlur = Math.max(0, edge.shadowBlur ?? DEFAULT_SHADOW_BLUR);
+    ctx.shadowOffsetX = edge.shadowOffsetX ?? DEFAULT_SHADOW_OFFSET_X;
+    ctx.shadowOffsetY = edge.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
+  }
+
+  const strokeAlpha = Math.max(0, Math.min(1, edge.strokeOpacity ?? 1));
+  const strokeColor = strokeAlpha < 1 ? hexToRgba(edge.strokeColor, strokeAlpha) : edge.strokeColor;
+
   ctx.lineWidth = edge.strokeWidth;
-  ctx.strokeStyle = edge.strokeColor;
-  ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : "butt";
+  ctx.strokeStyle = strokeColor;
+  ctx.lineJoin = "round";
+  ctx.lineCap = edge.strokeStyle === "dotted" ? "round" : edge.strokeCap ?? "butt";
   const pattern = DASH_PATTERNS[edge.strokeStyle];
   ctx.setLineDash(edge.strokeStyle === "dotted" ? pattern.map((n) => n * (edge.strokeWidth / 2 || 1)) : pattern);
   ctx.stroke(path);
@@ -3850,8 +4790,27 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
   ctx.lineCap = "butt";
 
   const { startDeg, endDeg } = edgeEndAngleDeg(source, target, edge.routing, source.side, target.side, bow, waypoints);
-  drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, edge.strokeColor, edge.strokeWidth);
-  drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, edge.strokeColor, edge.strokeWidth);
+  drawArrowhead(ctx, edge.endArrowType, target.x, target.y, endDeg, strokeColor, edge.strokeWidth);
+  drawArrowhead(ctx, edge.startArrowType, source.x, source.y, startDeg, strokeColor, edge.strokeWidth);
+
+  if (edge.label) {
+    const labelPt = edgePointAtFraction(source, target, edge.routing, bow, waypoints, edge.labelPosition ?? 0.5);
+    const fontSize = edge.labelFontSize ?? 13;
+    const weight = edge.labelBold ? "bold " : "";
+    const style = edge.labelItalic ? "italic " : "";
+    ctx.font = `${style}${weight}${fontSize}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    if (edge.labelShowBackground ?? true) {
+      ctx.strokeStyle = edge.labelBackgroundColor ?? "#f7f7f8";
+      ctx.lineWidth = 4;
+      ctx.lineJoin = "round";
+      ctx.strokeText(edge.label, labelPt.x, labelPt.y);
+    }
+    ctx.fillStyle = edge.labelColor ?? "#374151";
+    ctx.fillText(edge.label, labelPt.x, labelPt.y);
+  }
+  ctx.restore();
 }
 
 // Flattens one page onto an offscreen canvas sized to its content bounds (see computeContentBounds)
@@ -3896,6 +4855,8 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
   if (imageSrcFor) {
     const srcs = new Set<string>();
     for (const node of page.nodes) {
+      const fillSrc = fillImageSrc(node, imageSrcFor);
+      if (fillSrc) srcs.add(fillSrc);
       if (node.shapeType !== "image") continue;
       const src = imageSrcFor(node);
       if (src) srcs.add(src);
@@ -3904,10 +4865,19 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
   }
 
   const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
-  for (const edge of page.edges) renderEdge(ctx, edge, nodesById);
-  // Sequential awaits, not Promise.all - every node shares this one ctx (save/translate/restore),
+  const layerOrder = resolvePageLayerOrder(page);
+  type RenderableItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
+  const orderedItems: RenderableItem[] = [
+    ...page.nodes.map((item): RenderableItem => ({ kind: "node", item })),
+    ...page.edges.map((item): RenderableItem => ({ kind: "edge", item })),
+  ].sort((a, b) => (layerOrder.get(a.item.id) ?? 0) - (layerOrder.get(b.item.id) ?? 0));
+
+  // Sequential awaits, not Promise.all - every item shares this one ctx (save/translate/restore),
   // so two renderNode calls running concurrently would interleave their transform stacks.
-  for (const node of page.nodes) await renderNode(ctx, node, imageSrcFor);
+  for (const entry of orderedItems) {
+    if (entry.kind === "node") await renderNode(ctx, entry.item, imageSrcFor);
+    else renderEdge(ctx, entry.item, nodesById);
+  }
 
   return canvas;
 }

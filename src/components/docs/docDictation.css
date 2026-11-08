@@ -1,0 +1,73 @@
+/* Decorations drawn by docDictationExtension.ts - interim text and the "listening/writing" dots at
+   the dictation anchor, plus a brief tint on each freshly inserted phrase. */
+.doc-dictation-preview {
+  color: rgb(115 115 115);
+  pointer-events: none;
+  user-select: none;
+}
+.dark .doc-dictation-preview {
+  color: rgb(163 163 163);
+}
+.doc-dictation-preview-text {
+  border-radius: 3px;
+  padding: 0 2px;
+  background: rgba(59, 130, 246, 0.08);
+  font-style: italic;
+}
+.doc-dictation-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 3px;
+  vertical-align: middle;
+}
+.doc-dictation-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: #ef4444;
+  animation: doc-dictation-dot 1.2s ease-in-out infinite;
+}
+.doc-dictation-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.doc-dictation-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+.doc-dictation-dots.is-working i {
+  background: #3b82f6;
+}
+@keyframes doc-dictation-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+.doc-dictation-fresh {
+  animation: doc-dictation-fresh 1.8s ease-out forwards;
+}
+@keyframes doc-dictation-fresh {
+  from {
+    background-color: rgba(59, 130, 246, 0.2);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+@media print {
+  .doc-dictation-preview {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .doc-dictation-dots i,
+  .doc-dictation-fresh {
+    animation: none;
+  }
+}

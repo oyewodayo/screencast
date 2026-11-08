@@ -38,3 +38,14 @@ export const getFileIcon = (filename: string) => {
   return "📄";
 };
 
+
+// Compact media length for list rows: "45s", "2m 05s", "1h 02m".
+export function formatMediaDuration(totalSeconds: number): string {
+  const secs = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(secs / 3600);
+  const minutes = Math.floor((secs % 3600) / 60);
+  const seconds = secs % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}

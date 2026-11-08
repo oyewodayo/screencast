@@ -39,6 +39,7 @@ import {
   resolveProgress,
 } from "../../utils/mindmapTypes";
 import { canAutoSize } from "../../handlers/mindmapHandlers";
+import ColorInput from "../common/ColorInput";
 
 const INPUT_CLASS =
   "w-full h-8 px-2 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-xs outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-500/20 transition";
@@ -391,8 +392,7 @@ const MindmapPanel: React.FC<MindmapPanelProps> = ({ selected, onUpdate, onAddTo
                 </div>
                 <div className="flex items-center justify-between text-xs text-gray-600 dark:text-neutral-300">
                   <span>Check colour</span>
-                  <input
-                    type="color"
+                  <ColorInput
                     value={resolveCheckColor(node)}
                     onChange={(e) => onUpdate({ checkColor: e.target.value })}
                     className="w-8 h-7 rounded-md border border-gray-200 dark:border-neutral-700 bg-transparent cursor-pointer p-0.5"

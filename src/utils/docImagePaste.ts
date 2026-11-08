@@ -55,8 +55,8 @@ async function uploadImage(docId: string, file: File): Promise<string> {
 // MIME type.
 export async function uploadImageFromPath(docId: string, path: string): Promise<string> {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
-  const bytes = await invoke<number[]>("read_file_bytes", { path });
-  return saveImageBytes(docId, bytes, extension);
+  const bytes = await invoke<ArrayBuffer>("read_file_bytes", { path });
+  return saveImageBytes(docId, Array.from(new Uint8Array(bytes)), extension);
 }
 
 // Position captured synchronously before the async upload starts, so a cursor move (or further

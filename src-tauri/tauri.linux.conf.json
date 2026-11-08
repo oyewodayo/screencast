@@ -1,0 +1,14 @@
+{
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "category": "Video",
+    "shortDescription": "Record, edit and explain - on your own computer",
+    "longDescription": "Briefcast records your screen, edits video by editing its transcript, burns in captions and writes papers with equations and citations. Everything stays on your computer.",
+    "linux": {
+      "deb": {
+        "depends": ["ffmpeg"],
+        "recommends": ["libheif-examples"]
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "blur-track"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Frame maths for Briefcast's sensitive-text blur (scroll tracking, colour sampling) - its own crate so `tauri dev` builds it optimised: it runs on every captured frame."
+
+[dependencies]

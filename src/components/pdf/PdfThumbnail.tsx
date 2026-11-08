@@ -1,6 +1,7 @@
 // components/pdf/PdfThumbnail.tsx
 import React, { useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
 const THUMBNAIL_WIDTH = 150;
 const PLACEHOLDER_ASPECT = 1.294; // US Letter height/width, used before the real page size is known
@@ -21,6 +22,7 @@ const PdfThumbnail: React.FC<PdfThumbnailProps> = ({ pdfDoc, pageIndex, isActive
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [visible, setVisible] = useState(false);
   const [aspect, setAspect] = useState(PLACEHOLDER_ASPECT);
+  const canvasRestoreTick = useCanvasRestoreTick();
 
   useEffect(() => {
     const el = containerRef.current;
@@ -69,7 +71,8 @@ const PdfThumbnail: React.FC<PdfThumbnailProps> = ({ pdfDoc, pageIndex, isActive
     return () => {
       cancelled = true;
     };
-  }, [visible, pdfDoc, pageIndex]);
+    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
+  }, [visible, pdfDoc, pageIndex, canvasRestoreTick]);
 
   return (
     <button

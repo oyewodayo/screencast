@@ -89,7 +89,7 @@ const DocCommentsSidebar: React.FC<DocCommentsSidebarProps> = ({ editor, comment
             {comment.resolved_at ? (
               <button
                 type="button"
-                title="Reopen"
+                data-tip="Reopen"
                 onClick={() => onReopen(comment.id)}
                 className="p-1 rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
               >
@@ -98,7 +98,7 @@ const DocCommentsSidebar: React.FC<DocCommentsSidebarProps> = ({ editor, comment
             ) : (
               <button
                 type="button"
-                title="Resolve"
+                data-tip="Resolve"
                 onClick={() => onResolve(comment.id)}
                 className="p-1 rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
               >
@@ -107,7 +107,7 @@ const DocCommentsSidebar: React.FC<DocCommentsSidebarProps> = ({ editor, comment
             )}
             <button
               type="button"
-              title="Delete comment"
+              data-tip="Delete comment"
               onClick={() => onDelete(comment.id)}
               className="p-1 rounded text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
             >
@@ -125,7 +125,7 @@ const DocCommentsSidebar: React.FC<DocCommentsSidebarProps> = ({ editor, comment
         <h2 className="text-sm font-medium text-neutral-800 dark:text-neutral-100">Comments</h2>
         <button
           type="button"
-          title="Close"
+          data-tip="Close"
           onClick={onClose}
           className="ml-auto p-1.5 rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
         >

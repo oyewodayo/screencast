@@ -23,7 +23,52 @@
 // gallery, backed by the same on-disk cache (get_image_thumbnail) - a photo already thumbnailed
 // via the gallery resolves here instantly, and vice versa.
 import React, { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
+
+// Module-level thumbnail URL cache so closing/reopening the sidebar or switching tabs/views
+// renders already-resolved thumbnails synchronously on first paint with zero IPC round-trip.
+const resolvedThumbCache = new Map<string, string>();
+const failedThumbCache = new Set<string>();
+
+if (typeof window !== "undefined") {
+  listen<string>("video-thumbnail-updated", (event) => {
+    if (event.payload) {
+      resolvedThumbCache.delete(event.payload);
+      failedThumbCache.delete(event.payload);
+    }
+  }).catch(() => {});
+}
+
+// Single shared IntersectionObserver across all sidebar icons so opening a sidebar with 100+
+// items doesn't allocate 100 separate IntersectionObserver instances on the main thread.
+const observerCallbacks = new Map<Element, () => void>();
+let sharedObserver: IntersectionObserver | null = null;
+
+function observeElement(el: Element, onIntersect: () => void): () => void {
+  if (!sharedObserver) {
+    sharedObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const cb = observerCallbacks.get(entry.target);
+          if (cb) {
+            observerCallbacks.delete(entry.target);
+            sharedObserver?.unobserve(entry.target);
+            cb();
+          }
+        }
+      },
+      { rootMargin: "200px" }
+    );
+  }
+  observerCallbacks.set(el, onIntersect);
+  sharedObserver.observe(el);
+  return () => {
+    observerCallbacks.delete(el);
+    sharedObserver?.unobserve(el);
+  };
+}
 
 interface SidebarFileIconProps {
   name: string;
@@ -32,6 +77,9 @@ interface SidebarFileIconProps {
   resolveThumbnailUrl?: (file: { name: string; path: string }) => Promise<string>;
   fallbackIcon: React.ReactNode;
   fallbackClassName: string;
+  // Grid view: a full-width 16:9 tile instead of the 20px row icon. Same lazy/limited resolve;
+  // `isImage` just means "has a thumbnail to resolve" (the grid also passes videos).
+  large?: boolean;
 }
 
 const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
@@ -41,50 +89,68 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
   resolveThumbnailUrl,
   fallbackIcon,
   fallbackClassName,
+  large = false,
 }) => {
   const tileRef = useRef<HTMLDivElement>(null);
-  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const [thumbUrl, setThumbUrl] = useState<string | null>(() => (isImage ? resolvedThumbCache.get(path) ?? null : null));
+  const [thumbFailed, setThumbFailed] = useState<boolean>(() => (isImage ? failedThumbCache.has(path) : false));
 
   useEffect(() => {
     if (!isImage || !resolveThumbnailUrl) return;
+    const cached = resolvedThumbCache.get(path);
+    if (cached) {
+      setThumbUrl(cached);
+      setThumbFailed(false);
+      return;
+    }
+    if (failedThumbCache.has(path)) {
+      setThumbFailed(true);
+      return;
+    }
     const el = tileRef.current;
     if (!el) return;
 
     let cancelled = false;
-    // rootMargin gives the resolve a head start before the tile is actually on screen, so it's
-    // usually already resolved (or at least in flight) by the time a fast scroll brings it fully
-    // into view, without going as far as resolving everything up front.
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!entries[0]?.isIntersecting) return;
-        observer.disconnect();
-        thumbnailLimiter(() => resolveThumbnailUrl({ name, path }))
-          .then((url) => {
-            if (!cancelled) setThumbUrl(url);
-          })
-          .catch((err) => console.error(`Failed to resolve sidebar thumbnail for ${path}:`, err));
-      },
-      { rootMargin: "200px" }
-    );
-    observer.observe(el);
+    const stopObserving = observeElement(el, () => {
+      thumbnailLimiter(() => resolveThumbnailUrl({ name, path }))
+        .then((url) => {
+          resolvedThumbCache.set(path, url);
+          if (!cancelled) setThumbUrl(url);
+        })
+        .catch((err) => {
+          failedThumbCache.add(path);
+          if (!cancelled) setThumbFailed(true);
+          console.error(`Failed to resolve sidebar thumbnail for ${path}:`, err);
+        });
+    });
     return () => {
       cancelled = true;
-      observer.disconnect();
+      stopObserving();
     };
     // path/name identify which file this tile is for; isImage/resolveThumbnailUrl gate whether it
     // applies at all - thumbUrl deliberately excluded, it's the effect's own output, not an input.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isImage, resolveThumbnailUrl, name, path]);
 
+  const isLoadingThumb = isImage && !thumbUrl && !thumbFailed;
+
   return (
     <div
       ref={tileRef}
-      className="shrink-0 w-5 h-5 rounded-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center"
+      className={
+        large
+          ? `w-full aspect-video rounded-lg overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ring-1 ring-black/5 dark:ring-white/5 ${
+              isLoadingThumb ? "animate-pulse bg-gray-200/80 dark:bg-neutral-800/90" : ""
+            }`
+          : `shrink-0 w-5 h-5 rounded-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ${
+              isLoadingThumb ? "animate-pulse" : ""
+            }`
+      }
     >
       {thumbUrl ? (
         <img src={thumbUrl} alt="" draggable={false} loading="lazy" className="w-full h-full object-cover" />
       ) : (
-        <span className={fallbackClassName}>{fallbackIcon}</span>
+        <span className={`${fallbackClassName} ${large ? "scale-[1.8]" : ""} ${isLoadingThumb ? "opacity-40" : ""}`}>{fallbackIcon}</span>
       )}
     </div>
   );

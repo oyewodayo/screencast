@@ -1,0 +1,27 @@
+/* links/links.css - entrance for the Linked control's popover, count badge and back chip: a short
+   spring-y scale/fade so they settle in rather than snapping. */
+@keyframes linksPop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.linksPop {
+  animation: linksPop 170ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  transform-origin: top right;
+}
+.linksScroll {
+  scrollbar-width: none;
+}
+.linksScroll::-webkit-scrollbar {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .linksPop {
+    animation: none;
+  }
+}

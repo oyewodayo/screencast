@@ -40,8 +40,9 @@ fn open_db() -> Result<Connection, String> {
 // Upsert - FTS5 has no native ON CONFLICT upsert, so this is a delete-then-insert inside one
 // transaction. Called by the frontend whenever a doc's content could have changed (on open, and on
 // every autosave) - see useDocsEditStore.ts.
-#[command]
+#[command(async)]
 pub fn index_doc_content(id: String, title: String, body: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let mut conn = open_db()?;
     let tx = conn
         .transaction()
@@ -61,8 +62,9 @@ pub fn index_doc_content(id: String, title: String, body: String) -> Result<(), 
 // from list_docs - stops showing up in search results too. Restoring a doc doesn't re-add it here
 // immediately; it picks itself back up the next time it's opened or saved, same as a doc that was
 // never indexed in the first place (see list_indexed_doc_ids' own comment on that gap).
-#[command]
+#[command(async)]
 pub fn remove_doc_from_index(id: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
     let conn = open_db()?;
     conn.execute("DELETE FROM docs_fts WHERE id = ?1", params![id])
         .map_err(|e| format!("Failed to remove document from search index: {}", e))?;
@@ -75,8 +77,9 @@ pub fn remove_doc_from_index(id: String) -> Result<(), String> {
 // background (load + extract text + index_doc_content), the same "fix it up the next time it's
 // touched" posture relink_doc_path already uses for stale linked-file paths elsewhere in this
 // feature.
-#[command]
+#[command(async)]
 pub fn list_indexed_doc_ids() -> Result<Vec<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let conn = open_db()?;
     let mut stmt = conn
         .prepare("SELECT id FROM docs_fts")
@@ -112,8 +115,9 @@ fn sanitize_fts_query(query: &str) -> String {
 // Returns matching doc ids only (not titles/snippets) - DocsHome.tsx already holds the full
 // DocSummary list from list_docs and just needs to know which ones matched, not a second copy of
 // their metadata.
-#[command]
+#[command(async)]
 pub fn search_docs(query: String) -> Result<Vec<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
     let sanitized = sanitize_fts_query(&query);
     if sanitized.is_empty() {
         return Ok(Vec::new());

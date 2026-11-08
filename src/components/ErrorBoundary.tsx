@@ -7,6 +7,7 @@
 // entire app - which is what actually happened repeatedly while building Docs, since nothing in
 // this app had an error boundary anywhere before this.
 import React from "react";
+import { reportError } from "../utils/telemetry";
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
@@ -30,6 +31,7 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
 
   componentDidCatch(error: Error, info: React.ErrorInfo): void {
     console.error("Caught render error:", error, info.componentStack);
+    reportError(error);
   }
 
   handleReset = (): void => {

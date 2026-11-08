@@ -178,6 +178,7 @@ pub async fn capture_window_screenshots_by_title(
             image_path: String::new(),
             hwnd: index as isize,
             exe_path: w.process_name,
+            ..Default::default()
         })
         .collect())
 }

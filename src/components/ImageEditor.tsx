@@ -16,6 +16,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
+import LinksControl from "./links/LinksControl";
+import { fileRef } from "../utils/itemLinks";
 import {
   DEFAULT_BLUR_RADIUS,
   cropCanvas,
@@ -867,6 +869,7 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
           </span>
         )}
         <div className="flex items-center gap-3 shrink-0 ml-auto">
+          <LinksControl self={fileRef(sourcePath)} title={title ?? "Image"} variant="header" />
           <ZoomControl zoom={zoom} onZoomChange={setZoom} minZoom={MIN_ZOOM} maxZoom={MAX_ZOOM} />
           <IconButton
             title={copyStatus === "error" ? "Failed to copy - try again" : copyStatus === "copied" ? "Copied!" : "Copy to clipboard"}

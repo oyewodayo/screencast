@@ -16,7 +16,7 @@ export type TimelineToolMode = "select" | "razor";
 
 const TOOLS: { id: TimelineToolMode; label: string; hint: string; icon: React.ReactNode }[] = [
   { id: "select", label: "Select", hint: "Click to select, drag to reorder/trim", icon: <BsCursor size={13} /> },
-  { id: "razor", label: "Razor", hint: "Click anywhere on a clip to split it there", icon: <IoCutOutline size={14} /> },
+  { id: "razor", label: "Razor", hint: "Click anywhere on a clip or audio to cut it there", icon: <IoCutOutline size={14} /> },
 ];
 
 interface ToolModePopoverProps {

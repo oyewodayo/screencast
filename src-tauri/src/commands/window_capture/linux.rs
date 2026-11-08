@@ -245,9 +245,9 @@ pub async fn capture_window_screenshots_by_title(
             if title.is_empty() {
                 continue;
             }
-            let geometry = match conn.get_geometry(window).and_then(|c| c.reply()) {
-                Ok(g) => g,
-                Err(_) => continue, // window closed between listing and here, or unreadable
+            let geometry = match conn.get_geometry(window).ok().and_then(|c| c.reply().ok()) {
+                Some(g) => g,
+                None => continue, // window closed between listing and here, or unreadable
             };
             if geometry.width <= 100 || geometry.height <= 100 {
                 continue;
@@ -291,6 +291,7 @@ pub async fn capture_window_screenshots_by_title(
                 image_path,
                 hwnd: *window as isize,
                 exe_path: window_exe_path(&conn, &atoms, *window),
+                ..Default::default()
             });
         }
 

@@ -5,7 +5,7 @@
 // meant the whole binary couldn't compile on macOS/Linux regardless of anything else — moved
 // here and given a real implementation per platform, same pattern as recording.rs.
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_ram_info() -> Result<(u64, u64), String> {
     #[cfg(target_os = "windows")]
     return windows::ram_info();
@@ -129,4 +129,10 @@ mod macos {
             .and_then(|value| value.trim().trim_end_matches('.').parse::<u64>().ok())
             .unwrap_or(0)
     }
+}
+
+/// "WINDOWS" / "MACOS" / "LINUX" / "ANDROID" / "IOS" - the compile-time target, upper-cased.
+#[tauri::command(async)]
+pub fn get_os_info() -> String {
+    std::env::consts::OS.to_uppercase()
 }

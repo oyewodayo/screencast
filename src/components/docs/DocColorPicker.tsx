@@ -21,6 +21,7 @@ import {
   rgbToHex,
   rgbToHsv,
 } from "../../utils/docColor";
+import { EyedropperIcon, pickColorFromScreen } from "../common/ColorInput";
 
 interface DocColorPickerProps {
   value: string | null;
@@ -36,7 +37,7 @@ const PALETTE_GRID = buildPaletteGrid();
 const Swatch: React.FC<{ color: string; selected: boolean; onClick: () => void; title?: string }> = ({ color, selected, onClick, title }) => (
   <button
     type="button"
-    title={title ?? color}
+    data-tip={title ?? color}
     onClick={onClick}
     className={`w-5 h-5 rounded-sm border transition-transform hover:scale-110 ${
       selected ? "border-blue-500 ring-1 ring-blue-500" : "border-black/10 dark:border-white/10"
@@ -121,7 +122,7 @@ const DocColorPicker: React.FC<DocColorPickerProps> = ({ value, onChange, onClea
     return (
       <div onClick={(e) => e.stopPropagation()} className="w-56 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-md shadow-lg p-2.5">
         <div className="flex items-center gap-1 mb-2">
-          <button type="button" title="Back" onClick={() => setMode("palette")} className="p-1 -ml-1 rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-700">
+          <button type="button" data-tip="Back" onClick={() => setMode("palette")} className="p-1 -ml-1 rounded text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-700">
             <IoArrowBack size={14} />
           </button>
           <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Custom color</span>
@@ -175,6 +176,18 @@ const DocColorPicker: React.FC<DocColorPickerProps> = ({ value, onChange, onClea
         </div>
 
         <div className="flex items-center gap-2 mt-2.5">
+          <button
+            type="button"
+            data-tip="Pick a colour from the screen"
+            aria-label="Pick a colour from the screen"
+            onClick={async () => {
+              const picked = await pickColorFromScreen();
+              if (picked) handleHexChange(picked);
+            }}
+            className="w-7 h-7 shrink-0 rounded border border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-100"
+          >
+            <EyedropperIcon size={14} />
+          </button>
           <div className="w-7 h-7 rounded border border-neutral-300 dark:border-neutral-600 shrink-0" style={{ backgroundColor: currentHex }} />
           <input
             value={hexInput}
@@ -228,11 +241,26 @@ const DocColorPicker: React.FC<DocColorPickerProps> = ({ value, onChange, onClea
           ))}
           <button
             type="button"
-            title="Custom color"
+            data-tip="Custom color"
             onClick={openCustom}
             className="w-5 h-5 rounded-sm border border-dashed border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-400 dark:text-neutral-500 hover:border-neutral-400 dark:hover:border-neutral-500"
           >
             +
+          </button>
+          {/* Any colour on the screen - a logo, a photo, another app. */}
+          <button
+            type="button"
+            data-tip="Pick a colour from the screen"
+            aria-label="Pick a colour from the screen"
+            onClick={async () => {
+              const picked = await pickColorFromScreen();
+              if (!picked) return;
+              setRecentColors(addRecentColor(storageKey, picked));
+              pick(picked);
+            }}
+            className="w-5 h-5 rounded-sm border border-neutral-300 dark:border-neutral-600 flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:border-neutral-400 hover:text-neutral-700"
+          >
+            <EyedropperIcon size={12} />
           </button>
         </div>
       </div>

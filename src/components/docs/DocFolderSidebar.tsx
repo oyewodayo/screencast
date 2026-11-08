@@ -168,7 +168,7 @@ const DocFolderSidebar: React.FC<DocFolderSidebarProps> = ({
                 >
                   <button
                     type="button"
-                    title={isExpanded ? "Collapse" : "Expand"}
+                    data-tip={isExpanded ? "Collapse" : "Expand"}
                     onClick={(e) => {
                       e.stopPropagation();
                       toggleExpanded(folder.id);
@@ -182,7 +182,7 @@ const DocFolderSidebar: React.FC<DocFolderSidebarProps> = ({
 
                   <button
                     type="button"
-                    title="Folder options"
+                    data-tip="Folder options"
                     onClick={(e) => {
                       e.stopPropagation();
                       setConfirmDeleteId(null);
@@ -243,7 +243,7 @@ const DocFolderSidebar: React.FC<DocFolderSidebarProps> = ({
         <span className="text-xs font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">Folders</span>
         <button
           type="button"
-          title="New folder"
+          data-tip="New folder"
           onClick={() => startCreate(null)}
           className="p-1 rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800"
         >

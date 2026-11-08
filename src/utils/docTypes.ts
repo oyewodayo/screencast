@@ -35,6 +35,27 @@ export const DOC_DRAG_MIME = "application/x-briefcast-doc-id";
 // through docs.rs's DocMeta.page_size with no translation needed.
 export type DocPageSize = "letter" | "a4" | "legal";
 
+// Page margins in inches (docs.rs DocMargins). null on a doc = the 1in default all round.
+export interface DocMargins {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+// null on a doc = portrait (docs.rs DocMeta.orientation stores only "landscape").
+export type DocOrientation = "portrait" | "landscape";
+
+export interface DocPageSetupPatch {
+  pageSize?: DocPageSize | null;
+  headerText?: string | null;
+  footerText?: string | null;
+  margins?: DocMargins | null;
+  orientation?: DocOrientation | null;
+  // "#rrggbb" paper colour; null = white.
+  pageColor?: string | null;
+}
+
 // Frontend mirror of docs.rs's DocComment - see its own header comment on why the anchored text
 // range is never stored here, only `mark_id` (looked up live against the current document).
 export interface DocComment {

@@ -10,8 +10,13 @@
     "core:window:allow-create",
     "core:window:allow-show",
     "core:window:allow-hide",
+    "core:window:allow-set-title",
     "core:window:allow-close",
+    "core:window:allow-destroy",
     "core:window:allow-set-fullscreen",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size",
+    "core:window:allow-unminimize",
     "core:window:allow-set-focus",
     "core:window:allow-set-ignore-cursor-events",
     "core:window:allow-start-dragging",
@@ -20,11 +25,6 @@
     "dialog:allow-save",
     "dialog:allow-message",
     "dialog:allow-ask",
-    "global-shortcut:allow-is-registered",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-register-all",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-unregister-all",
     "dialog:default"
   ]
 }

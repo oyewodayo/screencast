@@ -11,13 +11,16 @@ import {
   addTextRange,
   applyColorRun,
   applyCommand,
+  cleanSelectedPdfText,
   devicePointToPdfPoint,
+  findCommentObjectAt,
   findImageObjectAt,
   findTextLineAt,
   findTextObjectAt,
   hitTestEraser,
   invertCommand,
   isTextRangeCovered,
+  makeCommentObject,
   pdfPointToDevicePoint,
   removeTextRange,
   shiftColorRunsForEdit,
@@ -235,5 +238,38 @@ describe("findTextLineAt", () => {
 
   it("returns null well outside any line, even with slack", () => {
     expect(findTextLineAt(lines, { x: 50, y: 500, pressure: 1 })).toBeNull();
+  });
+});
+
+describe("cleanSelectedPdfText", () => {
+  it("folds the text layer's per-line breaks into spaces", () => {
+    expect(cleanSelectedPdfText("Chuang and Nielsen have\nproduced the first")).toBe("Chuang and Nielsen have produced the first");
+  });
+
+  it("rejoins words hyphenated across a line break", () => {
+    expect(cleanSelectedPdfText("intrinsic capa-\nbilities and limits")).toBe("intrinsic capabilities and limits");
+  });
+
+  it("keeps a hyphen that isn't followed by a lowercase continuation", () => {
+    expect(cleanSelectedPdfText("IBM -\nPeter Shor")).toBe("IBM - Peter Shor");
+  });
+
+  it("collapses repeated whitespace and trims", () => {
+    expect(cleanSelectedPdfText("  a  \r\n  b  c  ")).toBe("a b c");
+  });
+});
+
+describe("comment objects", () => {
+  const comment = makeCommentObject(0, [{ x1: 10, y1: 100, x2: 200, y2: 112 }, { x1: 10, y1: 86, x2: 80, y2: 98 }], "quote", "note");
+
+  it("hit-tests any of its line rects", () => {
+    expect(findCommentObjectAt([comment], { x: 150, y: 105, pressure: 1 })?.id).toBe(comment.id);
+    expect(findCommentObjectAt([comment], { x: 50, y: 90, pressure: 1 })?.id).toBe(comment.id);
+    expect(findCommentObjectAt([comment], { x: 150, y: 90, pressure: 1 })).toBeNull();
+  });
+
+  it("is erasable like any other object", () => {
+    expect(hitTestEraser([comment], { x: 205, y: 105, pressure: 1 }, 6)).toEqual([comment]);
+    expect(hitTestEraser([comment], { x: 300, y: 105, pressure: 1 }, 6)).toEqual([]);
   });
 });

@@ -1,0 +1,10 @@
+[package]
+name = "composition-effects"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Direct2D effects for Windows.UI.Composition (the screen blur's Gaussian) - its own crate because #[implement] expands to ::windows_core, which must be the windows 0.57 one, while the app also links windows-core 0.62 for webview2-com."
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.57.0", features = ["Foundation", "Graphics", "Graphics_Effects", "Win32_Foundation", "Win32_System_WinRT", "Win32_System_WinRT_Graphics", "Win32_System_WinRT_Graphics_Direct2D", "implement"] }
+windows-core = "0.57.0"

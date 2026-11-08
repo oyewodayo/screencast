@@ -25,9 +25,9 @@ use std::process::Command;
 use tauri::{AppHandle, State};
 
 use super::{
-    build_camera_overlay_filter_complex, codec_args_for_ext, extract_ffmpeg_error,
+    audio_codec_args_for_ext, build_camera_overlay_filter_complex, codec_args_for_ext_hw, extract_ffmpeg_error,
     map_overlay_size, resolve_capture_target, spawn_recording, AppState, CaptureTarget, FormData,
-    MAX_RECORDING_WIDTH,
+    desktop_scale_filter, resolved_framerate, resolved_max_width,
 };
 use crate::services::utility::{get_ffmpeg_path, path_to_str};
 
@@ -81,7 +81,7 @@ fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
             "-i".to_string(),
             format!("{}+{},{}", x11_display(), x, y),
         ]),
-        CaptureTarget::Window { title } => {
+        CaptureTarget::Window { title, .. } => {
             let (x, y, width, height) =
                 crate::commands::window_capture::linux::get_window_rect_by_title(title)?;
             Ok(vec![
@@ -280,7 +280,7 @@ fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData) -> Resu
         &form_data.overlay_position,
         &form_data.overlay_size,
         form_data.video_devices.len(),
-        MAX_RECORDING_WIDTH,
+        resolved_max_width(form_data),
         None,
     );
     args.extend(vec!["-filter_complex".to_string(), filter_complex]);
@@ -300,7 +300,7 @@ pub async fn recording_with_output_sva(
         "-f".to_string(),
         "x11grab".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        resolved_framerate(form_data, 30).to_string(),
     ];
     args.extend(x11grab_input_args(&resolve_capture_target(
         app_handle, form_data,
@@ -362,12 +362,13 @@ pub async fn recording_with_output_sva(
         ]);
     } else {
         plain_audio_args(&mut args, form_data, 1);
+        args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
     }
 
-    args.extend(codec_args_for_ext(&form_data.file_ext));
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Screen and audio
@@ -383,18 +384,23 @@ pub async fn recording_with_output_sa(
         "-f".to_string(),
         "x11grab".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        resolved_framerate(form_data, 30).to_string(),
     ];
     args.extend(x11grab_input_args(&resolve_capture_target(
         app_handle, form_data,
     ))?);
     plain_audio_args(&mut args, form_data, 1);
+    args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+    // The container's codec table, as the other screen mode (sva) and Windows already apply:
+    // without it ffmpeg picks yuv444 from x11grab's raw frames (many players and WebViews can't
+    // decode that) and an mp4 isn't fragmented, so a force-killed recording is unplayable.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec![
         "-y".to_string(),
         path_to_str(output_path)?.to_string(),
     ]);
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Video (camera) only
@@ -410,18 +416,22 @@ pub async fn recording_with_output_v(
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
     let camera_path = require_v4l2_path(&video_device)?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
         camera_path,
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Hardware encoding, and the container's own codec table, rather than the bare `-c:v mpeg4`
+    // this used to hardcode. That old default ignored the file type the user picked entirely and
+    // produced MPEG-4 Part 2 - a pre-H.264 codec with markedly worse quality per byte, and one
+    // most players treat as legacy - while the equivalent Windows path had been using the shared
+    // H.264 table all along. It also meant camera recordings carried no audio codec choice at all.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Audio only
@@ -433,16 +443,18 @@ pub async fn recording_with_output_a(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "pulse".to_string(),
         "-i".to_string(),
         form_data.audio_device.clone(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Explicit audio codec and bitrate for the chosen container, as Windows does - ffmpeg's own
+    // per-container default measured out to 128k for mp3.
+    args.extend(audio_codec_args_for_ext(&form_data.file_ext));
+    args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Video (camera) and audio
@@ -460,7 +472,7 @@ pub async fn recording_with_output_va(
     // v4l2 and pulse can't be combined into one -i (unlike dshow/avfoundation) — two separate
     // inputs, one video-only stream and one audio-only stream, which ffmpeg's default stream
     // selection maps unambiguously since each type has exactly one candidate.
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
@@ -469,13 +481,15 @@ pub async fn recording_with_output_va(
         "pulse".to_string(),
         "-i".to_string(),
         form_data.audio_device.clone(),
-        "-c:v".to_string(),
-        "mpeg4".to_string(),
-        "-y".to_string(),
-        path_to_str(output_path)?.to_string(),
     ];
+    // Same change as recording_with_output_v above: the container's own codec table plus hardware
+    // encoding, instead of a hardcoded `-c:v mpeg4` that ignored the chosen file type and left the
+    // audio codec entirely to the muxer's default.
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+    args.push("-y".to_string());
+    args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 //Screen only
@@ -491,7 +505,7 @@ pub async fn recording_with_output_s(
         "-f".to_string(),
         "x11grab".to_string(),
         "-framerate".to_string(),
-        "30".to_string(),
+        resolved_framerate(form_data, 30).to_string(),
     ];
     args.extend(x11grab_input_args(&resolve_capture_target(
         app_handle, form_data,
@@ -508,10 +522,12 @@ pub async fn recording_with_output_s(
             source,
         ]);
     }
+    args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+    args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
 
-    spawn_recording(&state, output_path, &ffmpeg_path, args).await
+    spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await
 }
 
 // A real instant screenshot: `-frames:v 1` tells ffmpeg to grab exactly one frame and exit on

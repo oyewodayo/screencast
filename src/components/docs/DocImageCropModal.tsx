@@ -254,7 +254,7 @@ const DocImageCropModal: React.FC<DocImageCropModalProps> = ({ docId, src, onCan
       <div className="flex flex-col gap-3 p-4 rounded-2xl bg-neutral-900 ring-1 ring-white/10 shadow-2xl" onMouseDown={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between gap-6">
           <h3 className="text-sm font-semibold text-white">Crop image</h3>
-          <button type="button" title="Close" onClick={onCancel} className="p-1 rounded-full hover:bg-white/10 text-white/60 hover:text-white">
+          <button type="button" data-tip="Close" onClick={onCancel} className="p-1 rounded-full hover:bg-white/10 text-white/60 hover:text-white">
             <IoClose size={16} />
           </button>
         </div>
@@ -286,7 +286,7 @@ const DocImageCropModal: React.FC<DocImageCropModalProps> = ({ docId, src, onCan
                 onPointerMove={handlePanMove}
                 onPointerUp={endPan}
                 onPointerCancel={endPan}
-                title="Drag to move"
+                data-tip="Drag to move"
                 className="absolute outline outline-2 outline-white cursor-move"
                 style={{ left: liveRect.xPx, top: liveRect.yPx, width: liveRect.wPx, height: liveRect.hPx }}
               >
@@ -297,7 +297,7 @@ const DocImageCropModal: React.FC<DocImageCropModalProps> = ({ docId, src, onCan
                     onPointerMove={handleResizeMove}
                     onPointerUp={endResize}
                     onPointerCancel={endResize}
-                    title="Drag to resize"
+                    data-tip="Drag to resize"
                     className={`absolute w-3.5 h-3.5 rounded-full bg-amber-400 hover:bg-amber-300 ring-2 ring-white/80 ${cornerPositionClass[corner]} ${cornerCursor[corner]}`}
                   />
                 ))}

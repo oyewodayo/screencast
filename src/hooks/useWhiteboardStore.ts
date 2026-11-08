@@ -40,9 +40,14 @@ export interface UseWhiteboardStoreResult {
   batchEditNodes: (before: WhiteboardNode[], after: WhiteboardNode[]) => void;
   addEdge: (edge: WhiteboardEdge) => void;
   editEdge: (before: WhiteboardEdge, after: WhiteboardEdge) => void;
+  batchEditEdges: (before: WhiteboardEdge[], after: WhiteboardEdge[]) => void;
+  // Nodes and edges replaced together as one undo step - group/ungroup, mixed-selection move/flip.
+  batchEditItems: (beforeNodes: WhiteboardNode[], afterNodes: WhiteboardNode[], beforeEdges: WhiteboardEdge[], afterEdges: WhiteboardEdge[]) => void;
   deleteEdge: (edge: WhiteboardEdge) => void;
   // Full replacement order for the whole nodes array - "Bring to front" / "Send to back".
   reorderNodes: (newOrder: WhiteboardNode[]) => void;
+  // Unified z-order reorder across both nodes and edges.
+  reorderItems: (afterNodes: WhiteboardNode[], afterEdges: WhiteboardEdge[]) => void;
   // Adds any number of nodes/edges (a clipboard paste) as a single undo step - see
   // whiteboardTypes.ts's "paste-items" command doc comment. Callers own id generation/positioning
   // (WhiteboardEditor.tsx's handlePaste) - this just dispatches the already-prepared items.
@@ -242,11 +247,27 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     [dispatch]
   );
 
+  const batchEditEdges = useCallback(
+    (before: WhiteboardEdge[], after: WhiteboardEdge[]) => {
+      if (before.length === 0 || after.length === 0) return;
+      dispatch({ type: "batch-edit-edges", before, after });
+    },
+    [dispatch]
+  );
+
+  const batchEditItems = useCallback(
+    (beforeNodes: WhiteboardNode[], afterNodes: WhiteboardNode[], beforeEdges: WhiteboardEdge[], afterEdges: WhiteboardEdge[]) => {
+      if (afterNodes.length === 0 && afterEdges.length === 0) return;
+      dispatch({ type: "batch-edit-items", beforeNodes, afterNodes, beforeEdges, afterEdges });
+    },
+    [dispatch]
+  );
+
   const deleteEdge = useCallback((edge: WhiteboardEdge) => dispatch({ type: "delete-edge", item: edge }), [dispatch]);
 
   const pasteItems = useCallback(
     (nodes: WhiteboardNode[], edges: WhiteboardEdge[]) => {
-      if (nodes.length === 0) return;
+      if (nodes.length === 0 && edges.length === 0) return;
       dispatch({ type: "paste-items", nodes, edges });
     },
     [dispatch]
@@ -257,6 +278,21 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
       const page = docRef.current?.pages.find((p) => p.id === docRef.current!.activePageId);
       if (!page) return;
       dispatch({ type: "reorder-nodes", before: page.nodes, after: newOrder });
+    },
+    [dispatch]
+  );
+
+  const reorderItems = useCallback(
+    (afterNodes: WhiteboardNode[], afterEdges: WhiteboardEdge[]) => {
+      const page = docRef.current?.pages.find((p) => p.id === docRef.current!.activePageId);
+      if (!page) return;
+      dispatch({
+        type: "reorder-items",
+        beforeNodes: page.nodes,
+        afterNodes,
+        beforeEdges: page.edges,
+        afterEdges,
+      });
     },
     [dispatch]
   );
@@ -404,8 +440,11 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     batchEditNodes,
     addEdge,
     editEdge,
+    batchEditEdges,
+    batchEditItems,
     deleteEdge,
     reorderNodes,
+    reorderItems,
     pasteItems,
     setShowGrid,
     setSnapToGrid,

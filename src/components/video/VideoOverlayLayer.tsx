@@ -19,49 +19,70 @@
 // instead of it never having existed.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoChevronDown, IoChevronUp } from "react-icons/io5";
+import { IoChevronDown, IoClose, IoImageOutline, IoShapesOutline, IoText } from "react-icons/io5";
+import { MdBlurOn } from "react-icons/md";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import AssetCanvas from "./AssetCanvas";
+import ResizeHandles from "./ResizeHandles";
+import { ResizeHandle, PxBox, isCornerHandle, resizeBoxFromHandle } from "../../utils/boxResize";
+import RevealText from "./RevealText";
+import ImageRevealWrap from "./ImageRevealWrap";
+import RevealMaskBox from "./RevealMaskBox";
+import { isTextReveal } from "../../utils/textReveal";
+import AssetFloatingControls from "./AssetFloatingControls";
+import { OverlayAsset, assetEntry } from "../../utils/videoAssets";
+import { stickerAspect, stickerHugs } from "../../utils/stickerAssets";
+import { OverlayKeyframe, keyframeStateAt } from "../../utils/keyframes";
 import { FrameRect } from "../../utils/videoFrameRect";
-import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay, TextOverlayCornerStyle } from "../../utils/videoEditTypes";
-import { overlaysActiveAt } from "../../handlers/videoEditHandlers";
+import { BLUR_SIGMA_FRACTION } from "../../utils/videoOverlayRender";
+import { BlurOverlay, BlurShape, ImageOverlay, OverlayAnimation, TextOverlay } from "../../utils/videoEditTypes";
+import { overlayAnimationStyle } from "../../utils/overlayAnimation";
+import { cssBlendMode } from "../../utils/blendModes";
+import { cachedLayerMaskAlphaUrl, DEFAULT_MASK, type LayerMask } from "../../utils/layerMask";
+import MaskEditor from "./MaskEditor";
+import { overlayStack, overlaysActiveAt } from "../../handlers/videoEditHandlers";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { renderFormattedSegments } from "../../utils/textFormatting";
 import { TEXT_FONT_FAMILY, measureTextBlock } from "../../handlers/pdfAnnotationHandlers";
+import CanvasTextOverlay from "./CanvasTextOverlay";
+import { caseText, textBoxBackgroundCss, textBoxBorderCss, textCornerRadiusPx, textLineHeight, textPaddingPx, textStrokePx, usesCanvasText } from "../../utils/videoOverlayRender";
+import { titleFontCss, titleFontStyle } from "../../utils/titleFonts";
+import { lookPatch } from "../../utils/titleStyles";
 import { TextAlign, TextColorRun, TextRange } from "../../utils/pdfAnnotationTypes";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
-import TextNoteEditor from "../pdf/TextNoteEditor";
 import ColorSwatchPicker from "../pdf/ColorSwatchPicker";
 import ImageOverlayCropPanel from "./ImageOverlayCropPanel";
+import { DOCKED_PANEL_CLASS, useOpenToolPanel, useToolPanelHost } from "../docker/ToolPanelHost";
+import { BlurDockedPanel, ImageDockedPanel, TextDockedPanel, TextDockedPanelProps } from "./OverlayDockedPanels";
+import TextQuickBar from "./TextQuickBar";
+import VideoTextEditor, { VideoTextEditorHandle, VideoTextFormat } from "./VideoTextEditor";
 
 export const DEFAULT_OVERLAY_WIDTH_FRACTION = 0.4;
 export const DEFAULT_OVERLAY_FONT_FRACTION = 0.06;
 export const DEFAULT_OVERLAY_DURATION_SEC = 5;
+// Where a new overlay starts: at the playhead - or, near the end, early enough that it still gets
+// its full length (placed at the very end it would otherwise last a few milliseconds).
+const placementStart = (playhead: number, total: number): number =>
+  total > 0 ? Math.max(0, Math.min(playhead, total - Math.min(DEFAULT_OVERLAY_DURATION_SEC, total))) : playhead;
 // The padding every text overlay had before `padding` existed as its own field (a plain 2px,
 // unaffected by frame size) - expressed as a frameRect.height fraction so newly-opened editing
 // sessions (which stage padding as a fraction, same basis as fontSize) start from the exact same
 // visual size old overlays already render at, rather than a value that would visibly jump the box
 // the moment you touch any other field on the same overlay.
 const legacyPaddingFraction = (frameHeightPx: number): number => (frameHeightPx > 0 ? 2 / frameHeightPx : 0);
+const FRAME_BOUNDS = { x0: 0, y0: 0, x1: 1, y1: 1 };
+const clampTo = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
 const DEFAULT_IMAGE_WIDTH_FRACTION = 0.25;
 const MIN_IMAGE_WIDTH_PX = 24;
 const DEFAULT_BLUR_WIDTH_FRACTION = 0.18;
 const DEFAULT_BLUR_HEIGHT_FRACTION = 0.18;
-// Blur strength is stored as 0..1 (BlurOverlay.intensity), not a raw px radius, so it stays
-// meaningful regardless of the frame's actual size - resolved to a CSS px radius here as a
-// fraction of frameRect.height, the same "fraction of the frame, not a fixed px" convention
-// fontSize/padding already use. Doesn't need to exactly match the export-side radius formula in
-// export_trimmed_video (crop pixels vs CSS backdrop-filter px are different spaces entirely) -
-// just to look comparably strong at intensity 0 vs 1.
-const BLUR_PREVIEW_SCALE = 0.12;
+// Blur strength is stored as 0..1 (BlurOverlay.intensity), resolved to a CSS blur() radius (a
+// Gaussian's standard deviation) as a fraction of frameRect.height - export blurs with the same
+// Gaussian at the same fraction of its own frame (BLUR_SIGMA_FRACTION).
+const BLUR_PREVIEW_SCALE = BLUR_SIGMA_FRACTION;
 const MIN_BLUR_WIDTH_PX = 24;
 
-const TEXT_STYLE_PRESETS: { name: string; patch: TextOverlayContentPatch }[] = [
-  { name: "Clean", patch: { backgroundColor: undefined, strokeColor: undefined, strokeWidth: undefined, cornerStyle: "square" } },
-  { name: "Caption", patch: { backgroundColor: "rgba(0,0,0,0.65)", strokeColor: undefined, strokeWidth: undefined, cornerStyle: "pill" } },
-  { name: "Outline", patch: { backgroundColor: undefined, strokeColor: "#000000", strokeWidth: 3, cornerStyle: "square" } },
-];
-const CORNER_OPTIONS: TextOverlayCornerStyle[] = ["square", "rounded", "pill"];
 
 type TextOverlayContentPatch = Partial<
   Pick<
@@ -83,11 +104,27 @@ type TextOverlayContentPatch = Partial<
     | "height"
     | "fontSize"
     | "padding"
+    | "paddingX"
+    | "lineHeight"
+    | "textCase"
+    | "boxFill"
+    | "boxBorder"
+    | "keyframes"
+    | "reveal"
+    | "blendMode"
+    | "track"
+    | "fontFamily"
+    | "letterSpacing"
+    | "fill"
+    | "glow"
+    | "shadow"
+    | "rotation"
   >
 >;
 type ImageOverlayContentPatch = Partial<
   Pick<
     ImageOverlay,
+    | "keyframes"
     | "x"
     | "y"
     | "width"
@@ -105,6 +142,11 @@ type ImageOverlayContentPatch = Partial<
     | "cropY"
     | "cropWidth"
     | "cropHeight"
+    | "asset"
+    | "reveal"
+    | "blendMode"
+    | "track"
+    | "mask"
   >
 >;
 // "rounded" is a flat px amount (converted to a frameRect.height fraction at click time) rather
@@ -120,7 +162,9 @@ const IMAGE_ROUNDED_CORNER_PX = 12;
 // panel's position (so the panel can reserve enough room above the box to clear the handle instead
 // of drawing directly on top of it) - see rotateHandleRise's own inline comment for why the rise
 // itself is clamped this way against .video-container's overflow:hidden.
-const rotateHandleRiseFor = (roomAbovePx: number): number => Math.min(32, Math.max(10, roomAbovePx - 2));
+// With no room above the box (it touches the frame's top - a full-frame shape), the grip moves
+// just inside the box instead, below the top resize handle, where it can still be reached.
+const rotateHandleRiseFor = (roomAbovePx: number): number => (roomAbovePx < 20 ? -30 : Math.min(32, Math.max(10, roomAbovePx - 2)));
 
 // All four crop fields are optional/undefined for the common "never cropped" case (see
 // ImageOverlay.cropX's own doc comment) - true only once a real, non-full crop rect has actually
@@ -147,79 +191,25 @@ const cropBackgroundStyle = (o: ImageOverlay): React.CSSProperties => {
   };
 };
 
-// Shared entry/exit timing envelope for OverlayAnimation - text and image overlays both use the
-// exact same "ramp over the first/last ANIMATION_RAMP_DURATION_SEC of the overlay's own time
-// range" shape, just driving different CSS (opacity for fade, a translate offset for slide), so
-// this is one function feeding both render paths below instead of two near-duplicates.
-const ANIMATION_RAMP_DURATION_SEC = 0.4;
-// How far off its resting position a "slide" overlay sits at the very start/end of its ramp, as a
-// fraction of the frame dimension it travels along - large enough to read clearly as a slide,
-// small enough that it doesn't travel distractingly far across the frame.
-const SLIDE_DISTANCE_FRACTION = 0.12;
-
-interface OverlayAnimationStyle {
-  opacity: number;
-  translateXPx: number;
-  translateYPx: number;
-  scale: number;
+// An in-progress eight-handle resize (pictures and blur regions) - everything in frame pixels.
+interface BoxResizeDrag {
+  id: string;
+  startClientX: number;
+  startClientY: number;
+  start: PxBox;
+  rotation: number;
+  handle: ResizeHandle;
+  // Corners keep proportions when true (Shift inverts it for the drag in progress).
+  aspectLocked: boolean;
+  live: PxBox;
 }
 
-// Standard ease-out-back overshoot curve (t:0..1 -> slightly past 1, settling back to 1) - the
-// "pop" animation's whole visual identity is that overshoot, so a plain ease-out wouldn't read as
-// distinct from a slower fade/scale.
-const easeOutBack = (t: number): number => {
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2;
+const stepBoxResize = (drag: BoxResizeDrag, pointer: { clientX: number; clientY: number; shiftKey: boolean }, minPx: number): BoxResizeDrag => {
+  const keepAspect = isCornerHandle(drag.handle) && drag.aspectLocked !== pointer.shiftKey;
+  const live = resizeBoxFromHandle(drag.start, drag.rotation, drag.handle, pointer.clientX - drag.startClientX, pointer.clientY - drag.startClientY, keepAspect, minPx);
+  return { ...drag, live };
 };
 
-const overlayAnimationStyle = (
-  animation: OverlayAnimation | undefined,
-  startTime: number,
-  endTime: number,
-  currentTime: number,
-  frameWidth: number,
-  frameHeight: number
-): OverlayAnimationStyle => {
-  if (!animation || animation === "none") return { opacity: 1, translateXPx: 0, translateYPx: 0, scale: 1 };
-
-  const ramp = Math.min(ANIMATION_RAMP_DURATION_SEC, (endTime - startTime) / 2);
-  // 0 right at either edge of the overlay's time range, ramping up to 1 once fully "arrived" -
-  // clamped to half the overlay's own duration so a very short overlay still finishes entering
-  // before it starts leaving, same reasoning fade already used before this was generalized.
-  const progress = ramp <= 0 ? 1 : Math.max(0, Math.min(1, (currentTime - startTime) / ramp, (endTime - currentTime) / ramp));
-
-  if (animation === "fade") return { opacity: progress, translateXPx: 0, translateYPx: 0, scale: 1 };
-
-  // Pop keeps full opacity throughout - only its scale ramps, overshooting past 1 before settling
-  // (same overall shape as CSS's ease-out-back), symmetric on both entry and exit since `progress`
-  // already accounts for both edges via the min() above.
-  if (animation === "pop") {
-    const scale = progress >= 1 ? 1 : easeOutBack(progress);
-    return { opacity: 1, translateXPx: 0, translateYPx: 0, scale };
-  }
-
-  // Slide keeps full opacity throughout - only its position ramps. `remaining` is "how far from
-  // fully in place" (1 at either edge, 0 once arrived), so multiplying it by the travel distance
-  // gives an offset that shrinks to 0 as the overlay settles in, then grows back as it leaves -
-  // out the same side it came in from, a deliberate "peek and retreat" rather than a conveyor
-  // that enters one side and exits the other.
-  const remaining = 1 - progress;
-  const distanceX = frameWidth * SLIDE_DISTANCE_FRACTION;
-  const distanceY = frameHeight * SLIDE_DISTANCE_FRACTION;
-  switch (animation) {
-    case "slide-left":
-      return { opacity: 1, translateXPx: -distanceX * remaining, translateYPx: 0, scale: 1 };
-    case "slide-right":
-      return { opacity: 1, translateXPx: distanceX * remaining, translateYPx: 0, scale: 1 };
-    case "slide-up":
-      return { opacity: 1, translateXPx: 0, translateYPx: -distanceY * remaining, scale: 1 };
-    case "slide-down":
-      return { opacity: 1, translateXPx: 0, translateYPx: distanceY * remaining, scale: 1 };
-    default:
-      return { opacity: 1, translateXPx: 0, translateYPx: 0, scale: 1 };
-  }
-};
 
 // Local, not-yet-persisted position/size for whichever text overlay is currently open for editing
 // - same reasoning as PdfPage's EditingTextState: position/size come from drag/resize handles and
@@ -238,10 +228,15 @@ interface EditingOverlayState {
   // continuously and should land as one undo step alongside the rest of this edit, not one per
   // pixel dragged.
   padding: number;
+  // Left/right padding, same basis - undefined follows `padding` (TextOverlay.paddingX).
+  paddingX?: number;
 }
 
 interface VideoOverlayLayerProps {
   frameRect: FrameRect;
+  // The exact output time right now, read from the player every animation frame - keyframed
+  // overlays move with it smoothly (currentOutputTime alone only updates a few times a second).
+  getOutputTime?: () => number | null;
   overlays: TextOverlay[];
   imageOverlays: ImageOverlay[];
   currentOutputTime: number;
@@ -250,6 +245,9 @@ interface VideoOverlayLayerProps {
   onSelectOverlay: (id: string | null) => void;
   selectedImageOverlayId: string | null;
   onSelectImageOverlay: (id: string | null) => void;
+  // While playing, a selection keeps its settings panel but not its handles - they'd sit over
+  // the moving picture.
+  isPlaying?: boolean;
   // Text tool armed from VideoTimelineDocker's toolbar (lifted to Dashboard since that button and
   // this click surface live in separate subtrees) - the next click on the video places a new
   // overlay there and disarms itself via onPlacementConsumed.
@@ -261,6 +259,9 @@ interface VideoOverlayLayerProps {
   onDuplicateTextOverlay: (id: string) => void;
   onBringTextOverlayToFront: (id: string) => void;
   onSendTextOverlayToBack: (id: string) => void;
+  // How far a picture's top-left may be dragged, in frame fractions - the picture itself (0..1)
+  // unless a Screen Style puts padding around it, which pictures and text may sit on too.
+  placeBounds?: { x0: number; y0: number; x1: number; y1: number };
   // Image tool armed the same way, but consumed immediately (opens the file picker as soon as
   // it's armed - no click-on-video step, unlike text, since an image's aspect ratio isn't known
   // until a file's actually picked, so there's nothing useful a pre-pick click position would add).
@@ -285,185 +286,39 @@ interface VideoOverlayLayerProps {
   onAddBlurOverlay: (x: number, y: number, width: number, height: number, intensity: number, startTime: number, endTime: number) => string;
   onUpdateBlurOverlayContent: (
     id: string,
-    patch: Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation">>
+    patch: Partial<Pick<BlurOverlay, "x" | "y" | "width" | "height" | "intensity" | "shape" | "cornerRadius" | "rotation" | "keyframes" | "track">>
   ) => void;
   onDeleteBlurOverlay: (id: string) => void;
   onDuplicateBlurOverlay: (id: string) => void;
+  // Sets one edge of an overlay's time range (output seconds) - the docked panels' timing
+  // controls. Same store operation as dragging the overlay chip's edge on the timeline.
+  onSetOverlayTime?: (kind: "text" | "image" | "blur", id: string, edge: "start" | "end", time: number) => void;
+  // Starts motion tracking for an overlay (Dashboard runs the target picker and the track).
+  onTrackMotion?: (kind: "text" | "image" | "blur", id: string) => void;
 }
-
-// A compact numeric stepper matching the image panel's own rotation input (a native
-// <input type="number">, which browsers already render with an up/down spinner) - up/down caret
-// buttons step the value in real time (tap once, hold to repeat), and clicking the value itself
-// types an exact number. Can't actually BE a native number input here, though: focusing one shifts
-// keyboard focus there, which blurs TextNoteEditor's textarea and fires its own onBlur={commit},
-// closing/deleting the whole editing session out from under the input the instant it's clicked
-// (TextNoteEditor is reused as-is - see this file's own top comment - so that behavior isn't
-// something this file can intercept). The caret buttons dodge this the same way every other button
-// in this panel does (onMouseDown={preventDefault} - a *button* just never takes focus at all), and
-// typing dodges it by never focusing anything either - a document-level keydown listener (capture
-// phase) intercepts digits while in type mode and preventDefault+stopPropagation keeps them from
-// reaching whatever's actually focused (the textarea). Purely local/session state in the caller
-// (onChangePx) - this component holds no value of its own beyond the transient typing buffer.
-interface SteppedNumberFieldProps {
-  valuePx: number;
-  min: number;
-  max: number;
-  step?: number;
-  title: string;
-  onChangePx: (px: number) => void;
-}
-const STEP_REPEAT_DELAY_MS = 350;
-const STEP_REPEAT_INTERVAL_MS = 60;
-const SteppedNumberField: React.FC<SteppedNumberFieldProps> = ({ valuePx, min, max, step = 1, title, onChangePx }) => {
-  const [editText, setEditText] = useState<string | null>(null);
-
-  // Tracks the in-progress value across repeated ticks independent of the `valuePx` prop, which
-  // only catches up once the parent re-renders after each onChangePx call (a render cycle behind
-  // during a fast hold) - reading the stale prop inside a setInterval closure would otherwise step
-  // from the same starting number every tick instead of accumulating.
-  const liveValueRef = useRef(valuePx);
-  const repeatTimeoutRef = useRef<number | null>(null);
-  const repeatIntervalRef = useRef<number | null>(null);
-
-  const stopRepeat = useCallback(() => {
-    if (repeatTimeoutRef.current != null) {
-      window.clearTimeout(repeatTimeoutRef.current);
-      repeatTimeoutRef.current = null;
-    }
-    if (repeatIntervalRef.current != null) {
-      window.clearInterval(repeatIntervalRef.current);
-      repeatIntervalRef.current = null;
-    }
-  }, []);
-  useEffect(() => stopRepeat, [stopRepeat]);
-
-  const stepOnce = useCallback(
-    (delta: number) => {
-      liveValueRef.current = Math.max(min, Math.min(max, Math.round(liveValueRef.current + delta)));
-      onChangePx(liveValueRef.current);
-    },
-    [min, max, onChangePx]
-  );
-  // Tap once to step, hold to ramp into continuous change - the standard spinner-button convention.
-  const beginRepeat = (delta: number) => {
-    liveValueRef.current = valuePx;
-    stepOnce(delta);
-    stopRepeat();
-    repeatTimeoutRef.current = window.setTimeout(() => {
-      repeatIntervalRef.current = window.setInterval(() => stepOnce(delta), STEP_REPEAT_INTERVAL_MS);
-    }, STEP_REPEAT_DELAY_MS);
-  };
-  // Window-level fallback so a release outside the button's own bounds (cursor drifted off it
-  // while holding) still stops the repeat, same "don't let a drag/hold get stuck" reasoning as the
-  // pointer-cancel handlers elsewhere in this file.
-  useEffect(() => {
-    window.addEventListener("mouseup", stopRepeat);
-    return () => window.removeEventListener("mouseup", stopRepeat);
-  }, [stopRepeat]);
-
-  const commitEdit = useCallback(() => {
-    setEditText((current) => {
-      if (current != null && current.length > 0) {
-        const parsed = parseInt(current, 10);
-        if (Number.isFinite(parsed)) onChangePx(Math.max(min, Math.min(max, parsed)));
-      }
-      return null;
-    });
-  }, [min, max, onChangePx]);
-
-  useEffect(() => {
-    if (editText == null) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key >= "0" && e.key <= "9") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText((prev) => ((prev ?? "") + e.key).slice(0, 4));
-      } else if (e.key === "Backspace") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText((prev) => (prev ?? "").slice(0, -1));
-      } else if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
-        e.stopPropagation();
-        commitEdit();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        setEditText(null);
-      } else {
-        // Blocks everything else (e.g. plain letters) from leaking through to whatever's actually
-        // focused underneath while this field is "typing" - it never takes real focus itself.
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown, true);
-    return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [editText, commitEdit]);
-
-  useEffect(() => {
-    if (editText == null) return;
-    document.addEventListener("pointerdown", commitEdit);
-    return () => document.removeEventListener("pointerdown", commitEdit);
-  }, [editText, commitEdit]);
-
-  return (
-    <div
-      title={editText != null ? "Type a value, Enter to confirm" : title}
-      className={`flex items-stretch h-5 rounded overflow-hidden select-none ${editText != null ? "ring-1 ring-blue-400" : ""}`}
-    >
-      <div
-        onClick={(e) => {
-          e.stopPropagation();
-          if (editText == null) setEditText(String(valuePx));
-        }}
-        onMouseDown={(e) => e.stopPropagation()}
-        className={`w-9 px-1 text-[10px] text-white flex items-center justify-center cursor-text ${editText != null ? "bg-blue-500/30" : "bg-white/10"}`}
-      >
-        {editText != null ? editText || "0" : valuePx}
-      </div>
-      <div className="flex flex-col w-3.5 bg-white/10 border-l border-black/30">
-        <button
-          type="button"
-          tabIndex={-1}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            beginRepeat(step);
-          }}
-          onMouseUp={stopRepeat}
-          onMouseLeave={stopRepeat}
-          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30"
-        >
-          <IoChevronUp size={7} />
-        </button>
-        <button
-          type="button"
-          tabIndex={-1}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            beginRepeat(-step);
-          }}
-          onMouseUp={stopRepeat}
-          onMouseLeave={stopRepeat}
-          className="flex-1 flex items-center justify-center hover:bg-white/20 active:bg-white/30 border-t border-black/30"
-        >
-          <IoChevronDown size={7} />
-        </button>
-      </div>
-    </div>
-  );
-};
 
 const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
   { value: "none", label: "None" },
   { value: "fade", label: "Fade" },
   { value: "pop", label: "Pop" },
+  { value: "flip", label: "Flip" },
+  { value: "zoom", label: "Zoom" },
+  { value: "drop", label: "Drop" },
   { value: "slide-left", label: "Slide ←" },
   { value: "slide-right", label: "Slide →" },
   { value: "slide-up", label: "Slide ↑" },
   { value: "slide-down", label: "Slide ↓" },
+];
+// Letter-by-letter title reveals - text only (textReveal.ts).
+const TEXT_REVEAL_OPTIONS: { value: OverlayAnimation; label: string }[] = [
+  { value: "typewriter", label: "Typewriter" },
+  { value: "words", label: "Word by word" },
+  { value: "rise", label: "Rise" },
+  { value: "blur", label: "Blur in" },
+  { value: "scatter", label: "Scatter" },
+  { value: "drop", label: "Drop" },
+  { value: "spread", label: "Spread" },
+  { value: "wave", label: "Wave" },
 ];
 
 // A single button (shared by the text and image style panels) that opens a small menu of
@@ -477,8 +332,11 @@ const ANIMATION_OPTIONS: { value: OverlayAnimation; label: string }[] = [
 interface AnimationPickerProps {
   value: OverlayAnimation | undefined;
   onChange: (next: OverlayAnimation) => void;
+  // Offer the letter-by-letter title reveals too.
+  text?: boolean;
 }
-const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) => {
+const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange, text }) => {
+  const options = text ? [...ANIMATION_OPTIONS, ...TEXT_REVEAL_OPTIONS] : ANIMATION_OPTIONS;
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
   // Measures the menu's own rendered size and nudges it back on-screen if the raw anchor (just
@@ -487,7 +345,7 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
   // near the audio-overlay timeline lane; this trigger sits in a floating panel that can end up
   // just as close to an edge.
   const { ref: menuRef, position: clampedMenuPos } = useClampedPopoverPosition(menuPos ?? { left: 0, top: 0 });
-  const current = ANIMATION_OPTIONS.find((o) => o.value === (value ?? "none")) ?? ANIMATION_OPTIONS[0];
+  const current = options.find((o) => o.value === (value ?? "none")) ?? options[0];
 
   useEffect(() => {
     if (!menuPos) return;
@@ -525,11 +383,10 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
             style={{ position: "fixed", left: clampedMenuPos.left, top: clampedMenuPos.top, zIndex: 9999 }}
             className="w-28 py-1 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10"
           >
-            {ANIMATION_OPTIONS.map((opt) => (
+            {options.map((opt) => (
               <button
                 key={opt.value}
                 type="button"
-                title={opt.value === "pop" ? "Exports as Fade - the scale animation is preview-only" : undefined}
                 onClick={() => {
                   onChange(opt.value);
                   setMenuPos(null);
@@ -545,6 +402,55 @@ const AnimationPicker: React.FC<AnimationPickerProps> = ({ value, onChange }) =>
           document.body
         )}
     </>
+  );
+};
+
+// Settings for the selected text box / image / blur region. In the sidebar's Tools tab when there
+// is one (ToolPanelHost.tsx), as `docked` - a layout built for a tall narrow panel
+// (OverlayDockedPanels.tsx) - and otherwise as `children`, the original one-row toolbar floating
+// above the overlay at `floatingStyle`.
+const OverlaySettingsPanel: React.FC<{
+  title: string;
+  icon: React.ReactNode;
+  onClose: () => void;
+  docked: React.ReactNode;
+  children: React.ReactNode;
+  // The floating content places and styles itself (the text quick bar) - no wrapper card.
+  bare?: boolean;
+  floatingStyle?: React.CSSProperties;
+}> = ({ title, icon, floatingStyle, onClose, docked, children, bare }) => {
+  const host = useToolPanelHost();
+  if (!host && bare) return <>{children}</>;
+  if (!host) {
+    return (
+      <div
+        style={floatingStyle}
+        className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
+      >
+        {children}
+      </div>
+    );
+  }
+  return createPortal(
+    <div className={`${DOCKED_PANEL_CLASS} p-3.5 gap-4`}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[13px] font-semibold flex items-center gap-2">
+          {icon}
+          {title}
+        </span>
+        <button
+          type="button"
+          title="Done"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onClose}
+          className="shrink-0 p-0.5 rounded hover:bg-white/10 text-white/60 hover:text-white"
+        >
+          <IoClose size={14} />
+        </button>
+      </div>
+      {docked}
+    </div>,
+    host
   );
 };
 
@@ -605,8 +511,20 @@ const ToolbarOverflowMenu: React.FC<{ children: React.ReactNode }> = ({ children
   );
 };
 
+// The part of a box (frame fractions; scaled by `scale` about its centre, as CSS `scale` does) that
+// lies off the picture, as a clip-path inset in the box's own unscaled pixels - what keeps a blur
+// region from blurring past the picture's edge.
+const frameCut = (x: number, y: number, width: number, height: number, scale: number, W: number, H: number): string => {
+  const s = scale > 0 ? scale : 1;
+  const left = x + (width * (1 - s)) / 2;
+  const top = y + (height * (1 - s)) / 2;
+  const off = (v: number) => Math.max(0, v);
+  return `inset(${(off(-top) * H) / s}px ${(off(left + width * s - 1) * W) / s}px ${(off(top + height * s - 1) * H) / s}px ${(off(-left) * W) / s}px)`;
+};
+
 const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   frameRect,
+  getOutputTime,
   overlays,
   imageOverlays,
   currentOutputTime,
@@ -615,6 +533,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onSelectOverlay,
   selectedImageOverlayId,
   onSelectImageOverlay,
+  isPlaying = false,
   isPlacingText,
   onPlacementConsumed,
   onAddTextOverlay,
@@ -623,6 +542,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onDuplicateTextOverlay,
   onBringTextOverlayToFront,
   onSendTextOverlayToBack,
+  placeBounds = FRAME_BOUNDS,
+  onSetOverlayTime,
   isPlacingImage,
   onPlacementImageConsumed,
   onAddImageOverlay,
@@ -640,6 +561,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onUpdateBlurOverlayContent,
   onDeleteBlurOverlay,
   onDuplicateBlurOverlay,
+  onTrackMotion,
 }) => {
   // Text and image overlays are selected/edited independently by id, but their toolbars
   // (including the animation-picker popover each one owns) are two visually separate floating
@@ -682,6 +604,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
 
   const [editingOverlay, setEditingOverlay] = useState<EditingOverlayState | null>(null);
   const editingOverlayRef = useRef(editingOverlay);
+  // With the sidebar's Tools tab available, text is edited in place by VideoTextEditor (no bar on
+  // the box - its colour/style controls are the docked Text panel's), and the panel drives it
+  // through textEditorRef. liveTextFormat mirrors the editor's whole-box formatting so the panel
+  // can show what's current. Without a sidebar, TextNoteEditor and its own bar are used as before.
+  const openToolPanel = useOpenToolPanel();
+  const textEditorRef = useRef<VideoTextEditorHandle>(null);
+  const [liveTextFormat, setLiveTextFormat] = useState<VideoTextFormat | null>(null);
   useEffect(() => {
     editingOverlayRef.current = editingOverlay;
   }, [editingOverlay]);
@@ -724,9 +653,19 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     // videoEditTypes.ts's TextOverlay doc comment on why x/width and y/fontSize are fractions of
     // different bases) - device px via frameRect is that common space; the resulting height is
     // converted back to a frameRect.height fraction to store alongside the rest.
-    const widthPx = session.width * frameRect.width;
+    // Measured as it's drawn: in its own face and tracking, wrapping inside the box less its side
+    // padding - and stored as the whole box, padding included (as templates store it), so the
+    // position pad centres the box itself.
+    const look = overlaysRef.current.find((o) => o.id === session.id);
+    const pad = textPaddingPx({ padding: session.padding, paddingX: session.paddingX }, frameRect.height);
     const fontSizePx = session.fontSize * frameRect.height;
-    const { height: heightPx } = measureTextBlock(text, fontSizePx, widthPx);
+    const wrapPx = Math.max(1, session.width * frameRect.width - pad.x * 2);
+    const { height: textHeightPx } = measureTextBlock(caseText(text, look?.textCase), fontSizePx, wrapPx, {
+      font: titleFontCss(look?.fontFamily, fontSizePx),
+      letterSpacing: (look?.letterSpacing ?? 0) * fontSizePx,
+      lineHeight: look ? textLineHeight(look) : undefined,
+    });
+    const heightPx = textHeightPx + pad.y * 2;
 
     onUpdateTextOverlayContent(session.id, {
       text,
@@ -740,8 +679,9 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       y: session.y,
       width: session.width,
       fontSize: session.fontSize,
-      height: frameRect.height > 0 ? heightPx / frameRect.height : session.fontSize * 1.3,
+      height: frameRect.height > 0 ? heightPx / frameRect.height : session.fontSize * (look ? textLineHeight(look) : 1.3) + session.padding * 2,
       padding: session.padding,
+      paddingX: session.paddingX,
     });
   }, [frameRect, onSelectOverlay, onUpdateTextOverlayContent, onDeleteTextOverlay]);
 
@@ -786,6 +726,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       width: existing.width,
       fontSize: existing.fontSize,
       padding: existing.padding ?? legacyPaddingFraction(frameRect.height),
+      paddingX: existing.paddingX,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedOverlayId]);
@@ -843,7 +784,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       const fontSize = DEFAULT_OVERLAY_FONT_FRACTION;
       const nx = Math.max(0, Math.min((e.clientX - rect.left) / rect.width - width / 2, 1 - width));
       const ny = Math.max(0, Math.min((e.clientY - rect.top) / rect.height, 1 - fontSize * 1.3));
-      const startTime = currentOutputTime;
+      const startTime = placementStart(currentOutputTime, totalOutputDuration);
       const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
       const id = onAddTextOverlay(nx, ny, width, fontSize, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
@@ -872,7 +813,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       const height = DEFAULT_BLUR_HEIGHT_FRACTION;
       const nx = Math.max(0, Math.min((e.clientX - rect.left) / rect.width - width / 2, 1 - width));
       const ny = Math.max(0, Math.min((e.clientY - rect.top) / rect.height - height / 2, 1 - height));
-      const startTime = currentOutputTime;
+      const startTime = placementStart(currentOutputTime, totalOutputDuration);
       const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
       const id = onAddBlurOverlay(nx, ny, width, height, 0.5, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
@@ -936,7 +877,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const height = frameRect.height > 0 ? (width * frameRect.width) / imageAspect / frameRect.height : width;
         const nx = Math.max(0, Math.min(0.5 - width / 2, 1 - width));
         const ny = Math.max(0, Math.min(0.5 - height / 2, 1 - height));
-        const startTime = currentOutputTime;
+        const startTime = placementStart(currentOutputTime, totalOutputDuration);
         const endTime = Math.min(totalOutputDuration, startTime + DEFAULT_OVERLAY_DURATION_SEC);
 
         const id = onAddImageOverlay(selected, nx, ny, width, height, startTime, endTime > startTime ? endTime : startTime + DEFAULT_OVERLAY_DURATION_SEC);
@@ -984,20 +925,16 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   // mounted near the bottom of this component's return. Its own Apply/Cancel own everything about
   // the crop session; this is only "is it open, and for which overlay".
   const [croppingOverlayId, setCroppingOverlayId] = useState<string | null>(null);
+  // Editing a picture's mask on the video (MaskEditor) - and whether the next drag draws an outline.
+  const [imageMaskEdit, setImageMaskEdit] = useState<{ id: string; drawing: boolean } | null>(null);
+  const [imageMaskLive, setImageMaskLive] = useState<LayerMask | null>(null);
+  useEffect(() => {
+    if (imageMaskEdit && imageMaskEdit.id !== selectedImageOverlayId) setImageMaskEdit(null);
+  }, [imageMaskEdit, selectedImageOverlayId]);
 
-  const [imageResizeDrag, setImageResizeDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startClientY: number;
-    startWidthPx: number;
-    startHeightPx: number;
-    aspect: number;
-    aspectLocked: boolean;
-    liveWidthPx: number;
-    liveHeightPx: number;
-  }>(null);
+  const [imageResizeDrag, setImageResizeDrag] = useState<BoxResizeDrag | null>(null);
   const imageResizeRafRef = useRef<number | null>(null);
-  const imageResizeLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const imageResizeLatestRef = useRef<{ clientX: number; clientY: number; shiftKey: boolean } | null>(null);
 
   const [imageRotateDrag, setImageRotateDrag] = useState<null | { id: string; centerX: number; centerY: number; startAngle: number; startRotation: number; liveRotation: number }>(
     null
@@ -1035,7 +972,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         if (!prev) return prev;
         const dx = (latest.clientX - prev.startClientX) / frameRect.width;
         const dy = (latest.clientY - prev.startClientY) / frameRect.height;
-        return { ...prev, liveX: Math.max(0, Math.min(1, prev.startX + dx)), liveY: Math.max(0, Math.min(1, prev.startY + dy)) };
+        return { ...prev, liveX: clampTo(prev.startX + dx, placeBounds.x0, placeBounds.x1), liveY: clampTo(prev.startY + dy, placeBounds.y0, placeBounds.y1) };
       });
     });
   };
@@ -1050,47 +987,24 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     onUpdateImageOverlayContent(id, { x: liveX, y: liveY });
   };
 
-  const beginImageResizeDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
+  // Any of the eight handles (boxResize.ts): the opposite side stays put; corners keep the
+  // proportions while "Resize: Locked" is on (Shift flips it for one drag), edges stretch freely.
+  const beginImageResizeDrag = (overlay: ImageOverlay, handle: ResizeHandle) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     selectImageOverlayExclusive(overlay.id);
-    const startWidthPx = overlay.width * frameRect.width;
-    const startHeightPx = overlay.height * frameRect.height;
-    setImageResizeDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startClientY: e.clientY,
-      startWidthPx,
-      startHeightPx,
-      aspect: startHeightPx > 0 ? startWidthPx / startHeightPx : 1,
-      aspectLocked,
-      liveWidthPx: startWidthPx,
-      liveHeightPx: startHeightPx,
-    });
+    const start = { x: overlay.x * frameRect.width, y: overlay.y * frameRect.height, width: overlay.width * frameRect.width, height: overlay.height * frameRect.height };
+    setImageResizeDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, start, rotation: overlay.rotation ?? 0, handle, aspectLocked, live: start });
   };
   const handleImageResizeDragMove = (e: React.PointerEvent) => {
     if (!imageResizeDrag) return;
     e.stopPropagation();
-    imageResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
+    imageResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey };
     if (imageResizeRafRef.current != null) return;
     imageResizeRafRef.current = requestAnimationFrame(() => {
       imageResizeRafRef.current = null;
       const latest = imageResizeLatestRef.current;
-      if (!latest) return;
-      setImageResizeDrag((prev) => {
-        if (!prev) return prev;
-        const dx = latest.clientX - prev.startClientX;
-        if (prev.aspectLocked) {
-          const liveWidthPx = Math.max(MIN_IMAGE_WIDTH_PX, prev.startWidthPx + dx);
-          return { ...prev, liveWidthPx, liveHeightPx: liveWidthPx / prev.aspect };
-        }
-        const dy = latest.clientY - prev.startClientY;
-        return {
-          ...prev,
-          liveWidthPx: Math.max(MIN_IMAGE_WIDTH_PX, prev.startWidthPx + dx),
-          liveHeightPx: Math.max(MIN_IMAGE_WIDTH_PX, prev.startHeightPx + dy),
-        };
-      });
+      if (latest) setImageResizeDrag((prev) => (prev ? stepBoxResize(prev, latest, MIN_IMAGE_WIDTH_PX) : prev));
     });
   };
   const endImageResizeDrag = () => {
@@ -1100,8 +1014,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       imageResizeRafRef.current = null;
     }
     if (frameRect.width > 0 && frameRect.height > 0) {
-      const { id, liveWidthPx, liveHeightPx } = imageResizeDrag;
-      onUpdateImageOverlayContent(id, { width: liveWidthPx / frameRect.width, height: liveHeightPx / frameRect.height });
+      const { id, live } = imageResizeDrag;
+      onUpdateImageOverlayContent(id, { x: live.x / frameRect.width, y: live.y / frameRect.height, width: live.width / frameRect.width, height: live.height / frameRect.height });
     }
     setImageResizeDrag(null);
   };
@@ -1164,17 +1078,9 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   const blurDragRafRef = useRef<number | null>(null);
   const blurDragLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
 
-  const [blurResizeDrag, setBlurResizeDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startClientY: number;
-    startWidthPx: number;
-    startHeightPx: number;
-    liveWidthPx: number;
-    liveHeightPx: number;
-  }>(null);
+  const [blurResizeDrag, setBlurResizeDrag] = useState<BoxResizeDrag | null>(null);
   const blurResizeRafRef = useRef<number | null>(null);
-  const blurResizeLatestRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const blurResizeLatestRef = useRef<{ clientX: number; clientY: number; shiftKey: boolean } | null>(null);
 
   const [blurRotateDrag, setBlurRotateDrag] = useState<null | { id: string; centerX: number; centerY: number; startAngle: number; startRotation: number; liveRotation: number }>(
     null
@@ -1224,29 +1130,23 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     onUpdateBlurOverlayContent(id, { x: liveX, y: liveY });
   };
 
-  const beginBlurResizeDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
+  // Same eight handles as a picture; a blur region resizes freely (Shift keeps its proportions).
+  const beginBlurResizeDrag = (overlay: BlurOverlay, handle: ResizeHandle) => (e: React.PointerEvent) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     selectBlurOverlayExclusive(overlay.id);
-    const startWidthPx = overlay.width * frameRect.width;
-    const startHeightPx = overlay.height * frameRect.height;
-    setBlurResizeDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, startWidthPx, startHeightPx, liveWidthPx: startWidthPx, liveHeightPx: startHeightPx });
+    const start = { x: overlay.x * frameRect.width, y: overlay.y * frameRect.height, width: overlay.width * frameRect.width, height: overlay.height * frameRect.height };
+    setBlurResizeDrag({ id: overlay.id, startClientX: e.clientX, startClientY: e.clientY, start, rotation: overlay.rotation ?? 0, handle, aspectLocked: false, live: start });
   };
   const handleBlurResizeDragMove = (e: React.PointerEvent) => {
     if (!blurResizeDrag) return;
     e.stopPropagation();
-    blurResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY };
+    blurResizeLatestRef.current = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey };
     if (blurResizeRafRef.current != null) return;
     blurResizeRafRef.current = requestAnimationFrame(() => {
       blurResizeRafRef.current = null;
       const latest = blurResizeLatestRef.current;
-      if (!latest) return;
-      setBlurResizeDrag((prev) => {
-        if (!prev) return prev;
-        const dx = latest.clientX - prev.startClientX;
-        const dy = latest.clientY - prev.startClientY;
-        return { ...prev, liveWidthPx: Math.max(MIN_BLUR_WIDTH_PX, prev.startWidthPx + dx), liveHeightPx: Math.max(MIN_BLUR_WIDTH_PX, prev.startHeightPx + dy) };
-      });
+      if (latest) setBlurResizeDrag((prev) => (prev ? stepBoxResize(prev, latest, MIN_BLUR_WIDTH_PX) : prev));
     });
   };
   const endBlurResizeDrag = () => {
@@ -1256,8 +1156,8 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       blurResizeRafRef.current = null;
     }
     if (frameRect.width > 0 && frameRect.height > 0) {
-      const { id, liveWidthPx, liveHeightPx } = blurResizeDrag;
-      onUpdateBlurOverlayContent(id, { width: liveWidthPx / frameRect.width, height: liveHeightPx / frameRect.height });
+      const { id, live } = blurResizeDrag;
+      onUpdateBlurOverlayContent(id, { x: live.x / frameRect.width, y: live.y / frameRect.height, width: live.width / frameRect.width, height: live.height / frameRect.height });
     }
     setBlurResizeDrag(null);
   };
@@ -1318,7 +1218,14 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     [onUpdateImageOverlayContent]
   );
 
-  const activeOverlays = overlaysActiveAt(overlays, currentOutputTime);
+  // Parked on the timeline's very end, the player still shows the last frame - so whatever runs to
+  // the end is on screen there too (end times are otherwise exclusive). Without this, text placed
+  // with the playhead at the end (backed up to fit, ending at the end) wasn't "on screen", so its
+  // editor never opened and the empty overlay was committed - deleted - the moment it was made.
+  const atEnd = totalOutputDuration > 0 && currentOutputTime >= totalOutputDuration - 1e-3;
+  const onScreen = <T extends { startTime: number; endTime: number }>(list: T[]): T[] =>
+    atEnd ? list.filter((o) => currentOutputTime >= o.startTime && (currentOutputTime < o.endTime || o.endTime >= totalOutputDuration - 1e-3)) : overlaysActiveAt(list, currentOutputTime);
+  const activeOverlays = onScreen(overlays);
   const editingSession = editingOverlay && activeOverlays.some((o) => o.id === editingOverlay.id) ? editingOverlay : null;
   const editingOverlayData = editingSession ? overlays.find((o) => o.id === editingSession.id) : undefined;
 
@@ -1338,31 +1245,98 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
     }
   }, [editingOverlay, editingSession, commitEditingOverlay]);
 
-  const activeImageOverlays = overlaysActiveAt(imageOverlays, currentOutputTime).map((o) => {
+  // Keyframed motion, every animation frame: each keyframed overlay's box gets the offset, scale
+  // and fade its keyframes give at the player's exact current time (keyframes.ts - the same curve
+  // export builds). Uses the CSS `translate`/`scale` properties, separate from `transform`, so it
+  // composes with rotation and the entry animations without touching them. Kept on while dragging,
+  // so a keyframed box moves from where it's shown; the drop is then turned into a keyframe at the
+  // playhead (Dashboard's keyframeAwarePatch adds the drag's movement to the keyframed state).
+  const keyframedRef = useRef<{ id: string; x: number; y: number; width: number; height: number; startTime: number; keyframes: OverlayKeyframe[] }[]>([]);
+  keyframedRef.current = [...overlays, ...imageOverlays, ...blurOverlays]
+    .filter((o) => o.keyframes && o.keyframes.length > 0)
+    .map((o) => ({ id: o.id, x: o.x, y: o.y, width: "width" in o ? o.width : 0, height: "height" in o ? o.height : 0, startTime: o.startTime, keyframes: o.keyframes! }));
+  const frameSizeRef = useRef({ w: frameRect.width, h: frameRect.height });
+  frameSizeRef.current = { w: frameRect.width, h: frameRect.height };
+  const currentOutputTimeRef = useRef(currentOutputTime);
+  currentOutputTimeRef.current = currentOutputTime;
+  const hasKeyframed = keyframedRef.current.length > 0;
+  useEffect(() => {
+    if (!hasKeyframed) return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = getOutputTime?.() ?? currentOutputTimeRef.current;
+      const { w, h } = frameSizeRef.current;
+      for (const o of keyframedRef.current) {
+        const els = document.querySelectorAll<HTMLElement>(`[data-kf-overlay="${o.id}"]`);
+        if (els.length === 0) continue;
+        const state = keyframeStateAt(o.keyframes, now - o.startTime);
+        if (!state) continue;
+        for (const el of els) {
+          el.style.translate = `${(state.x - o.x) * w}px ${(state.y - o.y) * h}px`;
+          el.style.scale = String(state.scale);
+          el.style.setProperty("--kf-opacity", String(state.opacity));
+        }
+        // A blur region's cut at the picture's edge follows it too (see frameCut).
+        const cutEl = document.querySelector<HTMLElement>(`[data-frame-cut="${o.id}"]`);
+        if (cutEl) cutEl.style.clipPath = frameCut(state.x, state.y, o.width, o.height, state.scale, w, h);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [hasKeyframed, getOutputTime]);
+
+  // A picture with a reveal (wipe / glare / focus) plays it inside the box - ImageRevealWrap.
+  const wrapImageReveal = (o: ImageOverlay, picture: React.ReactNode): React.ReactNode =>
+    o.reveal ? (
+      <ImageRevealWrap
+        settings={o.reveal}
+        duration={o.endTime - o.startTime}
+        widthPx={o.width * frameRect.width}
+        heightPx={o.height * frameRect.height}
+        maskSrc={hasActiveCrop(o) ? undefined : convertFileSrc(o.src)}
+        borderRadius={(o.cornerRadius ?? 0) * frameRect.height}
+        getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime}
+      >
+        {picture}
+      </ImageRevealWrap>
+    ) : (
+      picture
+    );
+
+  const activeImageOverlays = onScreen(imageOverlays).map((o) => {
     if (imageDrag && o.id === imageDrag.id) return { ...o, x: imageDrag.liveX, y: imageDrag.liveY };
     if (imageResizeDrag && o.id === imageResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
-      return { ...o, width: imageResizeDrag.liveWidthPx / frameRect.width, height: imageResizeDrag.liveHeightPx / frameRect.height };
+      const b = imageResizeDrag.live;
+      return { ...o, x: b.x / frameRect.width, y: b.y / frameRect.height, width: b.width / frameRect.width, height: b.height / frameRect.height };
     }
     if (imageRotateDrag && o.id === imageRotateDrag.id) return { ...o, rotation: imageRotateDrag.liveRotation };
     return o;
   });
   const selectedImageOverlayData = selectedImageOverlayId ? activeImageOverlays.find((o) => o.id === selectedImageOverlayId) : undefined;
+  const stackedActiveOverlays = overlayStack(activeImageOverlays, activeOverlays);
 
-  const activeBlurOverlays = overlaysActiveAt(blurOverlays, currentOutputTime).map((o) => {
+  // An element's settings changed. A sticker sized to its words keeps its box fitted to them - same
+  // height and left edge, the width its words now need - so the outline matches what's drawn.
+  const assetPatch = (o: ImageOverlay, patch: Partial<OverlayAsset>): ImageOverlayContentPatch => {
+    const asset = { ...o.asset!, ...patch };
+    const aspect = stickerHugs(asset.kind) ? stickerAspect(asset) : null;
+    if (!aspect || frameRect.width <= 0 || frameRect.height <= 0) return { asset };
+    const width = Math.min(1.5, (o.height * frameRect.height * aspect) / frameRect.width);
+    return Math.abs(width - o.width) > 1e-4 ? { asset, width } : { asset };
+  };
+
+  const activeBlurOverlays = onScreen(blurOverlays).map((o) => {
     if (blurDrag && o.id === blurDrag.id) return { ...o, x: blurDrag.liveX, y: blurDrag.liveY };
     if (blurResizeDrag && o.id === blurResizeDrag.id && frameRect.width > 0 && frameRect.height > 0) {
-      return { ...o, width: blurResizeDrag.liveWidthPx / frameRect.width, height: blurResizeDrag.liveHeightPx / frameRect.height };
+      const b = blurResizeDrag.live;
+      return { ...o, x: b.x / frameRect.width, y: b.y / frameRect.height, width: b.width / frameRect.width, height: b.height / frameRect.height };
     }
     if (blurRotateDrag && o.id === blurRotateDrag.id) return { ...o, rotation: blurRotateDrag.liveRotation };
     return o;
   });
   const selectedBlurOverlayData = selectedBlurOverlayId ? activeBlurOverlays.find((o) => o.id === selectedBlurOverlayId) : undefined;
 
-  const cornerRadiusCss = (style: TextOverlayCornerStyle | undefined, heightPx: number): number => {
-    if (style === "pill") return heightPx / 2;
-    if (style === "rounded") return 8;
-    return 0;
-  };
 
   const PANEL_HEIGHT_PX = 38;
   // Same .video-container overflow:hidden clipping the rotate handle's own comment explains -
@@ -1432,13 +1406,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
       else dyPx = stepPx;
 
       onUpdateImageOverlayContent(overlay.id, {
-        x: Math.max(0, Math.min(1, overlay.x + dxPx / frameRect.width)),
-        y: Math.max(0, Math.min(1, overlay.y + dyPx / frameRect.height)),
+        x: clampTo(overlay.x + dxPx / frameRect.width, placeBounds.x0, placeBounds.x1),
+        y: clampTo(overlay.y + dyPx / frameRect.height, placeBounds.y0, placeBounds.y1),
       });
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent]);
+  }, [selectedImageOverlayId, imageOverlays, frameRect, onUpdateImageOverlayContent, placeBounds]);
 
   // Same arrow-key nudging as the image overlay effect above (1px per press, 10px with Shift),
   // scoped to blur overlays for the same reason - no focus trap here, unlike a selected text
@@ -1482,6 +1456,14 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         <div
           className="absolute inset-0"
           style={{ pointerEvents: "auto" }}
+          // Video tracks (PipOverlayLayer) sit beneath this layer - a press over one goes on to it,
+          // so it can still be grabbed and selected while a title is selected.
+          onPointerDown={(e) => {
+            const pip = document.elementsFromPoint(e.clientX, e.clientY).find((el) => el instanceof HTMLElement && el.dataset.pipInteractive !== undefined);
+            if (!pip) return;
+            e.stopPropagation();
+            pip.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, clientX: e.clientX, clientY: e.clientY, button: e.button, buttons: e.buttons, pointerId: e.pointerId, pointerType: e.pointerType, shiftKey: e.shiftKey }));
+          }}
           onClick={() => {
             onSelectOverlay(null);
             onSelectImageOverlay(null);
@@ -1497,7 +1479,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           comparably strong, same "close enough for a live preview" spirit as every other overlay
           aesthetic here that has a real export-side implementation. */}
       {activeBlurOverlays.map((o) => {
-        const isSelected = selectedBlurOverlayId === o.id;
+        const isSelected = selectedBlurOverlayId === o.id && !isPlaying;
         const blurPx = Math.max(0, o.intensity) * frameRect.height * BLUR_PREVIEW_SCALE;
         // Same clamped-rise reasoning as the image overlay's own rotate handle just below (see
         // that block's comment) - reused here via the same rotateHandleRiseFor/roomAbovePx shape
@@ -1505,6 +1487,12 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const roomAbovePx = o.y * frameRect.height;
         const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
+        const radius = o.shape === "ellipse" ? "50%" : (o.cornerRadius ?? 0) * frameRect.height;
+        // Only the picture gets blurred - export blurs the frame and nothing past its edge, so the
+        // part of a region hanging off it (a find near the edge, padded) mustn't smear the
+        // wallpaper or the black around the picture here either. Cut in the region's own box, so
+        // an unrotated one only (a rotated region's edge isn't axis-aligned).
+        const cut = o.rotation ? undefined : frameCut(o.x, o.y, o.width, o.height, 1, frameRect.width, frameRect.height);
         return (
           <div
             key={o.id}
@@ -1513,6 +1501,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             onPointerUp={endBlurDrag}
             onPointerCancel={endBlurDrag}
             onContextMenu={openContextMenu("blur", o.id)}
+            data-kf-overlay={o.keyframes?.length ? o.id : undefined}
             title="Drag to move"
             className={`absolute cursor-move outline outline-2 transition-colors ${
               isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"
@@ -1522,22 +1511,27 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               top: o.y * frameRect.height,
               width: o.width * frameRect.width,
               height: o.height * frameRect.height,
-              backdropFilter: `blur(${blurPx}px)`,
-              WebkitBackdropFilter: `blur(${blurPx}px)`,
-              borderRadius: o.shape === "ellipse" ? "50%" : (o.cornerRadius ?? 0) * frameRect.height,
+              borderRadius: radius,
               transform: o.rotation ? `rotate(${o.rotation}deg)` : undefined,
               pointerEvents: placingAnything ? "none" : "auto",
             }}
           >
+            <div
+              className="absolute inset-0 pointer-events-none"
+              data-frame-cut={o.rotation ? undefined : o.id}
+              style={{ backdropFilter: `blur(${blurPx}px)`, WebkitBackdropFilter: `blur(${blurPx}px)`, borderRadius: radius, clipPath: cut }}
+            />
             {isSelected && (
               <>
-                <div
-                  onPointerDown={beginBlurResizeDrag(o)}
+                <ResizeHandles
+                  box={{ x: o.x * frameRect.width, y: o.y * frameRect.height, width: o.width * frameRect.width, height: o.height * frameRect.height }}
+                  rotation={o.rotation ?? 0}
+                  frameRect={frameRect}
+                  color="sky"
+                  title="Drag to resize - Shift keeps the proportions"
+                  onPointerDown={(handle) => beginBlurResizeDrag(o, handle)}
                   onPointerMove={handleBlurResizeDragMove}
                   onPointerUp={endBlurResizeDrag}
-                  onPointerCancel={endBlurResizeDrag}
-                  title="Drag to resize"
-                  className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 rounded-full bg-sky-400 hover:bg-sky-300 ring-2 ring-white/80 cursor-nwse-resize"
                 />
                 {showRotateStem && (
                   <div
@@ -1559,8 +1553,139 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           </div>
         );
       })}
-      {activeImageOverlays.map((o) => {
-        const isSelected = selectedImageOverlayId === o.id;
+      {/* Pictures and text in one pile, bottom first (overlayStack) - the order export composites
+          them in, so Bring to front / Send to back move a title past a picture and back. The
+          title being edited keeps its place in the pile too. */}
+      {stackedActiveOverlays.map((s) => {
+        if (s.kind === "text") {
+          if (s.o.id === editingSession?.id && editingOverlayData) {
+            // VideoPlayer's overlay wrapper is `pointer-events: none` by default (so clicks reach the
+            // video when there's nothing to interact with), and it's inherited - this opts the
+            // editor back in.
+            return (
+              <div key={`editing-${s.o.id}`} style={{ pointerEvents: "auto" }}>
+                <VideoTextEditor
+                  ref={textEditorRef}
+                  key={editingSession.id}
+                  keyframedId={editingOverlayData.keyframes?.length ? editingOverlayData.id : undefined}
+                  left={editingSession.x * frameRect.width}
+                  top={editingSession.y * frameRect.height}
+                  width={editingSession.width * frameRect.width}
+                  fontSize={editingSession.fontSize * frameRect.height}
+                  paddingPx={editingSession.padding * frameRect.height}
+                  paddingXPx={(editingSession.paddingX ?? editingSession.padding) * frameRect.height}
+                  strokeColor={editingOverlayData.strokeColor}
+                  strokeWidth={editingOverlayData.strokeWidth ? textStrokePx(editingOverlayData.strokeWidth, frameRect.height) : undefined}
+                  cornerStyle={editingOverlayData.cornerStyle}
+                  fontFamily={editingOverlayData.fontFamily}
+                  letterSpacing={editingOverlayData.letterSpacing}
+                  look={editingOverlayData}
+                  frameWidth={frameRect.width}
+                  frameHeight={frameRect.height}
+                  initialText={liveTextRef.current}
+                  initialColor={liveColorRef.current}
+                  initialBackgroundColor={liveBackgroundColorRef.current}
+                  initialColorRuns={liveColorRunsRef.current}
+                  initialBoldRuns={liveBoldRunsRef.current}
+                  initialItalicRuns={liveItalicRunsRef.current}
+                  initialTextAlign={liveTextAlignRef.current}
+                  onContentChange={handleNoteContentChange}
+                  onFormatChange={setLiveTextFormat}
+                  onCommit={commitEditingOverlay}
+                  onCancel={cancelEditingOverlay}
+                  onMoveEnd={handleNoteMoveEnd}
+                  onResizeEnd={handleNoteResizeEnd}
+                  onResizeWidthEnd={handleNoteWidthResizeEnd}
+                  onNudge={(dx, dy) => {
+                    // Alt+arrow keys: frame pixels on a 1080-tall frame, as the panel's nudge pad counts them.
+                    if (frameRect.height <= 0) return;
+                    const aspect = frameRect.width / frameRect.height;
+                    setEditingOverlay((prev) => (prev ? { ...prev, x: prev.x + dx / (1080 * aspect), y: prev.y + dy / 1080 } : prev));
+                  }}
+                />
+              </div>
+            );
+          }
+          const o = s.o;
+          const { x: paddingXPx, y: paddingPx } = textPaddingPx(o, frameRect.height);
+          const heightPx = o.fontSize * frameRect.height * textLineHeight(o) + paddingPx * 2;
+          // Shown in capitals (textCase) letter for letter, as the canvas and export draw it.
+          const shown = o.textCase ? { ...o, text: caseText(o.text, o.textCase) } : o;
+          const onCanvas = usesCanvasText(o);
+          const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
+          return (
+            <div
+              key={o.id}
+              onClick={() => selectTextOverlayExclusive(o.id)}
+              onContextMenu={openContextMenu("text", o.id)}
+              data-kf-overlay={o.keyframes?.length ? o.id : undefined}
+              className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
+              style={{
+                // The app turns font synthesis off (App.css); a title face with no italic or bold
+                // file of its own then ignored the Italic/Bold buttons. Export's canvas slants and
+                // thickens such a face, and so does this (the canvas inside inherits it).
+                fontSynthesis: "style weight",
+                mixBlendMode: cssBlendMode(o.blendMode),
+                left: o.x * frameRect.width,
+                top: o.y * frameRect.height,
+                width: o.width * frameRect.width,
+                font: `${o.fontSize * frameRect.height}px ${TEXT_FONT_FAMILY}`,
+                // Drawn on canvas: the box only holds the place (and the hit area) at the text's size.
+                ...(onCanvas
+                  ? {
+                      ...titleFontStyle(o.fontFamily),
+                      fontSize: o.fontSize * frameRect.height,
+                      letterSpacing: o.letterSpacing ? `${o.letterSpacing}em` : undefined,
+                      color: "transparent",
+                    }
+                  : {}),
+                lineHeight: textLineHeight(o),
+                padding: `${paddingPx}px ${paddingXPx}px`,
+                textAlign: o.textAlign ?? "left",
+                pointerEvents: placingAnything ? "none" : "auto",
+                // --reveal-fade: a title reveal's exit fade, set by RevealText.
+                opacity: o.keyframes?.length || isTextReveal(o.animation) ? `calc(${anim.opacity} * var(--kf-opacity, 1) * var(--reveal-fade, 1))` : anim.opacity,
+                // Turned about its own centre after any slide/scale, as pictures are; the canvas
+                // inside draws it level (CanvasTextOverlay) and this turns both together.
+                transform:
+                  [
+                    anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+                    anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
+                    o.rotation ? `rotate(${o.rotation}deg)` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" ") || undefined,
+                background: onCanvas ? "transparent" : textBoxBackgroundCss(o),
+                boxShadow: onCanvas ? undefined : textBoxBorderCss(o, frameRect.height),
+                borderRadius: textCornerRadiusPx(o.cornerStyle, heightPx, o.fontSize * frameRect.height),
+                // -webkit-text-stroke draws centered on the glyph outline by default, which can eat
+                // into thin strokes of the fill color on top of it - paint-order puts the stroke
+                // fully behind the fill instead, the standard trick for a clean "outlined caption"
+                // look (this is a Chromium/WebView2 app, so both properties are safe to rely on).
+                WebkitTextStroke: !onCanvas && o.strokeColor && o.strokeWidth ? `${textStrokePx(o.strokeWidth, frameRect.height)}px ${o.strokeColor}` : undefined,
+                paintOrder: !onCanvas && o.strokeColor && o.strokeWidth ? "stroke fill" : undefined,
+                // Default text has no backgroundColor and no stroke, so a plain drop-shadow keeps
+                // it legible over arbitrary (light or busy) video content instead of only working
+                // on dark footage - standard caption/title styling. Skipped once a stroke is set -
+                // the two together look muddy, and the stroke alone already solves legibility.
+                textShadow: onCanvas || o.backgroundColor || o.boxFill || (o.strokeColor && o.strokeWidth) ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
+              }}
+            >
+              {onCanvas ? (
+                <>
+                  {shown.text}
+                  <CanvasTextOverlay overlay={o} frameWidth={frameRect.width} frameHeight={frameRect.height} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
+                </>
+              ) : isTextReveal(o.animation) ? (
+                <RevealText overlay={shown} kind={o.animation} paddingPx={paddingPx} paddingXPx={paddingXPx} getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime} />
+              ) : (
+                renderFormattedSegments(shown.text, o.colorRuns ?? [], o.boldRuns ?? [], o.italicRuns ?? [], o.color)
+              )}
+            </div>
+          );
+        }
+        const o = s.o;
+        const isSelected = selectedImageOverlayId === o.id && !isPlaying;
         const radiusPx = (o.cornerRadius ?? 0) * frameRect.height;
         // .video-container (the ancestor VideoPlayer renders all of this into) clips with
         // overflow:hidden, so a handle positioned purely by a fixed negative offset (e.g. always
@@ -1572,51 +1697,55 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
         const rotateHandleRise = rotateHandleRiseFor(roomAbovePx);
         const showRotateStem = roomAbovePx >= 32;
         const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
-        return (
-          <div
-            key={o.id}
-            onPointerDown={beginImageDrag(o)}
-            onPointerMove={handleImageDragMove}
-            onPointerUp={endImageDrag}
-            onPointerCancel={endImageDrag}
-            onContextMenu={openContextMenu("image", o.id)}
-            title="Drag to move"
-            className={`absolute cursor-move outline outline-2 transition-colors ${isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"}`}
-            style={{
-              left: o.x * frameRect.width,
-              top: o.y * frameRect.height,
-              width: o.width * frameRect.width,
-              height: o.height * frameRect.height,
-              opacity: o.opacity * anim.opacity,
-              borderRadius: radiusPx,
-              // translate (slide animation) is listed before rotate so it applies in screen-space,
-              // outside the image's own local rotation - see overlayAnimationStyle's own comment on
-              // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
-              // order (each function transforms the *coordinate system* for the ones after it, so
-              // rotate here only ever spins the box around its own center, never around some
-              // already-translated point).
-              transform:
-                [
-                  anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
-                  anim.scale !== 1 ? `scale(${anim.scale})` : null,
-                  o.rotation ? `rotate(${o.rotation}deg)` : null,
-                ]
-                  .filter(Boolean)
-                  .join(" ") || undefined,
-              // Border and drop shadow combine into one box-shadow rather than a real `border` - a
-              // real border adds to the box's layout size unless box-sizing is pinned, and
-              // box-shadow already composes multiple layers for free via commas. Both are drawn as
-              // OUTER shadows (no `inset`) - box-shadow paints as part of the box's own border step,
-              // which happens before its children paint, so an inset ring here would sit entirely
-              // behind the <img> child below and never actually be visible (this was the "border
-              // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
-              // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
-              // reach, so nothing paints over it.
-              boxShadow: [o.borderColor ? `0 0 0 3px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined,
-              pointerEvents: placingAnything ? "none" : "auto",
-            }}
-          >
-            {hasActiveCrop(o) ? (
+        // translate (slide animation) is listed before rotate so it applies in screen-space,
+        // outside the image's own local rotation - see overlayAnimationStyle's own comment on
+        // why "peek and retreat" rather than a conveyor, and CSS's own transform-composition
+        // order (each function transforms the *coordinate system* for the ones after it, so
+        // rotate here only ever spins the box around its own center, never around some
+        // already-translated point).
+        const transform =
+          [
+            anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null,
+            anim.scale !== 1 || (anim.scaleX ?? 1) !== 1 ? `scale(${anim.scale * (anim.scaleX ?? 1)}, ${anim.scale})` : null,
+            o.rotation ? `rotate(${o.rotation}deg)` : null,
+          ]
+            .filter(Boolean)
+            .join(" ") || undefined;
+        // Border and drop shadow combine into one box-shadow rather than a real `border` - a
+        // real border adds to the box's layout size unless box-sizing is pinned, and
+        // box-shadow already composes multiple layers for free via commas. Both are drawn as
+        // OUTER shadows (no `inset`) - box-shadow paints as part of the box's own border step,
+        // which happens before its children paint, so an inset ring here would sit entirely
+        // behind the <img> child below and never actually be visible (this was the "border
+        // doesn't show" bug: it was rendering, just permanently hidden under the picture). An
+        // outer ring instead grows 3px past the box's own edge, into space the <img> doesn't
+        // reach, so nothing paints over it.
+        // A shape draws its own shadow (following its outline, not this box) - see AssetCanvas.
+        const boxShadow = o.asset
+          ? undefined
+          : [o.borderColor ? `0 0 0 ${o.borderWidth ? o.borderWidth * frameRect.height : 3}px ${o.borderColor}` : null, o.shadow ? "0 6px 16px rgba(0,0,0,0.45)" : null].filter(Boolean).join(", ") || undefined;
+        const box: React.CSSProperties = { left: o.x * frameRect.width, top: o.y * frameRect.height, width: o.width * frameRect.width, height: o.height * frameRect.height };
+        const look: React.CSSProperties = {
+          // --kf-opacity: keyframed fade, written every frame by the keyframe loop below.
+          opacity: o.keyframes?.length ? `calc(${o.opacity * anim.opacity} * var(--kf-opacity, 1))` : o.opacity * anim.opacity,
+          borderRadius: o.asset ? undefined : radiusPx,
+          transform,
+          boxShadow,
+        };
+        const picture = (
+          <>
+            {o.asset ? (
+              <AssetCanvas
+                asset={o.asset}
+                widthPx={o.width * frameRect.width}
+                heightPx={o.height * frameRect.height}
+                duration={o.endTime - o.startTime}
+                getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime}
+                flipHorizontal={o.flipHorizontal}
+                flipVertical={o.flipVertical}
+                shadow={o.shadow}
+              />
+            ) : wrapImageReveal(o, hasActiveCrop(o) ? (
               // object-fit can only ever show the *whole* picture (letterboxed or covering) - it
               // has no way to show a sub-rectangle of it, so a crop needs a different technique
               // entirely: an oversized background-image, scaled/positioned so only the cropped
@@ -1652,16 +1781,49 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                   transform: o.flipHorizontal || o.flipVertical ? `scale(${o.flipHorizontal ? -1 : 1}, ${o.flipVertical ? -1 : 1})` : undefined,
                 }}
               />
-            )}
+            ))}
+          </>
+        );
+        // Its mask (with the corner rounding folded in) - the same picture export draws it with
+        // (layerMask.ts, drawImageOverlayPng).
+        const imageMask = !o.asset ? (imageMaskEdit?.id === o.id ? imageMaskLive : null) ?? o.mask : undefined;
+        // An opening mask plays (except while it's being edited - that shows it open).
+        const maskedPicture = imageMask?.reveal && imageMaskEdit?.id !== o.id ? (
+          <RevealMaskBox
+            mask={imageMask}
+            widthPx={o.width * frameRect.width}
+            heightPx={o.height * frameRect.height}
+            span={o.endTime - o.startTime}
+            getTime={() => (getOutputTime?.() ?? currentOutputTimeRef.current) - o.startTime}
+          >
+            {picture}
+          </RevealMaskBox>
+        ) : imageMask ? (
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={(() => {
+              const url = cachedLayerMaskAlphaUrl({ mask: imageMask }, o.width * frameRect.width, o.height * frameRect.height);
+              return { maskImage: `url(${url})`, WebkitMaskImage: `url(${url})`, maskSize: "100% 100%", WebkitMaskSize: "100% 100%", maskRepeat: "no-repeat", WebkitMaskRepeat: "no-repeat" };
+            })()}
+          >
+            {picture}
+          </div>
+        ) : (
+          picture
+        );
+        const handles = (
+          <>
             {isSelected && (
               <>
-                <div
-                  onPointerDown={beginImageResizeDrag(o)}
+                <ResizeHandles
+                  box={{ x: o.x * frameRect.width, y: o.y * frameRect.height, width: o.width * frameRect.width, height: o.height * frameRect.height }}
+                  rotation={o.rotation ?? 0}
+                  frameRect={frameRect}
+                  color="amber"
+                  title={aspectLocked ? "Drag to resize - corners keep the proportions (Shift to stretch)" : "Drag to resize - Shift keeps the proportions"}
+                  onPointerDown={(handle) => beginImageResizeDrag(o, handle)}
                   onPointerMove={handleImageResizeDragMove}
                   onPointerUp={endImageResizeDrag}
-                  onPointerCancel={endImageResizeDrag}
-                  title="Drag to resize"
-                  className="absolute -right-1.5 -bottom-1.5 w-3.5 h-3.5 rounded-full bg-amber-400 hover:bg-amber-300 ring-2 ring-white/80 cursor-nwse-resize"
                 />
                 {/* Rotate handle - a short stem plus a round grip above top-center, the standard
                     affordance for "drag around the shape's own center" (distinct in both look and
@@ -1685,234 +1847,266 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 />
               </>
             )}
+          </>
+        );
+        const dragProps = {
+          onPointerDown: beginImageDrag(o),
+          onPointerMove: handleImageDragMove,
+          onPointerUp: endImageDrag,
+          onPointerCancel: endImageDrag,
+          onContextMenu: openContextMenu("image", o.id),
+          title: "Drag to move",
+          className: `absolute cursor-move outline outline-2 transition-colors ${isSelected ? "outline-dashed outline-white" : "outline-transparent hover:outline-white/40"}`,
+        };
+        const blendMode = cssBlendMode(o.blendMode);
+        if (blendMode) {
+          // A blend mode applies to the whole element it's set on - so the picture blends from
+          // its own element, and the outline and handles sit on a plain one over it (blending
+          // them too would make them vanish - white under Multiply).
+          return (
+            <React.Fragment key={o.id}>
+              <div data-kf-overlay={o.keyframes?.length ? o.id : undefined} className="absolute pointer-events-none" style={{ ...box, ...look, mixBlendMode: blendMode }}>
+                {maskedPicture}
+              </div>
+              <div {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, transform, pointerEvents: placingAnything ? "none" : "auto" }}>
+                {handles}
+              </div>
+            </React.Fragment>
+          );
+        }
+        return (
+          <div key={o.id} {...dragProps} data-kf-overlay={o.keyframes?.length ? o.id : undefined} style={{ ...box, ...look, pointerEvents: placingAnything ? "none" : "auto" }}>
+            {maskedPicture}
+            {handles}
           </div>
         );
       })}
 
-      {activeOverlays
-        .filter((o) => o.id !== editingSession?.id)
-        .map((o) => {
-          const paddingPx = o.padding !== undefined ? o.padding * frameRect.height : 2;
-          const heightPx = o.fontSize * frameRect.height * 1.3 + paddingPx * 2;
-          const anim = overlayAnimationStyle(o.animation, o.startTime, o.endTime, currentOutputTime, frameRect.width, frameRect.height);
-          return (
-            <div
-              key={o.id}
-              onClick={() => selectTextOverlayExclusive(o.id)}
-              onContextMenu={openContextMenu("text", o.id)}
-              className="absolute whitespace-pre-wrap break-words cursor-text outline outline-2 outline-transparent hover:outline-white/40 transition-colors"
-              style={{
-                left: o.x * frameRect.width,
-                top: o.y * frameRect.height,
-                width: o.width * frameRect.width,
-                font: `${o.fontSize * frameRect.height}px ${TEXT_FONT_FAMILY}`,
-                lineHeight: 1.3,
-                padding: paddingPx,
-                textAlign: o.textAlign ?? "left",
-                pointerEvents: placingAnything ? "none" : "auto",
-                opacity: anim.opacity,
-                transform:
-                  [anim.translateXPx || anim.translateYPx ? `translate(${anim.translateXPx}px, ${anim.translateYPx}px)` : null, anim.scale !== 1 ? `scale(${anim.scale})` : null]
-                    .filter(Boolean)
-                    .join(" ") || undefined,
-                background: o.backgroundColor ?? "transparent",
-                borderRadius: cornerRadiusCss(o.cornerStyle, heightPx),
-                // -webkit-text-stroke draws centered on the glyph outline by default, which can eat
-                // into thin strokes of the fill color on top of it - paint-order puts the stroke
-                // fully behind the fill instead, the standard trick for a clean "outlined caption"
-                // look (this is a Chromium/WebView2 app, so both properties are safe to rely on).
-                WebkitTextStroke: o.strokeColor && o.strokeWidth ? `${o.strokeWidth}px ${o.strokeColor}` : undefined,
-                paintOrder: o.strokeColor && o.strokeWidth ? "stroke fill" : undefined,
-                // Default text has no backgroundColor and no stroke, so a plain drop-shadow keeps
-                // it legible over arbitrary (light or busy) video content instead of only working
-                // on dark footage - standard caption/title styling. Skipped once a stroke is set -
-                // the two together look muddy, and the stroke alone already solves legibility.
-                textShadow: o.backgroundColor || (o.strokeColor && o.strokeWidth) ? undefined : "0 1px 3px rgba(0,0,0,0.85), 0 0 6px rgba(0,0,0,0.5)",
-              }}
-            >
-              {renderFormattedSegments(o.text, o.colorRuns ?? [], o.boldRuns ?? [], o.italicRuns ?? [], o.color)}
-            </div>
-          );
-        })}
 
       {editingSession && editingOverlayData && (
         <>
-          {/* VideoPlayer's overlay wrapper is `pointer-events: none` by default (so clicks reach
-              the video when there's nothing to interact with) - `pointer-events` is an inherited
-              CSS property, and TextNoteEditor (reused as-is, not our code to edit) never opts back
-              into `auto` itself the way our own read-only/placement divs already do. Without this
-              wrapper every click inside the editor - the drag header, the color picker, the
-              textarea itself - silently fell through to the <video> behind it instead of reaching
-              the editor. Same reasoning applies to the style panel below. */}
-          <div style={{ pointerEvents: "auto" }}>
-            <TextNoteEditor
-              key={editingSession.id}
-              left={editingSession.x * frameRect.width}
-              top={editingSession.y * frameRect.height}
-              width={editingSession.width * frameRect.width}
-              fontSize={editingSession.fontSize * frameRect.height}
-              initialText={liveTextRef.current}
-              initialColor={liveColorRef.current}
-              initialBackgroundColor={liveBackgroundColorRef.current}
-              initialColorRuns={liveColorRunsRef.current}
-              initialBoldRuns={liveBoldRunsRef.current}
-              initialItalicRuns={liveItalicRunsRef.current}
-              initialTextAlign={liveTextAlignRef.current}
-              onContentChange={handleNoteContentChange}
-              onCommit={commitEditingOverlay}
-              onCancel={cancelEditingOverlay}
-              onMoveEnd={handleNoteMoveEnd}
-              onResizeEnd={handleNoteResizeEnd}
-              onResizeWidthEnd={handleNoteWidthResizeEnd}
-            />
-          </div>
-          {/* Video-only creative styling - stroke/background-shape/fade animation apply straight
-              to the store on click (each becomes its own undo step) rather than staging through
-              TextNoteEditor's session, since these are discrete one-click choices, not continuous
-              typing. Positioned a fixed offset above the editor's own header bar so the two don't
-              overlap regardless of box width. */}
-          <div
-            style={{
-              position: "absolute",
-              left: editingSession.x * frameRect.width,
-              top: panelTopPx(editingSession.y * frameRect.height, editingOverlayData.height * frameRect.height),
-              pointerEvents: "auto",
-              zIndex: 21,
-            }}
-            className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
-          >
-            {/* Font size - caret buttons step it in real time (matches the image panel's own
-                rotation input's up/down spinner), or click the value to type an exact number.
-                Reads/writes editingSession.fontSize (the staged, not-yet-committed value the
-                corner drag handle also uses), so this and that handle stay two ways of setting the
-                exact same in-progress number instead of racing each other, both flushing together
-                at the normal commit point. */}
-            <SteppedNumberField
-              valuePx={Math.round(editingSession.fontSize * frameRect.height)}
-              min={4}
-              max={500}
-              title="Font size - click the arrows or type a value"
-              onChangePx={(px) => {
-                if (frameRect.height <= 0) return;
-                setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
-              }}
-            />
-            <div className="w-px h-4 bg-white/15" />
-            {TEXT_STYLE_PRESETS.map((preset) => (
-              <button
-                key={preset.name}
-                type="button"
-                title={preset.name}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, preset.patch)}
-                className="px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-              >
-                {preset.name}
-              </button>
-            ))}
-            <div className="w-px h-4 bg-white/15" />
-            {/* Everything past this point is reached for less often than font size/style presets
-                above - tucked behind a caret instead of growing this row every time a new text
-                aesthetic ships (padding, then outline, then corners, then animations, ...). */}
-            <ToolbarOverflowMenu>
-              {/* Padding around the text inside its box - most visible once a background/pill is
-                  applied. Same staged-in-session treatment as font size above, for the same reason
-                  (one undo step per edit, not one per pixel/keystroke). Note this doesn't preview
-                  live *while* the editor is open - TextNoteEditor (reused as-is) draws its own
-                  fixed-padding chrome and has no padding prop of its own to drive - it becomes
-                  visible the moment editing ends, same as this panel's other aesthetic controls
-                  (stroke/corner/fade) already work. */}
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Padding</span>
-                <SteppedNumberField
-                  valuePx={Math.round(editingSession.padding * frameRect.height)}
-                  min={0}
-                  max={100}
-                  title="Padding - click the arrows or type a value"
-                  onChangePx={(px) => {
+          {(() => {
+            // One set of props: the full panel docked in the sidebar, or the quick bar riding on the
+            // box when the sidebar is closed (TextQuickBar).
+            const textPanel = (
+                <TextDockedPanel
+                  frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
+                  look={{ ...editingOverlayData, ...(liveTextFormat ? { color: liveTextFormat.color, backgroundColor: liveTextFormat.backgroundColor } : {}) }}
+                  onApplyLook={(style) => {
+                    const { color, backgroundColor, padding, ...rest } = lookPatch(style.look);
+                    // Colour and box fill are the editor's (it's what gets committed), the rest the store's.
+                    if (color) textEditorRef.current?.applyColor(color);
+                    textEditorRef.current?.setBackground(backgroundColor);
+                    setEditingOverlay((prev) => (prev ? { ...prev, padding: padding ?? legacyPaddingFraction(frameRect.height), paddingX: undefined } : prev));
+                    onUpdateTextOverlayContent(editingOverlayData.id, rest);
+                  }}
+                  onLook={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
+                  backgroundColor={liveTextFormat ? liveTextFormat.backgroundColor : editingOverlayData.backgroundColor}
+                  textColor={liveTextFormat?.color}
+                  textAlign={liveTextFormat?.textAlign}
+                  onTextColor={(c) => textEditorRef.current?.applyColor(c)}
+                  onHighlight={(c) => textEditorRef.current?.setBackground(c)}
+                  onBold={() => textEditorRef.current?.toggleBold()}
+                  onItalic={() => textEditorRef.current?.toggleItalic()}
+                  onAlign={(a) => textEditorRef.current?.setAlign(a)}
+                  strokeColor={editingOverlayData.strokeColor}
+                  strokeWidth={editingOverlayData.strokeWidth}
+                  cornerStyle={editingOverlayData.cornerStyle}
+                  animation={editingOverlayData.animation}
+                  fontSizePx={Math.round(editingSession.fontSize * frameRect.height)}
+                  paddingPx={Math.round(editingSession.padding * frameRect.height)}
+                  paddingXPx={Math.round((editingSession.paddingX ?? editingSession.padding) * frameRect.height)}
+                  onFontSizePx={(px) => {
                     if (frameRect.height <= 0) return;
-                    setEditingOverlay((prev) => (prev ? { ...prev, padding: px / frameRect.height } : prev));
+                    setEditingOverlay((prev) => (prev ? { ...prev, fontSize: px / frameRect.height } : prev));
+                  }}
+                  onPaddingPx={(edge, px) => {
+                    if (frameRect.height <= 0) return;
+                    // Setting top/bottom pins the sides at what they show now, so each moves on its own.
+                    setEditingOverlay((prev) =>
+                      prev ? (edge === "x" ? { ...prev, paddingX: px / frameRect.height } : { ...prev, padding: px / frameRect.height, paddingX: prev.paddingX ?? prev.padding }) : prev
+                    );
+                  }}
+                  onCornerStyle={(cornerStyle) => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle })}
+                  onStroke={(patch) => onUpdateTextOverlayContent(editingOverlayData.id, patch)}
+                  onAnimation={(animation) => {
+                    onUpdateTextOverlayContent(editingOverlayData.id, { animation });
+                    textEditorRef.current?.previewAnimation(animation);
+                  }}
+                  text={editingOverlayData.text}
+                  reveal={editingOverlayData.reveal}
+                  onReveal={(patch) => {
+                    onUpdateTextOverlayContent(editingOverlayData.id, { reveal: { ...editingOverlayData.reveal, ...patch } });
+                    textEditorRef.current?.previewAnimation(editingOverlayData.animation);
+                  }}
+                  x={editingSession.x}
+                  y={editingSession.y}
+                  width={editingSession.width}
+                  height={editingOverlayData.height}
+                  startTime={editingOverlayData.startTime}
+                  endTime={editingOverlayData.endTime}
+                  playhead={currentOutputTime}
+                  onPlace={(x, y) => setEditingOverlay((prev) => (prev ? { ...prev, x, y } : prev))}
+                  keyframes={editingOverlayData.keyframes}
+                  onKeyframes={(keyframes) => onUpdateTextOverlayContent(editingOverlayData.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                  blendMode={editingOverlayData.blendMode}
+                  onBlendMode={(blendMode) => onUpdateTextOverlayContent(editingOverlayData.id, { blendMode })}
+                  track={editingOverlayData.track}
+                  onTrackMotion={onTrackMotion ? () => onTrackMotion("text", editingOverlayData.id) : undefined}
+                  onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("text", editingOverlayData.id, edge, time) : undefined}
+                  onDuplicate={() => onDuplicateTextOverlay(editingOverlayData.id)}
+                  onFront={() => onBringTextOverlayToFront(editingOverlayData.id)}
+                  onBack={() => onSendTextOverlayToBack(editingOverlayData.id)}
+                  onDelete={() => {
+                    const id = editingOverlayData.id;
+                    cancelEditingOverlay();
+                    onDeleteTextOverlay(id);
                   }}
                 />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Outline</span>
-                <div onMouseDown={(e) => e.preventDefault()} title="Outline color/width">
-                  <ColorSwatchPicker
-                    color={editingOverlayData.strokeColor ?? "#000000"}
-                    onChange={(c) => onUpdateTextOverlayContent(editingOverlayData.id, { strokeColor: c, strokeWidth: editingOverlayData.strokeWidth || 2 })}
-                    size="sm"
-                  />
-                </div>
-                <button
-                  type="button"
-                  title={editingOverlayData.strokeWidth ? "Remove outline" : "Add outline"}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() =>
-                    onUpdateTextOverlayContent(editingOverlayData.id, {
-                      strokeWidth: editingOverlayData.strokeWidth ? undefined : 2,
-                      strokeColor: editingOverlayData.strokeColor ?? "#000000",
-                    })
-                  }
-                  className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-                    editingOverlayData.strokeWidth ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-                  }`}
-                >
-                  {editingOverlayData.strokeWidth ? "On" : "Off"}
-                </button>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Corners</span>
-                {CORNER_OPTIONS.map((corner) => (
-                  <button
-                    key={corner}
-                    type="button"
-                    title={corner === "square" ? "Square corners" : corner === "rounded" ? "Rounded corners" : "Pill shape"}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => onUpdateTextOverlayContent(editingOverlayData.id, { cornerStyle: corner })}
-                    className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
-                      (editingOverlayData.cornerStyle ?? "square") === corner ? "bg-blue-500/20 ring-1 ring-blue-400" : "hover:bg-white/10"
-                    }`}
-                  >
-                    <span
-                      className="block w-2.5 h-2.5 bg-white/80"
-                      style={{ borderRadius: corner === "pill" ? 999 : corner === "rounded" ? 3 : 0 }}
-                    />
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-white/50 w-12">Animate</span>
-                <AnimationPicker value={editingOverlayData.animation} onChange={(next) => onUpdateTextOverlayContent(editingOverlayData.id, { animation: next })} />
-              </div>
-              <button
-                type="button"
-                title="Duplicate this text overlay"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onDuplicateTextOverlay(editingOverlayData.id)}
-                className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-              >
-                Duplicate
-              </button>
-            </ToolbarOverflowMenu>
-          </div>
+            );
+            return (
+              <OverlaySettingsPanel title="Text" icon={<IoText size={14} />} onClose={commitEditingOverlay} docked={textPanel} bare>
+                <TextQuickBar
+                  {...(textPanel.props as TextDockedPanelProps)}
+                  boxLeftPx={editingSession.x * frameRect.width}
+                  boxTopPx={editingSession.y * frameRect.height}
+                  boxWidthPx={editingSession.width * frameRect.width}
+                  boxHeightPx={editingOverlayData.height * frameRect.height}
+                  frameWidthPx={frameRect.width}
+                  frameHeightPx={frameRect.height}
+                  onOpenSettings={openToolPanel ?? undefined}
+                />
+              </OverlaySettingsPanel>
+            );
+          })()}
         </>
       )}
 
+      {selectedImageOverlayData && imageMaskEdit?.id === selectedImageOverlayData.id && (selectedImageOverlayData.mask || imageMaskEdit.drawing) && (
+        <div style={{ pointerEvents: "auto" }}>
+          <MaskEditor
+            box={{
+              left: selectedImageOverlayData.x * frameRect.width,
+              top: selectedImageOverlayData.y * frameRect.height,
+              width: selectedImageOverlayData.width * frameRect.width,
+              height: selectedImageOverlayData.height * frameRect.height,
+            }}
+            rotation={selectedImageOverlayData.rotation ?? 0}
+            mask={selectedImageOverlayData.mask ?? { ...DEFAULT_MASK, x: 0, y: 0, width: 1, height: 1 }}
+            drawing={imageMaskEdit.drawing}
+            zIndex={22}
+            onLive={setImageMaskLive}
+            onCommit={(mask) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { mask })}
+            onDrawn={() => setImageMaskEdit({ id: selectedImageOverlayData.id, drawing: false })}
+          />
+        </div>
+      )}
+
       {selectedImageOverlayData && (
-        <div
-          style={{
+        <OverlaySettingsPanel
+          title={selectedImageOverlayData.asset ? assetEntry(selectedImageOverlayData.asset.kind).label : "Image"}
+          icon={selectedImageOverlayData.asset ? <IoShapesOutline size={14} /> : <IoImageOutline size={14} />}
+          onClose={() => onSelectImageOverlay(null)}
+          docked={(() => {
+            const o = selectedImageOverlayData;
+            const radiusFor = (corner: "square" | "rounded" | "round") =>
+              corner === "square"
+                ? 0
+                : corner === "rounded"
+                  ? frameRect.height > 0
+                    ? IMAGE_ROUNDED_CORNER_PX / frameRect.height
+                    : 0
+                  : frameRect.height > 0
+                    ? Math.min(o.width * frameRect.width, o.height * frameRect.height) / 2 / frameRect.height
+                    : 0;
+            const corner = (["square", "rounded", "round"] as const).find((c) => Math.abs((o.cornerRadius ?? 0) - radiusFor(c)) < 0.001) ?? null;
+            return (
+              <ImageDockedPanel
+                frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
+                opacity={o.opacity}
+                corner={corner}
+                borderColor={o.borderColor}
+                shadow={!!o.shadow}
+                rotation={o.rotation ?? 0}
+                flipHorizontal={!!o.flipHorizontal}
+                flipVertical={!!o.flipVertical}
+                animation={o.animation}
+                onOpacity={(opacity) => onUpdateImageOverlayContent(o.id, { opacity })}
+                onCorner={(c) => onUpdateImageOverlayContent(o.id, { cornerRadius: radiusFor(c) })}
+                onBorderColor={(borderColor) => onUpdateImageOverlayContent(o.id, { borderColor })}
+                onShadow={(shadow) => onUpdateImageOverlayContent(o.id, { shadow })}
+                onRotation={(deg) => onUpdateImageOverlayContent(o.id, { rotation: ((deg % 360) + 360) % 360 })}
+                onScale={(width) => {
+                  // Keeps the picture's proportions and its centre where it is.
+                  const ratio = o.width > 0 ? o.height / o.width : 1;
+                  const height = width * ratio;
+                  onUpdateImageOverlayContent(o.id, {
+                    width,
+                    height,
+                    x: Math.max(0, o.x + (o.width - width) / 2),
+                    y: Math.max(0, o.y + (o.height - height) / 2),
+                  });
+                }}
+                onFlipHorizontal={() => onUpdateImageOverlayContent(o.id, { flipHorizontal: !o.flipHorizontal })}
+                onFlipVertical={() => onUpdateImageOverlayContent(o.id, { flipVertical: !o.flipVertical })}
+                onAnimation={(animation) => onUpdateImageOverlayContent(o.id, { animation })}
+                onReplace={() => void handleReplaceImage(o.id)}
+                onCrop={() => setCroppingOverlayId(o.id)}
+                asset={o.asset}
+                onAsset={(patch) => onUpdateImageOverlayContent(o.id, assetPatch(o, patch))}
+                reveal={o.reveal}
+                onReveal={(reveal) => onUpdateImageOverlayContent(o.id, { reveal })}
+                mask={o.mask}
+                maskEditing={imageMaskEdit?.id === o.id}
+                onMaskShape={(shape) => {
+                  if (shape === null) {
+                    onUpdateImageOverlayContent(o.id, { mask: undefined });
+                    setImageMaskEdit(null);
+                  } else if (shape === "path") {
+                    setImageMaskEdit({ id: o.id, drawing: true });
+                  } else {
+                    onUpdateImageOverlayContent(o.id, { mask: { ...(o.mask ?? DEFAULT_MASK), shape, points: undefined } });
+                    setImageMaskEdit({ id: o.id, drawing: false });
+                  }
+                }}
+                onMask={(mask) => onUpdateImageOverlayContent(o.id, { mask })}
+                onToggleMaskEdit={() => setImageMaskEdit((m) => (m?.id === o.id ? null : { id: o.id, drawing: false }))}
+                x={o.x}
+                y={o.y}
+                width={o.width}
+                height={o.height}
+                startTime={o.startTime}
+                endTime={o.endTime}
+                playhead={currentOutputTime}
+                onPlace={(x, y) => onUpdateImageOverlayContent(o.id, { x, y })}
+                keyframes={o.keyframes}
+                onKeyframes={(keyframes) => onUpdateImageOverlayContent(o.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                blendMode={o.blendMode}
+                onBlendMode={(blendMode) => onUpdateImageOverlayContent(o.id, { blendMode })}
+                track={o.track}
+                onTrackMotion={onTrackMotion ? () => onTrackMotion("image", o.id) : undefined}
+                onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("image", o.id, edge, time) : undefined}
+                onDuplicate={() => onDuplicateImageOverlay(o.id)}
+                onFront={() => onBringImageOverlayToFront(o.id)}
+                onBack={() => onSendImageOverlayToBack(o.id)}
+                onDelete={() => {
+                  onDeleteImageOverlay(o.id);
+                  onSelectImageOverlay(null);
+                }}
+              />
+            );
+          })()}
+          floatingStyle={{
             position: "absolute",
             left: selectedImageOverlayData.x * frameRect.width,
             top: panelTopPx(
               selectedImageOverlayData.y * frameRect.height,
               selectedImageOverlayData.height * frameRect.height,
-              rotateHandleRiseFor(selectedImageOverlayData.y * frameRect.height) + 16
+              Math.max(0, rotateHandleRiseFor(selectedImageOverlayData.y * frameRect.height)) + 16
             ),
             pointerEvents: "auto",
             zIndex: 21,
           }}
-          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
         >
           <input
             type="range"
@@ -1926,7 +2120,13 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             className="w-16 accent-amber-400"
           />
           <div className="w-px h-4 bg-white/15" />
-          {(["square", "rounded", "round"] as const).map((corner) => {
+          {selectedImageOverlayData.asset && (
+            <AssetFloatingControls
+              asset={selectedImageOverlayData.asset}
+              onAsset={(patch) => onUpdateImageOverlayContent(selectedImageOverlayData.id, assetPatch(selectedImageOverlayData, patch))}
+            />
+          )}
+          {!selectedImageOverlayData.asset && (["square", "rounded", "round"] as const).map((corner) => {
             const radiusFraction =
               corner === "square"
                 ? 0
@@ -1949,27 +2149,31 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               </button>
             );
           })}
-          <div className="w-px h-4 bg-white/15" />
-          <div onMouseDown={(e) => e.preventDefault()} title="Border color">
-            <ColorSwatchPicker
-              color={selectedImageOverlayData.borderColor ?? "#ffffff"}
-              onChange={(c) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: c })}
-              size="sm"
-            />
-          </div>
-          <button
-            type="button"
-            title={selectedImageOverlayData.borderColor ? "Remove border" : "Add border"}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() =>
-              onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: selectedImageOverlayData.borderColor ? undefined : "#ffffff" })
-            }
-            className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
-              selectedImageOverlayData.borderColor ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
-            }`}
-          >
-            Border
-          </button>
+          {!selectedImageOverlayData.asset && (
+            <>
+              <div className="w-px h-4 bg-white/15" />
+              <div onMouseDown={(e) => e.preventDefault()} title="Border color">
+                <ColorSwatchPicker
+                  color={selectedImageOverlayData.borderColor ?? "#ffffff"}
+                  onChange={(c) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: c })}
+                  size="sm"
+                />
+              </div>
+              <button
+                type="button"
+                title={selectedImageOverlayData.borderColor ? "Remove border" : "Add border"}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() =>
+                  onUpdateImageOverlayContent(selectedImageOverlayData.id, { borderColor: selectedImageOverlayData.borderColor ? undefined : "#ffffff" })
+                }
+                className={`px-1.5 h-5 flex items-center rounded text-[10px] transition-colors ${
+                  selectedImageOverlayData.borderColor ? "text-blue-400 bg-blue-500/10" : "text-white/70 hover:text-white hover:bg-white/10"
+                }`}
+              >
+                Border
+              </button>
+            </>
+          )}
           <div className="w-px h-4 bg-white/15" />
           {/* Everything past this point is reached for less often than opacity/corners/border
               above - tucked behind a caret instead of growing this row every time a new image
@@ -2055,24 +2259,28 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
                 onChange={(next) => onUpdateImageOverlayContent(selectedImageOverlayData.id, { animation: next })}
               />
             </div>
-            <button
-              type="button"
-              title="Replace the picture, keeping position/size/style"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
-              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-            >
-              Replace
-            </button>
-            <button
-              type="button"
-              title="Crop to a sub-region of the picture"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
-              className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
-            >
-              Crop
-            </button>
+            {!selectedImageOverlayData.asset && (
+              <>
+                <button
+                  type="button"
+                  title="Replace the picture, keeping position/size/style"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => void handleReplaceImage(selectedImageOverlayData.id)}
+                  className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  Replace
+                </button>
+                <button
+                  type="button"
+                  title="Crop to a sub-region of the picture"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setCroppingOverlayId(selectedImageOverlayData.id)}
+                  className="w-full text-left px-1.5 h-5 flex items-center rounded text-[10px] text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  Crop
+                </button>
+              </>
+            )}
             <button
               type="button"
               title="Duplicate this image overlay"
@@ -2083,12 +2291,64 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
               Duplicate
             </button>
           </ToolbarOverflowMenu>
-        </div>
+        </OverlaySettingsPanel>
       )}
 
       {selectedBlurOverlayData && (
-        <div
-          style={{
+        <OverlaySettingsPanel
+          title="Blur"
+          icon={<MdBlurOn size={15} />}
+          onClose={() => onSelectBlurOverlay(null)}
+          docked={(() => {
+            const o = selectedBlurOverlayData;
+            const shape = o.shape ?? "rectangle";
+            const preset = shape === "ellipse" ? "ellipse" : o.cornerRadius && o.cornerRadius > 0 ? "rounded" : "square";
+            const maxRadiusPx = Math.min(o.width * frameRect.width, o.height * frameRect.height) / 2;
+            return (
+              <BlurDockedPanel
+                frameAspect={frameRect.height > 0 ? frameRect.width / frameRect.height : undefined}
+                intensity={o.intensity}
+                shape={shape}
+                preset={preset}
+                cornerRadiusPx={(o.cornerRadius ?? 0) * frameRect.height}
+                maxCornerRadiusPx={maxRadiusPx}
+                rotation={o.rotation ?? 0}
+                onIntensity={(intensity) => onUpdateBlurOverlayContent(o.id, { intensity })}
+                onPreset={(next) =>
+                  onUpdateBlurOverlayContent(
+                    o.id,
+                    next === "ellipse"
+                      ? { shape: "ellipse", cornerRadius: undefined }
+                      : next === "rounded"
+                        ? { shape: "rectangle", cornerRadius: frameRect.height > 0 ? IMAGE_ROUNDED_CORNER_PX / frameRect.height : 0 }
+                        : { shape: "rectangle", cornerRadius: 0 }
+                  )
+                }
+                onCornerRadiusPx={(px) => frameRect.height > 0 && onUpdateBlurOverlayContent(o.id, { cornerRadius: px / frameRect.height })}
+                onRotation={(rotation) => onUpdateBlurOverlayContent(o.id, { rotation })}
+                onGeometry={(patch) => onUpdateBlurOverlayContent(o.id, patch)}
+                x={o.x}
+                y={o.y}
+                width={o.width}
+                height={o.height}
+                startTime={o.startTime}
+                endTime={o.endTime}
+                playhead={currentOutputTime}
+                onPlace={(x, y) => onUpdateBlurOverlayContent(o.id, { x, y })}
+                keyframes={o.keyframes}
+                onKeyframes={(keyframes) => onUpdateBlurOverlayContent(o.id, { keyframes, ...(keyframes ? {} : { track: undefined }) })}
+                track={o.track}
+                onTrackMotion={onTrackMotion ? () => onTrackMotion("blur", o.id) : undefined}
+                onSetTime={onSetOverlayTime ? (edge, time) => onSetOverlayTime("blur", o.id, edge, time) : undefined}
+                onDuplicate={() => onDuplicateBlurOverlay(o.id)}
+                onDelete={() => {
+                  onDeleteBlurOverlay(o.id);
+                  onSelectBlurOverlay(null);
+                }}
+              />
+            );
+          })()}
+          floatingStyle={{
             position: "absolute",
             left: selectedBlurOverlayData.x * frameRect.width,
             // Extra clearance matches the image overlay panel's own call just below - without it,
@@ -2100,12 +2360,11 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             top: panelTopPx(
               selectedBlurOverlayData.y * frameRect.height,
               selectedBlurOverlayData.height * frameRect.height,
-              rotateHandleRiseFor(selectedBlurOverlayData.y * frameRect.height) + 16
+              Math.max(0, rotateHandleRiseFor(selectedBlurOverlayData.y * frameRect.height)) + 16
             ),
             pointerEvents: "auto",
             zIndex: 21,
           }}
-          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-neutral-900/90 backdrop-blur-md shadow-lg ring-1 ring-white/10 whitespace-nowrap"
         >
           <span className="text-[10px] text-white/50">Blur</span>
           <input
@@ -2177,7 +2436,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           >
             Delete
           </button>
-        </div>
+        </OverlaySettingsPanel>
       )}
 
       {isPlacingText && (
@@ -2224,6 +2483,19 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
             >
               Duplicate
             </button>
+            {contextMenu.kind === "image" && (
+              <button
+                type="button"
+                className="w-full text-left px-3 py-1.5 hover:bg-white/10 transition-colors"
+                onClick={() => {
+                  const id = contextMenu.id;
+                  setContextMenu(null);
+                  void handleReplaceImage(id);
+                }}
+              >
+                Replace…
+              </button>
+            )}
             {/* No z-order for a blur region (see BlurOverlay's own doc comment) - nothing for it
                 to stack against except the video itself, which is always behind by construction. */}
             {contextMenu.kind !== "blur" && (
