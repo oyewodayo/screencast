@@ -4,15 +4,16 @@
 // A person is cut out of their video with Robust Video Matting (RVM, MobileNetV3 - Lin et al. 2021):
 // a recurrent network that carries what it saw in earlier frames forward, so hair and edges stay
 // steady instead of flickering frame to frame the way per-image segmentation does. It runs on ONNX
-// Runtime through DirectML (any DirectX 12 GPU; ONNX Runtime falls back to the CPU on its own).
+// Runtime - through DirectML on Windows (any DirectX 12 GPU; ONNX Runtime falls back to the CPU on
+// its own), on the CPU on macOS (Apple Silicon) and Linux.
 //
 // The result is a derived video: the person's colours (RVM's de-spilled foreground) with an alpha
 // channel, as VP9 in WebM - a format the webview plays with its transparency, and ffmpeg decodes
 // with it (libvpx-vp9). Preview and export both use that one file, so they show the same cut-out by
 // construction. It's made once per source file and kept with the other derived media.
 //
-// Nothing is bundled: the engine (ONNX Runtime with DirectML, ~40 MB, from Microsoft's official
-// PyPI wheel) and the model (15 MB, from the RVM authors' release) download on first use into
+// Nothing is bundled: the engine (ONNX Runtime, 17-25 MB, from Microsoft's official PyPI wheel) and
+// the model (15 MB, from the RVM authors' release) download on first use into
 // <app local data>/background-removal, each pinned by size and SHA-256 (asset_download.rs).
 use serde::Serialize;
 use std::collections::HashMap;
@@ -30,19 +31,67 @@ use crate::services::utility::{get_ffmpeg_path, get_ffprobe_path};
 
 // ---- The engine -----------------------------------------------------------------------------------
 
-// ONNX Runtime 1.24.4 with DirectML, as Microsoft publishes it for Python - the three native
-// libraries inside are plain C-API DLLs, usable from here. Only those are kept.
+// ONNX Runtime 1.24.4, as Microsoft publishes it for Python - the native libraries inside are plain
+// C-API libraries, usable from here. Only those are kept. Which wheel depends on the system:
+//   Windows x86-64 - the DirectML build (three DLLs);
+//   Linux x86-64   - the CPU build (glibc 2.28 or newer);
+//   macOS arm64    - the CPU build, Apple Silicon on macOS 14 or newer. This version has no
+//                    Intel Mac build, so the features on this engine aren't offered there.
+// Anywhere else the engine is unsupported (ENGINE_SUPPORTED) and these are empty.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const WHEEL_ASSET: DownloadAsset = DownloadAsset {
     file_name: "onnxruntime_directml-1.24.4.whl",
     url: "https://files.pythonhosted.org/packages/88/ea/33814eb0ec96775eda4c1d30b0d86e91d7d2cd0d84c66d3915aef0e06fa3/onnxruntime_directml-1.24.4-cp312-cp312-win_amd64.whl",
     sha256: "f2ecb68b7b7b259d2ef3112ae760149f9b5a1e7c0fbb73d539da6250a648a614",
     size: 25_111_930,
 };
+#[cfg(all(windows, target_arch = "x86_64"))]
 const DLLS: &[(&str, u64, &str)] = &[
     ("onnxruntime.dll", 21_111_832, "302c69f9779d63ef4ab90316e59444c4acbaca7fe3455020d79d10bcfcb00715"),
     ("DirectML.dll", 18_527_776, "b73972115320e906a49602f2027a3266622881b0d325ba685e0f165a9482a8d7"),
     ("onnxruntime_providers_shared.dll", 21_576, "f6bbae3af4c0673b0d1e6ca8db900dc85ad959a395b69d361038ec7995cc2652"),
 ];
+// The one ONNX Runtime itself is loaded from (the others resolve beside it).
+#[cfg(all(windows, target_arch = "x86_64"))]
+const MAIN_LIB: &str = "onnxruntime.dll";
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const WHEEL_ASSET: DownloadAsset = DownloadAsset {
+    file_name: "onnxruntime-1.24.4.whl",
+    url: "https://files.pythonhosted.org/packages/6d/ab/5b68110e0460d73fad814d5bd11c7b1ddcce5c37b10177eb264d6a36e331/onnxruntime-1.24.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    sha256: "0d640eb9f3782689b55cfa715094474cd5662f2f137be6a6f847a594b6e9705c",
+    size: 17_244_912,
+};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const DLLS: &[(&str, u64, &str)] = &[
+    ("libonnxruntime.so.1.24.4", 22_159_232, "2d518e11c7767f9fdc4413bdbeb45acf30db504ff76a82fc19d9238a3f9f6c24"),
+    ("libonnxruntime_providers_shared.so", 14_632, "086ec1d5388f64153d9c63470d126693db9a182c8ce236d3a1119068471b8a0d"),
+];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MAIN_LIB: &str = "libonnxruntime.so.1.24.4";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const WHEEL_ASSET: DownloadAsset = DownloadAsset {
+    file_name: "onnxruntime-1.24.4.whl",
+    url: "https://files.pythonhosted.org/packages/d7/38/31db1b232b4ba960065a90c1506ad7a56995cd8482033184e97fadca17cc/onnxruntime-1.24.4-cp312-cp312-macosx_14_0_arm64.whl",
+    sha256: "cad1c2b3f455c55678ab2a8caa51fb420c25e6e3cf10f4c23653cdabedc8de78",
+    size: 17_341_875,
+};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DLLS: &[(&str, u64, &str)] = &[("libonnxruntime.1.24.4.dylib", 27_708_456, "f958c8c8f50a787f64cd13aa5f07710b97075d9869c6983dc0001d2452100eaa")];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MAIN_LIB: &str = "libonnxruntime.1.24.4.dylib";
+
+#[cfg(not(any(all(windows, target_arch = "x86_64"), all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+const WHEEL_ASSET: DownloadAsset = DownloadAsset { file_name: "", url: "", sha256: "", size: 0 };
+#[cfg(not(any(all(windows, target_arch = "x86_64"), all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+const DLLS: &[(&str, u64, &str)] = &[];
+#[cfg(not(any(all(windows, target_arch = "x86_64"), all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+const MAIN_LIB: &str = "";
+
+// Whether this system has an engine at all - what "unsupported" in the features' status means. Shared
+// with face matching and the AI voice, which run on the same engine.
+pub(crate) const ENGINE_SUPPORTED: bool = cfg!(any(all(windows, target_arch = "x86_64"), all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")));
 // RVM MobileNetV3, fp32 (PeterL1n/RobustVideoMatting, release v1.0.0).
 const MODEL_ASSET: DownloadAsset = DownloadAsset {
     file_name: "rvm_mobilenetv3_fp32.onnx",
@@ -80,7 +129,7 @@ pub struct BackgroundRemovalStatus {
 
 #[tauri::command]
 pub async fn background_removal_status(app_handle: AppHandle) -> Result<BackgroundRemovalStatus, String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
+    if !ENGINE_SUPPORTED {
         return Ok(BackgroundRemovalStatus { state: "unsupported", download_mb: 0 });
     }
     let dir = engine_dir(&app_handle)?;
@@ -103,8 +152,8 @@ struct EngineDownloadProgress {
 // Fetches (or repairs) the engine and model. Emits "background-removal-download" {downloaded, total}.
 #[tauri::command]
 pub async fn download_background_removal(app_handle: AppHandle, window: Window) -> Result<(), String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
-        return Err("Background removal isn't available on this platform yet.".into());
+    if !ENGINE_SUPPORTED {
+        return Err("Background removal isn't available on this system: it needs Windows, Linux on x86-64, or a Mac with Apple Silicon.".into());
     }
     let dir = engine_dir(&app_handle)?;
     DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
@@ -156,25 +205,26 @@ pub fn cancel_background_removal_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
 }
 
-// The three DLLs out of the wheel (a zip) with Windows' own tar (bsdtar reads zip), each checked
-// against its pin before it's put in place.
+// The engine's libraries out of the wheel (a zip), each checked against its pin before it's put in
+// place.
 fn extract_dlls(wheel: &Path, dir: &Path) -> Result<(), String> {
     let staging = dir.join("extract");
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    let tar = std::env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("System32").join("tar.exe")).filter(|p| p.exists()).unwrap_or_else(|| PathBuf::from("tar"));
-    let mut cmd = Command::new(tar);
-    #[cfg(windows)]
-    hide_console_window(&mut cmd);
-    cmd.arg("-xf").arg(wheel).arg("-C").arg(&staging);
-    for (name, _, _) in DLLS {
-        cmd.arg(format!("onnxruntime/capi/{name}"));
-    }
-    let out = cmd.stdout(Stdio::null()).stderr(Stdio::piped()).output().map_err(|e| format!("Failed to unpack the engine: {}", e))?;
-    if !out.status.success() {
-        return Err(format!("Failed to unpack the engine: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
     let unpacked = staging.join("onnxruntime").join("capi");
+    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
+    let unpack = || -> Result<(), String> {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(wheel).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        for (name, _, _) in DLLS {
+            let mut entry = archive.by_name(&format!("onnxruntime/capi/{name}")).map_err(|e| format!("{name}: {e}"))?;
+            let mut file = std::fs::File::create(unpacked.join(name)).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    if let Err(e) = unpack() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("Failed to unpack the engine: {e}"));
+    }
     for dll in DLLS {
         if !dll_ok(&unpacked, dll) {
             let _ = std::fs::remove_dir_all(&staging);
@@ -186,15 +236,16 @@ fn extract_dlls(wheel: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// ONNX Runtime, loaded once per process. onnxruntime.dll is loaded first by this code with its own
-// folder on the search path, so DirectML.dll and the providers library resolve from beside it
-// (not System32's older DirectML); ort's own load of the same path then reuses that module.
+// ONNX Runtime, loaded once per process. On Windows onnxruntime.dll is loaded first by this code with
+// its own folder on the search path, so DirectML.dll and the providers library resolve from beside
+// it (not System32's older DirectML); ort's own load of the same path then reuses that module.
+// Elsewhere ort loads the library by its path and the providers library is found beside it.
 static ORT_ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 
 pub(crate) fn ort_environment(dir: &Path) -> Result<&'static ort::environment::Environment, String> {
     ORT_ENV
         .get_or_init(|| {
-            let dll = dir.join("onnxruntime.dll");
+            let dll = dir.join(MAIN_LIB);
             #[cfg(windows)]
             unsafe {
                 use windows::core::HSTRING;
@@ -206,6 +257,17 @@ pub(crate) fn ort_environment(dir: &Path) -> Result<&'static ort::environment::E
         })
         .as_ref()
         .map_err(|e| e.clone())
+}
+
+// Where there is a GPU path, takes it: DirectML on Windows (ONNX Runtime uses the CPU on its own when
+// there is no DirectX 12 GPU). Elsewhere the engine is the CPU build already.
+#[cfg(windows)]
+pub(crate) fn with_gpu(builder: ort::session::builder::SessionBuilder) -> ort::Result<ort::session::builder::SessionBuilder> {
+    builder.with_execution_providers([ort::ep::DirectML::default().build()]).map_err(|e| e.into())
+}
+#[cfg(not(windows))]
+pub(crate) fn with_gpu(builder: ort::session::builder::SessionBuilder) -> ort::Result<ort::session::builder::SessionBuilder> {
+    Ok(builder)
 }
 
 // ---- Cutting a person out -----------------------------------------------------------------------
@@ -388,12 +450,12 @@ fn cut_out(
     let fps = format!("{:.6}", src.fps);
     let total_frames = (src.duration * src.fps).round().max(1.0);
 
-    // DirectML first; ONNX Runtime uses the CPU when it can't (no DirectX 12 GPU). Half the cores at
+    // The GPU first where there is a path to one (with_gpu); the CPU otherwise. Half the cores at
     // most, so the editor stays responsive while it runs (all of them starved the webview for ~2 s
     // at a time).
     let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 4);
     let mut session = Session::builder(env)
-        .and_then(|b| b.with_execution_providers([ort::ep::DirectML::default().build()]).map_err(|e| e.into()))
+        .and_then(with_gpu)
         .and_then(|b| b.with_intra_threads(threads).map_err(|e| e.into()))
         .and_then(|mut b| b.commit_from_file(model))
         .map_err(|e| format!("The background-removal model didn't load: {}", e))?;
@@ -507,6 +569,54 @@ mod tests {
         assert_eq!(work_size(1080, 1920), (406, 720, 384.0 / 720.0));
         // Odd sizes come out even.
         assert_eq!(work_size(321, 241).0 % 2, 0);
+    }
+
+    // Not a unit test (it downloads ~32 MB): the whole engine on THIS system - the pinned wheel is fetched
+    // and unpacked, ONNX Runtime loads, and a short video is cut out frame by frame through ffmpeg. Run with
+    // `cargo test --lib the_engine_ -- --ignored --nocapture`; needs ffmpeg on the PATH (or $FFMPEG_DIR).
+    #[test]
+    #[ignore]
+    fn the_engine_downloads_loads_and_cuts_out_a_video_on_this_system() {
+        assert!(ENGINE_SUPPORTED, "this system has no engine");
+        let dir = std::env::temp_dir().join(format!("briefcast_engine_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+
+        ensure_engine_dlls(&dir, &cancel, "cancelled", &|_| {}).expect("the engine downloads and unpacks");
+        assert!(engine_dlls_ready(&dir), "every library verifies against its pin");
+        let model = dir.join(MODEL_ASSET.file_name);
+        download_asset(&MODEL_ASSET, &model, &cancel, "cancelled", &|_| {}).expect("the model downloads");
+        println!("engine and model ready in {:.1}s", started.elapsed().as_secs_f64());
+
+        let env = ort_environment(&dir).expect("ONNX Runtime loads");
+        let ffmpeg = std::env::var("FFMPEG_DIR")
+            .map(|d| PathBuf::from(d).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }))
+            .unwrap_or_else(|_| crate::services::utility::find_on_path("ffmpeg").expect("ffmpeg on the PATH"));
+        let ffprobe = ffmpeg.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+        let source = dir.join("source.mp4");
+        let made = Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=15:d=2", "-pix_fmt", "yuv420p"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let out = dir.join("cutout.webm");
+        let run = std::time::Instant::now();
+        let mut last = 0.0;
+        cut_out(env, &model, &ffmpeg, &ffprobe, source.to_str().unwrap(), None, &out, &cancel, &|p| last = p).expect("the video is cut out");
+        println!("cut out 30 frames in {:.1}s", run.elapsed().as_secs_f64());
+        assert!(std::fs::metadata(&out).map(|m| m.len() > 1000).unwrap_or(false), "a WebM was written");
+        // Thirty frames in, thirty out.
+        let frames = Command::new(&ffprobe)
+            .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

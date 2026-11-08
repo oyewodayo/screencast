@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 
-use crate::commands::background_removal::{engine_dir, engine_ready, model_path, ort_environment};
+use crate::commands::background_removal::{engine_dir, engine_ready, model_path, ort_environment, with_gpu};
 use crate::services::utility::get_ffmpeg_path;
 
 // What goes behind the person: "blur" (their own background, blurred by `amount` 0..1), "color"
@@ -276,10 +276,13 @@ fn run_matting(s: &Shared, dir: &std::path::Path, model: &std::path::Path, w: us
     let env = ort_environment(dir)?;
     let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 4);
     let cpu = Session::builder(env).and_then(|b| b.with_intra_threads(threads).map_err(|e| e.into())).and_then(|mut b| b.commit_from_file(model)).map_err(|e| e.to_string())?;
-    let gpu = Session::builder(env)
-        .and_then(|b| b.with_execution_providers([ort::ep::DirectML::default().build()]).map_err(|e| e.into()))
-        .and_then(|mut b| b.commit_from_file(model))
-        .ok();
+    // A GPU session only where there is a path to one (DirectML on Windows) - elsewhere it would be a
+    // second copy of the CPU one.
+    let gpu = if cfg!(windows) {
+        Session::builder(env).and_then(with_gpu).and_then(|mut b| b.commit_from_file(model)).ok()
+    } else {
+        None
+    };
     let mut sessions: Vec<(&str, Session)> = vec![("cpu", cpu)];
     if let Some(g) = gpu {
         sessions.push(("gpu", g));

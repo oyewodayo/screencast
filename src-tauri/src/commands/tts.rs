@@ -24,7 +24,7 @@ pub struct TtsStatus {
 
 #[tauri::command]
 pub async fn tts_status(app_handle: AppHandle) -> Result<TtsStatus, String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
+    if !crate::commands::background_removal::ENGINE_SUPPORTED {
         return Ok(TtsStatus { state: "unsupported", download_mb: 0, voices: tts::voice_list() });
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -44,8 +44,8 @@ struct DownloadProgress {
 // Fetches (or repairs) the voice engine, model, dictionaries and voices. Emits "tts-download" {downloaded, total}.
 #[tauri::command]
 pub async fn download_tts(app_handle: AppHandle, window: Window) -> Result<(), String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
-        return Err("The AI voice isn't available on this platform yet.".into());
+    if !crate::commands::background_removal::ENGINE_SUPPORTED {
+        return Err("The AI voice isn't available on this system: it needs Windows, Linux on x86-64, or a Mac with Apple Silicon.".into());
     }
     DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
     tauri::async_runtime::spawn_blocking(move || {
