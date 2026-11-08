@@ -537,9 +537,17 @@ fn cut_out(
     if !enc_out.status.success() {
         return Err(format!("Couldn't encode the cut-out: {}", String::from_utf8_lossy(&enc_out.stderr).lines().last().unwrap_or("")));
     }
+    // How the decoder ended: if it failed part way, the cut-out is shorter than the video and would drift
+    // out of step with it - so that's an error, with ffmpeg's own words, not a quietly short file.
+    let decoded = children.0.remove(0).wait_with_output().map_err(|e| e.to_string())?;
+    if !decoded.status.success() {
+        let why = String::from_utf8_lossy(&decoded.stderr);
+        return Err(format!("The video couldn't be read to its end (after {done} frames): {}", why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("ffmpeg stopped")));
+    }
     if done < 1.0 {
         return Err("No frames could be read from the video.".into());
     }
+    log::info!("Cut out {done} frames of {source}");
     progress(1.0);
     Ok(())
 }
@@ -621,7 +629,9 @@ mod tests {
             .arg(&out)
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
+        let counted = String::from_utf8_lossy(&frames.stdout).trim().to_string();
+        println!("the cut-out holds {counted} frames");
+        assert_eq!(counted, "30");
         if seeded.is_none() {
             let _ = std::fs::remove_dir_all(&dir);
         }
