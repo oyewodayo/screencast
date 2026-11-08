@@ -10791,11 +10791,21 @@ mod tests {
         assert!(heic_path.exists(), "heif-enc produced no output file");
 
         let decoded_png = dir.join("decoded.png");
-        tauri::async_runtime::block_on(crate::services::heic_unix::decode_to_png(
+        let decode = tauri::async_runtime::block_on(crate::services::heic_unix::decode_to_png(
             heic_path.clone(),
             decoded_png.clone(),
-        ))
-        .expect("heic_unix::decode_to_png failed");
+        ));
+        // The encoder and the decoder are separate plugins on newer distributions. Having the first
+        // without the second is a missing tool - the app reports it with an install hint (tested in
+        // heic_unix) - not a decode bug, so it stops here. Any other failure is a real one.
+        if let Err(e) = &decode {
+            if crate::services::heic_unix::is_missing_hevc_decoder(e) {
+                eprintln!("SKIPPED heic_unix round trip: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+        decode.expect("heic_unix::decode_to_png failed");
 
         let decoded = image::open(&decoded_png).expect("decoded output is not a valid image");
         assert_eq!(decoded.dimensions(), (16, 16));

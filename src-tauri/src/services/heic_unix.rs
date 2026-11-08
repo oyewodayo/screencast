@@ -28,6 +28,32 @@ const INSTALL_HINT: &str = "install libheif (`brew install libheif`)";
 #[cfg(target_os = "linux")]
 const INSTALL_HINT: &str = "install libheif's example tools (e.g. `sudo apt install libheif-examples` on Debian/Ubuntu, or the equivalent `libheif-tools`/`libheif-utils` package on your distro)";
 
+// libheif ships its codecs as plugins on newer distributions, and iPhone photos are HEVC. With
+// libheif installed but no HEVC decoder plugin, heif-convert fails with "Unsupported feature:
+// Unsupported codec" - true, but not something anyone can act on. This says what is missing.
+pub const NO_HEVC_DECODER: &str = "libheif has no HEVC decoder";
+
+#[cfg(target_os = "macos")]
+const DECODER_HINT: &str = "reinstall it with `brew reinstall libheif`";
+#[cfg(target_os = "linux")]
+const DECODER_HINT: &str = "install the decoder plugin (`sudo apt install libheif-plugin-libde265` on Debian/Ubuntu 24.04 or newer; older releases include it in libheif1, and Fedora has it in `libheif-freeworld` from RPM Fusion)";
+
+/// Whether an error from this module means "no HEVC decoder" rather than a problem with the photo.
+/// (Tests use it to tell an environment without the plugin from a real decode failure.)
+#[cfg(test)]
+pub fn is_missing_hevc_decoder(error: &str) -> bool {
+    error.contains(NO_HEVC_DECODER)
+}
+
+fn failure_message(tool: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.contains("Unsupported codec") {
+        format!("{NO_HEVC_DECODER}, the codec iPhone photos use, so this photo can't be opened - {DECODER_HINT} ({tool}: {stderr})")
+    } else {
+        format!("{tool} failed: {stderr}")
+    }
+}
+
 fn run(mut cmd: Command, tool: &str) -> Result<std::process::Output, String> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -50,7 +76,7 @@ fn decode_blocking(input_path: &Path, output_path: &Path) -> Result<(), String> 
     let output = run(cmd, "heif-convert")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("heif-convert failed: {}", stderr.trim()));
+        return Err(failure_message("heif-convert", &stderr));
     }
     if !output_path.exists() {
         return Err("heif-convert exited successfully but produced no output file".to_string());
@@ -79,7 +105,7 @@ fn extract_thumbnail_blocking(
     let output = run(cmd, "heif-thumbnailer")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("heif-thumbnailer failed: {}", stderr.trim()));
+        return Err(failure_message("heif-thumbnailer", &stderr));
     }
     if !output_path.exists() {
         return Err("heif-thumbnailer exited successfully but produced no output file".to_string());
@@ -100,4 +126,27 @@ pub async fn extract_thumbnail(
     })
     .await
     .map_err(|e| format!("HEIC thumbnail task panicked: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_hevc_decoder_gets_an_actionable_message() {
+        // What libheif prints on a CI image with heif-convert but no libde265 plugin.
+        let m = failure_message("heif-convert", "Could not decode image: 0: Unsupported feature: Unsupported codec\n");
+        assert!(is_missing_hevc_decoder(&m), "{m}");
+        assert!(m.contains(DECODER_HINT), "must say how to fix it: {m}");
+        assert!(m.contains("Unsupported codec"), "and keep libheif's own words for support: {m}");
+    }
+
+    #[test]
+    fn other_failures_pass_through_and_are_not_mistaken_for_a_missing_decoder() {
+        let m = failure_message("heif-convert", "Could not read input file\n");
+        assert_eq!(m, "heif-convert failed: Could not read input file");
+        assert!(!is_missing_hevc_decoder(&m));
+        // An unsupported *feature* of some other kind is the photo's problem, not a missing plugin.
+        assert!(!is_missing_hevc_decoder(&failure_message("heif-convert", "Unsupported feature: Unsupported image type")));
+    }
 }
