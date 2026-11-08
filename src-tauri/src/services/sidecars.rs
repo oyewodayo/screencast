@@ -41,7 +41,55 @@ pub fn set_hidden(path: &Path, hidden: bool) {
         }
     }
 }
-#[cfg(not(windows))]
+// macOS: Finder's own hidden flag (UF_HIDDEN). Unlike Windows' attribute it doesn't stop a write, so only
+// hiding is ever needed - and a write-then-rename makes a new file, which commit_sidecar hides again.
+#[cfg(target_os = "macos")]
+pub fn set_hidden(path: &Path, hidden: bool) {
+    use std::os::macos::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    const UF_HIDDEN: u32 = 0x8000;
+    if !hidden {
+        return;
+    }
+    let Ok(meta) = fs::metadata(path) else { return };
+    let flags = meta.st_flags();
+    if flags & UF_HIDDEN != 0 {
+        return;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+    // SAFETY: a plain syscall on a NUL-terminated path that outlives it.
+    unsafe {
+        libc::chflags(c_path.as_ptr(), flags | UF_HIDDEN);
+    }
+}
+
+// Linux: there is no hidden attribute, but GNOME Files, KDE's Dolphin and other file managers leave out
+// the names listed in a folder's `.hidden` file - so each companion is listed there, once. (Unhiding is
+// never needed: nothing stops a write.) A file moved out of the folder simply shows again.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn set_hidden(path: &Path, hidden: bool) {
+    use std::io::Write;
+    if !hidden {
+        return;
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return };
+    if name.contains('\n') {
+        return;
+    }
+    let list = dir.join(".hidden");
+    let current = fs::read_to_string(&list).unwrap_or_default();
+    if current.lines().any(|line| line == name) {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&list) {
+        if !current.is_empty() && !current.ends_with('\n') {
+            let _ = file.write_all(b"\n");
+        }
+        let _ = writeln!(file, "{name}");
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn set_hidden(_path: &Path, _hidden: bool) {}
 
 // Puts a fully written temp file in place as the companion `dest` (write-then-rename, so a crash
@@ -275,6 +323,30 @@ mod tests {
         hide_sidecars_in(&dir);
         assert!(is_hidden(&old));
         assert!(!is_hidden(&dir.join("old.png")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_folders_hidden_list_names_each_companion_once() {
+        let dir = temp_dir("hidden_list");
+        let edits = sidecar_path(&dir.join("clip.mp4"), ".edits.json");
+        write_sidecar(&edits, "{\"a\":1}").unwrap();
+        write_sidecar(&edits, "{\"a\":2}").unwrap();
+        let tmp = sidecar_path(&edits, ".tmp");
+        fs::write(&tmp, "{\"a\":3}").unwrap();
+        commit_sidecar(&tmp, &edits).unwrap();
+        assert_eq!(fs::read_to_string(&edits).unwrap(), "{\"a\":3}");
+        // Older visible ones get listed by the start-up pass; ordinary files never are.
+        fs::write(dir.join("old.png"), b"png").unwrap();
+        fs::write(sidecar_path(&dir.join("old.png"), ".imageedit.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(sidecar_path(&dir.join("sub").join("v.mp4"), ".chapters.json"), "[]").unwrap();
+        hide_sidecars_in(&dir);
+        let mut listed: Vec<String> = fs::read_to_string(dir.join(".hidden")).unwrap().lines().map(String::from).collect();
+        listed.sort();
+        assert_eq!(listed, vec!["clip.mp4.edits.json".to_string(), "old.png.imageedit.json".to_string()]);
+        assert_eq!(fs::read_to_string(dir.join("sub").join(".hidden")).unwrap(), "v.mp4.chapters.json\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
