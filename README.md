@@ -524,12 +524,14 @@ Annotation, Files, and PDF Annotator:
 
 ## Platform support
 
-**Windows** is the supported platform: it has installers, and Briefcast bundles its own
+**Windows** is the best-tested platform: it has installers, and Briefcast bundles its own
 ffmpeg and the other tools it shells out to.
 
-**macOS and Linux** build and run from source; there are no installers yet. CI builds and
+**macOS and Linux** have installers too, from v0.1.5 (a universal .dmg; an .AppImage and a
+.deb), built by the release workflow - and they still build and run from source. CI builds and
 tests both on every push, and on Linux a real screen + microphone recording has been checked
-end to end (X11 capture with PulseAudio, Ubuntu 22.04). On these platforms Briefcast uses the
+end to end (X11 capture with PulseAudio, Ubuntu 22.04); the macOS code has not yet been run on
+real hardware. On these platforms Briefcast uses the
 ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
 startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet: the
 screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
