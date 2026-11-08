@@ -7,18 +7,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "nsis",
-      "msi"
-    ],
     "createUpdaterArtifacts": true,
     "resources": [
-      "binaries/ffmpeg/ffmpeg.exe",
-      "binaries/ffmpeg/ffprobe.exe",
-      "binaries/heif/*",
-      "binaries/whisper/*.exe",
-      "binaries/whisper/*.dll",
-      "binaries/rnnoise/*",
       "licenses/*"
     ],
     "icon": [

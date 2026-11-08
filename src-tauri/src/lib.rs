@@ -100,6 +100,8 @@ pub(crate) mod services {
     pub mod countdown;
     // "Start Briefcast when I sign in" - straight into the tray, no UI loaded.
     pub mod autostart;
+    // Is the system ffmpeg (macOS/Linux) new enough, with the encoders recordings need?
+    pub mod ffmpeg_check;
     pub mod trash;
     // The tray icon the closed window hides to - see the module's own comment.
     pub mod tray;
@@ -277,6 +279,8 @@ fn setup(app: &AppHandle) {
     services::responsiveness::start_ui_watchdog(app);
     #[cfg(target_os = "windows")]
     services::webview_recovery::install(app);
+    // ffmpeg version and encoders, checked once in the background; the UI asks for the result.
+    services::ffmpeg_check::warm(app);
     // A sign-in entry pointing at an executable an update has since moved is rewritten.
     std::thread::spawn(services::autostart::refresh);
     // After recovery is installed (create() attaches it to the new window itself). A `--tray`

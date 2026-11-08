@@ -35,14 +35,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      # tauri.conf.json's `bundle.resources` globs binaries/{ffmpeg,heif,whisper}/*, and
-      # tauri-build FAILS the build script outright when a resource glob matches nothing:
+      # tauri.windows.conf.json (merged on Windows only) bundles binaries/{ffmpeg,heif,whisper,
+      # rnnoise}, and tauri-build FAILS the build script outright when a resource matches nothing:
       #   "glob pattern binaries/ffmpeg/* path not found or didn't match any files"
       # Those binaries are gitignored (`binaries/*` in .gitignore), so a CI checkout never has
-      # them - which broke `cargo test` on every platform, inside the build script, before a
-      # single test compiled or ran. Nothing in CI bundles, so one placeholder file per folder is
-      # all the glob needs - named to match the exact files tauri.conf.json lists, not just its folders. The filename must NOT start with a dot, and `shell: bash` is explicit
-      # because windows-latest defaults to pwsh, where `mkdir -p` and `touch` don't exist.
+      # them. Nothing in CI bundles, so one placeholder per listed file is all it needs - named to
+      # match the exact files that config lists, not just its folders. The filename must NOT start
+      # with a dot, and `shell: bash` is explicit because windows-latest defaults to pwsh, where
+      # `mkdir -p` and `touch` don't exist. (macOS and Linux need none of this - see their jobs.)
       - name: Satisfy bundle.resources globs (binaries/ are gitignored)
         shell: bash
         run: |
@@ -101,12 +101,8 @@ jobs:
         run: |
           sudo apt-get install -y libheif-plugin-x265 || echo "libheif-plugin-x265 not available on this image"
           sudo apt-get install -y libheif-plugin-libde265 || echo "libheif-plugin-libde265 not available on this image"
-      # See the `rust` job's copy of this step for why it exists.
-      - name: Satisfy bundle.resources globs (binaries/ are gitignored)
-        shell: bash
-        run: |
-          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper binaries/rnnoise
-          touch binaries/ffmpeg/ffmpeg.exe binaries/ffmpeg/ffprobe.exe binaries/heif/placeholder             binaries/whisper/whisper-cli.exe binaries/whisper/placeholder.dll binaries/rnnoise/placeholder
+      # No placeholder binaries here: the Windows-only resources live in tauri.windows.conf.json,
+      # which Tauri merges on Windows only, so nothing on this platform expects them.
       - run: cargo test
 
   rust-macos:
@@ -127,10 +123,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - run: brew install libheif
-      # See the `rust` job's copy of this step for why it exists.
-      - name: Satisfy bundle.resources globs (binaries/ are gitignored)
-        shell: bash
-        run: |
-          mkdir -p binaries/ffmpeg binaries/heif binaries/whisper binaries/rnnoise
-          touch binaries/ffmpeg/ffmpeg.exe binaries/ffmpeg/ffprobe.exe binaries/heif/placeholder             binaries/whisper/whisper-cli.exe binaries/whisper/placeholder.dll binaries/rnnoise/placeholder
+      # No placeholder binaries here: the Windows-only resources live in tauri.windows.conf.json,
+      # which Tauri merges on Windows only, so nothing on this platform expects them.
       - run: cargo test

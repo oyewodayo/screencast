@@ -30,6 +30,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         services::countdown::is_recording_countdown_running,
         services::autostart::get_launch_at_login,
         services::autostart::set_launch_at_login,
+        services::ffmpeg_check::ffmpeg_status,
         services::telemetry::get_telemetry_settings,
         services::telemetry::set_telemetry_enabled,
         services::telemetry::dismiss_telemetry_notice,

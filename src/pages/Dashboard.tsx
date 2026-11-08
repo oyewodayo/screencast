@@ -2438,6 +2438,37 @@ const setScreen = () => {
 		});
 	}, [isRecording]);
 
+	// macOS and Linux use the system ffmpeg, which can be too old or built without the encoders
+	// recordings need (services/ffmpeg_check.rs). Say what to do - and check again each time this
+	// window comes back after a failed check, which is when someone has just installed a newer one in
+	// a terminal, so there is no button to find.
+	useEffect(() => {
+		let disposed = false;
+		let shown: string | null = null;
+		const check = async (recheck: boolean) => {
+			const status = await invoke<{ ok: boolean; version: string | null; problems: string[]; fix: string | null }>("ffmpeg_status", { recheck }).catch(() => null);
+			if (disposed || !status) return;
+			if (!status.ok) {
+				shown = [...status.problems, status.fix].filter(Boolean).join(" ");
+				setError(shown);
+			} else if (shown) {
+				// Fixed while Briefcast was open: take back only our own message.
+				const ours = shown;
+				shown = null;
+				setError((current) => (current === ours ? "" : current));
+				setMessage(`ffmpeg ${status.version ?? ""} found - recording and export are ready.`);
+			}
+		};
+		void check(false);
+		const unlisten = appWindow.onFocusChanged(({ payload: focused }) => {
+			if (focused && shown) void check(true);
+		});
+		return () => {
+			disposed = true;
+			void unlisten.then((fn) => fn());
+		};
+	}, []);
+
 	// One update check per launch, delayed so it never competes with startup work (device probes,
 	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
 	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);

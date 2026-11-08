@@ -516,25 +516,58 @@ Annotation, Files, and PDF Annotator:
 - **Global shortcuts can be taken by other apps.** If another running app already owns
   one of the global shortcuts above, Briefcast shows an error saying so and that
   shortcut won't work until the other app releases it.
-- **System audio capture** is Windows/WASAPI-only, and its start may lag the screen
-  capture's own start by up to roughly a hundred milliseconds, which can show up as a
-  small (sub-second) audio/video sync offset.
+- **System audio capture** uses WASAPI loopback on Windows, a PulseAudio monitor source on
+  Linux, and on macOS a virtual loopback device you install yourself (BlackHole, Loopback or
+  Soundflower - macOS has none built in). On Windows its start may lag the screen capture's
+  own start by up to roughly a hundred milliseconds, which can show up as a small
+  (sub-second) audio/video sync offset.
 
 ## Platform support
 
-Briefcast is Windows-only today. Screen/window capture (`gdigrab`/`dshow`), window and
-monitor enumeration, screenshot capture, and system-audio capture (WASAPI) are all
-implemented directly against the Win32 API, and only Windows FFmpeg binaries are
-bundled.
+**Windows** is the supported platform: it has installers, and Briefcast bundles its own
+ffmpeg and the other tools it shells out to.
+
+**macOS and Linux** build and run from source; there are no installers yet. CI builds and
+tests both on every push, and on Linux a real screen + microphone recording has been checked
+end to end (X11 capture with PulseAudio, Ubuntu 22.04). On these platforms Briefcast uses the
+ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
+startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet: the
+screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
+auto-zoom, the live preview while recording cameras only, USB phone transfer, and email
+through a desktop mail client. Linux screen capture needs X11 (or XWayland); under a pure
+Wayland session there is nothing to capture.
 
 ## Prerequisites
 
-- Windows 10 or 11 (64-bit)
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-- [Node.js](https://nodejs.org/) 18+ and npm
-- [Tauri's Windows prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites) (Microsoft C++ Build Tools, WebView2 — WebView2 ships with Windows 10/11 by default)
+All platforms:
 
-Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
+- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
+- [Node.js](https://nodejs.org/) 22 and npm
+
+**Windows** 10 or 11 (64-bit), with
+[Tauri's Windows prerequisites](https://v2.tauri.app/start/prerequisites/) (Microsoft C++
+Build Tools; WebView2 ships with Windows 10/11).
+
+**Linux** (Debian/Ubuntu package names; other distributions have equivalents):
+
+```bash
+sudo apt install build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev libgtk-3-dev   libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev   ffmpeg libheif-examples
+```
+
+- ffmpeg must be **5.1 or newer**. Ubuntu 22.04's is 4.4 - too old; Ubuntu 24.04 and
+  Debian 12 or newer are fine.
+- iPhone (HEIC) photos also need libheif's HEVC decoder. On Ubuntu 24.04 / Debian 13 or newer
+  it is a separate package, `libheif-plugin-libde265`; older releases include it.
+
+**macOS**: the Xcode command line tools (`xcode-select --install`), then
+`brew install ffmpeg libheif`.
+
+On macOS and Linux, skip the Windows binaries described below - nothing needs to be placed in
+`src-tauri/binaries/`. Those are bundled through `src-tauri/tauri.windows.conf.json`, which
+Tauri applies on Windows only. (The noise-removal model, `binaries/rnnoise/`, is among them, so
+"Remove noise" uses ffmpeg's built-in denoiser on macOS and Linux for now.)
+
+On Windows, Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
 `src-tauri/binaries/ffmpeg/` rather than requiring a system-wide install — but those
 binaries are gitignored (not committed to this repo, not even via Git LFS), so you need
 to place them yourself before the app can record, convert, or probe anything. HEIC/HEIF
@@ -552,11 +585,11 @@ cd screencast
 npm install
 ```
 
-Then download a Windows FFmpeg build (e.g. from
+On Windows, then download a Windows FFmpeg build (e.g. from
 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)) and copy `ffmpeg.exe`, `ffprobe.exe`,
 and `ffplay.exe` into `src-tauri/binaries/ffmpeg/`.
 
-HEIC/HEIF (iPhone photo) preview also needs two bundled binaries at
+On Windows, HEIC/HEIF (iPhone photo) preview also needs two bundled binaries at
 `src-tauri/binaries/heif/` — `heif-dec.exe` (full-resolution decode, for the single-image
 viewer and "Convert") and `heif-thumbnailer.exe` (fast small preview, for the image
 gallery grid) — alongside every DLL they depend on. Windows' own HEIC decoder (used
