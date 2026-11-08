@@ -846,52 +846,90 @@ pub async fn get_recording_preview_frame(
 // both exiting and writing for IDLE_GRACE is it considered hung. A hard cap still exists so this
 // can never wait forever on a pathological process.
 fn wait_for_ffmpeg_to_finalize(process: &mut Child, output_path: &Path) -> bool {
-    const POLL: Duration = Duration::from_millis(100);
+    let started = Instant::now();
+    // Both "is it still running" and "kill it" need the child mutably.
+    let process = std::cell::RefCell::new(process);
+    finalize_decision(
+        // Can't observe it any more counts as gone: nothing useful left to do.
+        || matches!(process.borrow_mut().try_wait(), Ok(None)),
+        || fs::metadata(output_path).map(|m| m.len()).ok(),
+        || {
+            let _ = process.borrow_mut().kill();
+        },
+        || started.elapsed(),
+        std::thread::sleep,
+        FINALIZE_TIMING,
+    )
+}
+
+struct FinalizeTiming {
+    poll: Duration,
     // No growth for this long, with the process still alive, means it is stuck rather than busy.
     // Matches the old flat timeout, which is a reasonable "it really isn't doing anything" bar.
-    const IDLE_GRACE: Duration = Duration::from_secs(2);
+    idle_grace: Duration,
     // Absolute ceiling, so a process that somehow keeps touching the file can't hold Stop open
     // indefinitely. Generous enough that only a genuinely stuck ffmpeg should ever reach it.
-    const HARD_CAP: Duration = Duration::from_secs(120);
+    hard_cap: Duration,
+}
 
-    let started = Instant::now();
-    let mut last_progress = Instant::now();
-    let mut last_size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+const FINALIZE_TIMING: FinalizeTiming = FinalizeTiming {
+    poll: Duration::from_millis(100),
+    idle_grace: Duration::from_secs(2),
+    hard_cap: Duration::from_secs(120),
+};
+
+// The decision loop behind wait_for_ffmpeg_to_finalize, with everything it touches in the outside
+// world passed in - the process, the file, the clock, the kill, the sleep. In production those are
+// real; in tests they are a simulated process and a clock that only moves when the loop sleeps.
+// That matters: this logic is about *time* ("no growth for two seconds"), and a test that measures
+// real time against a real process fails whenever the machine is busy enough to delay the process by
+// that same two seconds - which is exactly what loaded CI runners do. Returns whether it killed.
+fn finalize_decision(
+    mut alive: impl FnMut() -> bool,
+    mut size: impl FnMut() -> Option<u64>,
+    mut kill: impl FnMut(),
+    mut now: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    timing: FinalizeTiming,
+) -> bool {
+    let started = now();
+    let mut last_progress = started;
+    let mut last_size = size().unwrap_or(0);
 
     loop {
-        match process.try_wait() {
-            // Exited on its own - the file was finalized properly.
-            Ok(Some(_)) => return false,
-            Ok(None) => {}
-            // Can't observe it any more; nothing useful left to do here.
-            Err(_) => return false,
+        // Exited on its own - the file was finalized properly.
+        if !alive() {
+            return false;
         }
 
-        let size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(last_size);
-        if size != last_size {
-            last_size = size;
-            last_progress = Instant::now();
+        // An unreadable size counts as no change rather than as progress or as an error.
+        if let Some(current) = size() {
+            if current != last_size {
+                last_size = current;
+                last_progress = now();
+            }
         }
 
-        if started.elapsed() >= HARD_CAP {
+        let elapsed = now() - started;
+        if elapsed >= timing.hard_cap {
             warn!(
                 "ffmpeg still running {}s after being asked to stop, force-killing - the recording may be incomplete",
-                HARD_CAP.as_secs()
+                timing.hard_cap.as_secs()
             );
-            let _ = process.kill();
+            kill();
             return true;
         }
 
-        if last_progress.elapsed() >= IDLE_GRACE {
+        if now() - last_progress >= timing.idle_grace {
             warn!(
                 "ffmpeg stopped writing {}s ago but hasn't exited, force-killing - the recording may be incomplete",
-                IDLE_GRACE.as_secs()
+                timing.idle_grace.as_secs()
             );
-            let _ = process.kill();
+            kill();
             return true;
         }
 
-        std::thread::sleep(POLL);
+        sleep(timing.poll);
     }
 }
 
@@ -916,49 +954,26 @@ mod shutdown_tests {
         p
     }
 
-    // Waits (generously) until the stand-in process has actually started writing, as a real ffmpeg
-    // has by the time Stop is pressed. PowerShell alone can take seconds to start under a parallel
-    // `cargo test` - longer than IDLE_GRACE - which made these tests flaky, not the logic.
-    fn wait_until_writing(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+    // These two check the real wiring - Child::try_wait, Child::kill and the file's metadata - and
+    // nothing about timing. How the decision is made over time is in finalize_tests below, with a
+    // simulated clock: a real process paced against a real clock fails whenever a busy machine
+    // delays it by the two-second idle grace (both "starts and exits promptly" and "keeps writing"
+    // did, under load, before they were rewritten this way).
 
     #[test]
-    fn a_process_that_exits_promptly_is_not_killed() {
+    fn a_process_that_has_already_exited_is_not_killed() {
         let path = temp("quick");
         fs::write(&path, b"done").unwrap();
-        // cmd starts in milliseconds, unlike PowerShell - "exits promptly" is then really prompt.
         let mut child = Command::new("cmd").args(["/C", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn cmd");
+        // Let it finish first, however long a busy machine takes: the function then sees an exited
+        // process, whatever the scheduler did.
+        child.wait().expect("wait for cmd");
         assert!(!wait_for_ffmpeg_to_finalize(&mut child, &path));
         let _ = fs::remove_file(&path);
     }
 
-    // The regression this whole change exists for: ffmpeg still writing when the old flat
-    // two-second timeout would have expired must be left alone, not killed mid-write.
-    #[test]
-    fn a_slow_but_still_writing_process_is_left_alone() {
-        let path = temp("writing");
-        fs::write(&path, b"").unwrap();
-        let script = format!(
-            "1..24 | ForEach-Object {{ Add-Content -LiteralPath '{}' -Value 'x'; Start-Sleep -Milliseconds 200 }}",
-            path.display()
-        );
-        let mut child = ps(&script);
-        wait_until_writing(&path);
-        let started = Instant::now();
-        let killed = wait_for_ffmpeg_to_finalize(&mut child, &path);
-        assert!(!killed, "a process still growing the output file must not be force-killed");
-        assert!(
-            started.elapsed() >= Duration::from_secs(3),
-            "should have waited out the writes rather than giving up at the old 2s mark"
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    // The other half: alive but doing nothing is exactly what the kill is for.
+    // Alive but doing nothing is exactly what the kill is for. Load can only make this later, never
+    // wrong: a stalled process still counts as stalled, and the bound below is generous.
     #[test]
     fn a_hung_process_is_killed_after_the_idle_grace() {
         let path = temp("hung");
@@ -972,6 +987,94 @@ mod shutdown_tests {
         );
         let _ = child.wait();
         let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // A simulated process and clock. Time moves only when the loop sleeps, so these run instantly and
+    // a loaded machine cannot disturb them. `alive_until`: when the process exits (None: never).
+    // `size_at`: the output file's size at a given moment.
+    struct Run {
+        killed: bool,
+        ended_at: Duration,
+        decision: bool,
+    }
+
+    fn run(alive_until: Option<Duration>, size_at: impl Fn(Duration) -> Option<u64>) -> Run {
+        let clock = Cell::new(Duration::ZERO);
+        let killed = Cell::new(false);
+        let decision = finalize_decision(
+            || alive_until.is_none_or(|t| clock.get() < t),
+            || size_at(clock.get()),
+            || killed.set(true),
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+            FINALIZE_TIMING,
+        );
+        Run { killed: killed.get(), ended_at: clock.get(), decision }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_process_that_has_already_exited_is_never_killed() {
+        let r = run(Some(Duration::ZERO), |_| Some(4));
+        assert!(!r.decision && !r.killed);
+        assert_eq!(r.ended_at, Duration::ZERO);
+    }
+
+    // The regression this logic exists for: ffmpeg still writing when the old flat two-second
+    // timeout would have expired must be left alone, not killed mid-write.
+    #[test]
+    fn a_slow_but_still_writing_process_is_left_alone() {
+        // One byte every 200ms for 4.8s, then it finalizes and exits at 5.0s.
+        let r = run(Some(ms(5_000)), |t| Some((t.as_millis() as u64 / 200).min(24)));
+        assert!(!r.decision && !r.killed, "a process still growing the output file must not be force-killed");
+        assert!(r.ended_at >= Duration::from_secs(3), "should have waited out the writes, not given up at the old 2s mark");
+    }
+
+    #[test]
+    fn a_process_that_stops_writing_is_killed_after_the_idle_grace() {
+        let r = run(None, |_| Some(7));
+        assert!(r.decision && r.killed);
+        assert!(r.ended_at >= FINALIZE_TIMING.idle_grace, "must give it the whole grace period");
+        assert!(r.ended_at < FINALIZE_TIMING.idle_grace + FINALIZE_TIMING.poll * 3, "and not much longer");
+    }
+
+    #[test]
+    fn a_stall_shorter_than_the_grace_does_not_count() {
+        // Grows in bursts with a pause between them, repeatedly, then exits: a pause of 1.5s, then
+        // one of 1.9s - both under the two-second grace - must never be mistaken for a hang.
+        let r = run(Some(Duration::from_secs(10)), |t| Some(t.as_millis() as u64 / 1_500));
+        assert!(!r.decision && !r.killed);
+        let r = run(Some(Duration::from_secs(10)), |t| Some(t.as_millis() as u64 / 1_900));
+        assert!(!r.decision && !r.killed);
+    }
+
+    #[test]
+    fn a_process_that_never_stops_touching_the_file_is_killed_at_the_hard_cap() {
+        let r = run(None, |t| Some(t.as_millis() as u64 / 50));
+        assert!(r.decision && r.killed);
+        assert!(r.ended_at >= FINALIZE_TIMING.hard_cap && r.ended_at < FINALIZE_TIMING.hard_cap + FINALIZE_TIMING.poll * 3);
+    }
+
+    #[test]
+    fn an_unreadable_file_counts_as_no_progress_not_as_an_error() {
+        let r = run(None, |_| None);
+        assert!(r.decision && r.killed, "alive and unobservable output is treated like a stall");
+    }
+
+    #[test]
+    fn growth_after_an_unreadable_moment_resets_the_clock() {
+        // Unreadable for the first 1.5s, then readable and growing steadily until it exits.
+        let r = run(Some(Duration::from_secs(6)), |t| (t > ms(1_500)).then(|| t.as_millis() as u64 / 100));
+        assert!(!r.decision && !r.killed);
     }
 }
 

@@ -10777,11 +10777,17 @@ mod tests {
                 "heif-enc not found - install libheif's example tools to run this test locally \
                  (see heic_unix.rs's own doc comment for the exact package per OS)",
             );
-        assert!(
-            encode.status.success(),
-            "heif-enc failed: {}",
-            String::from_utf8_lossy(&encode.stderr)
-        );
+        // Making the input needs an HEVC *encoder*, which is a separate plugin on newer
+        // distributions (Ubuntu: libheif-plugin-x265) and absent from a bare libheif-examples. That
+        // is a missing tool, not a decode bug - this test is about decoding - so it says so and
+        // stops instead of failing. CI installs the plugin, so there it still runs.
+        let encode_error = String::from_utf8_lossy(&encode.stderr).to_string();
+        if !encode.status.success() && encode_error.contains("No HEVC encoder") {
+            eprintln!("SKIPPED heic_unix round trip: heif-enc has no HEVC encoder here ({})", encode_error.trim());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(encode.status.success(), "heif-enc failed: {}", encode_error);
         assert!(heic_path.exists(), "heif-enc produced no output file");
 
         let decoded_png = dir.join("decoded.png");
