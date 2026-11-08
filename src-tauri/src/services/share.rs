@@ -1,5 +1,9 @@
 // services/share.rs
 //
+// Windows has all of it (the share sheet, Simple MAPI, the clipboard); macOS and Linux do what their
+// systems offer (the unix module): links, the clipboard as text and as files, Mail / xdg-email with the
+// file attached, and the chat apps that are installed. No share sheet there - share_capabilities says so.
+//
 // Getting an exported document out of Briefcast and in front of other people, without the user
 // having to go and find the file first. The frontend (DocShareDialog.tsx) exports into a staging
 // folder (share_staging_path) and then hands that file to one of:
@@ -92,8 +96,7 @@ pub fn share_capabilities(schemes: Vec<String>) -> ShareCapabilities {
     }
     #[cfg(not(windows))]
     {
-        let _ = schemes;
-        ShareCapabilities { native_share: false, mail_client: None, apps: Vec::new() }
+        ShareCapabilities { native_share: false, mail_client: unix::mail_client_name(), apps: schemes.into_iter().filter(|s| unix::protocol_handled(s)).collect() }
     }
 }
 
@@ -112,13 +115,9 @@ pub fn open_share_url(url: String) -> Result<(), String> {
     {
         win::shell_open(&url)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(windows))]
     {
-        std::process::Command::new("open").arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open").arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
+        unix::shell_open(&url)
     }
 }
 
@@ -132,8 +131,7 @@ pub fn copy_file_to_clipboard(path: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = file;
-        Err("Copying files to the clipboard is only available on Windows".to_string())
+        unix::copy_file(&file)
     }
 }
 
@@ -147,7 +145,7 @@ pub(crate) fn clipboard_text() -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        None
+        unix::clipboard_text()
     }
 }
 
@@ -159,8 +157,7 @@ pub(crate) fn set_clipboard_text(text: &str) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = text;
-        Err("The clipboard is only available on Windows".to_string())
+        unix::set_clipboard_text(text)
     }
 }
 
@@ -178,7 +175,7 @@ pub(crate) fn open_web_link(url: &str) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("Opening links is only available on Windows".to_string())
+        unix::shell_open(url)
     }
 }
 
@@ -192,7 +189,7 @@ pub fn clipboard_file_paths() -> Vec<String> {
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        unix::clipboard_files()
     }
 }
 
@@ -242,14 +239,13 @@ pub async fn share_file_native(window: tauri::WebviewWindow, path: String, title
     #[cfg(not(windows))]
     {
         let _ = (window, file, title, description);
-        Err("The share sheet is only available on Windows".to_string())
+        Err("This system has no share sheet - use Email, Copy file or one of the apps instead".to_string())
     }
 }
 
 // Simple MAPI (the Windows mail path) is what reports Opened / Cancelled.
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub enum EmailOutcome {
     /// The mail client's compose window opened with the file attached.
     Opened,
@@ -277,8 +273,167 @@ pub async fn email_file(path: String, subject: String, body: String, to: Vec<Str
     }
     #[cfg(not(windows))]
     {
-        let _ = (file, subject, body, to);
-        Ok(EmailOutcome::Unavailable)
+        unix::email(&file, &subject, &body, &to)
+    }
+}
+
+// macOS and Linux. Everything that talks to the system is a command or the clipboard crate; the
+// frontend only ever sees the same answers the Windows code gives.
+#[cfg(not(windows))]
+mod unix {
+    use super::EmailOutcome;
+    use crate::services::utility::find_on_path;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    // One clipboard for the whole process: on X11 and Wayland the data lives in the process that set it,
+    // so a copy made with a handle that is then dropped would be gone before anything could paste it.
+    fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, String> {
+        static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+        let mut guard = CLIPBOARD.get_or_init(|| Mutex::new(None)).lock().map_err(|_| "The clipboard is busy".to_string())?;
+        if guard.is_none() {
+            *guard = Some(arboard::Clipboard::new().map_err(|e| format!("Couldn't reach the clipboard: {e}"))?);
+        }
+        f(guard.as_mut().expect("just set")).map_err(|e| e.to_string())
+    }
+
+    pub fn clipboard_text() -> Option<String> {
+        with_clipboard(|c| c.get_text()).ok()
+    }
+
+    pub fn set_clipboard_text(text: &str) -> Result<(), String> {
+        with_clipboard(|c| c.set_text(text.to_string()))
+    }
+
+    // Files copied in Finder / the file manager.
+    pub fn clipboard_files() -> Vec<String> {
+        with_clipboard(|c| c.get().file_list()).map(|files| files.into_iter().map(|p| p.to_string_lossy().to_string()).collect()).unwrap_or_default()
+    }
+
+    // The file itself on the clipboard, so Cmd/Ctrl+V drops it into a chat, a mail compose window or a folder.
+    pub fn copy_file(path: &Path) -> Result<(), String> {
+        with_clipboard(|c| c.set().file_list(&[path]))
+    }
+
+    // A link, in whatever the system opens it with.
+    pub fn shell_open(url: &str) -> Result<(), String> {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let program = find_on_path(opener).ok_or_else(|| format!("{opener} was not found, so the link can't be opened"))?;
+        Command::new(program).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    // Whether the app behind a chat link is installed, so the dialog offers it. macOS: the app by name
+    // (`open -Ra` only asks). Linux: whatever is registered for the URL scheme.
+    pub fn protocol_handled(scheme: &str) -> bool {
+        if cfg!(target_os = "macos") {
+            let app = match scheme {
+                "whatsapp" => "WhatsApp",
+                "tg" => "Telegram",
+                "slack" => "Slack",
+                "msteams" => "Microsoft Teams",
+                "discord" => "Discord",
+                "skype" => "Skype",
+                _ => return false,
+            };
+            let Some(open) = find_on_path("open") else { return false };
+            Command::new(open).args(["-Ra", app]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+        } else {
+            default_handler(&format!("x-scheme-handler/{scheme}")).is_some()
+        }
+    }
+
+    // The desktop file registered for a MIME type (Linux).
+    fn default_handler(mime: &str) -> Option<String> {
+        let xdg = find_on_path("xdg-mime")?;
+        let out = Command::new(xdg).args(["query", "default", mime]).stderr(Stdio::null()).output().ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    // "org.mozilla.Thunderbird.desktop" -> "Thunderbird".
+    fn friendly_name(desktop_file: &str) -> String {
+        let stem = desktop_file.trim_end_matches(".desktop");
+        let last = stem.rsplit('.').next().unwrap_or(stem);
+        let mut chars = last.chars();
+        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_else(|| stem.to_string())
+    }
+
+    // The mail app that "Email" opens with the file attached: Mail on a Mac, the desktop's mail client
+    // through xdg-email on Linux. None when there isn't one - the dialog then uses web mail or mailto.
+    pub fn mail_client_name() -> Option<String> {
+        if cfg!(target_os = "macos") {
+            ["/System/Applications/Mail.app", "/Applications/Mail.app"].iter().any(|p| Path::new(p).exists()).then(|| "Mail".to_string())
+        } else {
+            find_on_path("xdg-email")?;
+            default_handler("x-scheme-handler/mailto").map(|d| friendly_name(&d))
+        }
+    }
+
+    // A new message with the file attached. The client's compose window can't be watched from here the
+    // way Simple MAPI's can, so it is only ever "opened".
+    pub fn email(file: &Path, subject: &str, body: &str, to: &[String]) -> Result<EmailOutcome, String> {
+        if cfg!(target_os = "macos") {
+            let Some(osascript) = find_on_path("osascript") else { return Ok(EmailOutcome::Unavailable) };
+            if mail_client_name().is_none() {
+                return Ok(EmailOutcome::Unavailable);
+            }
+            // The text goes in as arguments, never into the script itself.
+            const SCRIPT: &str = r#"on run argv
+  set theSubject to item 1 of argv
+  set theBody to item 2 of argv
+  set theFile to item 3 of argv
+  tell application "Mail"
+    set m to make new outgoing message with properties {subject:theSubject, content:theBody, visible:true}
+    tell m
+      repeat with i from 4 to count of argv
+        make new to recipient at end of to recipients with properties {address:(item i of argv)}
+      end repeat
+      tell content to make new attachment with properties {file name:(POSIX file theFile)} at after the last paragraph
+    end tell
+    activate
+  end tell
+end run"#;
+            let out = Command::new(osascript).args(["-e", SCRIPT, "--", subject, body]).arg(file).args(to).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(EmailOutcome::Opened)
+            } else {
+                Err(format!("Mail couldn't start the message: {}", String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        } else {
+            let Some(xdg_email) = find_on_path("xdg-email") else { return Ok(EmailOutcome::Unavailable) };
+            let out = Command::new(xdg_email)
+                .args(["--subject", subject, "--body", body, "--attach"])
+                .arg(file)
+                .args(to)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(EmailOutcome::Opened)
+            } else {
+                Ok(EmailOutcome::Unavailable)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_desktop_file_becomes_a_name() {
+            assert_eq!(friendly_name("org.mozilla.Thunderbird.desktop"), "Thunderbird");
+            assert_eq!(friendly_name("evolution.desktop"), "Evolution");
+            assert_eq!(friendly_name("kmail"), "Kmail");
+        }
+
+        #[test]
+        fn unknown_chat_apps_are_not_offered_on_a_mac() {
+            if cfg!(target_os = "macos") {
+                assert!(!protocol_handled("not-a-real-scheme"));
+            }
+        }
     }
 }
 

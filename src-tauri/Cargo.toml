@@ -108,6 +108,9 @@ blur-track = { path = "crates/blur-track" }
 # Background removal (services/background_removal.rs): ONNX Runtime loaded at run time from the
 # engine downloaded on first use - nothing is linked or bundled at build time.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "directml", "api-24"] }
+# Unpacks that engine's wheel on every system (a wheel is a zip; Windows' tar.exe reads one, GNU tar
+# doesn't). Already in the build through the updater.
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Win32 bindings â€” only meaningful (and only compilable) on Windows. Unconditional before this,
 # which meant `cargo build` couldn't even start on macOS/Linux regardless of how much of the
@@ -129,6 +132,12 @@ windows-core = "0.62.2"
 # no libX11/libxcb .so needed at build or run time) â€” the closest Linux analog to using the
 # `windows` crate for direct Win32 access above. Only the extensions actually used are enabled:
 # randr for monitor geometry, composite for window screenshot capture.
+# The clipboard on macOS and Linux (services/share.rs): text, and the files copied in Finder / a file
+# manager. Windows has its own (win::), which also does what this crate can't there. Wayland's
+# clipboard needs the data-control protocol; X11 and macOS need nothing extra.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["randr", "composite"] }
 # Backs services/orphan_guard.rs's PR_SET_PDEATHSIG, which is how a recording's ffmpeg child is
