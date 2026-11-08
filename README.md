@@ -533,7 +533,10 @@ tests both on every push, and on Linux a real screen + microphone recording has 
 end to end (X11 capture with PulseAudio, Ubuntu 22.04); the macOS code has not yet been run on
 real hardware. On these platforms Briefcast uses the
 ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
-startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet: the
+startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet:
+offline captions and what depends on them (editing by transcript, filler-word removal: the
+whisper.cpp engine, `binaries/whisper`, is bundled in the Windows installer only), the "remove
+noise" mode (its RNNoise model, `binaries/rnnoise`, is too), the
 screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
 auto-zoom, the live preview while recording cameras only, USB phone transfer, and email
 through a desktop mail client. Linux screen capture needs X11 (or XWayland); under a pure
