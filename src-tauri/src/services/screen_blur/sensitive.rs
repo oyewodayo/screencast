@@ -9,6 +9,11 @@
 //     '=', ends its line (a form label above its field), or sits on a short form-like line.
 //   - The user's own keywords.
 // Over-blurring a word is cheap; missing a key is not - when in doubt, blur.
+//
+// Only Windows' OCR feeds this, but TextRules is part of the configure command's input on every
+// platform, so the module compiles everywhere (and its tests run everywhere).
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 use regex::Regex;
 use std::sync::OnceLock;
 

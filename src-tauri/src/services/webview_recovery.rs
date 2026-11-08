@@ -70,10 +70,17 @@ fn schedule_refresh(app: &AppHandle, reason: &'static str, delays: &'static [Dur
 pub fn install(app: &AppHandle) {
     log::info!("[webview-recovery] installing for {} window(s)", app.webview_windows().len());
     for window in app.webview_windows().values() {
-        watch_process_failures(app, window);
-        watch_restore(app, window);
+        attach(app, window);
     }
     start_resume_watch(app);
+}
+
+/// Crash and restore recovery for one window. `install` covers the windows that exist at startup;
+/// a window built later (the main window, rebuilt after being released to the tray - see
+/// services/main_window.rs) is attached as it is created.
+pub fn attach(app: &AppHandle, window: &tauri::WebviewWindow) {
+    watch_process_failures(app, window);
+    watch_restore(app, window);
 }
 
 fn start_resume_watch(app: &AppHandle) {

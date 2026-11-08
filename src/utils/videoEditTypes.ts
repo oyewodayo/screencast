@@ -23,6 +23,9 @@ import type { OverlayAsset } from "./videoAssets";
 import type { TextRevealSettings } from "./textReveal";
 import type { ImageRevealSettings } from "./imageReveal";
 import type { ScreenStyle } from "./screenStyle";
+import type { CutSounds } from "./cutSounds";
+import type { CanvasFormat } from "./canvasFormats";
+import type { SplitMember } from "./splitLayouts";
 import type { PointerStyle } from "./pointerTrack";
 import type { KeystrokeStyle } from "./keystrokes";
 import type { SpriteTrackSpec } from "./spriteTrack";
@@ -204,6 +207,31 @@ export interface ClipTransitionIn {
                      // produce an invalid ffmpeg offset.
 }
 
+// The video's intro and outro: a transition in from black over its first seconds, and out to black
+// over its last. They belong to the video rather than to a clip - so they stay at its edges whatever
+// the clip order, and a single clip can have them. Export: edge_transition_graph (conversion.rs);
+// preview: EdgeTransitionPreviewLayer. Both draw them with the same machinery as a cut between
+// clips, black standing in for the other picture.
+export interface EdgeTransitions {
+  intro?: ClipTransitionIn;
+  outro?: ClipTransitionIn;
+  // Their cut sounds (cutSounds.ts) when not the automatic one: a sound id, or null for none.
+  sounds?: { intro?: string | null; outro?: string | null };
+}
+export type TransitionEdge = "intro" | "outro";
+
+// Each edge's window in output seconds, for a video `total` seconds long - the same clamp as
+// edge_windows (conversion.rs): alone, at most 90% of the video; with both, 45% each, so they never
+// overlap. null = none.
+export function edgeTransitionWindows(edges: EdgeTransitions | undefined, total: number): { intro: number | null; outro: number | null } {
+  const want = (t: ClipTransitionIn | undefined) => (t && Number.isFinite(t.duration) && t.duration > 0 ? t.duration : null);
+  const intro = want(edges?.intro);
+  const outro = want(edges?.outro);
+  const share = intro !== null && outro !== null ? 0.45 : 0.9;
+  const fit = (d: number) => Math.max(0.05, Math.min(d, Math.max(0, total) * share));
+  return { intro: intro === null ? null : fit(intro), outro: outro === null ? null : fit(outro) };
+}
+
 export interface Clip {
   id: string;
   sourcePath: string;
@@ -223,6 +251,10 @@ export interface Clip {
   speedRamp?: ClipSpeedRamp;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
+  // The sound on the cut INTO this clip (cutSounds.ts), when the video has cut sounds on: a sound
+  // id picked for this cut, null for none here; undefined = the automatic one. Belongs to the cut
+  // the way transitionIn does, so it moves with it.
+  cutSound?: string | null;
   crop?: ClipCrop;
   // Horizontal mirror of the clip's own frame - applied first, before crop/Ken Burns, in both the
   // live preview (VideoPlayer's CSS transform) and export (conversion.rs's segment_effect_chain),
@@ -485,6 +517,8 @@ export interface ImageOverlay {
   track?: OverlayTrackInfo;
   // Only this part of the picture shows (layerMask.ts) - in the box's own space.
   mask?: LayerMask;
+  // One cell (or the backdrop) of a split screen, which can be rearranged as a whole (splitGroups.ts).
+  split?: SplitMember;
   // The visible sub-rectangle of the source picture, set via the dedicated Crop mode
   // (ImageOverlayCropPanel.tsx) - fractions of the SOURCE IMAGE's own natural pixel dimensions,
   // unlike every other field on this type (all normalized against the video frame instead). All
@@ -678,6 +712,8 @@ export interface PipOverlay {
   // A webcam bubble lifted off the main recording it was baked into (webcamBubble.ts): `sourcePath`
   // is that recording, `crop` the bubble, and the layer sits exactly over it.
   bakedBubble?: boolean;
+  // One cell of a split screen, which can be rearranged as a whole (splitGroups.ts).
+  split?: SplitMember;
   createdAt: number;
   updatedAt: number;
 }
@@ -730,6 +766,8 @@ export interface AdjustmentLayer {
   // A solid colour ("#rrggbb") instead of the adjusted picture - with a region, what masks the
   // main video: the area (or, inverted, everything around it) shows this colour.
   fill?: string;
+  // A split screen's backdrop - its gap colour, beneath its cells (splitGroups.ts).
+  split?: SplitMember;
   createdAt: number;
   updatedAt: number;
 }
@@ -860,9 +898,16 @@ export interface VideoEditState {
   screenStyle?: ScreenStyle | null;
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
+  // The shape and size the edit is made in and exported at (canvasFormats.ts); undefined/null =
+  // the open video's own.
+  canvas?: CanvasFormat | null;
   // Motion-graphics scenes (Stage - src/utils/stage): elements moving through beats, drawn over the
   // video and its tracks, beneath blur regions, pictures and text. Undefined = none.
   scenes?: StageScene[];
+  // The video's intro / outro (EdgeTransitions). Undefined = neither.
+  edgeTransitions?: EdgeTransitions;
+  // Sound on every cut (cutSounds.ts). Undefined = off.
+  cutSounds?: CutSounds;
   updatedAt: string;
 }
 
@@ -888,6 +933,9 @@ export interface EditableFields {
   pointerStyle?: Partial<PointerStyle>;
   keystrokeStyle?: Partial<KeystrokeStyle>;
   scenes?: StageScene[];
+  canvas?: CanvasFormat | null;
+  edgeTransitions?: EdgeTransitions;
+  cutSounds?: CutSounds;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -941,6 +989,10 @@ export interface VideoEditCommand {
     | "edit-video-tracks"
     | "find-hide"
     | "edit-screen-style"
+    | "edit-canvas"
+    | "edit-edge-transition"
+    | "edit-cut-sounds"
+    | "edit-split"
     | "add-scene"
     | "edit-scene"
     | "delete-scene";

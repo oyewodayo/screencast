@@ -31,7 +31,7 @@ import {
 import { createKeyboardHandler } from '../handlers/keyboardHandlers';
 import Dropdown from './custom/Dropdown';
 import { FrameRect, computeLetterboxRect } from '../utils/videoFrameRect';
-import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
+import { ActiveClipEffects, clipFrameAffine, cssFilterForColorPreset, insetFraming, isIdentityAffine, playerFraming, vignetteBackground } from '../utils/videoColorFilters';
 import { CaptionSettings, ClipCrop, hasAudioCleanup } from '../utils/videoEditTypes';
 import { isNeutralFx, type AudioFx } from '../utils/audioFx';
 import { createTrackFxNode, loadTrackFxModule, loadWorkletModule, masterInput, mixerContext, resumeMixer, setListenLevel, setNodeFx, useTimelineMuted } from '../utils/mixerGraph';
@@ -39,6 +39,7 @@ import { SubtitleCue, buildCaptionLines, cuesToCaptionWords, parseSubtitleFile }
 import { loadPlayerCaptionSettings, savePlayerCaptionSettings } from '../utils/playerCaptionSettings';
 import CaptionOverlayLayer from './video/CaptionOverlayLayer';
 import GradeCanvas from './video/GradeCanvas';
+import BlurBackdrop from './video/BlurBackdrop';
 import { speedAtSource } from '../utils/clipTiming';
 import ThumbnailPicker, { ScrubSpriteMeta, ThumbnailChoice } from './video/ThumbnailPicker';
 import { getPlayableUrl, isPictureless } from '../utils/playableVideo';
@@ -137,6 +138,7 @@ interface KeyboardHandlerActions {
   toggleShortcutsOverlay: () => void;
   playPrevious?: () => void;
   playNext?: () => void;
+  toggleEditor?: () => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -239,6 +241,9 @@ interface VideoPlayerProps {
   // drawn inside it instead of filling the frame, the frame's wallpaper drawn around it by the
   // caller. Null/undefined: the picture fills the frame.
   contentInset?: { x: number; y: number; width: number; height: number } | null;
+  // "blur": a canvas's Blur background (canvasFormats.ts) - around a clip that doesn't fill the
+  // frame, a blurred copy of it instead of black, as export draws it (frame_fit_blur_chain).
+  frameBackground?: "blur" | null;
 }
 
 // Imperative handle so a caller (Dashboard, for the video-tools timeline's playhead) can seek
@@ -332,7 +337,7 @@ const withPlayerNoise = (fx: ActiveClipEffects | null, noise: PlayerNoise): Acti
   return { ...base, noiseReduction: noise.strength, audioCleanup: { ...base.audioCleanup, mode: noise.mode } };
 };
 
-const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo, editTimeline = null }, ref) => {
+const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src, autoPlay = true, filePath, initialTime, loop = false, onTimeUpdate, onEnded, onPlayStateChange, autoplayNext, onAutoplayNextChange, overlay, trackVolume = 1, trackMuted = false, trackFx, meterTrack = false, activeClipEffects = null, gradeLut = null, onNoiseReductionStatusChange, onPrevious, onNext, controlsLeading, onSidebarPanelChange, contentInset = null, onEditVideo, isEditingVideo, editTimeline = null, frameBackground = null }, ref) => {
   // While loadSource is switching files: whether to play once there. Play/pause pressed meanwhile
   // (togglePauseAndPlay) changes it - the timeline's Play-from-the-end seeks and then plays.
   const loadPlayIntentRef = useRef<boolean | null>(null);
@@ -347,6 +352,10 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   };
   const contentInsetRef = useRef(contentInset);
   contentInsetRef.current = contentInset;
+  // The Blur background's layer (blurInnerRef - moved by the clip's crop / Ken Burns with the
+  // picture) and the small canvas the current frame is drawn into, blurred by CSS.
+  const blurInnerRef = useRef<HTMLDivElement>(null);
+  const blurCanvasRef = useRef<HTMLCanvasElement>(null);
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   // Mirrors the activeClipEffects prop into a ref, kept fresh every render, so applyCropAndKenBurns
@@ -473,6 +482,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // Fresh every render so the keyboard handler (bound once per mediaType) never calls a stale one.
   const onPreviousRef = useRef(onPrevious);
   onPreviousRef.current = onPrevious;
+  const onEditVideoRef = useRef(onEditVideo);
+  onEditVideoRef.current = onEditVideo;
   const onNextRef = useRef(onNext);
   onNextRef.current = onNext;
   const onNoiseReductionStatusChangeRef = useRef<VideoPlayerProps['onNoiseReductionStatusChange']>(undefined);
@@ -488,15 +499,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // reduction is never used at all this session. 48kHz because RNNoise ("Remove" mode) only works
   // at that rate - the media element source is resampled into it automatically.
   useEffect(() => {
-    // The mixer's own context (48kHz too), shared with every track so they all reach one master bus -
-    // it outlives this player, so unmounting only lets go of this element's nodes.
-    const ctx = mixerContext();
-    noiseCtxRef.current = ctx;
-    noiseWorkletReadyRef.current = loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
-      .catch((err) => {
-        console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
-        throw err;
-      });
+    noiseGraphUnmountedRef.current = false;
     return () => {
       noiseGraphUnmountedRef.current = true;
       mediaSourceRef.current?.source.disconnect();
@@ -535,6 +538,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     video.style.transformOrigin = framing.transform ? '0 0' : '';
     video.style.transform = framing.transform;
     video.style.clipPath = framing.clipPath;
+    // The Blur background is part of the frame the clip was fitted into, so crop / Ken Burns /
+    // mirror move it too (export fits first, then crops - frame_fit_blur_chain before crop_chain).
+    const blurInner = blurInnerRef.current;
+    if (blurInner) {
+      blurInner.style.transformOrigin = '0 0';
+      blurInner.style.transform = isIdentityAffine(m) ? '' : `matrix(${m.ax}, 0, 0, ${m.ay}, ${blurInner.clientWidth * m.bx}, ${blurInner.clientHeight * m.by})`;
+    }
   };
 
   useImperativeHandle(ref, () => ({
@@ -812,14 +822,27 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
 
   // Time and skip state
-  const [currentTimeElement, setCurrentTimeElement] = useState<string>("0:00");
-  const [totalTimeElement, setTotalTimeElement] = useState<string | null>(null);
+  const [currentTimeElement, setCurrentTimeElementState] = useState<string>("0:00");
+  const [totalTimeElement, setTotalTimeElementState] = useState<string | null>(null);
+  const lastCurrentTimeTextRef = useRef<string>("0:00");
+  const lastTotalTimeTextRef = useRef<string | null>(null);
+  const setCurrentTimeElement = (next: string) => {
+    if (lastCurrentTimeTextRef.current === next) return;
+    lastCurrentTimeTextRef.current = next;
+    setCurrentTimeElementState(next);
+  };
+  const setTotalTimeElement = (next: string | null) => {
+    if (lastTotalTimeTextRef.current === next) return;
+    lastTotalTimeTextRef.current = next;
+    setTotalTimeElementState(next);
+  };
   const [currentSkipTime, setCurrentSkipTime] = useState<number>(30);
 
   // Scrub-bar hover-preview sprite (see handleTimelineHover) - null until the backend finishes
   // generating it, or permanently for a file it can't be built for (audio/image, or ffmpeg
   // failure), in which case hovering the timeline just shows no preview.
   const [scrubSprite, setScrubSprite] = useState<ScrubSpriteMeta | null>(null);
+  const scrubSpriteRequestedForRef = useRef<string | null>(null);
   const previewWrapRef = useRef<HTMLDivElement>(null);
   // Audio's own equivalent of the video scrub-sprite above - a real decoded waveform (see
   // utils/audioWaveform.ts) drawn onto the timeline itself, since there's no video frame to show a
@@ -889,9 +912,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // error to the user.
   useEffect(() => {
     setScrubSprite(null); // clear the previous file's sprite immediately, don't show a stale one
-    if (mediaType !== 'video' || !filePath) return;
+    scrubSpriteRequestedForRef.current = null;
+  }, [mediaType, filePath]);
 
-    let cancelled = false;
+  const ensureScrubSprite = (): void => {
+    if (mediaType !== 'video' || !filePath || editTimelineRef.current) return;
+    if (scrubSpriteRequestedForRef.current === filePath) return;
+    const requestedPath = filePath;
+    scrubSpriteRequestedForRef.current = requestedPath;
     invoke<{
       spritePath: string;
       columns: number;
@@ -900,9 +928,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       tileHeight: number;
       count: number;
       interval: number;
-    }>('get_video_scrub_sprite', { inputPath: filePath })
+    }>('get_video_scrub_sprite', { inputPath: requestedPath })
       .then((sprite) => {
-        if (cancelled) return;
+        if (scrubSpriteRequestedForRef.current !== requestedPath) return;
         setScrubSprite({
           url: convertFileSrc(sprite.spritePath),
           columns: sprite.columns,
@@ -916,11 +944,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       .catch((err) => {
         console.warn('Scrub-bar preview unavailable for this file:', err);
       });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [mediaType, filePath]);
+  };
 
   // Audio's counterpart to the effect above - decodes the whole file's peak amplitudes (see
   // utils/audioWaveform.ts) as soon as an audio file opens, drawn onto the timeline once ready by
@@ -955,8 +979,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   useEffect(() => {
     if (mediaType !== 'audio') return;
     const video = videoRef.current;
-    const ctx = noiseCtxRef.current;
-    if (!video || !ctx) return;
+    if (!video) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
 
     let bus: GainNode;
     try {
@@ -1302,6 +1326,20 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     return () => observer.disconnect();
   }, []);
 
+  // While editing, the picture sits above the control bar rather than under it (player.css
+  // .editing): the container is padded by the bar's live height, and since the ResizeObserver
+  // above reports the content box, the letterbox math and every overlay fit the space left.
+  const controlsBarRef = useRef<HTMLDivElement>(null);
+  const [controlsBarHeight, setControlsBarHeight] = useState(0);
+  useEffect(() => {
+    const el = controlsBarRef.current;
+    if (!el || !isEditingVideo) return;
+    const observer = new ResizeObserver(() => setControlsBarHeight(Math.round(el.offsetHeight)));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [isEditingVideo, mediaType]);
+  const reserveControls = !!isEditingVideo && mediaType === 'video' && !isFullscreen;
+
   // The project frame when editing (every clip is fitted into it, as export does), else the file's.
   const frameSize = activeClipEffects?.frame ?? videoIntrinsicSize;
   const frameRect = useMemo(
@@ -1490,6 +1528,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   const openThumbnailPicker = (): void => {
     const video = videoRef.current;
     if (!video || !filePath || mediaType !== 'video') return;
+    ensureScrubSprite();
     video.pause();
     setThumbnailError(null);
     const primary = primarySrcRef.current;
@@ -1555,7 +1594,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
   // A copy that opens on the chosen thumbnail (make_share_ready_copy, conversion.rs) - what makes
   // it show on WhatsApp, Telegram, Instagram..., which preview a video by its first frame and
-  // ignore the embedded cover. Saved next to the original; progress shows in the notice.
+  // ignore the embedded cover. Saved in the library's Exports folder; progress shows in the notice.
   const makeShareReadyCopy = async (): Promise<void> => {
     if (!filePath || shareCopyBusyRef.current) return;
     shareCopyBusyRef.current = true;
@@ -1569,7 +1608,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       const output = await invoke<string>('make_share_ready_copy', { inputPath: key });
       const name = output.split(/[\\/]/).pop() ?? output;
       showThumbnailNotice({
-        text: `Saved "${name}" next to the original. Share that one - it opens on your thumbnail, so that's what WhatsApp and Telegram show.`,
+        text: `Saved "${name}" in Exports. Share that one - it opens on your thumbnail, so that's what WhatsApp and Telegram show.`,
         action: { label: 'Show in folder', run: () => void invoke('open_file_from_directory', { filepath: output }) },
       });
     } catch (err) {
@@ -1806,8 +1845,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       return;
     }
     if ((isNeutralFx(trackFx) && !meterTrack) || trackFxSetupRef.current) return;
-    const ctx = noiseCtxRef.current;
-    if (!ctx || !videoRef.current) return;
+    if (!videoRef.current) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
     trackFxSetupRef.current = true;
     loadTrackFxModule(ctx)
       .then(() => {
@@ -1983,8 +2022,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     if (noiseGraphSetupInProgressRef.current) return;
 
     const video = videoRef.current;
-    const ctx = noiseCtxRef.current;
-    if (!video || !ctx || !noiseWorkletReadyRef.current) return;
+    if (!video) return;
+    const ctx = noiseCtxRef.current ?? (noiseCtxRef.current = mixerContext());
+    noiseWorkletReadyRef.current ??= loadWorkletModule(ctx, "/audio-worklets/noise-reduction-processor.js")
+      .catch((err) => {
+        console.error("Failed to pre-load noise-reduction worklet - noise reduction preview will stay unavailable:", err);
+        noiseWorkletReadyRef.current = null;
+        throw err;
+      });
     noiseGraphSetupInProgressRef.current = true;
 
     noiseWorkletReadyRef.current
@@ -2229,6 +2274,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     }
 
     const sprite = scrubSprite;
+    if (!sprite) ensureScrubSprite();
     const wrap = previewWrapRef.current;
     if (!sprite || !wrap || sprite.count === 0) return;
 
@@ -2413,7 +2459,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     const handlePlay = (): void => {
       // Sound routed through Web Audio (cleanup, mixer) is silent while its context is suspended.
       if (noiseCtxRef.current?.state === 'suspended' && mediaSourceRef.current) noiseCtxRef.current.resume().catch(() => {});
-      resumeMixer();
+      if (mediaSourceRef.current || editTimelineRef.current) resumeMixer();
       setIsPlaying(true);
       setIsPaused(false);
       onPlayStateChange?.(true);
@@ -2460,7 +2506,9 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       stepFrameForward: () => stepFrame(1),
       toggleShortcutsOverlay: () => setShowShortcutsOverlay((prev) => !prev),
       playPrevious: () => onPreviousRef.current?.(),
-      playNext: () => onNextRef.current?.()
+      playNext: () => onNextRef.current?.(),
+      // Read live: the file (and whether it's a video) changes without this effect re-running.
+      toggleEditor: () => onEditVideoRef.current?.()
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -2627,6 +2675,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					<div className="flex flex-col gap-3 text-sm">
 						{[
 							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
+							...(onEditVideo ? [{ title: 'Editing', rows: [['E', isEditingVideo ? 'Close the editor' : 'Open the editor']] }] : []),
 							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
 							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
 							{ title: 'Captions', rows: [['C', 'Toggle captions']] },
@@ -2652,15 +2701,15 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded`}
 			ref={videoContainerRef}
 			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
 			// flyout menus in player.css so a short player scrolls them instead of clipping their top.
-			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}) } as React.CSSProperties}
+			style={{ opacity: videoOpacity, ...(containerSize ? { '--player-h': `${containerSize.height}px` } : {}), ...(reserveControls ? { paddingBottom: controlsBarHeight } : {}) } as React.CSSProperties}
 			data-volume-level={volumeLevel}>
 			{(mediaType === 'video' || mediaType === 'audio') && (
 				<div>
-					<div className="video-controls-container pt-1 pb-1 place-items-center">
+					<div ref={controlsBarRef} className="video-controls-container pt-1 pb-1 place-items-center">
 					<div
 						className="timeline-container"
 						id="timelineContainer"
@@ -3053,8 +3102,17 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 
 			{
 				<>
+					{frameBackground === 'blur' && frameRect && (
+						<div className="absolute pointer-events-none overflow-hidden" style={{ left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height }}>
+							<div ref={blurInnerRef} className="absolute inset-0">
+								<BlurBackdrop videoRef={videoRef} canvasRef={blurCanvasRef} width={frameRect.width} height={frameRect.height} onReady={applyCropAndKenBurns} />
+							</div>
+						</div>
+					)}
 					<video
 						ref={videoRef}
+						// Over the Blur background (positioned, so it paints after it).
+						style={frameBackground === 'blur' ? { position: 'relative' } : undefined}
 						loop={loop || isLoopEnabled}
 						crossOrigin="anonymous"
 						onClick={handleVideoClick}

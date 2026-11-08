@@ -5,7 +5,9 @@ import { hasShapeOrMask, layerMaskGreyPng, revealMaskMotion } from "../utils/lay
 import { compactTracks, exportFades, freeTrack, isTrackHidden, pipTrack, stackOrder } from "../utils/videoTracks";
 import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/audioFx";
 import { automationForExport, type GainPoint } from "../utils/audioAutomation";
-import { joinFades, NO_FADES } from "../utils/audioJoins";
+import { EDGE_FADE_SEC, joinFades, NO_FADES } from "../utils/audioJoins";
+import { DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundPieces, type CutSounds } from "../utils/cutSounds";
+import { builtinSfxFile } from "../utils/builtinSfx";
 import { cleanedTrackPath, isCleaned } from "../utils/audioTrackCleanup";
 import { isNeutralMaster, masterForExport, type MasterBus } from "../utils/masterBus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,8 +15,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCaptionSettings, replaceCaptionLineText } from "../utils/captions";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { addCloseGuard } from "../utils/closeGuards";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import { addCloseGuard, addReleaseBlocker } from "../utils/closeGuards";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipCrop, ClipTransitionIn, EdgeTransitions, TransitionEdge, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
 import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
 import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
@@ -74,6 +76,13 @@ import { clipOutputDuration } from "../utils/clipTiming";
 import { computeSpeechTimeline, duckEnvelopeFor, isDucked } from "../utils/musicDucking";
 import type { OverlayKeyframe } from "../utils/keyframes";
 import type { OverlayAsset } from "../utils/videoAssets";
+import type { LayerMask } from "../utils/layerMask";
+import type { SplitGroupSettings } from "../utils/splitLayouts";
+import { adoptLegacySplits, alignSplitTiming, dropOrphanBackdrops, migrateSplitBackdrops, relayoutSplitGroups, splitBackdrop, type SplitChange, type SplitLayers } from "../utils/splitGroups";
+
+// The layers a split screen is made of (splitGroups.ts).
+const splitLayersOf = (s: VideoEditState): SplitLayers => ({ pipOverlays: s.pipOverlays, imageOverlays: s.imageOverlays, adjustmentLayers: s.adjustmentLayers ?? [] });
+import { remapLayers, type CanvasFormat } from "../utils/canvasFormats";
 
 // One cell of a split screen (addSplitScreen) - where it sits and which source it plays from where.
 export interface SplitScreenCell {
@@ -92,6 +101,20 @@ export interface SplitScreenCell {
   image?: { width: number; height: number };
   // The output frame's width / height (the cells' fractions are of it).
   frameAspect?: number;
+  // The part of the shot the cell shows, with the cell's own shape (framingCrop, splitLayouts.ts);
+  // undefined = the centre of it.
+  crop?: ClipCrop;
+  // Soft edges (a card's - featherMask).
+  mask?: LayerMask;
+  // The shot's width / height - kept so the split can be rearranged later (splitGroups.ts).
+  shotAspect?: number;
+}
+// The split screen a set of cells makes up: its id and settings, and whether it replaces an
+// earlier version of itself (edited in the panel).
+export interface SplitScreenGroup {
+  id: string;
+  settings: SplitGroupSettings;
+  replace?: boolean;
 }
 import { renderAssetFrames } from "../utils/videoAssets";
 import { keystrokesForExport, loadClipRecordings, screenStyleExport, withPointerLayers } from "../utils/screenPolish";
@@ -111,6 +134,9 @@ import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
 import { loadTitleFonts } from "../utils/titleFonts";
 import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, imageOverlayAnimates, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
+
+// One shared empty value, so a video with no intro/outro hands consumers a stable reference.
+const NO_EDGE_TRANSITIONS: EdgeTransitions = Object.freeze({});
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // An audio overlay can hang past the video's end, but must start at least this far before it.
@@ -158,8 +184,8 @@ const EDIT_MERGE_MS = 700;
 // Mirrors export_trimmed_video's own `quality`/`output_path` params (conversion.rs) - both
 // optional so a caller that passes nothing gets the exact same default behavior as before this
 // existed (resolve_export_quality's own "standard" fallback, and the default "<name> (edited).ext"
-// location next to the source).
-export type ExportQuality = "standard" | "high" | "small";
+// location next to the source). "youtube"/"social" are platform presets - see export_hw_tier.
+export type ExportQuality = "standard" | "high" | "small" | "youtube" | "social";
 export interface ExportOptions {
   quality?: ExportQuality;
   outputPath?: string;
@@ -195,7 +221,7 @@ type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec
 // with its part, title, licence, beats and ducking already decided).
 export type NewAudioOverlayExtras = Partial<Pick<AudioOverlay, "trimStart" | "label" | "library" | "bpm" | "beats" | "fadeInSec" | "fadeOutSec" | "volume" | "duckUnderSpeech" | "duckLevel" | "recorded">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode" | "fx" | "opacity" | "fadeIn" | "fadeOut" | "chromaKey" | "mask" | "cutout">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "cutSound" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -315,7 +341,14 @@ export interface UseVideoEditStoreResult {
   addPipOverlay: (sourcePath: string, sourceDuration: number, x: number, y: number, width: number, height: number, startTime: number, endTime: number) => string;
   // A whole split screen in one undo step: one PiP per cell, plus an optional full-frame colour
   // backdrop behind them (so the gaps between cells show a colour, not the main video).
-  addSplitScreen: (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null) => string[];
+  addSplitScreen: (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null, group?: SplitScreenGroup) => string[];
+  // Rearranges a split screen already made (another layout, shots moved round, the divider...).
+  updateSplitGroup: (change: SplitChange, frameAspect: number) => void;
+  adoptSplitGroups: (frameAspect: number) => void;
+  // The canvas the edit is made in (canvasFormats.ts) - every layer goes along with the picture,
+  // split screens are laid out afresh. `from`/`to`: the frame's size before and after.
+  canvas: CanvasFormat | null;
+  setCanvas: (canvas: CanvasFormat | null, from: { width: number; height: number }, to: { width: number; height: number }) => void;
   // Puts a highlight intro (highlightIntro.ts) in front of the timeline as one undo step: every
   // overlay moves along by the intro's length so it stays on the same shot - except music when
   // `keepMusicInPlace` (a beat-synced intro was cut to the music where it already is) - and the
@@ -336,6 +369,16 @@ export interface UseVideoEditStoreResult {
   // how the editor draws the recorded pointer and the shortcut chips (patches over the defaults).
   screenStyle: ScreenStyle | null;
   setScreenStyle: (style: ScreenStyle | null) => void;
+  // The video's intro / outro (EdgeTransitions): set, change or (null) remove one. One undo step
+  // per change; a dragged duration slider's run merges into one.
+  edgeTransitions: EdgeTransitions;
+  setEdgeTransition: (edge: TransitionEdge, transition: ClipTransitionIn | null) => void;
+  // The intro's / outro's cut sound: a sound id, null for none, undefined for the automatic one.
+  setEdgeSound: (edge: TransitionEdge, sound: string | null | undefined) => void;
+  // Sound on every cut (cutSounds.ts): null when off. `setCutSounds(patch)` switches it on (with
+  // the defaults) or changes it; `setCutSounds(null)` switches it off, keeping each cut's own pick.
+  cutSounds: CutSounds | null;
+  setCutSounds: (patch: Partial<CutSounds> | null) => void;
   pointerStyle: Partial<PointerStyle> | undefined;
   updatePointerStyle: (patch: Partial<PointerStyle>) => void;
   keystrokeStyle: Partial<KeystrokeStyle> | undefined;
@@ -597,6 +640,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
               // written - default them here (once, at load) rather than in the type guard, so
               // sidecars saved before these features existed still load instead of being treated
               // as corrupt.
+              // Split-screen backdrops saved as pictures (over their video cells) move beneath them.
+              const backdrops = migrateSplitBackdrops(parsed.imageOverlays ?? [], parsed.pipOverlays ?? [], parsed.adjustmentLayers ?? []);
+              if (backdrops) Object.assign(parsed, backdrops);
               setState({
                 ...parsed,
                 textOverlays: parsed.textOverlays ?? [],
@@ -721,10 +767,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       return true;
     });
 
+    // The editor's own (foreground) export runs in this page.
+    const removeBlocker = addReleaseBlocker(() => (isExportingRef.current ? "a video export is running" : null));
+
     setEditorCloseGuard(true);
     return () => {
       setEditorCloseGuard(false);
       removeGuard();
+      removeBlocker();
     };
   }, [sourcePath, flushSave]);
 
@@ -787,6 +837,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     pointerStyle: current.pointerStyle,
     keystrokeStyle: current.keystrokeStyle,
     scenes: current.scenes ?? [],
+    canvas: current.canvas ?? null,
+    edgeTransitions: current.edgeTransitions,
+    cutSounds: current.cutSounds,
     ...patch,
   });
 
@@ -1154,7 +1207,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const imageOverlays = resizeOverlayTime(current.imageOverlays, id, edge, totalOutputDuration(current.clips), time);
-      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+      // A split screen's cell trims the whole split screen.
+      const layers = alignSplitTiming(splitLayersOf(current), { ...splitLayersOf(current), imageOverlays }, id);
+      pushCommand(snapshot(current, {}), snapshot(current, layers), "edit-image");
     },
     [pushCommand]
   );
@@ -1164,7 +1219,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const imageOverlays = moveOverlayTime(current.imageOverlays, id, newStartTime, totalOutputDuration(current.clips));
-      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "edit-image");
+      // A split screen's cell moves the whole split screen.
+      const layers = alignSplitTiming(splitLayersOf(current), { ...splitLayersOf(current), imageOverlays }, id);
+      pushCommand(snapshot(current, {}), snapshot(current, layers), "edit-image");
     },
     [pushCommand]
   );
@@ -1174,7 +1231,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const imageOverlays = deleteOverlay(current.imageOverlays, id);
-      pushCommand(snapshot(current, {}), snapshot(current, { imageOverlays }), "delete-image");
+      // The last cell of a split screen takes its backdrop along.
+      pushCommand(snapshot(current, {}), snapshot(current, dropOrphanBackdrops({ ...splitLayersOf(current), imageOverlays })), "delete-image");
     },
     [pushCommand]
   );
@@ -1661,6 +1719,41 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     },
     [pushCommand]
   );
+  const setEdgeTransition = useCallback(
+    (edge: TransitionEdge, transition: ClipTransitionIn | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const next: EdgeTransitions = { ...(current.edgeTransitions ?? {}) };
+      if (transition) next[edge] = transition;
+      else delete next[edge];
+      const edgeTransitions = next.intro || next.outro ? next : undefined;
+      pushCommand(snapshot(current, {}), snapshot(current, { edgeTransitions }), "edit-edge-transition");
+    },
+    [pushCommand]
+  );
+  const setEdgeSound = useCallback(
+    (edge: TransitionEdge, sound: string | null | undefined) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const sounds = { ...(current.edgeTransitions?.sounds ?? {}) };
+      if (sound === undefined) delete sounds[edge];
+      else sounds[edge] = sound;
+      const edgeTransitions: EdgeTransitions = { ...(current.edgeTransitions ?? {}) };
+      if (Object.keys(sounds).length) edgeTransitions.sounds = sounds;
+      else delete edgeTransitions.sounds;
+      pushCommand(snapshot(current, {}), snapshot(current, { edgeTransitions }), "edit-cut-sounds");
+    },
+    [pushCommand]
+  );
+  const setCutSounds = useCallback(
+    (patch: Partial<CutSounds> | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const cutSounds = patch === null ? undefined : { ...DEFAULT_CUT_SOUNDS, ...(current.cutSounds ?? {}), on: true, ...patch };
+      pushCommand(snapshot(current, {}), snapshot(current, { cutSounds }), "edit-cut-sounds");
+    },
+    [pushCommand]
+  );
   const updatePointerStyle = useCallback(
     (patch: Partial<PointerStyle>) => {
       const current = stateRef.current;
@@ -1679,52 +1772,103 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   );
 
   const addSplitScreen = useCallback(
-    (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null): string[] => {
+    (cells: SplitScreenCell[], startTime: number, endTime: number, backdropColor: string | null, group?: SplitScreenGroup): string[] => {
       const current = stateRef.current;
       if (!current || cells.length === 0) return [];
+      const member = (cell: number, shotAspect = 1) => (group ? { split: { group: group.id, cell, settings: group.settings, shotAspect } } : {});
       // Picture cells are picture overlays, cropped (centred) to fill their cell like a video
       // cell's cover fit; video cells are picture-in-picture layers.
       const frameAspect = cells[0]?.frameAspect ?? 16 / 9;
       const pictures = cells
-        .filter((c) => c.image)
-        .map((c) => {
+        .map((c, cell) => ({ c, cell }))
+        .filter(({ c }) => c.image)
+        .map(({ c, cell }) => {
           const box = (c.width / c.height) * frameAspect;
           const img = c.image!.width / Math.max(1, c.image!.height);
-          const crop = img > box ? { cropWidth: box / img, cropHeight: 1 } : { cropWidth: 1, cropHeight: img / box };
+          const centred = img > box ? { width: box / img, height: 1 } : { width: 1, height: img / box };
+          const crop = c.crop ?? { x: (1 - centred.width) / 2, y: (1 - centred.height) / 2, ...centred };
           return {
             ...makeImageOverlay(c.sourcePath, c.x, c.y, c.width, c.height, startTime, endTime),
-            cropX: (1 - crop.cropWidth) / 2,
-            cropY: (1 - crop.cropHeight) / 2,
-            ...crop,
+            cropX: crop.x,
+            cropY: crop.y,
+            cropWidth: crop.width,
+            cropHeight: crop.height,
+            ...(c.mask ? { mask: c.mask } : {}),
+            ...member(cell, c.shotAspect),
             // A picture's corner radius is a fraction of the frame's height, a PiP's of its box's.
             ...(c.cornerRadius > 0 ? { cornerRadius: c.cornerRadius * c.height } : {}),
           };
         });
-      const pips = cells.filter((c) => !c.image).map((c) => ({
+      const pips = cells
+        .map((c, cell) => ({ c, cell }))
+        .filter(({ c }) => !c.image)
+        .map(({ c, cell }) => ({
         ...makePipOverlay(c.sourcePath, c.sourceDuration, c.x, c.y, c.width, c.height, startTime, endTime),
         shape: (c.cornerRadius > 0 ? "rounded" : "rectangle") as PipOverlay["shape"],
         ...(c.cornerRadius > 0 ? { cornerRadius: c.cornerRadius } : {}),
         // Never past the end of its own source.
         trimStart: Math.max(0, Math.min(c.trimStart, c.sourceDuration - (endTime - startTime))),
         muted: c.muted,
+        ...(c.crop ? { crop: c.crop } : {}),
+        ...(c.mask ? { mask: c.mask } : {}),
+        ...member(cell, c.shotAspect),
       }));
-      const backdrop = backdropColor
-        ? [
-            makeImageOverlay("", 0, 0, 1, 1, startTime, endTime, {
-              kind: "rectangle",
-              color: backdropColor,
-              entrance: "none",
-              exit: false,
-              loop: "none",
-            }),
-          ]
-        : [];
+      // The gap colour beneath the cells (a picture would sit over the video cells - splitGroups.ts).
+      const backdrop = backdropColor ? [splitBackdrop(backdropColor, startTime, endTime, member(-1).split)] : [];
+      // Edited in the panel: the earlier version of this split screen goes, in the same step.
+      const keep = <T extends { split?: { group: string } }>(o: T) => !(group?.replace && o.split?.group === group.id);
       pushCommand(
         snapshot(current, {}),
-        snapshot(current, { pipOverlays: [...current.pipOverlays, ...pips], imageOverlays: [...current.imageOverlays, ...backdrop, ...pictures] }),
-        "add-pip"
+        snapshot(current, {
+          pipOverlays: [...current.pipOverlays.filter(keep), ...pips],
+          imageOverlays: [...current.imageOverlays.filter(keep), ...pictures],
+          adjustmentLayers: [...backdrop, ...(current.adjustmentLayers ?? []).filter(keep)],
+        }),
+        group?.replace ? "edit-split" : "add-pip"
       );
       return [...pips.map((p) => p.id), ...pictures.map((p) => p.id)];
+    },
+    [pushCommand]
+  );
+
+  const updateSplitGroup = useCallback(
+    (change: SplitChange, frameAspect: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const next = relayoutSplitGroups(current.pipOverlays, current.imageOverlays, frameAspect, frameAspect, change);
+      pushCommand(snapshot(current, {}), snapshot(current, next), "edit-split");
+    },
+    [pushCommand]
+  );
+
+  // Split screens made before their layers carried a group become rearrangeable - recognised once
+  // the frame they're laid out on is known (adoptLegacySplits). Not an edit of the user's, so no
+  // undo step; just saved.
+  const adoptSplitGroups = useCallback(
+    (frameAspect: number) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const adopted = adoptLegacySplits(splitLayersOf(current), frameAspect);
+      if (!adopted) return;
+      const next = { ...current, ...adopted };
+      stateRef.current = next;
+      setState(next);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const setCanvas = useCallback(
+    (canvas: CanvasFormat | null, from: { width: number; height: number }, to: { width: number; height: number }) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const moved = remapLayers(
+        { textOverlays: current.textOverlays, imageOverlays: current.imageOverlays, blurOverlays: current.blurOverlays, pipOverlays: current.pipOverlays, adjustmentLayers: current.adjustmentLayers ?? [] },
+        from,
+        to
+      );
+      const split = relayoutSplitGroups(moved.pipOverlays, moved.imageOverlays, from.width / from.height, to.width / to.height);
+      pushCommand(snapshot(current, {}), snapshot(current, { ...moved, ...split, canvas }), "edit-canvas");
     },
     [pushCommand]
   );
@@ -1769,7 +1913,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       if (!current) return;
       const pipOverlays = resizePipOverlayTime(current.pipOverlays, id, edge, totalOutputDuration(current.clips), time);
-      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays }), "edit-pip");
+      const layers = alignSplitTiming(splitLayersOf(current), { ...splitLayersOf(current), pipOverlays }, id);
+      pushCommand(snapshot(current, {}), snapshot(current, layers), "edit-pip");
     },
     [pushCommand]
   );
@@ -1778,15 +1923,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string, newStartTime: number, track?: number) => {
       const current = stateRef.current;
       if (!current) return;
-      const moved = moveOverlayTime(current.pipOverlays, id, newStartTime, totalOutputDuration(current.clips));
+      // A split screen's cell moves the whole split screen.
+      const layers = alignSplitTiming(splitLayersOf(current), { ...splitLayersOf(current), pipOverlays: moveOverlayTime(current.pipOverlays, id, newStartTime, totalOutputDuration(current.clips)) }, id);
       // Dragged up or down onto another video track, too - then numbered without gaps.
       if (track === undefined) {
-        pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays: moved }), "edit-pip");
+        pushCommand(snapshot(current, {}), snapshot(current, layers), "edit-pip");
         return;
       }
-      const retracked = moved.map((o) => (o.id === id ? { ...o, track: Math.max(1, Math.round(track)) } : o));
+      const retracked = layers.pipOverlays.map((o) => (o.id === id ? { ...o, track: Math.max(1, Math.round(track)) } : o));
       const compact = compactTracks(retracked, current.hiddenVideoTracks);
-      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays: compact.layers, hiddenVideoTracks: compact.hidden }), "edit-pip");
+      pushCommand(snapshot(current, {}), snapshot(current, { ...layers, pipOverlays: compact.layers, hiddenVideoTracks: compact.hidden }), "edit-pip");
     },
     [pushCommand]
   );
@@ -1795,8 +1941,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      const compact = compactTracks(deletePipOverlayAndCloseGap(current.pipOverlays, id), current.hiddenVideoTracks);
-      pushCommand(snapshot(current, {}), snapshot(current, { pipOverlays: compact.layers, hiddenVideoTracks: compact.hidden }), "delete-pip");
+      // A split screen's cell just goes - nothing after it moves up.
+      const isCell = !!current.pipOverlays.find((o) => o.id === id)?.split;
+      const compact = compactTracks(isCell ? current.pipOverlays.filter((o) => o.id !== id) : deletePipOverlayAndCloseGap(current.pipOverlays, id), current.hiddenVideoTracks);
+      // The last cell of a split screen takes its backdrop along.
+      const layers = dropOrphanBackdrops({ ...splitLayersOf(current), pipOverlays: compact.layers });
+      pushCommand(snapshot(current, {}), snapshot(current, { ...layers, hiddenVideoTracks: compact.hidden }), "delete-pip");
     },
     [pushCommand]
   );
@@ -2350,6 +2500,29 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           fx: fxForExport(o.fx),
           gain: automationForExport(o),
         }));
+      // Sound on every cut (cutSounds.ts): each cue as one more piece of audio, at the cut sounds'
+      // own volume - unless that channel is muted in the mixer.
+      if (current.cutSounds?.on && !current.cutSounds.muted && current.cutSounds.volume > 0) {
+        const total = totalOutputDuration(current.clips);
+        const pieces = await cutSoundPieces(cutSoundCues(current.clips, current.edgeTransitions, current.cutSounds), total, builtinSfxFile);
+        for (const piece of pieces) {
+          audioOverlays.push({
+            sourcePath: piece.sourcePath,
+            startTime: piece.startTime,
+            endTime: piece.endTime,
+            trimStart: piece.trimStart,
+            volume: current.cutSounds.volume,
+            // A sound cut short (at the video's edges) gets the click-proof edge fade.
+            fadeIn: piece.trimStart > 0 ? EDGE_FADE_SEC : 0,
+            fadeOut: EDGE_FADE_SEC,
+            fadeInCurve: "equalPower" as const,
+            fadeOutCurve: "equalPower" as const,
+            duck: undefined,
+            fx: null,
+            gain: null,
+          });
+        }
+      }
 
       // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
       // per-line PNGs - hundreds of timed lines, each re-drawn per word for emphasis, is exactly
@@ -2393,6 +2566,10 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           audioVolume: current.videoAudioVolume,
           videoWidth: timelinePixelSize?.width ?? null,
           videoHeight: timelinePixelSize?.height ?? null,
+          // A canvas of its own: every clip fitted into it, as the preview shows (canvasFormats.ts).
+          fitToFrame: !!current.canvas,
+          // What fills the canvas around a clip (a Screen Style draws its own wallpaper there).
+          frameBackground: current.canvas?.background === "blur" && !current.screenStyle ? "blur" : null,
           quality: options?.quality ?? null,
           outputPath: options?.outputPath ?? null,
           captionsAss,
@@ -2405,6 +2582,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           screenStyle,
           keystrokes,
           stageLayers,
+          edgeTransitions: current.edgeTransitions ?? null,
         },
         sourcePath,
         durationSec: totalOutputDuration(current.clips),
@@ -2624,11 +2802,20 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     setVideoTrackHidden,
     screenStyle: state?.screenStyle ?? null,
     setScreenStyle,
+    edgeTransitions: state?.edgeTransitions ?? NO_EDGE_TRANSITIONS,
+    setEdgeTransition,
+    setEdgeSound,
+    cutSounds: state?.cutSounds?.on ? state.cutSounds : null,
+    setCutSounds,
     pointerStyle: state?.pointerStyle,
     updatePointerStyle,
     keystrokeStyle: state?.keystrokeStyle,
     updateKeystrokeStyle,
     addSplitScreen,
+    updateSplitGroup,
+    adoptSplitGroups,
+    canvas: state?.canvas ?? null,
+    setCanvas,
     insertHighlightIntro,
     updatePipOverlayContent,
     resizePipOverlayTime: resizePipOverlayTimeCb,

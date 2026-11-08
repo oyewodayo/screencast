@@ -29,7 +29,6 @@ struct Session {
     dir: PathBuf,
     width: u32,
     height: u32,
-    fps: f64,
     // Frame numbers stored so far (in any order - frames encode in parallel).
     frames: Vec<u32>,
 }
@@ -153,7 +152,7 @@ pub(crate) fn open_session(width: u32, height: u32, fps: f64) -> Result<StageRen
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't make a folder for the scene's frames: {e}"))?;
     let dir_str = dir.to_string_lossy().to_string();
-    sessions().lock().map_err(|_| "Scene render state is unavailable.".to_string())?.insert(id, Session { dir, width, height, fps, frames: Vec::new() });
+    sessions().lock().map_err(|_| "Scene render state is unavailable.".to_string())?.insert(id, Session { dir, width, height, frames: Vec::new() });
     Ok(StageRenderSession { id, dir: dir_str, port: None, token: None })
 }
 

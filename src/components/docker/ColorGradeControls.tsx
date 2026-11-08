@@ -50,13 +50,19 @@ const GradeHistogram: React.FC<{ lut: Lut3D | null }> = ({ lut }) => {
   lutRef.current = lut;
   useEffect(() => {
     const scratch = document.createElement("canvas");
-    scratch.width = 96;
-    scratch.height = 54;
+    scratch.width = 64;
+    scratch.height = 36;
     const sctx = scratch.getContext("2d", { willReadFrequently: true });
-    const timer = window.setInterval(() => {
+    let lastTime = -1;
+    let lastLut: Lut3D | null | undefined = undefined;
+    const drawHistogram = () => {
       const video = document.querySelector<HTMLVideoElement>(".video-container video");
       const out = canvasRef.current?.getContext("2d");
       if (!video || !sctx || !out || video.readyState < 2) return;
+      const current = lutRef.current;
+      if (video.paused && video.currentTime === lastTime && current === lastLut) return;
+      lastTime = video.currentTime;
+      lastLut = current;
       sctx.drawImage(video, 0, 0, scratch.width, scratch.height);
       let pixels: Uint8ClampedArray;
       try {
@@ -65,7 +71,6 @@ const GradeHistogram: React.FC<{ lut: Lut3D | null }> = ({ lut }) => {
         return;
       }
       const bins = [new Float32Array(BINS), new Float32Array(BINS), new Float32Array(BINS)];
-      const current = lutRef.current;
       for (let i = 0; i < pixels.length; i += 4) {
         let r = pixels[i] / 255, g = pixels[i + 1] / 255, b = pixels[i + 2] / 255;
         if (current) [r, g, b] = sampleLut(current, r, g, b);
@@ -87,7 +92,9 @@ const GradeHistogram: React.FC<{ lut: Lut3D | null }> = ({ lut }) => {
         out.fill();
       });
       out.globalCompositeOperation = "source-over";
-    }, 250);
+    };
+    drawHistogram();
+    const timer = window.setInterval(drawHistogram, 350);
     return () => window.clearInterval(timer);
   }, []);
   return <canvas ref={canvasRef} width={HIST_W} height={HIST_H} className="w-full h-[72px] rounded bg-black/60 ring-1 ring-white/10" aria-label="RGB histogram" />;

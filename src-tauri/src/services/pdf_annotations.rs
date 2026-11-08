@@ -29,7 +29,7 @@ pub fn save_pdf_annotations(pdf_path: String, json: String) -> Result<(), String
 
     // Write-then-rename so a crash mid-write can't leave a truncated/corrupt sidecar behind.
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write annotations: {}", e))?;
-    fs::rename(&tmp, &sidecar).map_err(|e| format!("Failed to save annotations: {}", e))?;
+    crate::services::sidecars::commit_sidecar(&tmp, &sidecar).map_err(|e| format!("Failed to save annotations: {}", e))?;
 
     Ok(())
 }

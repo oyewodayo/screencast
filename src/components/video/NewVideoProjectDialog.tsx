@@ -62,13 +62,20 @@ import { getFileCategory } from "../../utils/fileCategory";
 import { useBatchedRecord } from "../../hooks/useBatchedRecord";
 import { buildMediaIndex, searchMedia } from "../../utils/mediaSearch";
 
+// What the slow part of creating reports as it goes: a step, and how far through it.
+export type PrepReporter = (step: string, done?: number, total?: number) => void;
+
 export interface NewVideoProjectRequest {
   name: string;
   frame: VideoProjectFrame;
   imagePaths: string[];
   options: NewProjectOptions;
-  // The finished project, built here (buildStyledProject) - absent for a blank timeline.
-  state?: VideoEditState;
+  // Builds the finished project (song, beat, photo fills, buildStyledProject) - absent for a blank
+  // timeline. Dashboard runs it on its "Making your video" screen, which opens the moment Create is
+  // clicked, rather than this dialog doing it first with nothing on screen but "Creating…".
+  prepare?: (report: PrepReporter) => Promise<VideoEditState | undefined>;
+  // The picked photos' thumbnails, in order, for that screen.
+  thumbs?: (string | null)[];
 }
 
 interface NewVideoProjectDialogProps {
@@ -81,6 +88,9 @@ interface NewVideoProjectDialogProps {
   resolveVideoThumbnailUrl: (file: { name: string; path: string }) => Promise<string>;
   // Rejects with a message to show in place (the dialog stays open on failure).
   onCreate: (request: NewVideoProjectRequest) => Promise<void>;
+  // While the project is being made: render nothing but stay mounted, so a failure can bring the
+  // dialog back with every choice still in place (and its stage and song preview stop meanwhile).
+  hidden?: boolean;
   onClose: () => void;
 }
 
@@ -435,8 +445,9 @@ const MediaGrid = memo(function MediaGrid({
 
 // ---------- the dialog ----------
 
-const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryImages, libraryVideos, resolveThumbnailUrl, resolveVideoThumbnailUrl, onCreate, onClose }) => {
-  const [name, setName] = useState("Untitled video");
+const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryImages, libraryVideos, resolveThumbnailUrl, resolveVideoThumbnailUrl, onCreate, onClose, hidden }) => {
+  // Empty = the name it gets on its own (autoName below) - shown as the field's placeholder.
+  const [name, setName] = useState("");
   // "auto": the shape most of the picked media are (autoFrameId).
   const [frameId, setFrameId] = useState("auto");
   // In clip order - the order images were picked in, rearranged by dragging in the sequence strip.
@@ -467,7 +478,6 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const [musicMuted, setMusicMuted] = useState(false);
   const [playing, setPlaying] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
-  const [creatingStep, setCreatingStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
   const [stagePictures, setStagePictures] = useState<Map<string, StagePicture>>(new Map());
@@ -480,6 +490,10 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const deferredMediaQuery = useDeferredValue(mediaQuery);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [brand, setBrandState] = useState<BrandOptions>(readBrand);
+  // A name worth finding it by later, when none is typed: the brand's, else what it is and when
+  // ("Photo video 3 Nov 2026") - never "Untitled video (38)". Projects live in the library's
+  // Projects folder (create_video_project).
+  const autoName = `${brand.name.trim() || (picked.length > 0 ? "Photo video" : "Video")} ${new Date().toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}`;
   const setBrand = (patch: Partial<BrandOptions>) =>
     setBrandState((prev) => {
       const next = { ...prev, ...patch };
@@ -647,6 +661,17 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   }, [picked, aspects, videoInfo]);
   const resolvedFrameId = frameId === "auto" ? autoFrameId : frameId;
   const frame = FRAME_PRESETS.find((preset) => preset.id === resolvedFrameId)?.frame ?? FRAME_PRESETS[0].frame;
+  // The new project plays on a black canvas of this size, and making one the first time takes
+  // several seconds (get_video_canvas_proxy). Started here, quietly, as soon as the size is known -
+  // by the time the photos are picked and Create is clicked it's ready, and the editor opens without
+  // that wait (Start blank included). Debounced so flicking through shapes doesn't start a build per
+  // shape; a size that's already made returns at once.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      invoke<string>("get_video_canvas_proxy", { width: frame.width, height: frame.height }).catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [frame.width, frame.height]);
 
   // ---- music ----
 
@@ -914,62 +939,70 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   const handleCreate = async () => {
     setIsCreating(true);
     setError(null);
-    try {
+    // Everything slow happens on Dashboard's "Making your video" screen, which opens at once - the
+    // values are read now, so changing the dialog meanwhile can't change what's being made.
+    const chosen = { picked: [...picked], music, stageMusic, blurFill, frame, template, style, aspects: { ...aspects }, fontsReady };
+    const prepare = async (report: PrepReporter): Promise<VideoEditState | undefined> => {
+      const { picked: photos } = chosen;
       let song: StyledProjectMusic | null = null;
-      if (music && picked.length) {
-        if (music.kind === "library") {
-          setCreatingStep("Getting the song…");
-          const path = await getTrackFile(music.track.id, "full");
-          let beats: TrackBeats | null = music.track.bpm && music.track.beats?.length ? { bpm: music.track.bpm, beats: music.track.beats } : null;
+      const m = chosen.music;
+      if (m && photos.length) {
+        if (m.kind === "library") {
+          report("Getting the song…");
+          const path = await getTrackFile(m.track.id, "full");
+          let beats: TrackBeats | null = m.track.bpm && m.track.beats?.length ? { bpm: m.track.bpm, beats: m.track.beats } : null;
           if (!beats) {
-            setCreatingStep("Finding the beat…");
+            report("Finding the beat…");
             beats = await invoke<TrackBeats>("detect_beats", { sourcePath: path }).catch(() => null);
           }
           // From where the stage played it, so the video is the one that was previewed.
-          song = { path, sourceDuration: music.track.duration, ...(beats ?? {}), highlightStart: stageMusic?.highlightStart, label: music.track.title, library: libraryInfoOf(music.track) };
+          song = { path, sourceDuration: m.track.duration, ...(beats ?? {}), highlightStart: chosen.stageMusic?.highlightStart, label: m.track.title, library: libraryInfoOf(m.track) };
         } else {
-          let beats: TrackBeats | null = music.bpm && music.beats ? { bpm: music.bpm, beats: music.beats } : null;
+          let beats: TrackBeats | null = m.bpm && m.beats ? { bpm: m.bpm, beats: m.beats } : null;
           if (!beats) {
-            setCreatingStep("Finding the beat…");
-            beats = await invoke<TrackBeats>("detect_beats", { sourcePath: music.path }).catch(() => null);
+            report("Finding the beat…");
+            beats = await invoke<TrackBeats>("detect_beats", { sourcePath: m.path }).catch(() => null);
           }
-          song = { path: music.path, sourceDuration: music.duration, ...(beats ?? {}), label: music.name.replace(/\.[^.]+$/, "") };
+          song = { path: m.path, sourceDuration: m.duration, ...(beats ?? {}), label: m.name.replace(/\.[^.]+$/, "") };
         }
       }
       // Photos of another shape get their filled stills made (once - they're cached), a few at a time.
       const fills = new Map<string, string>();
-      if (blurFill && picked.length) {
+      if (chosen.blurFill && photos.length) {
+        const queue = photos.filter((p) => !isVideoPath(p));
+        const total = queue.length;
         let done = 0;
-        const queue = picked.filter((p) => !isVideoPath(p));
+        report("Fitting photos to the frame", 0, total);
         const worker = async () => {
           for (let p = queue.shift(); p; p = queue.shift()) {
-            setCreatingStep(`Fitting photos to the frame… ${++done}/${queue.length + done}`);
-            fills.set(p, await photoFillPath(p, frame, aspects[p]).catch(() => p));
+            fills.set(p, await photoFillPath(p, chosen.frame, chosen.aspects[p]).catch(() => p));
+            report("Fitting photos to the frame", ++done, total);
           }
         };
         await Promise.all([worker(), worker(), worker()]);
       }
-      setCreatingStep(picked.length ? "Putting it together…" : null);
-      const state = picked.length
-        ? buildStyledProject(picked, frame, optionsFor(template, false, style, song), {
-            aspectOf: (p) => aspects[p] ?? 1,
-            measure: fontsReady ? measureText : undefined,
-            clipSource: (p) => fills.get(p) ?? p,
-            videoOf,
-            fillVideos: blurFill,
-          })
-        : undefined;
-      trackEvent("video_project_created", { style: template?.id ?? "custom", music: song ? (song.library ? "library" : "file") : "none", photos: picked.length });
+      if (!photos.length) return undefined;
+      report("Putting it together…");
+      const state = buildStyledProject(photos, chosen.frame, optionsFor(chosen.template, false, chosen.style, song), {
+        aspectOf: (p) => chosen.aspects[p] ?? 1,
+        measure: chosen.fontsReady ? measureText : undefined,
+        clipSource: (p) => fills.get(p) ?? p,
+        videoOf,
+        fillVideos: chosen.blurFill,
+      });
+      trackEvent("video_project_created", { style: chosen.template?.id ?? "custom", music: song ? (song.library ? "library" : "file") : "none", photos: photos.length });
+      return state;
+    };
+    try {
       await onCreate({
-        name: name.trim() || "Untitled video",
+        name: name.trim() || autoName,
         frame,
         imagePaths: picked,
         options: { imageDuration, kenBurns, transition: null },
-        ...(state ? { state } : {}),
+        ...(picked.length ? { prepare, thumbs: picked.map((p) => thumbUrls[p] ?? null) } : {}),
       });
     } catch (err) {
       setError(`Couldn't create the video: ${err instanceof Error ? err.message : err}`);
-      setCreatingStep(null);
       setIsCreating(false);
     }
   };
@@ -1008,6 +1041,9 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
   ]
     .filter(Boolean)
     .join(" · ");
+
+  // Stays mounted (every choice kept) but draws nothing - its stage and song preview stop with it.
+  if (hidden) return null;
 
   return (
     // No backdrop-filter here or on the stage's buttons: with the stage animating under it, the
@@ -1408,7 +1444,8 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
               </Section>
 
               <Section title="Name">
-                <TextField value={name} onChange={setName} label="Video name" />
+                <TextField value={name} onChange={setName} label="Video name" placeholder={autoName} />
+                <p className="mt-1.5 text-[11.5px] text-neutral-500 dark:text-neutral-400">Saved in your library's Projects folder.</p>
               </Section>
 
               <Section title="Format">
@@ -1556,8 +1593,6 @@ const NewVideoProjectDialog: React.FC<NewVideoProjectDialogProps> = ({ libraryIm
           <p className="flex-1 min-w-0 text-[12.5px] text-neutral-500 dark:text-neutral-400 truncate">
             {error ? (
               <span className="text-red-600 dark:text-red-400">{error}</span>
-            ) : creatingStep ? (
-              creatingStep
             ) : picked.length > 0 ? (
               `About ${formatLength(projectLength)} long${template ? ` in ${template.label} style` : ""}${music ? `, cut to "${musicTitle}"` : ""} - every part stays editable.`
             ) : (

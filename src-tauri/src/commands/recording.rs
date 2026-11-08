@@ -171,7 +171,10 @@ pub struct ViewSwitchEvent {
     pub mode: String,
 }
 
+// Some fields drive features only Windows has so far (click/pointer/key tracking, the window
+// title bar, ...) and are read only there.
 #[derive(serde::Deserialize, Debug)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct FormData {
     file_name: String,
     file_ext: String,
@@ -281,6 +284,7 @@ impl AppState {
     ///
     /// Cloning the Arc rather than lending a reference matters: the thread outlives this call and
     /// runs until ffmpeg closes its stdout.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn preview_frame_handle(&self) -> crate::services::preview_stream::PreviewFrame {
         self.preview_frame.clone()
     }
@@ -312,6 +316,8 @@ impl FormData {
 // (and, for windows, window_title) so every capture mode — take_screenshot and every
 // screen-capturing recording_with_output_* — interprets it the same way instead of each
 // reimplementing (or, as before this existed, half-implementing) its own parsing of it.
+// `hwnd` and `title_bar` are read by the Windows capture only (macOS and Linux match by title).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) enum CaptureTarget {
     FullScreen,
     Monitor {
@@ -462,6 +468,7 @@ fn bubble_sidecar_path(video_path: &Path) -> PathBuf {
     video_path.with_file_name(format!("{}.bubble.json", stem))
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn write_bubble_sidecar(video_path: &Path, form_data: &FormData, camera_count: usize) {
     let json = serde_json::json!({
         "shape": form_data.overlay_shape,
@@ -470,7 +477,7 @@ pub(crate) fn write_bubble_sidecar(video_path: &Path, form_data: &FormData, came
         "border": form_data.overlay_border,
         "cameraCount": camera_count,
     });
-    if let Err(e) = fs::write(bubble_sidecar_path(video_path), json.to_string()) {
+    if let Err(e) = crate::services::sidecars::write_sidecar(&bubble_sidecar_path(video_path), json.to_string()) {
         warn!("Failed to write the camera bubble sidecar: {}", e);
     }
 }
@@ -712,10 +719,7 @@ pub async fn save_phone_camera_capture(
     // duration in its header at all (it was written as a live stream). Both are re-encoded away
     // here into a plain CFR mp4, which is what the editor's seeking assumes. Hardware encoding
     // when the machine has it, for the same reason the main recording path uses it.
-    #[cfg(target_os = "windows")]
     let hw = crate::services::hw_encoder::detect(&ffmpeg_path);
-    #[cfg(not(target_os = "windows"))]
-    let hw: Option<()> = None;
 
     // Quality here is deliberately higher than the main recording's.
     //
@@ -729,7 +733,6 @@ pub async fn save_phone_camera_capture(
     // a container start_time, which the editor's PiP layer assumes is zero. Not worth trading
     // correct A/V alignment for, so the re-encode stays and simply pays for quality instead.)
     match hw {
-        #[cfg(target_os = "windows")]
         Some(encoder) => {
             args.push("-c:v".into());
             args.push(encoder.name().to_string());
@@ -843,52 +846,90 @@ pub async fn get_recording_preview_frame(
 // both exiting and writing for IDLE_GRACE is it considered hung. A hard cap still exists so this
 // can never wait forever on a pathological process.
 fn wait_for_ffmpeg_to_finalize(process: &mut Child, output_path: &Path) -> bool {
-    const POLL: Duration = Duration::from_millis(100);
+    let started = Instant::now();
+    // Both "is it still running" and "kill it" need the child mutably.
+    let process = std::cell::RefCell::new(process);
+    finalize_decision(
+        // Can't observe it any more counts as gone: nothing useful left to do.
+        || matches!(process.borrow_mut().try_wait(), Ok(None)),
+        || fs::metadata(output_path).map(|m| m.len()).ok(),
+        || {
+            let _ = process.borrow_mut().kill();
+        },
+        || started.elapsed(),
+        std::thread::sleep,
+        FINALIZE_TIMING,
+    )
+}
+
+struct FinalizeTiming {
+    poll: Duration,
     // No growth for this long, with the process still alive, means it is stuck rather than busy.
     // Matches the old flat timeout, which is a reasonable "it really isn't doing anything" bar.
-    const IDLE_GRACE: Duration = Duration::from_secs(2);
+    idle_grace: Duration,
     // Absolute ceiling, so a process that somehow keeps touching the file can't hold Stop open
     // indefinitely. Generous enough that only a genuinely stuck ffmpeg should ever reach it.
-    const HARD_CAP: Duration = Duration::from_secs(120);
+    hard_cap: Duration,
+}
 
-    let started = Instant::now();
-    let mut last_progress = Instant::now();
-    let mut last_size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+const FINALIZE_TIMING: FinalizeTiming = FinalizeTiming {
+    poll: Duration::from_millis(100),
+    idle_grace: Duration::from_secs(2),
+    hard_cap: Duration::from_secs(120),
+};
+
+// The decision loop behind wait_for_ffmpeg_to_finalize, with everything it touches in the outside
+// world passed in - the process, the file, the clock, the kill, the sleep. In production those are
+// real; in tests they are a simulated process and a clock that only moves when the loop sleeps.
+// That matters: this logic is about *time* ("no growth for two seconds"), and a test that measures
+// real time against a real process fails whenever the machine is busy enough to delay the process by
+// that same two seconds - which is exactly what loaded CI runners do. Returns whether it killed.
+fn finalize_decision(
+    mut alive: impl FnMut() -> bool,
+    mut size: impl FnMut() -> Option<u64>,
+    mut kill: impl FnMut(),
+    mut now: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    timing: FinalizeTiming,
+) -> bool {
+    let started = now();
+    let mut last_progress = started;
+    let mut last_size = size().unwrap_or(0);
 
     loop {
-        match process.try_wait() {
-            // Exited on its own - the file was finalized properly.
-            Ok(Some(_)) => return false,
-            Ok(None) => {}
-            // Can't observe it any more; nothing useful left to do here.
-            Err(_) => return false,
+        // Exited on its own - the file was finalized properly.
+        if !alive() {
+            return false;
         }
 
-        let size = fs::metadata(output_path).map(|m| m.len()).unwrap_or(last_size);
-        if size != last_size {
-            last_size = size;
-            last_progress = Instant::now();
+        // An unreadable size counts as no change rather than as progress or as an error.
+        if let Some(current) = size() {
+            if current != last_size {
+                last_size = current;
+                last_progress = now();
+            }
         }
 
-        if started.elapsed() >= HARD_CAP {
+        let elapsed = now() - started;
+        if elapsed >= timing.hard_cap {
             warn!(
                 "ffmpeg still running {}s after being asked to stop, force-killing - the recording may be incomplete",
-                HARD_CAP.as_secs()
+                timing.hard_cap.as_secs()
             );
-            let _ = process.kill();
+            kill();
             return true;
         }
 
-        if last_progress.elapsed() >= IDLE_GRACE {
+        if now() - last_progress >= timing.idle_grace {
             warn!(
                 "ffmpeg stopped writing {}s ago but hasn't exited, force-killing - the recording may be incomplete",
-                IDLE_GRACE.as_secs()
+                timing.idle_grace.as_secs()
             );
-            let _ = process.kill();
+            kill();
             return true;
         }
 
-        std::thread::sleep(POLL);
+        sleep(timing.poll);
     }
 }
 
@@ -913,49 +954,26 @@ mod shutdown_tests {
         p
     }
 
-    // Waits (generously) until the stand-in process has actually started writing, as a real ffmpeg
-    // has by the time Stop is pressed. PowerShell alone can take seconds to start under a parallel
-    // `cargo test` - longer than IDLE_GRACE - which made these tests flaky, not the logic.
-    fn wait_until_writing(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+    // These two check the real wiring - Child::try_wait, Child::kill and the file's metadata - and
+    // nothing about timing. How the decision is made over time is in finalize_tests below, with a
+    // simulated clock: a real process paced against a real clock fails whenever a busy machine
+    // delays it by the two-second idle grace (both "starts and exits promptly" and "keeps writing"
+    // did, under load, before they were rewritten this way).
 
     #[test]
-    fn a_process_that_exits_promptly_is_not_killed() {
+    fn a_process_that_has_already_exited_is_not_killed() {
         let path = temp("quick");
         fs::write(&path, b"done").unwrap();
-        // cmd starts in milliseconds, unlike PowerShell - "exits promptly" is then really prompt.
         let mut child = Command::new("cmd").args(["/C", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn cmd");
+        // Let it finish first, however long a busy machine takes: the function then sees an exited
+        // process, whatever the scheduler did.
+        child.wait().expect("wait for cmd");
         assert!(!wait_for_ffmpeg_to_finalize(&mut child, &path));
         let _ = fs::remove_file(&path);
     }
 
-    // The regression this whole change exists for: ffmpeg still writing when the old flat
-    // two-second timeout would have expired must be left alone, not killed mid-write.
-    #[test]
-    fn a_slow_but_still_writing_process_is_left_alone() {
-        let path = temp("writing");
-        fs::write(&path, b"").unwrap();
-        let script = format!(
-            "1..24 | ForEach-Object {{ Add-Content -LiteralPath '{}' -Value 'x'; Start-Sleep -Milliseconds 200 }}",
-            path.display()
-        );
-        let mut child = ps(&script);
-        wait_until_writing(&path);
-        let started = Instant::now();
-        let killed = wait_for_ffmpeg_to_finalize(&mut child, &path);
-        assert!(!killed, "a process still growing the output file must not be force-killed");
-        assert!(
-            started.elapsed() >= Duration::from_secs(3),
-            "should have waited out the writes rather than giving up at the old 2s mark"
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    // The other half: alive but doing nothing is exactly what the kill is for.
+    // Alive but doing nothing is exactly what the kill is for. Load can only make this later, never
+    // wrong: a stalled process still counts as stalled, and the bound below is generous.
     #[test]
     fn a_hung_process_is_killed_after_the_idle_grace() {
         let path = temp("hung");
@@ -969,6 +987,94 @@ mod shutdown_tests {
         );
         let _ = child.wait();
         let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // A simulated process and clock. Time moves only when the loop sleeps, so these run instantly and
+    // a loaded machine cannot disturb them. `alive_until`: when the process exits (None: never).
+    // `size_at`: the output file's size at a given moment.
+    struct Run {
+        killed: bool,
+        ended_at: Duration,
+        decision: bool,
+    }
+
+    fn run(alive_until: Option<Duration>, size_at: impl Fn(Duration) -> Option<u64>) -> Run {
+        let clock = Cell::new(Duration::ZERO);
+        let killed = Cell::new(false);
+        let decision = finalize_decision(
+            || alive_until.is_none_or(|t| clock.get() < t),
+            || size_at(clock.get()),
+            || killed.set(true),
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+            FINALIZE_TIMING,
+        );
+        Run { killed: killed.get(), ended_at: clock.get(), decision }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_process_that_has_already_exited_is_never_killed() {
+        let r = run(Some(Duration::ZERO), |_| Some(4));
+        assert!(!r.decision && !r.killed);
+        assert_eq!(r.ended_at, Duration::ZERO);
+    }
+
+    // The regression this logic exists for: ffmpeg still writing when the old flat two-second
+    // timeout would have expired must be left alone, not killed mid-write.
+    #[test]
+    fn a_slow_but_still_writing_process_is_left_alone() {
+        // One byte every 200ms for 4.8s, then it finalizes and exits at 5.0s.
+        let r = run(Some(ms(5_000)), |t| Some((t.as_millis() as u64 / 200).min(24)));
+        assert!(!r.decision && !r.killed, "a process still growing the output file must not be force-killed");
+        assert!(r.ended_at >= Duration::from_secs(3), "should have waited out the writes, not given up at the old 2s mark");
+    }
+
+    #[test]
+    fn a_process_that_stops_writing_is_killed_after_the_idle_grace() {
+        let r = run(None, |_| Some(7));
+        assert!(r.decision && r.killed);
+        assert!(r.ended_at >= FINALIZE_TIMING.idle_grace, "must give it the whole grace period");
+        assert!(r.ended_at < FINALIZE_TIMING.idle_grace + FINALIZE_TIMING.poll * 3, "and not much longer");
+    }
+
+    #[test]
+    fn a_stall_shorter_than_the_grace_does_not_count() {
+        // Grows in bursts with a pause between them, repeatedly, then exits: a pause of 1.5s, then
+        // one of 1.9s - both under the two-second grace - must never be mistaken for a hang.
+        let r = run(Some(Duration::from_secs(10)), |t| Some(t.as_millis() as u64 / 1_500));
+        assert!(!r.decision && !r.killed);
+        let r = run(Some(Duration::from_secs(10)), |t| Some(t.as_millis() as u64 / 1_900));
+        assert!(!r.decision && !r.killed);
+    }
+
+    #[test]
+    fn a_process_that_never_stops_touching_the_file_is_killed_at_the_hard_cap() {
+        let r = run(None, |t| Some(t.as_millis() as u64 / 50));
+        assert!(r.decision && r.killed);
+        assert!(r.ended_at >= FINALIZE_TIMING.hard_cap && r.ended_at < FINALIZE_TIMING.hard_cap + FINALIZE_TIMING.poll * 3);
+    }
+
+    #[test]
+    fn an_unreadable_file_counts_as_no_progress_not_as_an_error() {
+        let r = run(None, |_| None);
+        assert!(r.decision && r.killed, "alive and unobservable output is treated like a stall");
+    }
+
+    #[test]
+    fn growth_after_an_unreadable_moment_resets_the_clock() {
+        // Unreadable for the first 1.5s, then readable and growing steadily until it exits.
+        let r = run(Some(Duration::from_secs(6)), |t| (t > ms(1_500)).then(|| t.as_millis() as u64 / 100));
+        assert!(!r.decision && !r.killed);
     }
 }
 
@@ -1128,6 +1234,21 @@ pub(crate) fn resolved_max_width(form_data: &FormData) -> i32 {
         .resolution_width
         .map(|w| w.max(MIN_RESOLUTION_WIDTH))
         .unwrap_or(MAX_RECORDING_WIDTH)
+}
+
+// Capture framerate on the macOS and Linux backends: the user's setting, clamped to 1-60 like the
+// Windows one, else the mode's own default.
+#[allow(dead_code)] // the Windows backend resolves its framerate inside ScreenSource instead
+pub(crate) fn resolved_framerate(form_data: &FormData, default_fps: i32) -> i32 {
+    form_data.framerate.unwrap_or(default_fps).clamp(1, 60)
+}
+
+// `-vf` value that scales a screen capture down to the resolved max width, keeping its aspect
+// ratio and never enlarging. Width is forced even (and height follows with -2): H.264 in yuv420p
+// cannot encode an odd dimension, and a desktop or window can be any size.
+#[allow(dead_code)] // the Windows backend scales inside its own filter graph
+pub(crate) fn desktop_scale_filter(form_data: &FormData) -> String {
+    format!("scale='trunc(min({},iw)/2)*2':-2", resolved_max_width(form_data))
 }
 
 // libx264 defaults to a ~250-frame GOP when -g is unset, which at these recording framerates
@@ -1592,6 +1713,9 @@ pub(crate) fn hide_console_window(cmd: &mut Command) {
     cmd.creation_flags(0x08000000);
 }
 
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn hide_console_window(_cmd: &mut Command) {}
+
 // Runs ffmpeg with a hidden console window on Windows, stdin piped (every recording mode needs
 // this open for the graceful 'q'-to-stop in stop_recording), stdout/stderr discarded — the right
 // default for the long-running recording modes below, none of which read their own output.
@@ -1651,6 +1775,7 @@ pub(crate) fn sync_live_inputs(args: Vec<String>) -> Vec<String> {
 // compiled for — e.g. entirely unused in a Windows build, since win.rs doesn't call it.)
 #[allow(dead_code)]
 pub(crate) async fn spawn_recording(
+    app_handle: &AppHandle,
     state: &State<'_, AppState>,
     output_path: &PathBuf,
     ffmpeg_path: &PathBuf,
@@ -1661,7 +1786,14 @@ pub(crate) async fn spawn_recording(
         *app_state = Some(output_path.clone());
     }
 
-    let args = sync_live_inputs(args);
+    // ffmpeg writes its own `-progress` stats to a file (no pipe to drain, so no deadlock risk):
+    // start_recording waits on it to know capture has really started, and progress_watch forwards
+    // it to the recording bar as live fps / dropped frames - the same as on Windows. Without it
+    // every start here waited out the full capture-start timeout.
+    let progress_sidecar = crate::services::progress_watch::progress_sidecar_path(output_path);
+    let mut with_progress = vec!["-progress".to_string(), path_to_str(&progress_sidecar)?.to_string()];
+    with_progress.extend(args);
+    let args = sync_live_inputs(with_progress);
     log::debug!("FFmpeg args: {:?}", args);
 
     let mut cmd = silent_command(ffmpeg_path);
@@ -1672,10 +1804,12 @@ pub(crate) async fn spawn_recording(
         .map_err(|e| format!("Failed to start recording: {}", e))?;
     crate::services::orphan_guard::after_spawn(&child);
 
+    let pid = child.id();
     {
         let mut process_state = state.ffmpeg_process.lock().await;
         *process_state = Some(child);
     }
+    crate::services::progress_watch::watch(app_handle.clone(), progress_sidecar, state.ffmpeg_process.clone(), pid);
 
     Ok(format!(
         "Recording started. File will be saved to {}",
@@ -1736,6 +1870,13 @@ fn recording_in_progress(app_handle: &AppHandle) -> bool {
 pub fn warm_screen_capture(_ffmpeg_path: &Path) {
     #[cfg(target_os = "windows")]
     gpu_capture::warm(_ffmpeg_path);
+}
+
+/// Connected devices for a start request built in Rust (services/recording_setup.rs). Blocks on
+/// the first probe of a session - call it off the async runtime.
+pub(crate) fn connected_devices_now(app_handle: &AppHandle) -> crate::services::recording_setup::ConnectedDevices {
+    let (video, audio) = connected_devices_cached(app_handle, recording_in_progress(app_handle));
+    crate::services::recording_setup::ConnectedDevices { audio, video }
 }
 
 pub fn warm_device_cache(app_handle: &AppHandle) {
@@ -1821,8 +1962,25 @@ fn resolve_recording_output_path(form_data: &FormData) -> Result<PathBuf, String
     )
 }
 
+/// Starts a recording, then runs the side effects every recording needs whoever started it - tray
+/// dot, recording-only shortcuts, the recording bar's timer (services/recording_session.rs).
 #[tauri::command]
 pub async fn start_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    form_data: FormData,
+) -> Result<String, String> {
+    let can_switch_view = crate::services::recording_session::can_switch_view(
+        &form_data.record_type,
+        form_data.separate_webcam_capture,
+        &form_data.video_devices,
+    );
+    let message = start_recording_inner(app_handle.clone(), state, form_data).await?;
+    crate::services::recording_session::on_started(&app_handle, can_switch_view);
+    Ok(message)
+}
+
+async fn start_recording_inner(
     app_handle: AppHandle,
     state: State<'_, AppState>,
     form_data: FormData,
@@ -2041,9 +2199,14 @@ pub async fn start_recording(
     // gdigrab, with GPU capture switched off for the session - a driver that won't cooperate
     // costs the user a second's delay, not a failed recording.
     let progress_path = crate::services::progress_watch::progress_sidecar_path(&output_path);
+    // Counts GPU-capture start attempts: only Windows has a second path to fall back to.
+    #[cfg(target_os = "windows")]
     let mut attempts = 0;
     let (output, early_exit_status) = loop {
-        attempts += 1;
+        #[cfg(target_os = "windows")]
+        {
+            attempts += 1;
+        }
         #[cfg(target_os = "windows")]
         gpu_capture::note_start(None);
         // A previous attempt's progress file would read as this one having started already.
@@ -2522,8 +2685,20 @@ pub async fn take_screenshot(app_handle: AppHandle, form_data: FormData) -> Resu
     result
 }
 
+/// Stops the recording. The recording-wide side effects are undone as the stop begins - capture
+/// ends within a moment, while assembling the file can take minutes.
 #[tauri::command]
 pub async fn stop_recording(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if recording_in_progress(&app_handle) {
+        crate::services::recording_session::on_stopped(&app_handle);
+    }
+    stop_recording_inner(app_handle, state).await
+}
+
+async fn stop_recording_inner(
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
@@ -2710,7 +2885,7 @@ pub async fn stop_recording(
                 let clicks_path = click_sidecar_path(&output_path);
                 match serde_json::to_string(&clicks) {
                     Ok(json) => {
-                        if let Err(e) = fs::write(&clicks_path, json) {
+                        if let Err(e) = crate::services::sidecars::write_sidecar(&clicks_path, json) {
                             warn!("Failed to write click-tracking sidecar: {}", e);
                         }
                     }
@@ -2729,7 +2904,7 @@ pub async fn stop_recording(
                     None => Some((hns - started_hns) as f64 / 1e7).filter(|t| *t >= 0.0),
                 };
                 if !log.is_empty() {
-                    if let Err(e) = fs::write(pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
+                    if let Err(e) = crate::services::sidecars::write_sidecar(&pointer_sidecar_path(&output_path), log.to_sidecar(to_output).to_string()) {
                         warn!("Failed to write the pointer sidecar: {}", e);
                     }
                 }
@@ -2739,7 +2914,7 @@ pub async fn stop_recording(
                 let clicks = log.left_clicks(to_output);
                 if !clicks_path.exists() && !clicks.is_empty() {
                     if let Ok(json) = serde_json::to_string(&clicks) {
-                        let _ = fs::write(&clicks_path, json);
+                        let _ = crate::services::sidecars::write_sidecar(&clicks_path, json);
                     }
                 }
             }
@@ -2765,7 +2940,7 @@ pub async fn stop_recording(
             let switches_path = view_switch_sidecar_path(&output_path);
             match serde_json::to_string(&switches) {
                 Ok(json) => {
-                    if let Err(e) = fs::write(&switches_path, json) {
+                    if let Err(e) = crate::services::sidecars::write_sidecar(&switches_path, json) {
                         warn!("Failed to write view-switch sidecar: {}", e);
                     }
                 }
@@ -3051,6 +3226,46 @@ async fn create_or_replace_rec_completed_modal(
     })
     .await
     .map_err(|e| format!("Modal window creation task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn form(resolution_width: Option<i32>, framerate: Option<i32>) -> FormData {
+        let mut f: serde_json::Value = serde_json::json!({
+            "file_name": "t", "file_ext": "mp4", "record_type": "s", "audio_device": "",
+            "screen_size": "fullscreen", "overlay_shape": "rounded",
+            "overlay_position": "bottom_right", "overlay_size": "small",
+        });
+        f["resolution_width"] = serde_json::json!(resolution_width);
+        f["framerate"] = serde_json::json!(framerate);
+        serde_json::from_value(f).unwrap()
+    }
+
+    #[test]
+    fn untouched_settings_keep_the_old_defaults() {
+        assert_eq!(resolved_framerate(&form(None, None), 30), 30);
+        assert_eq!(resolved_max_width(&form(None, None)), MAX_RECORDING_WIDTH);
+    }
+
+    #[test]
+    fn framerate_follows_the_setting_within_sane_bounds() {
+        assert_eq!(resolved_framerate(&form(None, Some(24)), 30), 24);
+        assert_eq!(resolved_framerate(&form(None, Some(60)), 30), 60);
+        assert_eq!(resolved_framerate(&form(None, Some(240)), 30), 60);
+        assert_eq!(resolved_framerate(&form(None, Some(0)), 30), 1);
+    }
+
+    #[test]
+    fn scale_filter_caps_width_keeps_it_even_and_never_enlarges() {
+        assert_eq!(desktop_scale_filter(&form(None, None)), "scale='trunc(min(1920,iw)/2)*2':-2");
+        assert_eq!(desktop_scale_filter(&form(Some(1280), None)), "scale='trunc(min(1280,iw)/2)*2':-2");
+        // "Native" is a very large number, which min() turns into a no-op.
+        assert_eq!(desktop_scale_filter(&form(Some(7680), None)), "scale='trunc(min(7680,iw)/2)*2':-2");
+        // Below the floor it is raised rather than trusted.
+        assert_eq!(desktop_scale_filter(&form(Some(100), None)), "scale='trunc(min(640,iw)/2)*2':-2");
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { testFfmpeg } from "../test/ffmpeg";
 import { despill, guessKeyColor, keyAlpha, keyUV, pixelUV, spillType, type ChromaKey } from "./chromaKey";
 
 // A synthetic green-screen shot: a noisy, unevenly lit screen with a subject in the middle whose
@@ -64,9 +65,10 @@ describe("chroma key", () => {
   });
 
   // The export's chain (chroma_key_filters, conversion.rs) on the same picture: alpha and colour
-  // must match what this model - and so the preview shader - computes. Needs the bundled ffmpeg.
-  const ffmpeg = join(__dirname, "../../src-tauri/binaries/ffmpeg/ffmpeg.exe");
-  it.skipIf(!existsSync(ffmpeg))("matches ffmpeg's chromakey + despill", () => {
+  // must match what this model - and so the preview shader - computes. Needs a runnable ffmpeg
+  // (test/ffmpeg.ts).
+  const ffmpeg = testFfmpeg() ?? "";
+  it.skipIf(!ffmpeg)("matches ffmpeg's chromakey + despill", () => {
     const W = 96;
     const H = 64;
     const k: ChromaKey = { color: "#18a848", similarity: 0.1, blend: 0.12, spill: 0.7 };

@@ -377,6 +377,7 @@ FILTER {}", t.elapsed(), f.unwrap_or_default());
 // Integrated loudness everything is delivered at.
 pub const TARGET_LUFS: f64 = -16.0;
 // System audio sits this far under the voice when both are present, before ducking.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const SYSTEM_UNDER_VOICE_LU: f64 = 10.0;
 // Final safety limiter, -1.5dBFS - the headroom lossy encoders need to avoid clipping on decode.
 pub const LIMITER: &str = "alimiter=limit=0.84:attack=2:release=50:level=false";
@@ -414,6 +415,9 @@ pub fn gain_to(target: f64, measured: Option<f64>) -> f64 {
 }
 
 // The system-audio target: under the voice when there is one, the delivery level when it's alone.
+// System audio is ducked under the voice here only on Windows, where loopback capture is a separate
+// file mixed at the end; macOS and Linux mix it live while recording (amix), so it isn't ducked yet.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn system_target(with_voice: bool) -> f64 {
     if with_voice {
         TARGET_LUFS - SYSTEM_UNDER_VOICE_LU
@@ -424,6 +428,7 @@ pub fn system_target(with_voice: bool) -> f64 {
 
 // Ducks `[system]` under `[voice]` (sidechain: the system audio dips while you talk) and mixes
 // them, ending in `[label]` - the final limiter is the caller's.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn duck_and_mix(voice: &str, system: &str, label: &str) -> String {
     format!(
         "{v}asplit=2[dv][dk];{s}[dk]sidechaincompress=threshold=0.03:ratio=4:attack=30:release=500:makeup=1[ds];\
@@ -458,6 +463,7 @@ pub fn clean_voice(
 }
 
 // Loudness of `map` in `input` without writing anything.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn measure(ffmpeg: &Path, input: &Path, map: &str) -> Result<Option<f64>, String> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-nostats", "-i"])

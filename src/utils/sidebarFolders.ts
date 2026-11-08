@@ -32,6 +32,40 @@ export function togglePinnedFolder(folder: string): string[] {
   return next;
 }
 
+// Per-folder file order: by name (the default), newest first, or oldest first. Kept per folder
+// path so e.g. "recordings" can show the latest take on top while other folders stay A-Z.
+const FOLDER_SORT_KEY = "briefcast.folderSort.v1";
+export type FolderSort = "name" | "date-desc" | "date-asc";
+export type FolderSortMap = Record<string, FolderSort>;
+
+export function getFolderSorts(): FolderSortMap {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FOLDER_SORT_KEY) ?? "{}");
+    const out: FolderSortMap = {};
+    if (parsed && typeof parsed === "object") {
+      for (const [k, v] of Object.entries(parsed)) if (v === "date-desc" || v === "date-asc") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// name -> newest first -> oldest first -> name.
+export function cycleFolderSort(folder: string): FolderSortMap {
+  const sorts = getFolderSorts();
+  const cur = sorts[folder] ?? "name";
+  const next: FolderSort = cur === "name" ? "date-desc" : cur === "date-desc" ? "date-asc" : "name";
+  if (next === "name") delete sorts[folder];
+  else sorts[folder] = next;
+  try {
+    localStorage.setItem(FOLDER_SORT_KEY, JSON.stringify(sorts));
+  } catch {
+    /* preference only */
+  }
+  return sorts;
+}
+
 export function getSidebarViewMode(): SidebarViewMode {
   try {
     return localStorage.getItem(VIEW_MODE_KEY) === "grid" ? "grid" : "list";
@@ -43,6 +77,56 @@ export function getSidebarViewMode(): SidebarViewMode {
 export function saveSidebarViewMode(mode: SidebarViewMode): void {
   try {
     localStorage.setItem(VIEW_MODE_KEY, mode);
+  } catch {
+    /* preference only */
+  }
+}
+
+// The sidebar's width: dragged wider for long names and big thumbnails, never narrower than its
+// original 300px and at most 2.2x that. Kept separately for browsing and for editing a video - a
+// roomy sidebar for the editor's docked panels (mixer, effects, AI voice) needn't eat into the
+// picture while just watching - so it moves between the two as the editor opens and closes.
+// Or collapsed to a rail of icons (SIDEBAR_RAIL_W) for the most picture while editing.
+export type SidebarMode = "browsing" | "editing";
+const WIDTH_KEYS: Record<SidebarMode, string> = { browsing: "briefcast.sidebarWidth.v1", editing: "briefcast.sidebarWidth.editing.v1" };
+const COLLAPSED_KEY = "briefcast.sidebarCollapsed.v1";
+export const SIDEBAR_MIN_W = 300;
+export const SIDEBAR_MAX_W = 660;
+export const SIDEBAR_RAIL_W = 56;
+
+export const clampSidebarWidth = (w: number): number => Math.round(Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, Number.isFinite(w) ? w : SIDEBAR_MIN_W)));
+
+export function getSidebarWidth(mode: SidebarMode): number {
+  try {
+    // Editing starts from the browsing width until it's been set on its own.
+    const saved = localStorage.getItem(WIDTH_KEYS[mode]) ?? (mode === "editing" ? localStorage.getItem(WIDTH_KEYS.browsing) : null);
+    return clampSidebarWidth(Number(saved ?? SIDEBAR_MIN_W));
+  } catch {
+    return SIDEBAR_MIN_W;
+  }
+}
+
+export function saveSidebarWidth(mode: SidebarMode, w: number): number {
+  const width = clampSidebarWidth(w);
+  try {
+    localStorage.setItem(WIDTH_KEYS[mode], String(width));
+  } catch {
+    /* preference only */
+  }
+  return width;
+}
+
+export function getSidebarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveSidebarCollapsed(collapsed: boolean): void {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0");
   } catch {
     /* preference only */
   }

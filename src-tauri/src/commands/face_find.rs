@@ -531,7 +531,8 @@ pub async fn prepare_face_matching(app_handle: AppHandle) -> Result<(), String> 
     let dir = engine_dir(&app_handle)?;
     blocking(move || -> Result<(), String> {
         if models_ready(&dir) {
-            loaded_models(&dir)?;
+            // Warming only: load, then release the lock at once so a real query is never held up.
+            drop(loaded_models(&dir)?);
         }
         Ok(())
     })

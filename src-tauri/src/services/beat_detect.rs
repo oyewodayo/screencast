@@ -93,6 +93,9 @@ impl FrameEnergies {
     }
 }
 
+// Whole-file analysis in one call - the app streams through FrameEnergies instead; the tests use
+// this to check the streamed result against the one-shot one.
+#[cfg(test)]
 fn onset_envelope(samples: &[f32]) -> Vec<f32> {
     let mut energies = FrameEnergies::new();
     energies.push(samples);
@@ -152,6 +155,7 @@ fn estimate_period(env: &[f32], frame_rate: f64) -> Option<f64> {
     Some(best as f64 + shift)
 }
 
+#[cfg(test)]
 pub fn track_beats(samples: &[f32], sample_rate: f64) -> Option<BeatAnalysis> {
     beats_from_envelope(onset_envelope(samples), sample_rate)
 }

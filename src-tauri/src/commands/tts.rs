@@ -1,7 +1,7 @@
 // Commands behind the AI voice (components/docker/AiVoicePanel.tsx). The engine is services/tts.rs;
 // this is the thin layer that fetches it, runs it off the UI thread, and reports progress.
-use serde::Serialize;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Window};
 
@@ -105,6 +105,7 @@ pub async fn tts_synthesize(app_handle: AppHandle, window: Window, text: String,
         let name = format!("AI voice - {} - {} {}.wav", tts::name_from_text(&text), settings.voice, key);
         let path = dir.join(&name);
         if path.is_file() && seconds_of(&path) > 0.0 {
+            write_script(&path, &text, &settings);
             return Ok(SpokenFile { seconds: seconds_of(&path), path: path.to_string_lossy().into_owned(), cached: true });
         }
         let progress = |done: usize, total: usize| {
@@ -112,10 +113,97 @@ pub async fn tts_synthesize(app_handle: AppHandle, window: Window, text: String,
         };
         let spoken = tts::synthesize(&app_handle, &text, &settings, &SYNTH_CANCELLED, &progress)?;
         tts::write_wav(&path, &spoken.samples)?;
+        write_script(&path, &text, &settings);
         Ok(SpokenFile { seconds: spoken.samples.len() as f64 / tts::SAMPLE_RATE as f64, path: path.to_string_lossy().into_owned(), cached: false })
     })
     .await
     .map_err(|e| format!("Voice task failed: {}", e))?
+}
+
+// What a voice-over was made from, kept beside its .wav as "<name>.wav.json" - the panel's history
+// lists these so a voice-over can be found, placed again, or re-made with changed words long after
+// the panel forgot its draft. Not media, so the library never shows it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Script {
+    text: String,
+    voice: String,
+    speed: f32,
+    pause: f32,
+    created_at: u64,
+}
+
+fn script_path(wav: &Path) -> PathBuf {
+    let mut name = wav.as_os_str().to_owned();
+    name.push(".json");
+    PathBuf::from(name)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+// Best-effort: a voice-over without its script still plays; it just can't be re-made from history.
+fn write_script(wav: &Path, text: &str, settings: &Settings) {
+    let target = script_path(wav);
+    if target.is_file() {
+        return;
+    }
+    let script = Script { text: text.to_string(), voice: settings.voice.clone(), speed: settings.speed, pause: settings.pause, created_at: now_ms() };
+    if let Ok(json) = serde_json::to_string_pretty(&script) {
+        if let Err(e) = std::fs::write(&target, json) {
+            eprintln!("Couldn't save the voice-over's script: {}", e);
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceOverEntry {
+    path: String,
+    seconds: f64,
+    // None for one made before scripts were kept (v0.1.3 and earlier) - then only the start of its
+    // words survives, in the file name.
+    text: Option<String>,
+    voice: Option<String>,
+    speed: Option<f32>,
+    pause: Option<f32>,
+    created_at: u64,
+}
+
+// Every AI voice-over in the library's Voice-overs folder, newest first.
+#[tauri::command]
+pub async fn tts_history() -> Result<Vec<VoiceOverEntry>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dir = crate::services::utility::briefcast_dir()?.join("Voice-overs");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(Vec::new()) };
+        let mut list = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("AI voice - ") || !name.to_lowercase().ends_with(".wav") {
+                continue;
+            }
+            let script: Option<Script> = std::fs::read_to_string(script_path(&path)).ok().and_then(|j| serde_json::from_str(&j).ok());
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // "AI voice - <words> - <voice> <key>.wav" names the voice even without a script.
+            let voice_from_name = name.trim_end_matches(".wav").rsplit(" - ").next().and_then(|tail| tail.split(' ').next()).map(str::to_string);
+            list.push(match script {
+                Some(s) => VoiceOverEntry { path: path.to_string_lossy().into_owned(), seconds: seconds_of(&path), text: Some(s.text), voice: Some(s.voice), speed: Some(s.speed), pause: Some(s.pause), created_at: s.created_at },
+                None => VoiceOverEntry { path: path.to_string_lossy().into_owned(), seconds: seconds_of(&path), text: None, voice: voice_from_name, speed: None, pause: None, created_at: modified },
+            });
+        }
+        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(list)
+    })
+    .await
+    .map_err(|e| format!("Voice history task failed: {}", e))?
 }
 
 #[tauri::command(async)]

@@ -428,7 +428,7 @@ fn expand_core(core: &str) -> Option<String> {
                 let c2: String = format!("{:0<2}", c).chars().take(2).collect();
                 let cn: u64 = c2.parse().ok()?;
                 if cn > 0 {
-                    out = format!("{} and {} {}", out, number_to_words(cn), plural(if major == "pound" { "penny" } else { "cent" }, cn));
+                    out = format!("{} and {} {}", out, number_to_words(cn), plural(minor, cn));
                 }
             }
             return Some(out);

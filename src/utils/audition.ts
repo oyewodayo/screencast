@@ -20,7 +20,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { AudioFx } from "./audioFx";
 import { dbToGain, gainDbAt, hasAutomation, type GainPoint } from "./audioAutomation";
 import { fadeLevel, NO_FADES, type PieceFades } from "./audioJoins";
-import { resumeMixer, setElementGain, syncElementFx } from "./mixerGraph";
+import { resumeMixer, setElementGain, syncElementFx, unrouteElement } from "./mixerGraph";
 import { claimPlayback, registerPlayback, setPreviewHead } from "./previewHead";
 
 export interface AuditionPiece {
@@ -166,6 +166,7 @@ export class Audition {
     const player = this.players.get(id);
     if (!player) return;
     player.el.pause();
+    unrouteElement(player.el);
     // Lets go of the decoder at once rather than whenever it's collected.
     player.el.removeAttribute("src");
     player.el.load();

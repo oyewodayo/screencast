@@ -605,8 +605,11 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
     left: 8 - gutter,
     top: 8 - frameRect.top,
     width: panelWidth,
-    // Clear of the player's transport bar along the bottom.
-    maxHeight: Math.max(160, frameRect.height + 2 * frameRect.top - 16 - 64),
+    // Down to the bottom of the player's picture area. While editing, the transport bar already sits
+    // below that area (VideoPlayer's .editing layout), so only in fullscreen - where the bar floats
+    // over the picture - is its height kept clear; subtracting it always left an empty black strip
+    // under the panel with its last settings cut off above it.
+    maxHeight: Math.max(160, frameRect.height + 2 * frameRect.top - 16 - (document.querySelector(".video-container.editing") ? 0 : 64)),
   };
 
   return (

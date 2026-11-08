@@ -10,7 +10,6 @@
 // mirror (hue-rotate, saturate, grayscale, brightness) is exactly a 3x3 matrix.
 use crate::commands::conversion::{compose_css_color_ops, sendcmd_series, CssColorOp};
 use serde::Deserialize;
-use std::f64::consts::PI;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -166,7 +165,6 @@ mod tests {
         let g = clip_fx_graph(&ClipFx { kind: "huecycle".into(), intensity: 1.0 }, "i", "o", (64, 64), 1.0, 0).unwrap();
         let m = css_matrix(&[CssColorOp::HueRotate(60.0), CssColorOp::Saturate(1.25)]);
         assert!(g.contains(&format!("0.3000 colorchannelmixer@hc0 rr {:.6}", m[0][0])), "{g}");
-        let _ = PI;
     }
 
     #[test]

@@ -57,7 +57,8 @@ const hasTransition = (clip: Clip | undefined): clip is Clip => !!clip?.transiti
 
 // Last frame of the outgoing clip, by source URL + source time. A handful at most stay alive.
 const frameCache = new Map<string, Promise<HTMLCanvasElement>>();
-const FRAME_CACHE_MAX = 8;
+const FRAME_CACHE_MAX = 4;
+const MAX_CAPTURE_DIM = 1280;
 
 function captureFrame(url: string, time: number): Promise<HTMLCanvasElement> {
   const key = `${url}|${time.toFixed(3)}`;
@@ -83,8 +84,11 @@ function captureFrame(url: string, time: number): Promise<HTMLCanvasElement> {
           "seeked",
           () => {
             const canvas = document.createElement("canvas");
-            canvas.width = video.videoWidth || 2;
-            canvas.height = video.videoHeight || 2;
+            const vw = video.videoWidth || 2;
+            const vh = video.videoHeight || 2;
+            const scale = Math.min(1, MAX_CAPTURE_DIM / Math.max(vw, vh));
+            canvas.width = Math.max(2, Math.round(vw * scale));
+            canvas.height = Math.max(2, Math.round(vh * scale));
             canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
             finish();
             resolve(canvas);
@@ -150,7 +154,7 @@ const tailSpeed = (clip: Clip): number => Math.max(0.0625, Math.min(16, speedAtS
 // Detached tail players, by source URL + out-point: created (and seeked to the out-point) while the
 // outgoing clip is still on screen, so the tail is decoded and waiting when playback crosses over.
 const tailPool = new Map<string, HTMLVideoElement>();
-const TAIL_POOL_MAX = 3;
+const TAIL_POOL_MAX = 2;
 
 function tailVideo(url: string, start: number): HTMLVideoElement {
   const key = `${url}|${start.toFixed(3)}`;
@@ -176,7 +180,7 @@ function tailVideo(url: string, start: number): HTMLVideoElement {
 }
 
 // A reusable canvas the size of the frame in device pixels, cleared to black, scaled to frame px.
-function framePictureContext(canvas: HTMLCanvasElement, W: number, H: number, dpr: number): CanvasRenderingContext2D | null {
+export function framePictureContext(canvas: HTMLCanvasElement, W: number, H: number, dpr: number): CanvasRenderingContext2D | null {
   const w = Math.max(1, Math.round(W * dpr));
   const h = Math.max(1, Math.round(H * dpr));
   if (canvas.width !== w || canvas.height !== h) {
@@ -197,6 +201,26 @@ const shownGradeCanvas = (scope: Element | null | undefined): HTMLCanvasElement 
   const canvas = scope?.querySelector<HTMLCanvasElement>("canvas[data-grade-canvas]");
   return canvas && canvas.style.display !== "none" && canvas.width > 0 ? canvas : null;
 };
+
+// The player's picture as the frame shows it, painted into `ctx` (frame px): the clip with its
+// effect on (ClipFxLayer's frame-sized canvas) when it has one, else its graded copy or the <video>
+// itself, in its own CSS look. `root` is a layer laid over the player's whole <video> box (at
+// -frameRect.left, -frameRect.top), as TransitionPreviewLayer's and EdgeTransitionPreviewLayer's are.
+export function paintPlayerPicture(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, root: HTMLElement, frameRect: FrameRect): void {
+  const withFx = root.parentElement?.querySelector<HTMLCanvasElement>("canvas[data-clip-fx]");
+  if (withFx && withFx.style.display !== "none" && withFx.width > 0) {
+    ctx.drawImage(withFx, 0, 0, frameRect.width, frameRect.height);
+    return;
+  }
+  const box = { x: -frameRect.left, y: -frameRect.top, w: frameRect.width + 2 * frameRect.left, h: frameRect.height + 2 * frameRect.top };
+  // The <video>'s own layout box (transforms aside), relative to the frame's top-left.
+  const rootRect = root.getBoundingClientRect();
+  const parentRect = (video.offsetParent ?? video.parentElement)?.getBoundingClientRect();
+  const vbox = parentRect
+    ? { x: parentRect.left + video.offsetLeft - (rootRect.left + frameRect.left), y: parentRect.top + video.offsetTop - (rootRect.top + frameRect.top), w: video.offsetWidth, h: video.offsetHeight }
+    : box;
+  paintDisplayedPicture(ctx, shownGradeCanvas(video.parentElement) ?? video, vbox, video.style.transform, video.style.transformOrigin, video.style.filter);
+}
 
 const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRect, clips, activeClipId, getPlaybackState, getVideoElement, resolveClipUrl }) => {
   const activeIndex = activeClipId ? clips.findIndex((clip) => clip.id === activeClipId) : -1;
@@ -356,16 +380,7 @@ const TransitionPreviewLayer: React.FC<TransitionPreviewLayerProps> = ({ frameRe
       const box = { x: -frameRect.left, y: -frameRect.top, w: containerW, h: containerH };
       const oldEl = tailShown && tailVideoEl ? shownGradeCanvas(tailWrap) ?? tailVideoEl : readyCanvas;
       paintDisplayedPicture(oldCtx, oldEl, box, outgoingLook.transform, "", outgoingLook.filter);
-      // The <video>'s own layout box (transforms aside), relative to the frame's top-left.
-      const rootRect = root.getBoundingClientRect();
-      const parentRect = (video.offsetParent ?? video.parentElement)?.getBoundingClientRect();
-      const vbox = parentRect
-        ? { x: parentRect.left + video.offsetLeft - (rootRect.left + frameRect.left), y: parentRect.top + video.offsetTop - (rootRect.top + frameRect.top), w: video.offsetWidth, h: video.offsetHeight }
-        : box;
-      // The incoming clip with its effect on (ClipFxLayer's canvas, frame-sized), when it has one.
-      const withFx = root.parentElement?.querySelector<HTMLCanvasElement>("canvas[data-clip-fx]");
-      if (withFx && withFx.style.display !== "none" && withFx.width > 0) newCtx.drawImage(withFx, 0, 0, frameRect.width, frameRect.height);
-      else paintDisplayedPicture(newCtx, shownGradeCanvas(video.parentElement) ?? video, vbox, video.style.transform, video.style.transformOrigin, video.style.filter);
+      paintPlayerPicture(newCtx, video, root, frameRect);
       return { old: oldPicRef.current, next: newPicRef.current };
     };
     const render = (p: number) =>

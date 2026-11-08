@@ -1,0 +1,14 @@
+{
+  "bundle": {
+    "targets": ["nsis", "msi"],
+    "resources": [
+      "binaries/ffmpeg/ffmpeg.exe",
+      "binaries/ffmpeg/ffprobe.exe",
+      "binaries/heif/*",
+      "binaries/whisper/*.exe",
+      "binaries/whisper/*.dll",
+      "binaries/rnnoise/*",
+      "licenses/*"
+    ]
+  }
+}

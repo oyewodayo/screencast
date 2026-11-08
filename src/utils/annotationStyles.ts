@@ -88,28 +88,43 @@ export interface AnnotationInk {
 // perfect-freehand turns the raw point+pressure samples into a pressure-tapered outline polygon,
 // filled rather than stroked, which is what gives it a real marker/stylus feel instead of a
 // uniform-width polyline (same technique as PdfAnnotator's pen tool).
-const tracePath = (ctx: CanvasRenderingContext2D, ink: AnnotationInk, size: number, thinning: number): void => {
+//
+// Low streamline on purpose: streamline pulls each point back toward the one before it, and at 0.5
+// the ink's tip visibly trailed the pointer - drawing felt like dragging the line behind the pen.
+// The outline is kept per stroke and size, and only re-traced when its points change, so a stroke
+// already on screen costs nothing to trace again.
+const STREAMLINE = 0.15;
+const outlines = new WeakMap<AnnotationInk, Map<string, { points: AnnotationStrokePoint[]; count: number; path: Path2D }>>();
+
+const tracePath = (ink: AnnotationInk, size: number, thinning: number): Path2D => {
   const pts = ink.points;
+  const key = `${size}|${thinning}`;
+  let byKey = outlines.get(ink);
+  const cached = byKey?.get(key);
+  if (cached && cached.points === pts && cached.count === pts.length) return cached.path;
   const outline = getStroke(
     pts.map((p) => [p.x, p.y, p.pressure]),
     {
       size,
       thinning,
       smoothing: 0.5,
-      streamline: 0.5,
+      streamline: STREAMLINE,
       simulatePressure: pts.every((p) => p.pressure === 0.5),
     }
   );
-  ctx.beginPath();
+  const path = new Path2D();
   if (outline.length === 0) {
     // A plain tap/click - perfect-freehand needs at least two samples to form an outline, so this
     // still leaves a visible dot instead of drawing nothing.
-    ctx.arc(pts[0].x, pts[0].y, size / 2, 0, Math.PI * 2);
-    return;
+    path.arc(pts[0].x, pts[0].y, size / 2, 0, Math.PI * 2);
+  } else {
+    path.moveTo(outline[0][0], outline[0][1]);
+    for (let i = 1; i < outline.length; i++) path.lineTo(outline[i][0], outline[i][1]);
+    path.closePath();
   }
-  ctx.moveTo(outline[0][0], outline[0][1]);
-  for (let i = 1; i < outline.length; i++) ctx.lineTo(outline[i][0], outline[i][1]);
-  ctx.closePath();
+  if (!byKey) outlines.set(ink, (byKey = new Map()));
+  byKey.set(key, { points: pts, count: pts.length, path });
+  return path;
 };
 
 export const drawAnnotationInk = (ctx: CanvasRenderingContext2D, ink: AnnotationInk, opacity: number): void => {
@@ -130,8 +145,7 @@ export const drawAnnotationInk = (ctx: CanvasRenderingContext2D, ink: Annotation
       dropShadow();
       ctx.globalAlpha = opacity * 0.42;
       ctx.fillStyle = ink.color;
-      tracePath(ctx, ink, ink.width * 2.6, 0);
-      ctx.fill();
+      ctx.fill(tracePath(ink, ink.width * 2.6, 0));
       break;
     case "neon":
     case "laser": {
@@ -139,23 +153,60 @@ export const drawAnnotationInk = (ctx: CanvasRenderingContext2D, ink: Annotation
       ctx.shadowColor = ink.color;
       ctx.shadowBlur = size * 2.5;
       ctx.fillStyle = ink.color;
-      tracePath(ctx, ink, size, 0.35);
-      ctx.fill();
+      const body = tracePath(ink, size, 0.35);
+      ctx.fill(body);
       // Second, tighter halo, then a near-white core - what reads as "lit" rather than just blurred.
       ctx.shadowBlur = size;
-      ctx.fill();
+      ctx.fill(body);
       ctx.shadowBlur = 0;
       ctx.globalAlpha = opacity * 0.9;
       ctx.fillStyle = "#ffffff";
-      tracePath(ctx, ink, Math.max(1.5, size * 0.38), 0.35);
-      ctx.fill();
+      ctx.fill(tracePath(ink, Math.max(1.5, size * 0.38), 0.35));
       break;
     }
     default:
       dropShadow();
       ctx.fillStyle = ink.color;
-      tracePath(ctx, ink, ink.width, 0.6);
-      ctx.fill();
+      ctx.fill(tracePath(ink, ink.width, 0.6));
   }
   ctx.restore();
+};
+
+// A finished stroke drawn once, at full opacity, into a bitmap just big enough for it and its glow
+// or shadow - so the overlay's frames (a stroke holding, then fading) are a drawImage each instead
+// of re-filling every outline with its blurs. `dpr` keeps it as sharp as the live canvas.
+export interface BakedInk {
+  image: HTMLCanvasElement;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export const bakeAnnotationInk = (ink: AnnotationInk, dpr: number): BakedInk | null => {
+  if (ink.points.length === 0) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of ink.points) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  // The widest anything reaches past the points: the marker's 2.6x body, neon's 2.5x halo, a shadow.
+  const pad = Math.ceil(ink.width * 6 + 16);
+  const x = Math.floor(minX - pad);
+  const y = Math.floor(minY - pad);
+  const width = Math.ceil(maxX + pad) - x;
+  const height = Math.ceil(maxY + pad) - y;
+  const image = document.createElement("canvas");
+  image.width = Math.max(1, Math.round(width * dpr));
+  image.height = Math.max(1, Math.round(height * dpr));
+  const ctx = image.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(dpr, 0, 0, dpr, -x * dpr, -y * dpr);
+  drawAnnotationInk(ctx, ink, 1);
+  return { image, x, y, width, height };
 };

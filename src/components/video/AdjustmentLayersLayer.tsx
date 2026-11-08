@@ -141,6 +141,15 @@ const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selec
   const layer = layers.find((l) => l.id === selectedId) ?? null;
   const [drag, setDrag] = useState<Drag | null>(null);
   const [live, setLive] = useState<Drag["box"] | null>(null);
+  // Docked, the panel goes first in the Tools tab and is scrolled to whenever a layer is picked -
+  // appended under a panel already open there (a clip's effects), it was out of sight and the
+  // layer looked like it had no settings at all.
+  const dockedRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!selectedId) return;
+    const raf = requestAnimationFrame(() => dockedRef.current?.scrollIntoView({ block: "start", behavior: "smooth" }));
+    return () => cancelAnimationFrame(raf);
+  }, [selectedId, host]);
   if (!layer || !onUpdate) return null;
   const region = layer.region;
   // A followed area is edited where it is at the playhead; moving it shifts its whole path.
@@ -248,7 +257,7 @@ const Controls: React.FC<Props> = ({ frameRect, layers, currentOutputTime, selec
       )}
       {host
         ? createPortal(
-            <div className={`${DOCKED_PANEL_CLASS} p-3.5 gap-4`}>
+            <div ref={dockedRef} className={`${DOCKED_PANEL_CLASS} p-3.5 gap-4 order-first scroll-mt-3`}>
               {header}
               {panel}
             </div>,

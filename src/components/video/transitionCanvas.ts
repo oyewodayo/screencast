@@ -337,7 +337,8 @@ function drawFace(ctx: CanvasRenderingContext2D, src: CanvasImageSource, face: F
   const a0 = face.at(0);
   const a1 = face.at(1);
   const span = Math.abs(a1.along - a0.along) * dpr;
-  const n = Math.max(8, Math.min(720, Math.ceil(span / 1.5)));
+  const maxSlices = W <= 220 ? 20 : 64;
+  const n = Math.max(8, Math.min(maxSlices, Math.ceil(span / 2.5)));
   const [sw, sh] = sourceSize(src);
   const overlap = 0.6 / dpr;
   for (let i = 0; i < n; i++) {

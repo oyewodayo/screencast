@@ -19,7 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { PhysicalPosition } from "@tauri-apps/api/window";
-import { isRegistered, register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import { onGlobalShortcut, setShortcutGroup, type ShortcutAction } from "./globalShortcuts";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL, getPhoneCameraState, subscribePhoneCamera } from "./phoneCamera";
 
 // grid: every shown camera, tiled evenly. spotlight: the live camera large, the others in a
@@ -268,38 +268,29 @@ export const presentationActionForKey = (e: KeyboardEvent): PresentationAction |
 };
 
 // System-wide while the display is live, so the operator can cut cameras from another app
-// (slides, lyrics): Alt+Shift+1-9 cut, Alt+Shift+0 all cameras, Alt+Shift+L next layout. Alt+Shift
-// rather than Ctrl+Alt (AltGr on many keyboards), matching the recording's Alt+Shift+V.
-const GLOBAL_SHORTCUTS: [string, PresentationAction][] = [
-    ...Array.from({ length: 9 }, (_, i) => [`Alt+Shift+${i + 1}`, { type: "cut", index: i + 1 }] as [string, PresentationAction]),
-    ["Alt+Shift+0", { type: "all" }],
-    ["Alt+Shift+L", { type: "layout" }],
-];
-
-const registerGlobalShortcuts = async () => {
-    for (const [shortcut, action] of GLOBAL_SHORTCUTS) {
-        try {
-            // Re-registered rather than skipped: after a page reload the plugin still holds the
-            // shortcut, bound to the dead page's callback (see bindShortcut in Dashboard.tsx).
-            if (await isRegistered(shortcut)) await unregister(shortcut);
-            await register(shortcut, (event) => {
-                if (event.state === "Pressed") applyPresentationAction(action);
-            });
-        } catch (err) {
-            // Taken by another app - the in-app keys still work.
-            console.warn(`Couldn't register ${shortcut}:`, err);
-        }
-    }
+// (slides, lyrics): Alt+Shift+1-9 cut, Alt+Shift+0 all cameras, Alt+Shift+L next layout. The keys
+// are registered by Rust (services/shortcuts.rs, "presentation" group); this maps their actions.
+const shortcutAction = (action: ShortcutAction): PresentationAction | null => {
+    if (action === "presentation-all") return { type: "all" };
+    if (action === "presentation-layout") return { type: "layout" };
+    const cut = /^presentation-cut-(\d)$/.exec(action);
+    return cut ? { type: "cut", index: Number(cut[1]) } : null;
 };
 
-const unregisterGlobalShortcuts = async () => {
-    for (const [shortcut] of GLOBAL_SHORTCUTS) {
-        try {
-            if (await isRegistered(shortcut)) await unregister(shortcut);
-        } catch {
-            // Already gone.
-        }
-    }
+let stopShortcuts: (() => void) | null = null;
+
+const enableGlobalShortcuts = async () => {
+    stopShortcuts ??= onGlobalShortcut((action) => {
+        const mapped = shortcutAction(action);
+        if (mapped && state.active) applyPresentationAction(mapped);
+    });
+    await setShortcutGroup("presentation", true);
+};
+
+const disableGlobalShortcuts = async () => {
+    await setShortcutGroup("presentation", false);
+    stopShortcuts?.();
+    stopShortcuts = null;
 };
 
 let unlistenRequests: (() => void) | null = null;
@@ -367,7 +358,7 @@ export const startPresentation = async (monitorId?: string | null) => {
     displayReady = true;
     void emit(PRESENTATION_STATE_EVENT, state);
     void syncPhoneRelay();
-    void registerGlobalShortcuts();
+    void enableGlobalShortcuts();
 };
 
 export const stopPresentation = async () => {
@@ -376,7 +367,7 @@ export const stopPresentation = async () => {
     publish();
     // Tells the display to let go of its cameras.
     void emit(PRESENTATION_STATE_EVENT, state);
-    await unregisterGlobalShortcuts();
+    await disableGlobalShortcuts();
     const w = await WebviewWindow.getByLabel(PRESENTATION_WINDOW_LABEL);
     if (w) {
         await w.setFullscreen(false);

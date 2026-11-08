@@ -14,7 +14,7 @@ import { PHONE_CAMERA_DEVICE } from "../services/phoneCamera";
 import FileToolsDocker, { DockerFile } from "./docker/FileToolsDocker";
 import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
-import { loadSettings } from "../utils/appSettings";
+import { loadSettings, updateSettings } from "../utils/appSettings";
 import { startSnip } from "../services/snip";
 
 // Dispatched (on window) to bring the dock back up when it was minimized.
@@ -143,7 +143,7 @@ interface Props {
   isCroppingClip?: boolean;
   onToggleCroppingClip?: () => void;
   handleFolderSettings: () => void;
-  handleGoHome: () => void;
+  handleGoHome: (force?: boolean) => void;
   isHome: boolean;
   handleOpenBoard: () => void;
   isBoard: boolean;
@@ -501,10 +501,19 @@ const BottomDocker = ({
     setFileName(event.target.value);
   };
 
+  // Explicit picks are the user's setup and are saved as such (Rust starts recordings from the
+  // settings file with no window - services/recording_setup.rs). loadDevices' automatic choices
+  // are deliberately not saved: falling back to the first device while the usual one is unplugged
+  // must not replace the user's choice for when it's plugged back in.
+  const pickAudioDevice = (device: string) => {
+    setAudioDevice(device);
+    updateSettings({ defaultAudioDevice: device });
+  };
+
   const toggleVideoDevice = (device: string) => {
-    setVideoDevices((prev) =>
-      prev.includes(device) ? prev.filter((d) => d !== device) : [...prev, device]
-    );
+    const next = videoDevices.includes(device) ? videoDevices.filter((d) => d !== device) : [...videoDevices, device];
+    setVideoDevices(next);
+    updateSettings({ defaultVideoDevices: next });
   };
 
   // Drives the shortcut icons in ActiveRecordingState (scan/videocam/mic) when the full
@@ -632,7 +641,7 @@ const BottomDocker = ({
       fileExt={fileExt}
       onFileExtChange={setFileExt}
       audioDevice={audioDevice}
-      onAudioDeviceChange={setAudioDevice}
+      onAudioDeviceChange={pickAudioDevice}
       connectedAudioDevices={connectedAudioDevices}
       connectedCameraDevices={connectedCameraDevices}
       onToggleVideoDevice={toggleVideoDevice}
@@ -759,7 +768,7 @@ const BottomDocker = ({
             recordType={recordType}
             onRecordTypeChange={setRecordType}
             audioDevice={audioDevice}
-            onAudioDeviceChange={setAudioDevice}
+            onAudioDeviceChange={pickAudioDevice}
             connectedAudioDevices={connectedAudioDevices}
             connectedCameraDevices={connectedCameraDevices}
             videoDevices={videoDevices}

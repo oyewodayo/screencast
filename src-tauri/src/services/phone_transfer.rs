@@ -498,6 +498,7 @@ fn record(hub: &Arc<Hub>, app: &AppHandle, entry: HistoryEntry) {
 
 // For transfers that don't go through this server (usb_phone.rs) but belong in the same record.
 // A USB cable is a direct physical link, so those count as secure.
+#[cfg(target_os = "windows")]
 pub(crate) fn record_local(app: &AppHandle, kind: &str, device: &str, name: &str, size: u64) {
     let state = app.state::<PhoneTransferState>();
     let hub = state.hub.clone();
@@ -1122,6 +1123,24 @@ async fn handle_socket(socket: WebSocket, ctx: Ctx, auth: Auth, ua: String, name
                 emit_devices(&ctx);
             }
             // Remote, Voice-over and Prompter buttons - the desktop UI acts on them (Dashboard).
+            // With the main window released to the tray, the recording buttons are handled in Rust
+            // (services/recording_session.rs); the rest need the editor and wait for it to open.
+            Some("remote") if !crate::services::main_window::exists(&ctx.app) => {
+                use crate::services::recording_session::{handle, Request};
+                let action = value.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                let arg = value.get("value").and_then(|v| v.as_str()).map(str::to_owned);
+                match action {
+                    "record.toggle" => handle(&ctx.app, Request::Toggle(None)),
+                    "record.pause" => handle(&ctx.app, Request::PauseToggle),
+                    "view.toggle" => handle(&ctx.app, Request::ViewToggle),
+                    "record.mode" => {
+                        if let Some(rt) = arg {
+                            handle(&ctx.app, Request::SetRecordType(rt));
+                        }
+                    }
+                    _ => log::debug!("phone remote {:?} needs the main window; ignored while it is closed", action),
+                }
+            }
             Some("remote") => {
                 let _ = ctx.app.emit(
                     "phone-remote",
@@ -1811,12 +1830,23 @@ pub async fn phone_transfer_broadcast(
     if !matches!(kind.as_str(), "remote_state" | "voiceover") {
         return Err(format!("Unknown broadcast {kind}"));
     }
+    send_broadcast(&state, &kind, payload);
+    Ok(())
+}
+
+fn send_broadcast(state: &PhoneTransferState, kind: &str, payload: serde_json::Value) {
     let msg = json!({ "type": kind, "state": payload }).to_string();
-    state.hub.broadcasts.lock().unwrap().insert(kind, msg.clone());
+    state.hub.broadcasts.lock().unwrap().insert(kind.to_owned(), msg.clone());
     for session in state.hub.sessions.lock().unwrap().values() {
         let _ = session.tx.send(msg.clone());
     }
-    Ok(())
+}
+
+/// The same broadcast from Rust - the recording state while no main window exists to send it.
+pub fn broadcast(app: &tauri::AppHandle, kind: &str, payload: serde_json::Value) {
+    if let Some(state) = app.try_state::<PhoneTransferState>() {
+        send_broadcast(&state, kind, payload);
+    }
 }
 
 // Where a file sent with "Add to timeline" ended up, told to the phone that sent it.

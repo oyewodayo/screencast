@@ -2,14 +2,11 @@
 //
 // The transition picker in Clip effects: a grid of live tiles, each playing its transition on a
 // loop - from the previous clip's last frame into this clip's opening frame when those can be
-// captured, from two drawn stand-in pictures until then. Every tile is drawn by the same
+// captured, from two drawn stand-in pictures until then (and from / to black for the video's intro
+// and outro). Every tile is drawn by the same
 // renderTransitionFrame the player's preview uses (with this clip's current look - colour,
 // strength, direction), so what a tile shows is what the clip will do.
-//
-// One requestAnimationFrame loop drives all tiles from a shared clock (they play in step), writing
-// styles straight to each tile's DOM rather than through React state, and it idles whenever the
-// grid is scrolled out of view or the window is hidden.
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Clip, TransitionLook, TransitionType } from "../../utils/videoEditTypes";
 import { TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { clipStill, placeholderStills } from "../../utils/clipStill";
@@ -20,6 +17,7 @@ const HOLD_BEFORE = 0.45;
 const PLAY = 1.2;
 const HOLD_AFTER = 0.65;
 const CYCLE = HOLD_BEFORE + PLAY + HOLD_AFTER;
+const STATIC_PREVIEW_P = 0.45;
 
 interface TileRefs {
   type: TransitionType | null;
@@ -33,8 +31,10 @@ const Tile: React.FC<{
   active: boolean;
   stills: [string, string];
   register: (type: TransitionType | null, refs: TileRefs | null) => void;
+  onImageLoad: (type: TransitionType | null) => void;
+  onHoverChange: (type: TransitionType | null, entered: boolean) => void;
   onClick: () => void;
-}> = ({ type, label, active, stills, register, onClick }) => {
+}> = ({ type, label, active, stills, register, onImageLoad, onHoverChange, onClick }) => {
   const boxRef = useRef<HTMLDivElement>(null);
   const moverRef = useRef<HTMLDivElement>(null);
   const oldImgRef = useRef<HTMLImageElement>(null);
@@ -64,13 +64,15 @@ const Tile: React.FC<{
     <button
       type="button"
       onClick={onClick}
+      onMouseEnter={() => onHoverChange(type, true)}
+      onMouseLeave={() => onHoverChange(type, false)}
       title={label}
       className={`group flex flex-col gap-1 min-w-0 rounded-md p-1 text-left transition-colors ${active ? "bg-blue-500/15 ring-1 ring-blue-400/60" : "hover:bg-white/[0.06]"}`}
     >
       <div ref={boxRef} className="relative w-full aspect-video overflow-hidden rounded bg-black isolate">
-        <img ref={newImgRef} src={stills[1]} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
+        <img ref={newImgRef} src={stills[1]} onLoad={() => onImageLoad(type)} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
         <div ref={moverRef} className="absolute inset-0">
-          <img ref={oldImgRef} src={stills[0]} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
+          <img ref={oldImgRef} src={stills[0]} onLoad={() => onImageLoad(type)} alt="" draggable={false} className="absolute inset-0 w-full h-full" />
           <canvas ref={pixelRef} className="absolute inset-0 w-full h-full" style={{ imageRendering: "pixelated", display: "none" }} />
         </div>
         <div ref={blackRef} className="absolute inset-0 bg-black" style={{ opacity: 0 }} />
@@ -82,25 +84,55 @@ const Tile: React.FC<{
   );
 };
 
+// A side of the transition that's black: the video's intro comes in from it, its outro goes out to it.
+export const BLACK = "black" as const;
+type Side = Clip | typeof BLACK;
+
+let blackStillUrl: string | null = null;
+const blackStill = (): string => {
+  if (!blackStillUrl) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 16;
+    canvas.height = 9;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, 16, 9);
+    }
+    blackStillUrl = canvas.toDataURL();
+  }
+  return blackStillUrl;
+};
+
 interface TransitionGridProps {
   value: TransitionType | null;
   look: TransitionLook | undefined;
-  // The clip the transition comes from (its last frame) and the one it leads into.
-  outgoing: Clip | undefined;
-  incoming: Clip;
+  // The clip the transition comes from (its last frame) and the one it leads into - or black, for
+  // the video's intro (from black) and outro (to black).
+  outgoing: Side | undefined;
+  incoming: Side;
   onChange: (type: TransitionType | null) => void;
 }
 
 const TransitionGrid: React.FC<TransitionGridProps> = ({ value, look, outgoing, incoming, onChange }) => {
   const [stills, setStills] = useState<[string, string]>(placeholderStills);
+  const [hoveredType, setHoveredType] = useState<TransitionType | null>(null);
 
-  const outgoingKey = outgoing ? `${outgoing.sourcePath}|${outgoing.end}` : "";
-  const incomingKey = `${incoming.sourcePath}|${incoming.start}`;
+  const outgoingKey = outgoing === BLACK ? BLACK : outgoing ? `${outgoing.sourcePath}|${outgoing.end}` : "";
+  const incomingKey = incoming === BLACK ? BLACK : `${incoming.sourcePath}|${incoming.start}`;
   useEffect(() => {
     let cancelled = false;
     const [oldFallback, newFallback] = placeholderStills();
-    const before = outgoing ? clipStill(outgoing.sourcePath, Math.max(outgoing.start, outgoing.end - 1 / 30)).catch(() => oldFallback) : Promise.resolve(oldFallback);
-    const after = clipStill(incoming.sourcePath, incoming.start + Math.min(0.3, (incoming.end - incoming.start) / 4)).catch(() => newFallback);
+    const before =
+      outgoing === BLACK
+        ? Promise.resolve(blackStill())
+        : outgoing
+          ? clipStill(outgoing.sourcePath, Math.max(outgoing.start, outgoing.end - 1 / 30)).catch(() => oldFallback)
+          : Promise.resolve(oldFallback);
+    const after =
+      incoming === BLACK
+        ? Promise.resolve(blackStill())
+        : clipStill(incoming.sourcePath, incoming.start + Math.min(0.3, (incoming.end - incoming.start) / 4)).catch(() => newFallback);
     Promise.all([before, after]).then((pair) => !cancelled && setStills(pair));
     return () => {
       cancelled = true;
@@ -109,59 +141,93 @@ const TransitionGrid: React.FC<TransitionGridProps> = ({ value, look, outgoing, 
   }, [outgoingKey, incomingKey]);
 
   const tiles = useRef(new Map<TransitionType | null, TileRefs>());
-  const register = useMemo(
-    () => (type: TransitionType | null, refs: TileRefs | null) => {
-      if (refs) tiles.current.set(type, refs);
-      else tiles.current.delete(type);
-    },
-    []
-  );
-
   const lookRef = useRef<TransitionLook>(look ?? {});
   lookRef.current = look ?? {};
 
-  const gridRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const grid = gridRef.current;
-    if (!grid) return;
-    let visible = true;
-    let raf = 0;
-    const start = performance.now();
-    const tick = (now: number) => {
-      raf = 0;
-      if (!visible || document.hidden) return;
-      const t = ((now - start) / 1000) % CYCLE;
-      const p = Math.max(0, Math.min(1, (t - HOLD_BEFORE) / PLAY));
-      tiles.current.forEach(({ type, box, els }) => {
-        const W = box.clientWidth;
-        const H = box.clientHeight;
-        if (W === 0 || H === 0) return;
-        renderTransitionFrame(type, lookRef.current, p, els, { L: 0, T: 0, W, H, containerW: W, containerH: H });
-      });
-      raf = requestAnimationFrame(tick);
-    };
-    const resume = () => {
-      if (!raf && visible && !document.hidden) raf = requestAnimationFrame(tick);
-    };
-    const observer = new IntersectionObserver(([entry]) => {
-      visible = entry.isIntersecting;
-      resume();
-    });
-    observer.observe(grid);
-    document.addEventListener("visibilitychange", resume);
-    resume();
-    return () => {
-      observer.disconnect();
-      document.removeEventListener("visibilitychange", resume);
-      if (raf) cancelAnimationFrame(raf);
-    };
+  const paintTile = useCallback((entry: TileRefs, p: number) => {
+    const W = entry.box.clientWidth || 80;
+    const H = entry.box.clientHeight || 45;
+    if (W === 0 || H === 0) return;
+    renderTransitionFrame(entry.type, lookRef.current, entry.type === null ? 0 : p, entry.els, { L: 0, T: 0, W, H, containerW: W, containerH: H });
   }, []);
 
+  const register = useCallback(
+    (type: TransitionType | null, refs: TileRefs | null) => {
+      if (refs) {
+        tiles.current.set(type, refs);
+        paintTile(refs, STATIC_PREVIEW_P);
+      } else {
+        tiles.current.delete(type);
+      }
+    },
+    [paintTile]
+  );
+
+  const handleImageLoad = useCallback(
+    (type: TransitionType | null) => {
+      const entry = tiles.current.get(type);
+      if (entry) paintTile(entry, STATIC_PREVIEW_P);
+    },
+    [paintTile]
+  );
+
+  const handleHoverChange = useCallback((type: TransitionType | null, entered: boolean) => {
+    if (!type) return;
+    setHoveredType((prev) => (entered ? type : prev === type ? null : prev));
+  }, []);
+
+  // Re-paint static previews whenever stills or look settings change.
+  const lookKey = JSON.stringify(look ?? null);
+  useEffect(() => {
+    tiles.current.forEach((entry) => paintTile(entry, STATIC_PREVIEW_P));
+  }, [stills, lookKey, paintTile]);
+
+  // Animate only the hovered tile so opening and scrolling the grid of 33 transitions stays effortless.
+  useEffect(() => {
+    if (!hoveredType) return;
+    const entry = tiles.current.get(hoveredType);
+    if (!entry) return;
+    let raf = 0;
+    const start = performance.now();
+    const W = entry.box.clientWidth || 80;
+    const H = entry.box.clientHeight || 45;
+    const tick = (now: number) => {
+      const t = ((now - start) / 1000) % CYCLE;
+      const p = Math.max(0, Math.min(1, (t - HOLD_BEFORE) / PLAY));
+      renderTransitionFrame(entry.type, lookRef.current, p, entry.els, { L: 0, T: 0, W, H, containerW: W, containerH: H });
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      paintTile(entry, STATIC_PREVIEW_P);
+    };
+  }, [hoveredType, paintTile]);
+
   return (
-    <div ref={gridRef} className="grid grid-cols-3 gap-1">
-      <Tile type={null} label="None" active={value === null} stills={stills} register={register} onClick={() => onChange(null)} />
+    <div className="grid grid-cols-3 gap-1">
+      <Tile
+        type={null}
+        label="None"
+        active={value === null}
+        stills={stills}
+        register={register}
+        onImageLoad={handleImageLoad}
+        onHoverChange={handleHoverChange}
+        onClick={() => onChange(null)}
+      />
       {TRANSITION_PRESETS.map((p) => (
-        <Tile key={p.value} type={p.value} label={p.label} active={value === p.value} stills={stills} register={register} onClick={() => onChange(p.value)} />
+        <Tile
+          key={p.value}
+          type={p.value}
+          label={p.label}
+          active={value === p.value}
+          stills={stills}
+          register={register}
+          onImageLoad={handleImageLoad}
+          onHoverChange={handleHoverChange}
+          onClick={() => onChange(p.value)}
+        />
       ))}
     </div>
   );

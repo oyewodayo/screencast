@@ -245,6 +245,9 @@ interface VideoOverlayLayerProps {
   onSelectOverlay: (id: string | null) => void;
   selectedImageOverlayId: string | null;
   onSelectImageOverlay: (id: string | null) => void;
+  // While playing, a selection keeps its settings panel but not its handles - they'd sit over
+  // the moving picture.
+  isPlaying?: boolean;
   // Text tool armed from VideoTimelineDocker's toolbar (lifted to Dashboard since that button and
   // this click surface live in separate subtrees) - the next click on the video places a new
   // overlay there and disarms itself via onPlacementConsumed.
@@ -530,6 +533,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
   onSelectOverlay,
   selectedImageOverlayId,
   onSelectImageOverlay,
+  isPlaying = false,
   isPlacingText,
   onPlacementConsumed,
   onAddTextOverlay,
@@ -1475,7 +1479,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           comparably strong, same "close enough for a live preview" spirit as every other overlay
           aesthetic here that has a real export-side implementation. */}
       {activeBlurOverlays.map((o) => {
-        const isSelected = selectedBlurOverlayId === o.id;
+        const isSelected = selectedBlurOverlayId === o.id && !isPlaying;
         const blurPx = Math.max(0, o.intensity) * frameRect.height * BLUR_PREVIEW_SCALE;
         // Same clamped-rise reasoning as the image overlay's own rotate handle just below (see
         // that block's comment) - reused here via the same rotateHandleRiseFor/roomAbovePx shape
@@ -1681,7 +1685,7 @@ const VideoOverlayLayer: React.FC<VideoOverlayLayerProps> = ({
           );
         }
         const o = s.o;
-        const isSelected = selectedImageOverlayId === o.id;
+        const isSelected = selectedImageOverlayId === o.id && !isPlaying;
         const radiusPx = (o.cornerRadius ?? 0) * frameRect.height;
         // .video-container (the ancestor VideoPlayer renders all of this into) clips with
         // overflow:hidden, so a handle positioned purely by a fixed negative offset (e.g. always

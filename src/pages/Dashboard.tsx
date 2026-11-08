@@ -9,7 +9,7 @@ import type { BubbleRegion } from "../utils/webcamBubble";
 import { removeBackground } from "../utils/backgroundRemoval";
 import { BLUR_DEFAULT, cutoutBackgroundFromPref } from "../utils/cutoutBackground";
 import { VIDEO_CHANNEL, silencedBySolo, useMixerSession } from "../utils/mixerState";
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, startTransition } from "react";
 import { ToolPanelHostContext, ToolPanelOpenContext } from "../components/docker/ToolPanelHost";
 import CaptionOverlayLayer from "../components/video/CaptionOverlayLayer";
 import { buildCaptionLines } from "../utils/captions";
@@ -24,10 +24,9 @@ import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
 import { fadeTotalMs } from '../utils/annotationStyles';
-import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-shortcut';
+import { describeShortcutFailures, onGlobalShortcut, onShortcutFailures, type ShortcutAction } from '../services/globalShortcuts';
 import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
-import SidebarFileIcon from "../components/SidebarFileIcon";
 import {
   canMoveFolder,
   folderMatchesQuery,
@@ -38,10 +37,17 @@ import {
   pinRank,
   repathFolderKey,
   repathPinnedFolders,
-  saveSidebarViewMode,
-  togglePinnedFolder,
+  getFolderSorts,
+  type FolderSortMap,
+  getSidebarCollapsed,
+  getSidebarWidth,
+  saveSidebarCollapsed,
+  saveSidebarWidth,
+  SIDEBAR_RAIL_W,
+  type SidebarMode,
   type SidebarViewMode,
 } from "../utils/sidebarFolders";
+import { FileNameText, SidebarRail, SidebarResizeHandle } from "../components/SidebarResize";
 import VideoPlayer, { EditTimeline, VideoPlayerHandle } from "../components/VideoPlayer";
 import { seekTimeline, timelineTime } from "../utils/timelineTransport";
 import { chapterAtOutputTime, outputChapters } from "../utils/videoChapters";
@@ -71,15 +77,30 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
+import SidebarHeader from "../components/sidebar/SidebarHeader";
+import { FILE_CATEGORY_TABS } from "../components/sidebar/categoryTabs";
+import TidyLibraryDialog from "../components/video/TidyLibraryDialog";
+import { folderCollapse } from "../components/sidebar/folderCollapse";
+import { useStableCallbacks } from "../hooks/useStableCallbacks";
+import { FileEntry, GALLERY_CATEGORIES, SidebarTab, TrashEntry } from "../utils/libraryEntries";
+import { setEditorIntent, type EditorIntent } from "../utils/editorIntent";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
+import ProjectPrepOverlay from "../components/video/ProjectPrepOverlay";
+import { endPrep, getPrep, setWarm, startPrep, updatePrep } from "../utils/projectPrep";
 import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import PhonePreviewLayer from "../components/video/PhonePreviewLayer";
+import SplitArrangeBar from "../components/video/SplitArrangeBar";
+import { usePhonePreview } from "../hooks/usePhonePreview";
+import { splitGroupMembers } from "../utils/splitGroups";
 import AdjustmentLayersLayer from "../components/video/AdjustmentLayersLayer";
 import StageLayer from "../components/video/StageLayer";
 import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
-import { addCloseGuard, installCloseGuards, quitApp } from "../utils/closeGuards";
+import { addCloseGuard, addReleaseBlocker, HIDDEN_TO_TRAY_EVENT, installCloseGuards, quitApp } from "../utils/closeGuards";
+import { stopAllPlayback } from "../utils/previewHead";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
@@ -88,6 +109,7 @@ import { useGradeLut } from "../utils/gradeLuts";
 import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import EdgeTransitionPreviewLayer from "../components/video/EdgeTransitionPreviewLayer";
 import ClipFxLayer from "../components/video/ClipFxLayer";
 import { forgetTimelineBootstrap } from "../components/docker/VideoTimelineDocker";
 import ClipHandoffLayer, { ClipHandoffApi } from "../components/video/ClipHandoffLayer";
@@ -112,7 +134,6 @@ import {
   onPhoneRemote,
   onPhoneTimelineFile,
   PhoneRemoteCommand,
-  openPhoneReceive,
   openPhoneTransfer,
   reportPhonePlacement,
   setPhoneTimeline,
@@ -124,7 +145,7 @@ import FileInfoModal from "../components/Modals/FileInfoModal";
 import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
-import { SNIP_SHORTCUT, SnipResult, startSnip } from "../services/snip";
+import { SnipResult, startSnip } from "../services/snip";
 
 // Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
 // CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
@@ -139,7 +160,6 @@ import {
 } from "../services/phoneCamera";
 import Toast from "../components/custom/Toast";
 import { copyImageUrlToClipboard } from "../utils/imageClipboard";
-import InlineRenameInput from "../components/InlineRenameInput";
 import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
 import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
@@ -149,8 +169,8 @@ import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../u
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { AppSettings, loadSettings, saveSettings } from "../utils/appSettings";
-import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension, isConvertibleCategory } from "../utils/fileCategory";
+import { AppSettings, loadSettings, saveSettings, updateSettings } from "../utils/appSettings";
+import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
   getPinnedPaths,
   getRecentPaths,
@@ -177,83 +197,30 @@ import {
   forgetPlaybackState,
 } from "../utils/playbackResume";
 import {
-  IoVideocam,
-  IoMusicalNotes,
-  IoImage,
   IoDocumentText,
   IoChevronBack,
-  IoChevronForward,
-  IoRepeatOutline,
-  IoShuffleOutline,
-  IoPlayForwardOutline,
-  IoTrashOutline,
   IoArrowUndoOutline,
   IoFolderOutline,
-  IoAddCircleOutline,
-  IoBuildOutline,
   IoOptionsOutline,
-  IoAdd,
   IoPin,
-  IoPinOutline,
-  IoGridOutline,
-  IoListOutline,
-  IoCreateOutline,
-  IoSwapHorizontalOutline,
   IoLocateOutline,
-  IoRefresh,
-  IoSearch,
-  IoClose,
-  IoSwapVerticalOutline,
-  IoEyeOffOutline,
-  IoEyeOutline,
-  IoInformationCircleOutline,
   IoCutOutline,
   IoDocumentTextOutline,
   IoGitNetworkOutline,
   IoMapOutline,
   IoImagesOutline,
   IoFolderOpenOutline,
-  IoImageOutline,
   IoPhonePortraitOutline,
-  IoCopyOutline,
 } from "react-icons/io5";
-import { MdCreateNewFolder, MdOutlineDescription } from "react-icons/md";
+import { MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
 
 type RAMInfo = [number, number];
 
-const FILE_CATEGORY_TABS: { category: FileCategory; label: string; icon: React.ReactNode }[] = [
-  { category: "video", label: "Video", icon: <IoVideocam size={18} /> },
-  { category: "audio", label: "Audio", icon: <IoMusicalNotes size={18} /> },
-  { category: "image", label: "Image", icon: <IoImage size={18} /> },
-  { category: "pdf", label: "Pdf", icon: <IoDocumentText size={18} /> },
-  { category: "document", label: "Documents", icon: <MdOutlineDescription size={18} /> },
-];
 
 // The sidebar's active tab is either a real file category or the Trash view — the latter isn't
 // a FileCategory (getFileCategory never returns it; it's a distinct data source, not an
 // extension-based filter over `files`), so it gets its own type rather than being folded in.
-type SidebarTab = FileCategory | "trash";
-
-// Categories with a folder-click grid view (ImageFolderGallery/VideoFolderGallery/
-// PdfFolderGallery/DocumentFolderGallery) - audio doesn't have one yet. Centralized so adding a
-// category's gallery later is a one-line change here instead of hunting down every
-// activeFileCategory === "x" || activeFileCategory === "y" check this gates.
-const GALLERY_CATEGORIES: readonly SidebarTab[] = ["image", "video", "pdf", "document"];
-
-interface TrashEntry {
-  trashed_name: string;
-  name: string;
-  original_path: string;
-  deleted_at: number; // unix seconds
-}
-
-const formatDeletedAt = (unixSeconds: number): string => {
-  const diffDays = Math.floor((Date.now() - unixSeconds * 1000) / (1000 * 60 * 60 * 24));
-  if (diffDays <= 0) return "today";
-  if (diffDays === 1) return "1 day ago";
-  return `${diffDays} days ago`;
-};
 
 // Filters shown in the native "open file" dialog — same extensions the sidebar already
 // understands, so anything pickable there is guaranteed playable/viewable here too.
@@ -266,17 +233,10 @@ const OPEN_FILE_DIALOG_FILTERS = [
   { name: "Document", extensions: FILE_CATEGORY_EXTENSIONS.document },
 ];
 
-// Toggles the recording-overlay window's visibility. Registered as an OS-level hotkey via
-// Tauri's globalShortcut API (backed by RegisterHotKey) while a recording is in progress -
-// this only ever fires for this exact key combo, unlike a low-level keyboard hook that would
-// see every keystroke system-wide.
-const OVERLAY_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+H';
+// Every system-wide shortcut is registered by Rust (src-tauri/src/services/shortcuts.rs, which
+// holds the key combinations) and arrives here as a `global-shortcut` action - see the dispatcher
+// effect below. The constants that remain are for labels shown to the user.
 
-// Cuts the recording's main view between the screen and a full-frame camera, while recording -
-// only registered when the recording has a separate camera file to cut to (see canSwitchView).
-// Alt+Shift rather than Ctrl+Shift: Ctrl+Shift+V is "paste as plain text" in browsers, Slack and
-// Docs - exactly the apps people demo - and a global shortcut would swallow it.
-const VIEW_SWITCH_SHORTCUT = 'Alt+Shift+V';
 
 const toggleOverlayVisibility = async () => {
   const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
@@ -288,56 +248,16 @@ const toggleOverlayVisibility = async () => {
   }
 };
 
-// Global shortcuts go through these two instead of register/unregister directly:
-//
-//  - bindShortcut always re-registers. The plugin keeps a shortcut registered on the Rust side
-//    across a page reload, still pointing at the dead page's callback - the old "register only if
-//    !isRegistered" check then skipped registering for the new page, so the shortcut silently did
-//    nothing after any reload (a Vite full reload in dev, Settings' "Reload app").
-//  - Every bind/unbind for one shortcut runs strictly in call order. Effect cleanups used to
-//    unregister asynchronously, so under StrictMode's mount -> unmount -> mount (and on effect
-//    re-runs) a late unregister could land after the new register and remove it.
-//  - The handler fires on key-down only; the plugin reports release too.
-const shortcutQueues = new Map<string, Promise<void>>();
-const queueShortcutOp = (accelerator: string, op: () => Promise<void>): Promise<void> => {
-  const next = (shortcutQueues.get(accelerator) ?? Promise.resolve()).catch(() => {}).then(op);
-  shortcutQueues.set(accelerator, next);
-  return next;
-};
-const bindShortcut = (accelerator: string, onPress: () => void): Promise<void> =>
-  queueShortcutOp(accelerator, async () => {
-    if (await isRegistered(accelerator)) await unregister(accelerator);
-    await register(accelerator, (event) => {
-      if (event.state === 'Pressed') onPress();
-    });
-  });
-const unbindShortcut = (accelerator: string): Promise<void> =>
-  queueShortcutOp(accelerator, async () => {
-    if (await isRegistered(accelerator)) await unregister(accelerator);
-  });
+// The record shortcut (Ctrl+Shift+R, "record-toggle") starts a full-screen recording with the
+// current setup when not recording, or stops the one in progress - a single toggle rather than two
+// bindings. It deliberately skips EnhancedScreenOptions' target picker (screen_size is always
+// "fullscreen"), since the whole point of a global shortcut is starting without switching to this
+// window first.
 
-// Toggles the system-wide stylus annotation overlay's "draw mode" - unlike the recording overlay
-// above, this one is available any time (not gated on an active recording), so its hotkey is
-// registered/unregistered purely based on the enableAnnotationTool setting (see the effect that
-// watches annotationEnabled below), not recording state.
-const ANNOTATION_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+D';
-// Blurs the whole active window, or unblurs it (services/screen_blur) - from anywhere, no draw mode
-// needed. Lives and dies with the annotation tool, like the shortcut above.
-const BLUR_WINDOW_SHORTCUT = 'CommandOrControl+Alt+B';
-
-// Toggles visibility of the bottom-right recording-panel buttons (screenshot/screen-webcam-mic/
-// record) - meant for hiding them right before presenting/recording a screen that includes this
-// app's own window, without opening Settings mid-presentation. Registered once on mount, unlike
-// the two shortcuts above: there's no window to create/tear down, just a boolean to flip.
-const PANEL_BUTTONS_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+B';
-
-// Starts a full-screen recording with whatever settings are currently configured (record type,
-// file name/ext, audio/video devices, overlay options) when not recording, or stops the
-// in-progress one when pressed again - a single toggle rather than two separate bindings, same
-// convention as OVERLAY_TOGGLE_SHORTCUT/PANEL_BUTTONS_TOGGLE_SHORTCUT above. Deliberately skips
-// EnhancedScreenOptions' target picker (screen_size is hardcoded to "fullscreen") since the whole
-// point of a global hotkey is starting a recording without switching to this window first.
-const RECORDING_TOGGLE_SHORTCUT = 'CommandOrControl+Shift+R';
+// Whether a format from the bottom bar can carry this record type - a format picked while on
+// "mic only" (mp3) must not be handed to a screen recording started from the tray.
+const formatSuitsRecordType = (ext: string, recordType: string): boolean =>
+	recordType === 'a' ? ['mp3', 'wav', 'aac', 'wma'].includes(ext) : ['mp4', 'mkv', 'mov', 'webm', 'avi'].includes(ext);
 // How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
 // stroke that's still fading gets to finish instead of vanishing instantly - the longest fade the
 // current Settings > Annotation fade can produce (the overlay's toolbar can switch style, never
@@ -348,12 +268,6 @@ const annotationFadeGraceMs = (): number => {
 	return Math.max(fadeTotalMs('pen', annotationFade), fadeTotalMs('laser', annotationFade)) + 400;
 };
 
-interface FileEntry {
-    name: string;
-    path: string;
-    size: number;
-    modified?: number;
-}
 
 interface FileMap {
     [folder: string]: FileEntry[]
@@ -405,18 +319,31 @@ const Dashboard = () => {
   // Scoped correctly to only the main window: Dashboard only ever mounts on the "/" route (see
   // App.tsx's router), never in the recording-overlay/screenshot-overlay/annotation-overlay
   // windows, which manage their own visibility entirely separately.
+  //
+  // Not revealed when Rust rebuilt this window hidden to run a recording that needs a page (the
+  // phone camera - services/main_window.rs). If asking fails, reveal anyway.
   useEffect(() => {
+    let cancelled = false;
+    let fallbackTimer: number | undefined;
     const revealWindow = (): void => {
       appWindow.show().catch((err) => console.error("Failed to show main window:", err));
       appWindow.setFocus().catch((err) => console.error("Failed to focus main window:", err));
     };
-    revealWindow();
-    // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
-    // after is free insurance against this specific call failing/never resolving for some
-    // reason - a bug in this effect must never be able to leave the user with an app that looks
-    // like it silently failed to launch (permanently hidden behind nothing).
-    const fallbackTimer = window.setTimeout(revealWindow, 1500);
-    return () => window.clearTimeout(fallbackTimer);
+    void invoke<boolean>("main_window_should_reveal")
+      .catch(() => true)
+      .then((reveal) => {
+        if (cancelled || !reveal) return;
+        revealWindow();
+        // Safety net: showing an already-visible window is a harmless no-op, so retrying shortly
+        // after is free insurance against this specific call failing/never resolving for some
+        // reason - a bug in this effect must never be able to leave the user with an app that
+        // looks like it silently failed to launch (permanently hidden behind nothing).
+        fallbackTimer = window.setTimeout(revealWindow, 1500);
+      });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fallbackTimer);
+    };
   }, []);
   // Presentation mode for the PDF viewer: hides the sidebar and BottomDocker (not just the PDF's
   // own toolbar, which PdfAnnotator hides itself) and puts the actual OS window into fullscreen,
@@ -427,10 +354,11 @@ const Dashboard = () => {
   const [videoDevices, setVideoDevices] = useState<string[]>([]);
   const [selectScreen, setSelectScreen] = useState(false);
   const [selectedScreen, setSelectedScreen] = useState("");
-   const [screenSize, setScreenSize] = useState("fullscreen");
-     const [overlayShape, setOverlayShape] = useState("rounded"); // ADD THIS
-  const [overlayPosition, setOverlayPosition] = useState("bottom_right"); // ADD THIS
-  const [overlaySize, setOverlaySize] = useState("small"); // ADD THIS
+  const [screenSize, setScreenSize] = useState("fullscreen");
+  // The webcam bubble's look, remembered between launches - see AppSettings.cameraOverlayShape.
+  const [overlayShape, setOverlayShape] = useState(() => loadSettings().cameraOverlayShape);
+  const [overlayPosition, setOverlayPosition] = useState(() => loadSettings().cameraOverlayPosition);
+  const [overlaySize, setOverlaySize] = useState(() => loadSettings().cameraOverlaySize);
   // Phone-as-camera (see src/services/phoneCamera.ts). Only the connected flag lives in React
   // state here - the stream itself is held by the service singleton, because the pairing modal,
   // the overlay preview and the recorder below all need the same one.
@@ -454,21 +382,22 @@ const Dashboard = () => {
   // meaningful for the screen-capture record types (sva/sa/s); RecordingDocker only shows the
   // toggle for those.
   const [includeSystemAudio, setIncludeSystemAudio] = useState<boolean>(() => loadSettings().defaultIncludeSystemAudio);
-  // Opt-in, off by default every session (not persisted like includeSystemAudio above - this is a
-  // new, less-proven capture path, so it shouldn't silently carry forward as someone's default).
+  // Opt-in, off by default every session (this is a new, less-proven capture path, so it shouldn't
+  // silently carry forward as someone's default). Held in the settings so the Rust-built start
+  // request sees it, but settings_store.rs drops it at every launch - see SESSION_ONLY_KEYS.
   // When on (and exactly one camera is selected - see start_recording's own doc comment on why
   // more than one isn't supported), recording_with_output_sva writes the webcam as its own
   // second, uncomposited file alongside the main recording instead of baking it into a single
   // overlay - lets the editor's new PiP layer reposition/resize/reshape it after the fact, which
   // baked-in footage never could be. Recording with this off is byte-for-byte the same as before
   // this feature existed.
-  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(false);
-  // Opt-in, off by default every session (not persisted, same reasoning as separateWebcamCapture
+  const [separateWebcamCapture, setSeparateWebcamCapture] = useState<boolean>(() => loadSettings().separateWebcamCapture);
+  // Opt-in, off by default every session (session-only, same reasoning as separateWebcamCapture
   // above - a new, less-proven capture path). When on, start_recording installs a Windows mouse
   // hook (services/click_tracker.rs) for the duration of the recording and writes every click's
   // time+position to a "<name>.clicks.json" sidecar - the editor's own "auto zoom on click" tool
   // reads this back to suggest where to punch in. Recording with this off starts no hook at all.
-  const [trackClicks, setTrackClicks] = useState<boolean>(false);
+  const [trackClicks, setTrackClicks] = useState<boolean>(() => loadSettings().trackClicks);
   // Max output width for screen-capture record types - null means "use the backend's own default"
   // (1920px, see FormData.resolution_width's own doc comment on the Rust side), so a caller that
   // never touches this control gets byte-for-byte the same recording as before it existed. The
@@ -490,9 +419,23 @@ const Dashboard = () => {
   }, []);
   const [isMonitoring, setIsMonitoring] = useState<boolean>(false);
   const [showFileList, setShowFileList] = useState<boolean>(false);
+  const [sidebarContentReady, setSidebarContentReady] = useState<boolean>(false);
+  const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(true);
+  const [isLoadingTrash, setIsLoadingTrash] = useState<boolean>(false);
   const [files, setFiles] = useState<FileMap>({});
   const [activeFileCategory, setActiveFileCategory] = useState<SidebarTab>("video");
   const [trashItems, setTrashItems] = useState<TrashEntry[]>([]);
+
+  useEffect(() => {
+    if (!showFileList) {
+      setSidebarContentReady(false);
+      return;
+    }
+    const raf = requestAnimationFrame(() => {
+      startTransition(() => setSidebarContentReady(true));
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [showFileList]);
   // Sidebar file-list search - filters the active category's files (and trash) by name, case-
   // insensitive substring match. Kept as a single query shared across every tab/trash rather than
   // per-tab state, same as a normal file explorer's search box.
@@ -550,6 +493,13 @@ const Dashboard = () => {
   // icon lit and gives the open video a "Back to video editor" way out. See
   // components/video/VideoEditorHome.tsx's own doc comment.
   const [videoEditorScreen, setVideoEditorScreen] = useState<VideoEditorScreen | null>(null);
+  // On the Video Editor's home, a video dragged in from outside opens for editing instead of
+  // being imported (VideoEditorHome shows where to drop it, and opens it set up for whatever
+  // starter it was asking for).
+  const videoEditorHomeRef = useRef(false);
+  videoEditorHomeRef.current = videoEditorScreen?.mode === "home";
+  const [editorHomeDrag, setEditorHomeDrag] = useState(false);
+  const [editorHomeDrop, setEditorHomeDrop] = useState<{ paths: string[]; at: number } | null>(null);
   // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
   // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
   // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
@@ -568,18 +518,7 @@ const Dashboard = () => {
   // if none is. "" means creating a top-level folder directly under Briefcast.
   const [creatingFolderIn, setCreatingFolderIn] = useState<string | null>(null);
   const [newFolderValue, setNewFolderValue] = useState<string>("");
-  // Folder relative-paths whose file list is currently hidden - in-memory only (resets on
-  // restart), same as every other sidebar UI toggle here. A folder isn't in this set until
-  // explicitly collapsed, so everything starts expanded, matching the pre-existing behavior.
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
-  const toggleFolderCollapsed = (folder: string): void => {
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(folder)) next.delete(folder);
-      else next.add(folder);
-      return next;
-    });
-  };
+  // Which folders are collapsed lives in the sidebar tree's own store (folderCollapse.ts).
   // Sidebar declutter/ordering controls for the active category's file list - both in-memory
   // only, same lifetime as collapsedFolders above. Hiding empty folders only affects folders with
   // zero files in the *active* category (the "No {category} files" ones) — it never hides a
@@ -590,9 +529,26 @@ const Dashboard = () => {
   // list/grid choice - both remembered across restarts, see utils/sidebarFolders.ts.
   const [pinnedFolders, setPinnedFolders] = useState<string[]>(() => getPinnedFolders());
   const [sidebarViewMode, setSidebarViewMode] = useState<SidebarViewMode>(() => getSidebarViewMode());
+  // The sidebar's width, dragged by its right edge (SidebarResizeHandle below) and kept across
+  // launches - one for browsing, one for editing (sidebarFolders.ts) - or folded to its icon rail.
+  const [sidebarWidths, setSidebarWidths] = useState<Record<SidebarMode, number>>(() => ({ browsing: getSidebarWidth("browsing"), editing: getSidebarWidth("editing") }));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => getSidebarCollapsed());
+  const setSidebarFolded = (collapsed: boolean) => {
+    setSidebarCollapsed(collapsed);
+    saveSidebarCollapsed(collapsed);
+  };
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
   const [fileSortMode, setFileSortMode] = useState<"name-asc" | "name-desc" | "type">("name-asc");
-  const sortFileList = (fileList: FileEntry[]): FileEntry[] => {
+  const [folderSorts, setFolderSorts] = useState<FolderSortMap>(() => getFolderSorts());
+  const sortFileList = (fileList: FileEntry[], folder: string): FileEntry[] => {
     const sorted = [...fileList];
+    const folderSort = folderSorts[folder];
+    if (folderSort) {
+      const dir = folderSort === "date-desc" ? -1 : 1;
+      sorted.sort((a, b) => dir * ((a.modified ?? 0) - (b.modified ?? 0)) || a.name.localeCompare(b.name));
+      return sorted;
+    }
     if (fileSortMode === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
     else if (fileSortMode === "type") {
       sorted.sort((a, b) => {
@@ -645,13 +601,12 @@ const Dashboard = () => {
     }
     if (drag.isDragging) setDragPoint({ x: e.clientX, y: e.clientY, over: dropTargetAt(e.clientX, e.clientY) });
   };
-  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent) => {
+  const handleSidebarFilePointerUp = (file: FileEntry) => (e: React.PointerEvent): Promise<void> | void => {
     const drag = sidebarDragRef.current;
     sidebarDragRef.current = null;
     if (!drag?.isDragging) {
       // No real drag happened - a plain tap, handled the same as clicking the filename always has.
-      void openFileFromSidebar(file);
-      return;
+      return openFileFromSidebar(file);
     }
     setDraggingFiles(null);
     setDragPoint(null);
@@ -1008,6 +963,20 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     if (!selectedFile) setDockerMode("record");
   }, [selectedFile]);
+  // Whether each video had its editor open when it was left (a linked document opened, a folder,
+  // home, another file), so coming back to it brings the editor back exactly as it was - open or
+  // closed - instead of always closed. Session-only. Read in the cleanup, which runs before the
+  // reset just above has had its own render, so it still sees the mode the video was left in.
+  const dockerModeRef = useRef(dockerMode);
+  dockerModeRef.current = dockerMode;
+  const editorOpenByVideoRef = useRef(new Map<string, boolean>());
+  const selectedVideoPath = selectedFile && getFileCategory(selectedFile.name) === "video" ? selectedFile.sourcePath : null;
+  useEffect(() => {
+    if (!selectedVideoPath) return;
+    return () => {
+      editorOpenByVideoRef.current.set(selectedVideoPath, dockerModeRef.current === "file-tools");
+    };
+  }, [selectedVideoPath]);
   // Lets the video-tools timeline (FileToolsDocker -> VideoTimelineDocker) seek the actual player
   // imperatively — there's no controlled "currentTime" prop on VideoPlayer, since native
   // <video>/timeupdate already reports position out via onTimeUpdate below; this ref is just the
@@ -1085,7 +1054,16 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // get_image_clip_proxy), which is what keeps their crop/Ken Burns/overlay positions identical in
   // preview and export. null if it couldn't be read; cached per primary file for the session.
   const timelineFrameCacheRef = useRef<Map<string, Promise<VideoProjectFrame | null>>>(new Map());
+  // A canvas chosen for the edit (canvasFormats.ts) is the timeline's frame instead.
+  const canvasRef = useRef(editStore.canvas);
+  canvasRef.current = editStore.canvas;
+  // A canvas's Blur background (canvasFormats.ts) - not under a Screen Style, which draws its own.
+  const canvasBlur = editStore.canvas?.background === "blur" && !editStore.screenStyle;
+  const canvasBlurRef = useRef(canvasBlur);
+  canvasBlurRef.current = canvasBlur;
   const resolveTimelineFrame = useCallback((primaryPath: string): Promise<VideoProjectFrame | null> => {
+    const canvas = canvasRef.current;
+    if (canvas) return Promise.resolve({ width: canvas.width, height: canvas.height });
     let pending = timelineFrameCacheRef.current.get(primaryPath);
     if (!pending) {
       pending = (
@@ -1110,7 +1088,8 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // viewer so all three show the same picture). The prefetch effect below and an actual seek share
   // one encode through that module's cache.
   const resolveImageClipProxyUrl = useCallback(
-    async (imagePath: string, primaryPath: string): Promise<string> => resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath)),
+    async (imagePath: string, primaryPath: string): Promise<string> =>
+      resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath), canvasBlurRef.current ? "blur" : null),
     [resolveTimelineFrame]
   );
   // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
@@ -1480,6 +1459,48 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   useEffect(() => {
     if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId) setSelectedAdjustmentId(null);
   }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedPipOverlayId]);
+  // A click on the player around the picture (the black bars) lets go of the selected picture,
+  // region or PiP - as a click on the picture away from them already does (VideoOverlayLayer) -
+  // and, like that one, only deselects: the click doesn't also start or pause playback.
+  // The split screen the selected layer belongs to (SplitArrangeBar).
+  const [phonePreview] = usePhonePreview();
+  const selectedSplitGroup =
+    (selectedPipOverlayId ? editStore.pipOverlays.find((o) => o.id === selectedPipOverlayId)?.split?.group : undefined) ??
+    (selectedImageOverlayId ? editStore.imageOverlays.find((o) => o.id === selectedImageOverlayId)?.split?.group : undefined);
+  const selectedSplit = useMemo(() => {
+    if (!selectedSplitGroup) return null;
+    const { cells, settings } = splitGroupMembers(editStore.pipOverlays, editStore.imageOverlays, selectedSplitGroup);
+    return settings && cells > 0 ? { group: selectedSplitGroup, cells, settings } : null;
+  }, [selectedSplitGroup, editStore.pipOverlays, editStore.imageOverlays]);
+  const hasPictureSelectionRef = useRef(false);
+  hasPictureSelectionRef.current = !!(selectedImageOverlayId || selectedBlurOverlayId || selectedPipOverlayId);
+  useEffect(() => {
+    let swallowClick = false;
+    const aroundPicture = (target: EventTarget | null) => {
+      const el = target instanceof Element ? target : null;
+      if (!el || !el.closest(".video-container") || el.closest("[data-video-frame]")) return false;
+      return el.tagName === "VIDEO" || el.tagName === "CANVAS" || el.classList.contains("video-container");
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0 || !hasPictureSelectionRef.current || !aroundPicture(e.target)) return;
+      swallowClick = true;
+      setSelectedImageOverlayId(null);
+      setSelectedBlurOverlayId(null);
+      setSelectedPipOverlayId(null);
+    };
+    const onClick = (e: MouseEvent) => {
+      if (!swallowClick) return;
+      swallowClick = false;
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("click", onClick, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("click", onClick, true);
+    };
+  }, []);
   // A Stage scene is edited on its own - selecting one lets go of every other selection, and the
   // other way round.
   const selectScene = useCallback((id: string | null) => {
@@ -1638,26 +1659,38 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
       .catch((error) => console.error("Failed to load preview source for", sourcePath, error))
       .finally(settled);
   };
-  // Prepares every image clip's preview proxy ahead of the playhead, one at a time, so playback
-  // crossing into an image doesn't stall on its first encode. Re-runs on every edit, but anything
-  // already prepared is a cached promise - only newly added images do any work.
+  // Prepares every image clip's preview proxy, so playback crossing into a photo never stalls on its
+  // first encode and transitions have the pictures they need. Two at a time - measured fastest with
+  // full-size phone photos (2-3 at once; more only slow each other down) - which leaves the backend's
+  // third slot (get_image_clip_proxy) for the photo actually under the playhead. Re-runs on every
+  // edit, but anything already prepared is a cached promise - only newly added photos do any work.
+  // Reports how far it is (utils/projectPrep.ts), which the "Making your video" screen waits on.
+  // The canvas is a dependency: its size and Blur background decide which proxy each photo needs.
   useEffect(() => {
     const primaryPath = selectedFile?.sourcePath;
     if (!primaryPath || getFileCategory(selectedFile.name) !== "video") return;
     const imagePaths = Array.from(new Set(editStore.playbackClips.map((clip) => clip.sourcePath).filter(isImageClipPath)));
+    const total = imagePaths.length;
     let cancelled = false;
-    (async () => {
-      for (const imagePath of imagePaths) {
+    let done = 0;
+    setWarm({ primaryPath, done, total });
+    const queue = [...imagePaths];
+    const worker = async () => {
+      for (let imagePath = queue.shift(); imagePath; imagePath = queue.shift()) {
         if (cancelled) return;
         // eslint-disable-next-line no-await-in-loop
         await resolveImageClipProxyUrl(imagePath, primaryPath).catch((error) => console.error("Failed to prepare image clip preview", imagePath, error));
+        if (cancelled) return;
+        done += 1;
+        setWarm({ primaryPath, done, total });
       }
-    })();
+    };
+    void Promise.all([worker(), worker()]);
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl]);
+  }, [selectedFile?.sourcePath, editStore.playbackClips, resolveImageClipProxyUrl, canvasBlur, editStore.canvas?.width, editStore.canvas?.height]);
   // Audio playlist controls (repeat/shuffle/autoplay-next) — see navigateAudio/handleAudioEnded.
   const [audioRepeatMode, setAudioRepeatMode] = useState<"off" | "all" | "one">("off");
   const [audioShuffle, setAudioShuffle] = useState<boolean>(false);
@@ -1667,8 +1700,8 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // hold this itself since it fully remounts on every file change via `key={selectedFile.path}`).
   const [videoAutoplayNext, setVideoAutoplayNext] = useState<boolean>(true);
   // Whether the system-wide annotation overlay is allowed to exist at all this session — see
-  // handleSettingsSaved and the effect below that creates/hides the overlay window and
-  // registers/unregisters ANNOTATION_TOGGLE_SHORTCUT whenever this changes.
+  // handleSettingsSaved and the effect below that hides the overlay window when this turns off.
+  // (Its shortcuts follow the same setting from the Rust side - services/shortcuts.rs.)
   const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
   // The "Nothing playing yet" home screen's backdrop (Settings > Appearance > "Home screen
   // background") - see the decorative block a few hundred lines down in this file's JSX.
@@ -1739,8 +1772,6 @@ useEffect(() => {
       if (overlayWindow) {
         await overlayWindow.hide();
       }
-      await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
-      await unbindShortcut(VIEW_SWITCH_SHORTCUT);
       setCanSwitchView(false);
     });
     
@@ -2115,7 +2146,6 @@ const setScreen = () => {
               Boolean(formData.video_devices?.includes(PHONE_CAMERA_DEVICE))),
         });
 
-        await bindShortcut(OVERLAY_TOGGLE_SHORTCUT, () => void toggleOverlayVisibility());
 
         const switchable =
           formData.record_type === 'sva' &&
@@ -2124,9 +2154,6 @@ const setScreen = () => {
         setViewMode('screen');
         viewSwitchRef.current.canSwitchView = switchable;
         viewSwitchRef.current.viewMode = 'screen';
-        if (switchable) {
-          await bindShortcut(VIEW_SWITCH_SHORTCUT, () => void switchViewRef.current('toggle'));
-        }
 
         // Opt-in (Settings > Recording) - see AppSettings.notifyOnRecordingStart.
         if (loadSettings().notifyOnRecordingStart) {
@@ -2245,8 +2272,6 @@ const setScreen = () => {
     if (overlayWindow) {
       await overlayWindow.hide();
     }
-    await unbindShortcut(OVERLAY_TOGGLE_SHORTCUT);
-    await unbindShortcut(VIEW_SWITCH_SHORTCUT);
 
     try {
       // The finished path is shown by the completion window, so no toast repeats it here.
@@ -2355,6 +2380,8 @@ const setScreen = () => {
     } catch (error) {
       console.error("Error getting files:", error);
       setError(`Failed to load files: ${error}`);
+    } finally {
+      setIsLoadingFiles(false);
     }
   };
 
@@ -2405,10 +2432,12 @@ const setScreen = () => {
 
 	// Quitting Briefcast (main.rs) would end a recording in progress abruptly - its parts never
 	// assembled into a file. So while recording, quitting asks first, and "Stop and quit" saves the
-	// recording properly before letting the quit through. (Hiding to the tray never gets here.)
+	// recording properly before letting the quit through. (Hiding to the tray never gets here, and a
+	// release to the tray lets the recording carry on - Rust runs it without this page.)
 	useEffect(() => {
 		if (!isRecording) return;
-		return addCloseGuard(async () => {
+		return addCloseGuard(async (reason) => {
+			if (reason === "release") return true;
 			const stopAndQuit = await ask("A recording is in progress. Stop and save it, then quit Briefcast?", {
 				title: "Recording in progress",
 				kind: "warning",
@@ -2425,6 +2454,55 @@ const setScreen = () => {
 		});
 	}, [isRecording]);
 
+	// macOS and Linux use the system ffmpeg, which can be too old or built without the encoders
+	// recordings need (services/ffmpeg_check.rs). Say what to do - and check again each time this
+	// window comes back after a failed check, which is when someone has just installed a newer one in
+	// a terminal, so there is no button to find.
+	useEffect(() => {
+		let disposed = false;
+		let shown: string | null = null;
+		const check = async (recheck: boolean) => {
+			const status = await invoke<{ ok: boolean; version: string | null; problems: string[]; fix: string | null }>("ffmpeg_status", { recheck }).catch(() => null);
+			if (disposed || !status) return;
+			if (!status.ok) {
+				shown = [...status.problems, status.fix].filter(Boolean).join(" ");
+				setError(shown);
+			} else if (shown) {
+				// Fixed while Briefcast was open: take back only our own message.
+				const ours = shown;
+				shown = null;
+				setError((current) => (current === ours ? "" : current));
+				setMessage(`ffmpeg ${status.version ?? ""} found - recording and export are ready.`);
+			}
+		};
+		void check(false);
+		const unlisten = appWindow.onFocusChanged(({ payload: focused }) => {
+			if (focused && shown) void check(true);
+		});
+		return () => {
+			disposed = true;
+			void unlisten.then((fn) => fn());
+		};
+	}, []);
+
+	// Closing to the tray only hides the window - the page keeps running - so a video playing in it
+	// carried on, heard but not seen. Whatever plays stops as the window goes, as it would if the window
+	// really closed; it stays paused when Briefcast is opened again. The player is paused through its
+	// own controls so the editor's other layers stop with it. Live camera previews are left alone:
+	// they're streams rather than playback, and a paused one would come back frozen.
+	useEffect(() => {
+		const stopPlayback = () => {
+			if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+			// The timeline, the mixer's audition and the panels' previews.
+			stopAllPlayback();
+			document.querySelectorAll<HTMLMediaElement>("video, audio").forEach((el) => {
+				if (!el.paused && !el.srcObject) el.pause();
+			});
+		};
+		window.addEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
+		return () => window.removeEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
+	}, []);
+
 	// One update check per launch, delayed so it never competes with startup work (device probes,
 	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
 	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
@@ -2438,12 +2516,15 @@ const setScreen = () => {
 	}, []);
 
 	const loadTrash = async () => {
+		setIsLoadingTrash(true);
 		try {
 			const items = await invoke<TrashEntry[]>("list_trash");
 			setTrashItems(items);
 		} catch (error) {
 			console.error("Error loading trash:", error);
 			setError(`Failed to load trash: ${error}`);
+		} finally {
+			setIsLoadingTrash(false);
 		}
 	};
 
@@ -2631,7 +2712,9 @@ const setScreen = () => {
   
 	const toggleFileList = () => setShowFileList(prev => !prev);
 
-	const handleGoHome = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
+	// `force` (double-click on Home): also leave a folder gallery and drop the "back to…" point, so
+	// it always lands on the main home screen whatever was on top.
+	const handleGoHome = (force?: boolean) => { if (force === true) { setSelectedFolder(null); setReturnPoint(null); } setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenBoard = () => { setSelectedFile(null); setBoardScreen({ mode: "home" }); setDocsScreen(null); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenDocs = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen({ mode: "home" }); setWhiteboardScreen(null); setMindmapScreen(null); setVideoEditorScreen(null); };
 	const handleOpenWhiteboard = () => { setSelectedFile(null); setBoardScreen(null); setDocsScreen(null); setWhiteboardScreen({ mode: "home" }); setMindmapScreen(null); setVideoEditorScreen(null); };
@@ -2643,7 +2726,10 @@ const setScreen = () => {
 	// Video Editor already said "I'm here to edit" and shouldn't need the separate
 	// "show tools for this file" click. Ordered after the await because loadFileForPlayback
 	// resolves videoEditorScreen itself (see its own handling below).
-	const handleOpenVideoInEditor = async (file: { path: string; name: string }): Promise<void> => {
+	// `intent`: opened from one of the home's starters - the editor sets itself up for it once
+	// the video has loaded (editorIntent.ts).
+	const handleOpenVideoInEditor = async (file: { path: string; name: string }, intent?: EditorIntent): Promise<void> => {
+		setEditorIntent(file.path, intent);
 		await loadFileForPlayback(file.path, file.name);
 		setVideoEditorScreen({ mode: "editing" });
 		setDockerMode("file-tools");
@@ -2651,7 +2737,7 @@ const setScreen = () => {
 	// The Video Editor's "Open video from anywhere" - same OS picker as the docker's own
 	// open-from-anywhere button, but filtered to video only, since anything else can't be edited
 	// by the tool the user is standing in.
-	const handleOpenExternalVideoForEditing = async (): Promise<void> => {
+	const handleOpenExternalVideoForEditing = async (intent?: EditorIntent): Promise<void> => {
 		try {
 			const selected = await openFileDialog({
 				multiple: false,
@@ -2668,7 +2754,7 @@ const setScreen = () => {
 				return;
 			}
 
-			await handleOpenVideoInEditor({ path: selected, name });
+			await handleOpenVideoInEditor({ path: selected, name }, intent);
 		} catch (error) {
 			console.error('Error opening video for editing:', error);
 			setError(`Failed to open video: ${error}`);
@@ -2762,49 +2848,18 @@ const setScreen = () => {
 		}
 	}, []);
 
-	// Registers the annotation hotkey whenever the feature is enabled; unregisters it (and hides the
-	// overlay) whenever it's disabled. Independent of recording state — this feature is meant to be
-	// available any time, not just mid-recording (unlike OVERLAY_TOGGLE_SHORTCUT above).
+	// Turning the annotation tool off ends draw mode and hides its overlay. Its shortcuts are
+	// registered and dropped by Rust from the same setting (services/shortcuts.rs), and the
+	// dispatcher below ignores a press while the tool is off.
 	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
-			if (!annotationEnabled) {
-				if (annotationDrawModeRef.current) {
-					await toggleAnnotationDrawMode(true);
-				}
-				await unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
-				await unbindShortcut(BLUR_WINDOW_SHORTCUT);
-				const overlay = await WebviewWindow.getByLabel('annotation-overlay');
-				if (overlay) await overlay.hide();
-				return;
+		if (annotationEnabled) return;
+		void (async () => {
+			if (annotationDrawModeRef.current) {
+				await toggleAnnotationDrawMode(true);
 			}
-
-			if (cancelled) return;
-			try {
-				await bindShortcut(ANNOTATION_TOGGLE_SHORTCUT, () => void toggleAnnotationDrawMode());
-			} catch (err) {
-				// Most likely cause: another already-running app has this exact combo registered
-				// as its own OS-level global hotkey, so ours is rejected - surfaced here (rather
-				// than only console.error, which nobody sees without devtools) since otherwise the
-				// symptom is just "the shortcut silently does nothing," indistinguishable from the
-				// feature being broken.
-				console.error('Failed to register annotation hotkey:', err);
-				setError(`Couldn't register the annotation shortcut (${ANNOTATION_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
-			try {
-				await bindShortcut(BLUR_WINDOW_SHORTCUT, () => {
-					invoke('screen_blur_toggle_window').catch((err) => console.error('Blur window:', err));
-				});
-			} catch (err) {
-				console.error('Failed to register blur-window hotkey:', err);
-				setError(`Couldn't register the blur shortcut (${BLUR_WINDOW_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
+			const overlay = await WebviewWindow.getByLabel('annotation-overlay');
+			if (overlay) await overlay.hide();
 		})();
-
-		return () => {
-			cancelled = true;
-		};
 	}, [annotationEnabled, toggleAnnotationDrawMode]);
 
 	// Privacy blur strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
@@ -2841,13 +2896,6 @@ const setScreen = () => {
 		};
 	}, [toggleAnnotationDrawMode]);
 
-	// Unregister on unmount so the hotkey doesn't linger after Dashboard itself goes away.
-	useEffect(() => {
-		return () => {
-			void unbindShortcut(ANNOTATION_TOGGLE_SHORTCUT);
-		};
-	}, []);
-
 	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
 	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
 	// still show the state this shortcut/checkbox last left it in, not silently revert on save.
@@ -2859,44 +2907,19 @@ const setScreen = () => {
 		});
 	}, []);
 
-	// Registered once for the life of the window, unlike OVERLAY_TOGGLE_SHORTCUT (tied to an
-	// in-progress recording) or ANNOTATION_TOGGLE_SHORTCUT (tied to a Settings toggle) - this
-	// panel is visible any time the app is, so the shortcut to hide it should be too.
-	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
-			try {
-				if (!cancelled) await bindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT, toggleRecordingPanelButtons);
-			} catch (err) {
-				console.error('Failed to register panel-buttons hotkey:', err);
-				setError(`Couldn't register the panel-buttons shortcut (${PANEL_BUTTONS_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
-			}
-		})();
-
-		return () => {
-			cancelled = true;
-			void unbindShortcut(PANEL_BUTTONS_TOGGLE_SHORTCUT);
-		};
-	}, [toggleRecordingPanelButtons]);
-
-	// handleStartRecording/handleStopRecording (and every recording-setup field below) are
+	// handleStartRecording/handleStopRecording (and the bottom bar's name/format below) are
 	// recreated or reassigned on every render, so a stable (empty-deps) hotkey callback can't
 	// reference them directly without capturing a stale first-render snapshot forever - this ref
 	// is refreshed after every render instead (same pattern as selectedFileRef above) so the
 	// hotkey handler, registered once, always acts on the latest values.
 	const recordingHotkeyRef = useRef({
 		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
-		fileName, fileExt, recordType, audioDevice, videoDevices,
-		overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
-		resolutionWidth, framerate,
+		fileName, fileExt,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
 			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
-			fileName, fileExt, recordType, audioDevice, videoDevices,
-			overlayShape, overlayPosition, overlaySize, includeSystemAudio, separateWebcamCapture, trackClicks,
-			resolutionWidth, framerate,
+			fileName, fileExt,
 		};
 	});
 
@@ -2908,84 +2931,120 @@ const setScreen = () => {
 			return;
 		}
 		if (recordTypeOverride) setRecordType(recordTypeOverride);
-		void s.startRecording({
-			file_name: s.fileName,
-			file_ext: s.fileExt,
-			record_type: recordTypeOverride ?? s.recordType,
-			audio_device: s.audioDevice,
-			// Deliberately skips EnhancedScreenOptions' target picker - see RECORDING_TOGGLE_SHORTCUT's
-			// own doc comment for why.
-			screen_size: 'fullscreen',
-			video_devices: s.videoDevices,
-			overlay_shape: s.overlayShape,
-			overlay_position: s.overlayPosition,
-			overlay_size: s.overlaySize,
-			window_title: '',
-			include_system_audio: s.includeSystemAudio,
-			separate_webcam_capture: s.separateWebcamCapture,
-			track_clicks: s.trackClicks,
-			resolution_width: s.resolutionWidth,
-			framerate: s.framerate,
-		});
-	}, []);
-
-	// Registered once for the life of the window, same reasoning as the panel-buttons shortcut
-	// above - starting/stopping is meaningful any time the app is running, not just mid-recording.
-	useEffect(() => {
-		let cancelled = false;
-
-		(async () => {
+		void (async () => {
 			try {
-				if (!cancelled) await bindShortcut(RECORDING_TOGGLE_SHORTCUT, handleRecordingToggleHotkey);
+				// Built in Rust from the settings file (services/recording_setup.rs) - the same request
+				// a start with no window gets, so the two can't drift. It records the whole screen,
+				// skipping EnhancedScreenOptions' target picker (see the note on the record shortcut).
+				const request = await invoke<Record<string, unknown>>("get_current_setup_request", {
+					recordTypeOverride: recordTypeOverride ?? null,
+				});
+				// The name and format in the bottom bar belong to this take only and are never saved,
+				// so with a window open they win - as they always have.
+				const fileExt = s.fileExt?.toLowerCase();
+				void s.startRecording({
+					...request,
+					file_name: s.fileName || request.file_name,
+					...(fileExt && formatSuitsRecordType(fileExt, String(request.record_type)) ? { file_ext: fileExt } : {}),
+				});
 			} catch (err) {
-				console.error('Failed to register recording-toggle hotkey:', err);
-				setError(`Couldn't register the start/stop recording shortcut (${RECORDING_TOGGLE_SHORTCUT.replace('CommandOrControl', 'Ctrl')}) - it may already be in use by another app.`);
+				console.error("Couldn't build the recording request:", err);
+				setError(`Failed to start recording: ${err}`);
 			}
 		})();
+	}, []);
 
-		return () => {
-			cancelled = true;
-			void unbindShortcut(RECORDING_TOGGLE_SHORTCUT);
-		};
-	}, [handleRecordingToggleHotkey]);
+	// Every system-wide shortcut lands here as an action (registered by Rust - see
+	// services/globalShortcuts.ts). One subscription for the window's life; the handlers are read
+	// through a ref so a press always acts on the latest render's state. Presentation cuts are
+	// handled by services/presentation.ts, which subscribes on its own.
+	const shortcutHandlersRef = useRef<Partial<Record<ShortcutAction, () => void>>>({});
+	shortcutHandlersRef.current = {
+		'record-toggle': () => handleRecordingToggleHotkey(),
+		'panel-buttons-toggle': toggleRecordingPanelButtons,
+		'snip': () => {
+			startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+		},
+		'annotation-toggle': () => {
+			if (annotationEnabled) void toggleAnnotationDrawMode();
+		},
+		'blur-window': () => {
+			if (annotationEnabled) invoke('screen_blur_toggle_window').catch((err) => console.error('Blur window:', err));
+		},
+		'overlay-toggle': () => void toggleOverlayVisibility(),
+		'view-switch': () => void switchViewRef.current('toggle'),
+	};
+	useEffect(() => onGlobalShortcut((action) => shortcutHandlersRef.current[action]?.()), []);
 
-	// The screen/camera/mic toggles are what Ctrl+Shift+R records with, so they're remembered
-	// between launches rather than resetting to Settings' default - it's the same setting. "c" is
-	// only the screenshot flow's brief detour, never a recording setup to keep.
+	// A shortcut another app holds would otherwise just silently do nothing.
+	useEffect(() => onShortcutFailures((failures) => setError(describeShortcutFailures(failures))), []);
+
+	// The live setup is what Ctrl+Shift+R, the tray and the phone remote record with - and Rust
+	// builds that start request itself (services/recording_setup.rs), so every part of it is written
+	// through to the settings file as it changes. Bottom bar and Settings are therefore one setting.
+	// "c" is only the screenshot flow's brief detour, never a recording setup to keep. Devices are
+	// saved by the pickers themselves (BottomDocker), on an explicit pick only: an automatic fallback
+	// to the first device while the usual one is unplugged must not overwrite the user's choice.
 	useEffect(() => {
-		if (!["sva", "sa", "s", "va", "v", "a"].includes(recordType)) return;
-		const settings = loadSettings();
-		if (settings.defaultRecordType !== recordType) saveSettings({ ...settings, defaultRecordType: recordType });
-	}, [recordType]);
+		updateSettings({
+			...(["sva", "sa", "s", "va", "v", "a"].includes(recordType) ? { defaultRecordType: recordType } : {}),
+			defaultIncludeSystemAudio: includeSystemAudio,
+			defaultResolutionWidth: resolutionWidth,
+			defaultFramerate: framerate,
+			cameraOverlayShape: overlayShape,
+			cameraOverlayPosition: overlayPosition,
+			cameraOverlaySize: overlaySize,
+			separateWebcamCapture,
+			trackClicks,
+		});
+	}, [recordType, includeSystemAudio, resolutionWidth, framerate, overlayShape, overlayPosition, overlaySize, separateWebcamCapture, trackClicks]);
 
 	// The tray icon's menu (services/tray.rs) - it can be used with this window hidden in the tray.
+	// Also the work Rust queued for this page (services/main_window.rs): a start that needs a page
+	// (the phone camera) or an error to show, from a shortcut/tray/remote press while no window
+	// existed. The queue is pulled once the listeners are in place - pushed events could arrive
+	// before them and be lost.
+	const mainActionRef = useRef<(payload: { action: string; recordType?: string; message?: string }) => void>(() => {});
+	mainActionRef.current = (payload) => {
+		switch (payload.action) {
+			case "record":
+				if (!recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey(payload.recordType);
+				break;
+			case "stop":
+				if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
+				break;
+			case "screenshot":
+				startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+				break;
+			case "quit":
+				void quitApp();
+				break;
+			case "error":
+				if (payload.message) setError(payload.message);
+				break;
+		}
+	};
 	useEffect(() => {
-		const unlisten = listen<{ action: string; recordType?: string }>("tray-action", ({ payload }) => {
-			switch (payload.action) {
-				case "record":
-					if (!recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey(payload.recordType);
-					break;
-				case "stop":
-					if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
-					break;
-				case "screenshot":
-					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
-					break;
-				case "quit":
-					void quitApp();
-					break;
+		let disposed = false;
+		const unlisteners: Array<() => void> = [];
+		void (async () => {
+			for (const event of ["tray-action", "main-action"]) {
+				const fn = await listen<{ action: string; recordType?: string; message?: string }>(event, ({ payload }) => mainActionRef.current(payload));
+				if (disposed) fn();
+				else unlisteners.push(fn);
 			}
-		});
+			if (disposed) return;
+			const pending = await invoke<Array<{ action: string; recordType?: string; message?: string }>>("take_main_window_actions").catch(() => []);
+			pending.forEach((payload) => mainActionRef.current(payload));
+		})();
 		return () => {
-			unlisten.then((fn) => fn());
+			disposed = true;
+			unlisteners.forEach((fn) => fn());
 		};
-	}, [handleRecordingToggleHotkey]);
+	}, []);
 
-	// The tray icon gets a red dot while recording - the only sign of it with the window hidden
-	// and the recording bar tucked away (Ctrl+Shift+H).
-	useEffect(() => {
-		invoke("tray_set_recording", { recording: isRecording }).catch(() => {});
-	}, [isRecording]);
+	// (The tray's red dot and the recording-only shortcuts are set by the recording commands
+	// themselves - services/recording_session.rs - so they're right whoever starts or stops.)
 
 	// ---- The phone app's Remote, Voice-over and Beam (phone_transfer_page.html). Phones mirror this
 	// window's state: recording (with a pause-aware elapsed snapshot the phone ticks on from, so the
@@ -3168,15 +3227,6 @@ const setScreen = () => {
 	// Screenshots: Alt+Shift+S from any app opens the screen picker, and the picker reports back
 	// here when it's done (commands/snip.rs emits snip-done; null means cancelled).
 	useEffect(() => {
-		(async () => {
-			try {
-				await bindShortcut(SNIP_SHORTCUT, () => {
-					startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
-				});
-			} catch (err) {
-				console.warn(`Couldn't register ${SNIP_SHORTCUT}:`, err);
-			}
-		})();
 		const unlisten = listen<SnipResult | null>('snip-done', (event) => {
 			if (!event.payload) return;
 			const name = event.payload.path.split(/[\\/]/).pop() ?? event.payload.path;
@@ -3185,7 +3235,6 @@ const setScreen = () => {
 		});
 		return () => {
 			unlisten.then((fn) => fn());
-			void unbindShortcut(SNIP_SHORTCUT);
 		};
 	}, []);
 
@@ -3205,23 +3254,70 @@ const setScreen = () => {
 	// seeded with one clip per picked image (or none, for a blank timeline), opened straight into
 	// the editor. Errors are thrown back to NewVideoProjectDialog so it can show them in place.
 	const [isNewVideoProjectOpen, setIsNewVideoProjectOpen] = useState(false);
+	// The "Making your video" screen (ProjectPrepOverlay) - its progress lives in utils/projectPrep.ts,
+	// so only whether it's up is Dashboard state. While it's up the dialog is hidden but kept, so a
+	// failure brings it back with every choice in place.
+	const [isMakingVideo, setIsMakingVideo] = useState(false);
+	const [isNewVideoDialogHidden, setIsNewVideoDialogHidden] = useState(false);
 	const handleCreateVideoProject = async (request: NewVideoProjectRequest): Promise<void> => {
-		const state = request.state ?? createProjectState(request.imagePaths, request.options);
-		const projectPath = await invoke<string>("create_video_project", {
-			name: request.name,
-			width: request.frame.width,
-			height: request.frame.height,
-			editStateJson: JSON.stringify(state),
-		});
-		setIsNewVideoProjectOpen(false);
-		// The library re-listing waits until the editor is up - run alongside, its re-render of the
-		// whole library competed with opening the project and made Create feel slow.
+		const runId = crypto.randomUUID();
+		const started = performance.now();
+		// Each step's time goes to app.log, so a slow machine's report says where the time went.
+		const logStep = (label: string) =>
+			void invoke("report_frontend_event", { message: `create video: ${label} at ${Math.round(performance.now() - started)}ms` }).catch(() => {});
+		// The screen opens now - before anything slow - and the dialog steps aside.
+		startPrep({ id: runId, name: request.name, thumbs: request.thumbs ?? [] });
+		setIsMakingVideo(true);
+		setIsNewVideoDialogHidden(true);
+		let projectPath: string;
+		let state;
 		try {
+			state = request.prepare
+				? ((await request.prepare((step, done = 0, total = 0) => updatePrep(runId, { step, done, total }))) ?? createProjectState(request.imagePaths, request.options))
+				: createProjectState(request.imagePaths, request.options);
+			logStep("project built");
+			updatePrep(runId, { step: "Saving the project…", done: 0, total: 0 });
+			projectPath = await invoke<string>("create_video_project", {
+				name: request.name,
+				width: request.frame.width,
+				height: request.frame.height,
+				editStateJson: JSON.stringify(state),
+			});
+		} catch (error) {
+			// Back to the dialog, everything still chosen, with the reason shown there.
+			endPrep(runId);
+			setIsMakingVideo(false);
+			setIsNewVideoDialogHidden(false);
+			throw error;
+		}
+		setIsNewVideoProjectOpen(false);
+		setIsNewVideoDialogHidden(false);
+		// What "ready" waits for: every distinct photo on the new timeline prepared to play (the
+		// preparation effect below reports that for whatever timeline is open).
+		const expectedPhotos = new Set(state.clips.map((clip) => clip.sourcePath).filter(isImageClipPath)).size;
+		updatePrep(runId, { step: "Opening the editor…", primaryPath: projectPath, expectedPhotos });
+		try {
+			// Opens underneath the screen, which stays until the photos are ready (or "Start editing now").
 			await handleOpenVideoInEditor({ path: projectPath, name: projectPath.split(/[\\/]/).pop() ?? projectPath });
+			logStep("editor open");
+		} catch (error) {
+			endPrep(runId);
+			setIsMakingVideo(false);
+			setError(`The video was made, but couldn't be opened: ${error instanceof Error ? error.message : error}`);
 		} finally {
+			// The library re-listing waits until the editor is up - its re-render of the whole library
+			// competed with opening the project and made Create feel slow.
 			void handleDirectoryFiles();
 		}
 	};
+	const handleMakingVideoFinished = useCallback(() => {
+		const run = getPrep();
+		if (run) {
+			void invoke("report_frontend_event", { message: `create video: screen closed (photos ${run.expectedPhotos})` }).catch(() => {});
+			endPrep(run.id);
+		}
+		setIsMakingVideo(false);
+	}, []);
 	// Back to where the user was after a reload (sleep/wake, a recovered WebView, Ctrl+R) rather
 	// than the home screen - see sessionRestore.ts. Restored once on mount; saving only starts
 	// after that attempt, so the empty first render can't overwrite what's about to be restored.
@@ -3316,6 +3412,12 @@ const setScreen = () => {
 			setVideoEditorScreen({ mode: "editing" });
 			setDockerMode("file-tools");
 			window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
+		} else if (getFileCategory(fileName) === "video" && editorOpenByVideoRef.current.has(filePath)) {
+			// Back to a video seen earlier this session: its editor as it was left (see
+			// editorOpenByVideoRef). The timeline puts the playhead back too (leftAtByFile).
+			const wasOpen = editorOpenByVideoRef.current.get(filePath);
+			setDockerMode(wasOpen ? "file-tools" : "record");
+			if (wasOpen) window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
 		}
 		setRecentPaths(recordFileOpened(filePath));
 		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
@@ -3361,11 +3463,23 @@ const setScreen = () => {
 	libraryRefreshRef.current = () => void handleDirectoryFiles();
 	useEffect(() => {
 		installCloseGuards();
+		// What this page is doing that can't carry on without it - the window is kept (only hidden)
+		// in the tray while any of these is true. A plain recording isn't one: Rust runs it.
+		const stopBlocking = addReleaseBlocker(() => {
+			if (phoneCaptureRef.current) return "the phone camera is being recorded";
+			if (getPresentationState().active) return "the live display is on";
+			if (studioSilenceRef.current) return "a voice-over take is rolling";
+			return null;
+		});
 		installGlobalCloseGuard();
-		return onJobFinished((job) => {
+		const stopListening = onJobFinished((job) => {
 			libraryRefreshRef.current();
 			setMessage(`Exported ${formatFileName(job.resultPath?.split(/[\\/]/).pop() ?? job.title)}`);
 		});
+		return () => {
+			stopBlocking();
+			stopListening();
+		};
 	}, []);
 	const [shareJob, setShareJob] = useState<ExportJob | null>(null);
 
@@ -3410,20 +3524,34 @@ const setScreen = () => {
 	// same arrays back on every unrelated Dashboard render - a new array re-ran their thumbnail
 	// effects and re-rendered every tile.
 	const allLibraryFiles = useMemo(() => Object.values(files).flat(), [files]);
+	// Each library file's folder, looked up at once (findFileFolder walks every folder).
+	const folderByPath = useMemo(() => new Map(Object.entries(files).flatMap(([folder, list]) => list.map((f) => [f.path, folder] as const))), [files]);
+	const folderOfPath = useCallback((path: string) => folderByPath.get(path) ?? null, [folderByPath]);
+	// "Tidy up library" (TidyLibraryDialog) - from the Video Editor's home.
+	const [tidyOpen, setTidyOpen] = useState(false);
 	const libraryVideoFiles = useMemo(() => allLibraryFiles.filter((file) => getFileCategory(file.name) === "video"), [allLibraryFiles]);
 	const libraryImageClipFiles = useMemo(() => allLibraryFiles.filter((file) => isImageClipPath(file.path)), [allLibraryFiles]);
 	const libraryClipVideoFiles = useMemo(() => libraryVideoFiles.filter((file) => !isVideoProjectPath(file.path)), [libraryVideoFiles]);
-	const libraryFilesByPath = new Map(allLibraryFiles.map((file) => [file.path, file]));
-	const homeItems = buildHomeItems({
-		files: allLibraryFiles,
-		pinnedPaths,
-		recentPaths,
-		openedAt,
-		docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
-		whiteboards: whiteboardIndex,
-		mindmaps: mindmapIndex,
-	});
-	const homeFiles = homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : []));
+	// The home screen's items - rebuilt only when the library, pins, history or indexes change,
+	// not on every render of the page (playback ticks re-render it several times a second).
+	const libraryFilesByPath = useMemo(() => new Map(allLibraryFiles.map((file) => [file.path, file])), [allLibraryFiles]);
+	const homeItems = useMemo(
+		() =>
+			buildHomeItems({
+				files: allLibraryFiles,
+				pinnedPaths,
+				recentPaths,
+				openedAt,
+				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
+				whiteboards: whiteboardIndex,
+				mindmaps: mindmapIndex,
+			}),
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex]
+	);
+	const homeFiles = useMemo(
+		() => homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : [])),
+		[homeItems, libraryFilesByPath]
+	);
 	const openHomeItem = (item: HomeItem) => {
 		if (item.kind === "file") {
 			const file = libraryFilesByPath.get(item.id);
@@ -3810,13 +3938,7 @@ const setScreen = () => {
 			setSelectedFolder(null);
 		}
 		const folder = findFileFolder(selectedFile.sourcePath);
-		if (folder !== null && collapsedFolders.has(folder)) {
-			setCollapsedFolders((prev) => {
-				const next = new Set(prev);
-				next.delete(folder);
-				return next;
-			});
-		}
+		if (folder !== null) folderCollapse.expand(folder);
 		setPendingScrollToPath(selectedFile.sourcePath);
 	};
 
@@ -3826,10 +3948,11 @@ const setScreen = () => {
 	// that render instead of waiting on it.
 	useEffect(() => {
 		if (!pendingScrollToPath) return;
-		const row = document.querySelector(`[data-file-path="${CSS.escape(pendingScrollToPath)}"]`);
-		row?.scrollIntoView({ behavior: "smooth", block: "center" });
+		// A frame on, so a folder just expanded (folderCollapse - the tree re-renders on its own) is in.
+		const target = pendingScrollToPath;
+		requestAnimationFrame(() => document.querySelector(`[data-file-path="${CSS.escape(target)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
 		setPendingScrollToPath(null);
-	}, [pendingScrollToPath, activeFileCategory, collapsedFolders]);
+	}, [pendingScrollToPath, activeFileCategory]);
 
 	// True only if the filesystem folder is completely empty — no files of any type, no
 	// subfolders — not merely "no files in the currently active category". Root can never be
@@ -3867,12 +3990,7 @@ const setScreen = () => {
 		setOpenMenu(null);
 		// The new-subfolder input renders inside parentFolder's own (collapsible) body - expand it
 		// first so starting to create a folder never opens an input the user can't actually see.
-		setCollapsedFolders((prev) => {
-			if (!prev.has(parentFolder)) return prev;
-			const next = new Set(prev);
-			next.delete(parentFolder);
-			return next;
-		});
+		folderCollapse.expand(parentFolder);
 	};
 
 	const commitCreateFolder = async () => {
@@ -3911,7 +4029,8 @@ const setScreen = () => {
 		if (toMove.length === 0) return 0;
 		try {
 			const results = await Promise.allSettled(
-				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder }))
+				// A name already taken there: both kept, this one numbered ("name (2).ext") - never overwritten.
+				toMove.map((file) => invoke<string>("move_file", { sourcePath: file.path, destFolderPath: destFolder, keepBoth: true }))
 			);
 
 			// Keep pin/recent-history pointed at each moved file's new path — repathFile reads then
@@ -3952,9 +4071,15 @@ const setScreen = () => {
 			} else if (quiet) {
 					// the caller reports the combined result
 				} else if (toMove.length === 1) {
-				setMessage(`Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`);
+				const newName = results[0].status === "fulfilled" ? results[0].value.split(/[\\/]/).pop() ?? toMove[0].name : toMove[0].name;
+				setMessage(
+					newName === toMove[0].name
+						? `Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)}`
+						: `Moved ${formatFileName(toMove[0].name)} to ${folderDisplayName(destFolder)} as ${formatFileName(newName)} - that name was taken`
+				);
 			} else {
-				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}`);
+				const renamed = results.filter((r, i) => r.status === "fulfilled" && (r.value.split(/[\\/]/).pop() ?? "") !== toMove[i].name).length;
+				setMessage(`Moved ${toMove.length} files to ${folderDisplayName(destFolder)}${renamed ? ` (${renamed} numbered - their names were taken)` : ""}`);
 			}
 			return failedCount;
 		} catch (error) {
@@ -4006,7 +4131,7 @@ const setScreen = () => {
 			}
 			if (leftovers.length === 0) {
 				setPinnedFolders(repathPinnedFolders(folder, newKey));
-				setCollapsedFolders((prev) => new Set([...prev].map((k) => repathFolderKey(k, folder, newKey))));
+				folderCollapse.repath((k) => repathFolderKey(k, folder, newKey));
 				setSelectedFolder((prev) => (prev === null ? prev : repathFolderKey(prev, folder, newKey)));
 			}
 			await handleDirectoryFiles();
@@ -4164,6 +4289,7 @@ const setScreen = () => {
 		const unlistenPromise = appWindow.onDragDropEvent(async (event) => {
 			console.log("[Dashboard] onDragDropEvent", event.payload.type, event.payload.type === "drop" ? event.payload.paths : undefined);
 			if (event.payload.type === "enter" || event.payload.type === "over") {
+				if (videoEditorHomeRef.current) setEditorHomeDrag(true);
 				// v1's single "hover" type (fired repeatedly for the whole drag) is split into "enter"
 				// (once, with paths) and "over" (repeatedly, position only) in v2 - both are treated the
 				// same here since this handler only ever needed the position, not the paths, until drop.
@@ -4187,6 +4313,11 @@ const setScreen = () => {
 					void dropOnPhone(phone, event.payload.paths);
 					return;
 				}
+			}
+			if (event.payload.type === "drop" || event.payload.type === "leave") setEditorHomeDrag(false);
+			if (event.payload.type === "drop" && videoEditorHomeRef.current && event.payload.paths.some((p) => getFileCategory(p) === "video")) {
+				setEditorHomeDrop({ paths: event.payload.paths, at: Date.now() });
+				return;
 			}
 			if (event.payload.type === "drop") {
 				console.log("[Dashboard] drop - dragOverTimelineXRef was", dragOverTimelineXRef.current);
@@ -4485,7 +4616,7 @@ const setScreen = () => {
 	const isSearchingFiles = normalizedSearchQuery.length > 0;
 	// Search also matches folder names: a folder whose path matches shows all of its files (and
 	// stays listed even if it holds none in this tab), otherwise only files whose name matches.
-	const filteredEntriesUnordered = Object.entries(files)
+	const filteredEntries = useMemo(() => orderFolders(Object.entries(files)
 		.map(([folder, fileList]) => {
 			const folderMatches = folderMatchesQuery(folder, normalizedSearchQuery);
 			return [
@@ -4495,7 +4626,8 @@ const setScreen = () => {
 						(file) =>
 							getFileCategory(file.name) === activeFileCategory &&
 							(!isSearchingFiles || folderMatches || file.name.toLowerCase().includes(normalizedSearchQuery))
-					)
+					),
+						folder
 				),
 				folderMatches,
 			] as [string, FileEntry[], boolean];
@@ -4507,14 +4639,25 @@ const setScreen = () => {
 		// the active category are dropped too (root exempted - it's never hidden).
 		.filter(([, fileList, folderMatches]) => !isSearchingFiles || fileList.length > 0 || folderMatches)
 		.filter(([folder, fileList]) => !hideEmptyFolders || fileList.length > 0 || folder === "")
-		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]);
-	// Pinned folders (and what's inside them) first, then the usual path order.
-	const filteredEntries = orderFolders(filteredEntriesUnordered, pinnedFolders);
+		.map(([folder, fileList]) => [folder, fileList] as [string, FileEntry[]]),
+		// Pinned folders (and what's inside them) first, then the usual path order.
+		pinnedFolders),
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+		[files, normalizedSearchQuery, activeFileCategory, hideEmptyFolders, pinnedFolders, fileSortMode, folderSorts]);
+	// Folders the search is leaving out (of those this tab would otherwise list).
+	const hiddenBySearch = useMemo(
+		() =>
+			isSearchingFiles
+				? Object.entries(files).filter(([folder, list]) => !hideEmptyFolders || folder === "" || list.some((f) => getFileCategory(f.name) === activeFileCategory)).length - filteredEntries.length
+				: 0,
+		[isSearchingFiles, files, hideEmptyFolders, activeFileCategory, filteredEntries]
+	);
 	const isGridView = sidebarViewMode === "grid";
 	const firstUnpinnedIndex = filteredEntries.findIndex(([folder]) => pinRank(folder, pinnedFolders) === -1);
-	const filteredTrashItems = isSearchingFiles
-		? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery))
-		: trashItems;
+	const filteredTrashItems = useMemo(
+		() => (normalizedSearchQuery ? trashItems.filter((item) => item.name.toLowerCase().includes(normalizedSearchQuery)) : trashItems),
+		[trashItems, normalizedSearchQuery]
+	);
 	const sidebarHeaderLabel =
 		activeFileCategory === "trash"
 			? "Trash:"
@@ -4541,6 +4684,62 @@ const setScreen = () => {
     videoEditorScreen?.mode !== "home";
   // Tools/Media tabs (and a docking host) whenever something wants the sidebar's Tools tab.
   const showToolsSidebar = isEditingVideo || playerSidebarOpen;
+  // Its own width while editing, so opening the editor can widen it for the docked panels and
+  // closing it gives the picture its room back - animated by the sidebar's width transition.
+  const sidebarMode: SidebarMode = isEditingVideo ? "editing" : "browsing";
+  const sidebarWidth = sidebarCollapsed ? SIDEBAR_RAIL_W : sidebarWidths[sidebarMode];
+  // Picking a file type tab - the sidebar's own tabs and the folded rail's.
+  const selectFileCategory = (category: FileCategory) => {
+    setActiveFileCategory(category);
+    setSelectedFilePaths(new Set());
+    setSelectedFolder(null);
+    // Mid-edit these tabs only switch which files the sidebar lists - reopening the
+    // category's last file would replace the editor with it.
+    if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
+  };
+  const railGroups = [
+    ...(showToolsSidebar
+      ? [
+          [
+            { key: "tools", label: "Tools", icon: <IoOptionsOutline size={18} />, active: videoSidebarTab === "tools", onSelect: () => { setVideoSidebarTab("tools"); setSidebarFolded(false); } },
+            { key: "media", label: "Media", icon: <IoFolderOpenOutline size={18} />, active: videoSidebarTab === "media", onSelect: () => { setVideoSidebarTab("media"); setSidebarFolded(false); } },
+          ],
+        ]
+      : []),
+    FILE_CATEGORY_TABS.map(({ category, label, icon }) => ({
+      key: category,
+      label,
+      icon,
+      active: activeFileCategory === category && !(showToolsSidebar && videoSidebarTab === "tools"),
+      onSelect: () => {
+        if (showToolsSidebar) setVideoSidebarTab("media");
+        selectFileCategory(category);
+        setSidebarFolded(false);
+      },
+    })),
+  ];
+  // Ctrl+\ folds the sidebar to its rail and back (opening it first if it's hidden). Not while
+  // typing - and not Ctrl+B, which is bold in Docs and the text tools.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key !== "\\") return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      if (!showFileList) {
+        setShowFileList(true);
+        setSidebarFolded(false);
+        return;
+      }
+      setSidebarCollapsed((prev) => {
+        saveSidebarCollapsed(!prev);
+        return !prev;
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showFileList]);
 
   // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
   // control bar (fading with it) rather than as a row above the picture.
@@ -4562,6 +4761,62 @@ const setScreen = () => {
       </button>
     ) : undefined;
 
+  // The sidebar file tree's actions - stable, so the memoized tree skips re-rendering when nothing
+  // it shows changed (SidebarFileTree), yet always the latest.
+  const sidebarTreeActions = useStableCallbacks({
+    addMediaToVideo,
+    cancelRename,
+    categoryIcon,
+    categoryIconColorClassName,
+    commitCreateFolder,
+    commitRename,
+    filesToActOn,
+    folderDepth,
+    folderDisplayName,
+    handleAddFilesToBoard,
+    handleCopyFileImage,
+    handleCopyFilePath,
+    handleDeleteFile,
+    handleDeleteFolder,
+    handleDeleteForever,
+    handleEmptyTrash,
+    handleLinkNotes,
+    handleMoveFiles,
+    handleMoveFolder,
+    handleRestoreFromTrash,
+    handleSetThumbnail,
+    handleSidebarFilePointerDown,
+    handleSidebarFilePointerMove,
+    handleSidebarFilePointerUp,
+    handleTogglePin,
+    isFolderEmpty,
+    isSidebarDragging: () => !!sidebarDragRef.current?.isDragging,
+    openFolderGallery,
+    refreshDocsIndex,
+    resolveImageThumbnailUrl,
+    resolveVideoThumbnailUrl,
+    startCreateFolder,
+    startRename,
+    toggleFileSelected,
+    setAddMenuFor,
+    setConversionFile,
+    setCreatingFolderIn,
+    setDocsScreen,
+    setDraggingFiles,
+    setDraggingFolder,
+    setDragOverFolder,
+    setError,
+    setFolderMoveMenu,
+    setInfoFile,
+    setInfoTrashItem,
+    setLinkDocsMenuOpenFor,
+    setNewFolderValue,
+    setOpenMenu,
+    setPinnedFolders,
+    setSelectedFile,
+    setTransferMenu,
+  });
+
   return (
     <ItemLinksProvider files={allLibraryFiles} onOpen={openLinkedItem}>
     <ToolPanelHostContext.Provider value={showToolsSidebar ? toolPanelHostEl : null}>
@@ -4582,12 +4837,32 @@ const setScreen = () => {
           {/* File list sidebar — force-collapsed in PDF fullscreen/presentation mode,
               regardless of showFileList, so it never reappears over the presented page. */}
           <div
-            className={`h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 transition-all duration-300 overflow-hidden ${
-              showFileList && !isPdfFullscreen ? "w-[300px] opacity-100" : "w-0 opacity-0"
-            }`}
+            ref={sidebarRef}
+            // No width transition while it's being dragged - the edge must stay under the pointer.
+            className={`relative shrink-0 h-screen bg-neutral-50 dark:bg-neutral-900 border-b border-gray-300 dark:border-neutral-700 overflow-hidden ${
+              resizingSidebar ? "" : "transition-[width,opacity] duration-150 ease-out"
+            } ${showFileList && !isPdfFullscreen ? "opacity-100" : "w-0 opacity-0"}`}
+            style={showFileList && !isPdfFullscreen ? { width: sidebarWidth } : undefined}
           >
             {showFileList && !isPdfFullscreen && (
-              <div className="flex flex-col h-full">
+              <SidebarResizeHandle
+                sidebarRef={sidebarRef}
+                width={sidebarWidths[sidebarMode]}
+                collapsed={sidebarCollapsed}
+                onResizingChange={setResizingSidebar}
+                onCollapsedChange={setSidebarCollapsed}
+                onCommit={(w, collapsed) => {
+                  setSidebarFolded(collapsed);
+                  if (!collapsed) setSidebarWidths((prev) => ({ ...prev, [sidebarMode]: saveSidebarWidth(sidebarMode, w) }));
+                }}
+              />
+            )}
+            {showFileList && !isPdfFullscreen && sidebarCollapsed && <SidebarRail groups={railGroups} onExpand={() => setSidebarFolded(false)} />}
+            {showFileList && !isPdfFullscreen && !sidebarCollapsed && (
+              <div
+                className="flex flex-col h-full"
+                style={!resizingSidebar ? { width: sidebarWidths[sidebarMode], minWidth: sidebarWidths[sidebarMode] } : undefined}
+              >
                 {showToolsSidebar && (
                   <div className="flex items-center gap-1 p-2 border-b border-gray-300 dark:border-neutral-700 shrink-0">
                     {([
@@ -4630,300 +4905,45 @@ const setScreen = () => {
                   </div>
                 )}
                 <div className={`flex flex-col flex-1 min-h-0 ${showToolsSidebar && videoSidebarTab === "tools" ? "hidden" : ""}`}>
-                {/* File type tabs */}
-                <div className="flex items-center justify-around border-b border-gray-300 dark:border-neutral-700 py-2 shrink-0">
-                  {FILE_CATEGORY_TABS.map(({ category, label, icon }) => (
-                    <button
-                      key={category}
-                      type="button"
-                      title={label}
-                      onClick={() => {
-                        setActiveFileCategory(category);
-                        setSelectedFilePaths(new Set());
-                        setSelectedFolder(null);
-                        // Mid-edit these tabs only switch which files the sidebar lists - reopening the
-                        // category's last file would replace the editor with it.
-                        if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
-                      }}
-                      className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
-                        activeFileCategory === category
-                          ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                          : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                      }`}
-                    >
-                      {icon}
-                      <span>{label}</span>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    title="Trash"
-                    onClick={handleOpenTrash}
-                    className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
-                      activeFileCategory === "trash"
-                        ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                        : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    <IoTrashOutline size={18} />
-                    <span>Trash</span>
-                  </button>
-                </div>
-
-                {/* File search - filters the active tab's files (and trash) by name as you type.
-                    Fixed below the tabs, same as the folder-label bar beneath it. */}
-                <div className="px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
-                  <div className="relative">
-                    <IoSearch size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-neutral-500 pointer-events-none" />
-                    <input
-                      type="text"
-                      value={fileSearchQuery}
-                      onChange={(e) => setFileSearchQuery(e.target.value)}
-                      placeholder="Search files and folders"
-                      className="w-full pl-7 pr-7 py-1.5 rounded-md text-xs bg-gray-100 dark:bg-neutral-800 border border-transparent focus:border-blue-400 dark:focus:border-blue-500 outline-none text-neutral-800 dark:text-neutral-100 placeholder:text-gray-400 dark:placeholder:text-neutral-500"
-                    />
-                    {fileSearchQuery && (
-                      <button
-                        type="button"
-                        title="Clear search"
-                        onClick={() => setFileSearchQuery("")}
-                        className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                      >
-                        <IoClose size={13} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Folder label + prev/next/repeat/shuffle/autoplay controls — fixed below the
-                    tabs, does not scroll with the file list beneath it. */}
-                <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
-                  <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
-                  <div className="flex items-center gap-0.5 shrink-0">
-                    <button
-                      type="button"
-                      title="Refresh files"
-                      onClick={handleRefreshFiles}
-                      disabled={isRefreshingFiles}
-                      className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 disabled:opacity-50"
-                    >
-                      <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
-                    </button>
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title="Get files from phone"
-                        onClick={openPhoneReceive}
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <IoPhonePortraitOutline size={15} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title="New folder"
-                        onClick={() => startCreateFolder("")}
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <MdCreateNewFolder size={16} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={`Sort: ${fileSortMode === "name-asc" ? "Name (A-Z)" : fileSortMode === "name-desc" ? "Name (Z-A)" : "Type"} - click to cycle`}
-                        onClick={() =>
-                          setFileSortMode((prev) => (prev === "name-asc" ? "name-desc" : prev === "name-desc" ? "type" : "name-asc"))
-                        }
-                        className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                      >
-                        <IoSwapVerticalOutline size={15} />
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={isGridView ? "Switch to list view" : "Switch to grid view (thumbnails)"}
-                        onClick={() => {
-                          const next: SidebarViewMode = isGridView ? "list" : "grid";
-                          setSidebarViewMode(next);
-                          saveSidebarViewMode(next);
-                        }}
-                        className={`p-1 rounded transition-colors ${
-                          isGridView
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        {isGridView ? <IoListOutline size={15} /> : <IoGridOutline size={15} />}
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        title={hideEmptyFolders ? `Show folders with no ${activeFileCategory} files` : `Hide folders with no ${activeFileCategory} files`}
-                        onClick={() => setHideEmptyFolders((prev) => !prev)}
-                        className={`p-1 rounded transition-colors ${
-                          hideEmptyFolders
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        {hideEmptyFolders ? <IoEyeOffOutline size={15} /> : <IoEyeOutline size={15} />}
-                      </button>
-                    )}
-                    {activeFileCategory !== "trash" && (
-                      <button
-                        type="button"
-                        disabled={!selectedFile}
-                        title={
-                          !selectedFile
-                            ? "Select a file to see its tools"
-                            : dockerMode === "file-tools"
-                            ? isImageFileSelected
-                              ? "Hide image tools"
-                              : "Show recording controls"
-                            : isImageFileSelected
-                            ? "Show image tools"
-                            : "Show tools for this file"
-                        }
-                        onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
-                        className={`p-1 rounded transition-colors disabled:opacity-30 disabled:pointer-events-none ${
-                          dockerMode === "file-tools"
-                            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        }`}
-                      >
-                        <IoBuildOutline size={15} />
-                      </button>
-                    )}
-                    {(activeFileCategory === "image" || activeFileCategory === "audio") && (
-                      <>
-                        {activeFileCategory === "audio" && (
-                          <>
-                            <button
-                              type="button"
-                              title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
-                              onClick={cycleAudioRepeatMode}
-                              className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioRepeatMode !== "off"
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoRepeatOutline size={14} />
-                              {audioRepeatMode === "one" && (
-                                <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-blue-600 dark:bg-blue-500 text-white text-[8px] font-bold leading-none flex items-center justify-center">
-                                  1
-                                </span>
-                              )}
-                            </button>
-                            <button
-                              type="button"
-                              title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
-                              onClick={() => setAudioShuffle((prev) => !prev)}
-                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioShuffle
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoShuffleOutline size={14} />
-                            </button>
-                            <button
-                              type="button"
-                              title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
-                              onClick={() => setAudioAutoplayNext((prev) => !prev)}
-                              className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
-                                audioAutoplayNext
-                                  ? "text-blue-600 dark:text-blue-400"
-                                  : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
-                              }`}
-                            >
-                              <IoPlayForwardOutline size={14} />
-                            </button>
-                            <div className="w-px h-4 bg-gray-300 dark:bg-neutral-600 mx-0.5" />
-                          </>
-                        )}
-                        <button
-                          type="button"
-                          title="Previous (←)"
-                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
-                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        >
-                          <IoChevronBack size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          title="Next (→)"
-                          onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
-                          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
-                        >
-                          <IoChevronForward size={14} />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                {/* Bulk action bar — only for a real multi-selection (not trash, which has its
-                    own per-item restore/delete-forever actions already). */}
-                {activeFileCategory !== "trash" && selectedFilePaths.size > 0 && (
-                  <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-200 dark:border-neutral-700 shrink-0 bg-blue-50 dark:bg-blue-500/10">
-                    <span className="text-xs font-medium text-blue-700 dark:text-blue-300">
-                      {selectedFilePaths.size} selected
-                    </span>
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          const rect = e.currentTarget.getBoundingClientRect();
-                          setTransferMenu({ files: getSelectedFileEntries(), anchor: { left: rect.left, top: rect.bottom + 4 } });
-                        }}
-                        className="flex items-center gap-0.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                      >
-                        Move / Copy
-                        <IoChevronForward size={11} />
-                      </button>
-                      {isConvertibleCategory(activeFileCategory) && (
-                        <button
-                          type="button"
-                          onClick={() => setBulkConversionFiles(getSelectedFileEntries())}
-                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          Convert
-                        </button>
-                      )}
-                      {/* Only when a board is actually open - see BoardEditorHandle/boardEditorRef.
-                          Image tab only, matching FILE_CATEGORY_EXTENSIONS.image being the only
-                          thing Board can place on its canvas. */}
-                      {boardScreen?.mode === "editor" && activeFileCategory === "image" && (
-                        <button
-                          type="button"
-                          onClick={() => void handleAddFilesToBoard(getSelectedFileEntries())}
-                          className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          Add to board
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleBulkDeleteFiles(getSelectedFileEntries())}
-                        className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSelectedFilePaths(new Set())}
-                        className="text-xs text-neutral-500 dark:text-neutral-400 hover:underline"
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  </div>
-                )}
+                <SidebarHeader
+                  activeFileCategory={activeFileCategory}
+                  selectFileCategory={selectFileCategory}
+                  handleOpenTrash={handleOpenTrash}
+                  fileSearchQuery={fileSearchQuery}
+                  setFileSearchQuery={setFileSearchQuery}
+                  isSearchingFiles={isSearchingFiles}
+                  hiddenBySearch={hiddenBySearch}
+                  sidebarHeaderLabel={sidebarHeaderLabel}
+                  isRefreshingFiles={isRefreshingFiles}
+                  handleRefreshFiles={handleRefreshFiles}
+                  startCreateFolder={startCreateFolder}
+                  hideEmptyFolders={hideEmptyFolders}
+                  setHideEmptyFolders={setHideEmptyFolders}
+                  fileSortMode={fileSortMode}
+                  setFileSortMode={setFileSortMode}
+                  isGridView={isGridView}
+                  setSidebarViewMode={setSidebarViewMode}
+                  selectedFile={selectedFile}
+                  isImageFileSelected={isImageFileSelected}
+                  audioRepeatMode={audioRepeatMode}
+                  cycleAudioRepeatMode={cycleAudioRepeatMode}
+                  audioShuffle={audioShuffle}
+                  setAudioShuffle={setAudioShuffle}
+                  audioAutoplayNext={audioAutoplayNext}
+                  setAudioAutoplayNext={setAudioAutoplayNext}
+                  navigateAudio={navigateAudio}
+                  navigateImage={navigateImage}
+                  dockerMode={dockerMode}
+                  setDockerMode={setDockerMode}
+                  selectedFilePaths={selectedFilePaths}
+                  setSelectedFilePaths={setSelectedFilePaths}
+                  getSelectedFileEntries={getSelectedFileEntries}
+                  handleBulkDeleteFiles={handleBulkDeleteFiles}
+                  handleAddFilesToBoard={handleAddFilesToBoard}
+                  boardScreen={boardScreen}
+                  setBulkConversionFiles={setBulkConversionFiles}
+                  setTransferMenu={setTransferMenu}
+                />
 
                 {/* pb tracks --docker-height (published by BottomDocker's ResizeObserver, see
                     player.css for the sibling usage) so the last row can always scroll clear of
@@ -4960,657 +4980,62 @@ const setScreen = () => {
                       <span className="mb-0.5 block text-[10px] font-semibold uppercase leading-none tracking-wide text-blue-400 dark:text-blue-500/80">
                         Now open
                       </span>
-                      <span className="block truncate text-xs font-medium leading-tight text-blue-700 dark:text-blue-300">
-                        {truncateFileName(selectedFile.name)}
-                      </span>
+                      <FileNameText name={selectedFile.name} className="text-xs font-medium leading-tight text-blue-700 dark:text-blue-300" />
                     </span>
                     <IoLocateOutline size={14} className="shrink-0 text-blue-400 dark:text-blue-500" />
                   </button>
                 )}
-                {activeFileCategory === "trash" ? (
-                  filteredTrashItems.length === 0 ? (
-                    <p>{isSearchingFiles ? "No matching trash items" : "Trash is empty"}</p>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between mb-3">
-                        <span className="text-xs text-neutral-500 dark:text-neutral-400">
-                          {filteredTrashItems.length} item{filteredTrashItems.length === 1 ? "" : "s"}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={handleEmptyTrash}
-                          className="text-xs text-red-600 dark:text-red-400 hover:underline"
-                        >
-                          Empty Trash
-                        </button>
-                      </div>
-                      <ul className="space-y-0.5">
-                        {filteredTrashItems.map((item) => (
-                          <li
-                            key={item.trashed_name}
-                            className="flex items-center justify-between gap-2 group px-1 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-neutral-800"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate" title={item.name}>{formatFileName(item.name)}</div>
-                              <div className="text-[10px] text-neutral-400 dark:text-neutral-500">Deleted {formatDeletedAt(item.deleted_at)}</div>
-                            </div>
-                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                              <button
-                                type="button"
-                                title="Info"
-                                onClick={() => setInfoTrashItem(item)}
-                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                              >
-                                <IoInformationCircleOutline size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                title="Restore"
-                                onClick={() => handleRestoreFromTrash(item)}
-                                className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                              >
-                                <IoArrowUndoOutline size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                title="Delete forever"
-                                onClick={() => handleDeleteForever(item)}
-                                className="p-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-500/20"
-                              >
-                                <IoTrashOutline size={14} />
-                              </button>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </>
-                  )
-                ) : filteredEntries.length === 0 ? (
-                  <p>{isSearchingFiles ? `No ${activeFileCategory} files match "${fileSearchQuery.trim()}"` : `No ${activeFileCategory} files found`}</p>
+                {!sidebarContentReady ? (
+                  <SidebarSkeleton isGridView={isGridView} />
                 ) : (
-                  filteredEntries.map(([folder, fileList], folderIndex) => (
-                    <div
-                      key={folder}
-                      className="mb-3"
-                      // Folder-as-drop-target: reacts to an in-app file drag (draggingFiles) or an
-                      // OS file being dragged in from outside (e.dataTransfer.types includes
-                      // "Files", e.g. from Windows Explorer — this "types" check works during
-                      // dragover regardless of Tauri's native file-drop interception, which only
-                      // affects the final `drop` event's data, not the drag session itself) —
-                      // plain mouse hovering does neither, so it never lights up on its own.
-                      // This is purely visual/targeting state: for an external OS drag, the actual
-                      // import happens in the top-level onFileDropEvent listener above (which is
-                      // where the real file paths are available), not in onDrop below — a plain
-                      // HTML5 drop of an OS file never carries a usable path here.
-                      onDragOver={(e) => {
-                        if (draggingFolder !== null) {
-                          if (!canMoveFolder(draggingFolder, folder)) return;
-                        } else if (!draggingFiles && !e.dataTransfer.types.includes("Files")) return;
-                        e.preventDefault();
-                        if (dragOverFolder !== folder) setDragOverFolder(folder);
-                      }}
-                      onDragLeave={() => setDragOverFolder((prev) => (prev === folder ? null : prev))}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        if (draggingFolder !== null) void handleMoveFolder(draggingFolder, folder);
-                        else if (draggingFiles) handleMoveFiles(draggingFiles, folder);
-                      }}
-                    >
-                      {folderIndex === 0 && firstUnpinnedIndex !== 0 && (
-                        <div className="flex items-center gap-1 -mx-1 px-1 mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-500 dark:text-blue-400">
-                          <IoPin size={10} /> Pinned
-                        </div>
-                      )}
-                      {folderIndex === firstUnpinnedIndex && firstUnpinnedIndex > 0 && (
-                        <div className="-mx-1 px-1 mb-1 pt-2 border-t border-gray-200 dark:border-neutral-700 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-neutral-500">
-                          All folders
-                        </div>
-                      )}
-                      <div
-                        className={`group/folder flex items-center justify-between gap-1 -mx-1 px-1 py-0.5 rounded transition-colors ${
-                          dragOverFolder === folder ? "bg-blue-100 dark:bg-blue-500/20 ring-1 ring-blue-400" : ""
-                        }`}
-                        style={{ paddingLeft: 4 + folderDepth(folder) * 10 }}
-                        // Drag a folder onto another folder (or the Briefcast root) to move all of it.
-                        draggable={folder !== ""}
-                        onDragStart={(e) => {
-                          if (folder === "") return;
-                          e.stopPropagation();
-                          setDraggingFolder(folder);
-                          e.dataTransfer.effectAllowed = "move";
-                          e.dataTransfer.setData("text/plain", folder);
-                        }}
-                        onDragEnd={() => {
-                          setDraggingFolder(null);
-                          setDragOverFolder(null);
-                        }}
-                      >
-                        <h4
-                          className={`text-xs font-semibold flex items-center gap-1 min-w-0 truncate cursor-pointer ${
-                            GALLERY_CATEGORIES.includes(activeFileCategory) && selectedFolder === folder
-                              ? "text-blue-600 dark:text-blue-400"
-                              : "text-gray-500 dark:text-neutral-400"
-                          }`}
-                          // Full relative path here (not just folderDisplayName's leaf segment) so
-                          // two folders sharing a name at different nesting depths - e.g. two
-                          // "MSC Research" folders - are distinguishable on hover instead of both
-                          // showing an identical tooltip.
-                          title={`Open "${folder || "Briefcast"}"`}
-                        >
-                          <button
-                            type="button"
-                            title={`${collapsedFolders.has(folder) ? "Expand" : "Collapse"} "${folder || "Briefcast"}"`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleFolderCollapsed(folder);
-                            }}
-                            className="shrink-0 p-1 -m-1 rounded hover:bg-gray-200 dark:hover:bg-neutral-700"
-                          >
-                            <IoChevronForward size={10} className={`transition-transform ${collapsedFolders.has(folder) ? "" : "rotate-90"}`} />
-                          </button>
-                          <span className="flex items-center gap-1 min-w-0 ml-1" onClick={() => void openFolderGallery(folder)}>
-                            <IoFolderOutline size={12} className="shrink-0" />
-                            <span className="truncate">{folderDisplayName(folder)}</span>
-                          </span>
-                          {pinnedFolders.includes(folder) && <IoPin size={11} className="shrink-0 text-blue-500 dark:text-blue-400" />}
-                        </h4>
-                        <div className="flex items-center gap-0.5 opacity-0 group-hover/folder:opacity-100 transition-opacity shrink-0">
-                          {folder !== "" && (
-                            <button
-                              type="button"
-                              title={pinnedFolders.includes(folder) ? "Unpin folder" : "Pin folder to the top"}
-                              onClick={() => setPinnedFolders(togglePinnedFolder(folder))}
-                              className={`p-0.5 rounded hover:bg-gray-200 dark:hover:bg-neutral-700 ${
-                                pinnedFolders.includes(folder) ? "text-blue-500 dark:text-blue-400" : "text-gray-400 hover:text-blue-500"
-                              }`}
-                            >
-                              {pinnedFolders.includes(folder) ? <IoPin size={13} /> : <IoPinOutline size={13} />}
-                            </button>
-                          )}
-                          {isFolderEmpty(folder) && (
-                            <button
-                              type="button"
-                              title="Delete empty folder"
-                              onClick={() => handleDeleteFolder(folder)}
-                              className="p-0.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                            >
-                              <IoTrashOutline size={13} />
-                            </button>
-                          )}
-                          {folder !== "" && (
-                            <button
-                              type="button"
-                              title="Move folder to…"
-                              onClick={(e) => {
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                setFolderMoveMenu({ folder, anchor: { left: rect.left, top: rect.bottom + 4 } });
-                              }}
-                              className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                            >
-                              <IoFolderOpenOutline size={13} />
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            title="New subfolder"
-                            onClick={() => startCreateFolder(folder)}
-                            className="p-0.5 rounded text-gray-400 hover:text-blue-500 hover:bg-gray-200 dark:hover:bg-neutral-700"
-                          >
-                            <IoAddCircleOutline size={14} />
-                          </button>
-                        </div>
-                      </div>
-
-                      {!collapsedFolders.has(folder) && creatingFolderIn === folder && (
-                        <div className="flex items-center gap-1 mt-1" style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
-                          <IoFolderOutline size={12} className="text-gray-400 shrink-0" />
-                          <input
-                            autoFocus
-                            value={newFolderValue}
-                            onChange={(e) => setNewFolderValue(e.target.value)}
-                            onBlur={commitCreateFolder}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") commitCreateFolder();
-                              if (e.key === "Escape") setCreatingFolderIn(null);
-                            }}
-                            placeholder="Folder name"
-                            className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-xs bg-white dark:bg-neutral-800"
-                          />
-                        </div>
-                      )}
-
-                      {collapsedFolders.has(folder) && !isSearchingFiles ? null : fileList.length === 0 ? (
-                        <p
-                          className="text-[11px] text-neutral-400 dark:text-neutral-500 italic mt-1"
-                          style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}
-                        >
-                          No {activeFileCategory} files
-                        </p>
-                      ) : (
-                        <ul className={isGridView ? "mt-1 grid grid-cols-2 gap-2" : "mt-1 space-y-0.5"} style={{ paddingLeft: 4 + (folderDepth(folder) + 1) * 10 }}>
-                          {fileList.map((file) => (
-                            <li
-                              key={file.path}
-                              data-file-path={file.path}
-                              draggable
-                              onDragStart={(e) => {
-                                // While a video is being edited, dragging a video, picture or sound
-                                // takes it into the editor (handleSidebarFilePointerDown) - the
-                                // browser's own drag would cancel that gesture the moment it began.
-                                if (editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "")) {
-                                  e.preventDefault();
-                                  return;
-                                }
-                                setDraggingFiles(filesToActOn(file));
-                                e.dataTransfer.effectAllowed = "move";
-                              }}
-                              onDragEnd={() => {
-                                setDraggingFiles(null);
-                                setDragOverFolder(null);
-                              }}
-                              className={`${isGridView ? "relative flex flex-col gap-1 min-w-0 group cursor-pointer p-1 rounded-lg" : "flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md"} hover:bg-gray-50 dark:hover:bg-neutral-800 ${
-                                selectedFile?.sourcePath === file.path ? 'bg-blue-50 dark:bg-blue-500/10' : ''
-                              } ${draggingFiles?.some((f) => f.path === file.path) ? 'opacity-40' : ''}`}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={selectedFilePaths.has(file.path)}
-                                onClick={(e) => e.stopPropagation()}
-                                onChange={() => toggleFileSelected(file.path)}
-                                title="Select for bulk move"
-                                className={`shrink-0 accent-blue-500 transition-opacity ${isGridView ? "absolute top-2 left-2 z-10" : ""} ${
-                                  selectedFilePaths.size > 0 || selectedFilePaths.has(file.path) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                                }`}
-                              />
-                              {isGridView ? (
-                                // Same tap-to-open / drag-to-timeline gesture as the filename in list view.
-                                <div
-                                  className="w-full"
-                                  title={file.name}
-                                  onPointerDown={handleSidebarFilePointerDown(file)}
-                                  onPointerMove={handleSidebarFilePointerMove}
-                                  onPointerUp={handleSidebarFilePointerUp(file)}
-                                >
-                                  <SidebarFileIcon
-                                    large
-                                    name={file.name}
-                                    path={file.path}
-                                    isImage={["image", "video"].includes(getFileCategory(file.name) ?? "")}
-                                    resolveThumbnailUrl={getFileCategory(file.name) === "video" ? resolveVideoThumbnailUrl : resolveImageThumbnailUrl}
-                                    fallbackIcon={categoryIcon(getFileCategory(file.name))}
-                                    fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
-                                  />
-                                </div>
-                              ) : (
-                                <SidebarFileIcon
-                                  name={file.name}
-                                  path={file.path}
-                                  isImage={getFileCategory(file.name) === "image"}
-                                  resolveThumbnailUrl={resolveImageThumbnailUrl}
-                                  fallbackIcon={categoryIcon(getFileCategory(file.name))}
-                                  fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
-                                />
-                              )}
-                              {/* Name + badges: one row under the tile in grid view, plain siblings of the row in list view. */}
-                              <div className={isGridView ? "flex items-center gap-1 min-w-0 px-0.5 text-xs" : "contents"}>
-                              {/* MODIFIED: Now clicking plays the file in VideoPlayer */}
-                              {renamingFile === file.path && !renameInGallery ? (
-                                <InlineRenameInput
-                                  fileName={file.name}
-                                  onCommit={(value) => void commitRename(file, value)}
-                                  onCancel={cancelRename}
-                                  className="flex-1 min-w-0 border border-blue-400 rounded px-1 text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100"
-                                />
-                              ) : (
-                                <div
-                                  className={`flex-1 min-w-0 truncate hover:text-blue-500 dark:hover:text-blue-400 ${
-                                    selectedFile?.sourcePath === file.path ? 'text-blue-600 dark:text-blue-400 font-medium' : ''
-                                  }`}
-                                  title={file.name}
-                                  onPointerDown={handleSidebarFilePointerDown(file)}
-                                  onPointerMove={handleSidebarFilePointerMove}
-                                  onPointerUp={handleSidebarFilePointerUp(file)}
-                                >
-                                  {truncateFileName(file.name)}
-                                </div>
-                              )}
-
-                              {pinnedPaths.includes(file.path) && (
-                                <IoPin
-                                  size={12}
-                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
-                                  title="Pinned to home"
-                                />
-                              )}
-
-                              {linkedDocsByPath.has(file.path) && (
-                                <MdOutlineDescription
-                                  size={13}
-                                  className="shrink-0 text-gray-400 dark:text-neutral-500"
-                                  title={`${linkedDocsByPath.get(file.path)!.length} linked note(s)`}
-                                />
-                              )}
-
-                              </div>
-                              {/* Add + menu: floating over the tile's corner in grid view (on hover, or while a menu is open). */}
-                              <div
-                                className={
-                                  isGridView
-                                    ? `absolute top-2 right-2 z-10 flex items-center gap-0.5 rounded-md bg-white/90 dark:bg-neutral-900/85 shadow-sm transition-opacity ${
-                                      openMenu === file.path || addMenuFor === file.path ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                                    }`
-                                    : "contents"
-                                }
-                              >
-                              {/* Add to the video being edited: insert, append, or show on the picture. */}
-                              {editingVideoRef.current && ["video", "image", "audio"].includes(getFileCategory(file.name) ?? "") && file.path !== selectedFile?.sourcePath && (
-                                <div className="relative">
-                                  <button
-                                    title="Add to the video you're editing (or drag it onto the timeline or the picture)"
-                                    className={`p-1 rounded-md transition-colors ${addMenuFor === file.path ? 'opacity-100 bg-gray-200 dark:bg-neutral-700' : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'}`}
-                                    onPointerDown={(e) => e.stopPropagation()}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      if (getFileCategory(file.name) === "audio") {
-                                        void addMediaToVideo(file.path, "end");
-                                        return;
-                                      }
-                                      setAddMenuFor(addMenuFor === file.path ? null : file.path);
-                                    }}
-                                  >
-                                    <IoAdd size={14} />
-                                  </button>
-                                  {addMenuFor === file.path && (
-                                    <div
-                                      onPointerDown={(e) => e.stopPropagation()}
-                                      className="absolute right-0 top-full mt-1.5 w-52 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl overflow-hidden z-20 py-1 text-sm text-neutral-700 dark:text-neutral-200"
-                                    >
-                                      {(
-                                        [
-                                          ["insert", "Insert at the playhead"],
-                                          ["end", "Add to the end"],
-                                          ["overlay", getFileCategory(file.name) === "image" ? "Show on the video" : "Show on the video (picture-in-picture)"],
-                                        ] as const
-                                      ).map(([how, label]) => (
-                                        <button
-                                          key={how}
-                                          className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-neutral-700/70"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setAddMenuFor(null);
-                                            void addMediaToVideo(file.path, how);
-                                          }}
-                                        >
-                                          {label}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {/* Three vertical dots menu */}
-                              <div className="relative">
-                                <button
-                                  className={`p-1 rounded-md transition-colors ${
-                                    openMenu === file.path
-                                      ? 'opacity-100 bg-gray-200 dark:bg-neutral-700'
-                                      : 'opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-neutral-700'
-                                  }`}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setOpenMenu(openMenu === file.path ? null : file.path);
-                                    setLinkDocsMenuOpenFor(null);
-                                  }}
-                                >
-                                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
-                                    <path d="M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/>
-                                  </svg>
-                                </button>
-
-                                {/* Popup Menu - see the "Closes a file row's 3-dot menu" effect
-                                    above for outside-click/Escape handling. onPointerDown here
-                                    stops that same document-level listener from treating a click
-                                    *inside* this menu (e.g. expanding "Move to") as a click
-                                    outside it - mirrors ImageFolderGallery.tsx's own context menu. */}
-                                {openMenu === file.path && (
-                                  <>
-                                    <style>{`
-                                      @keyframes sidebarFileMenuIn {
-                                        from { opacity: 0; transform: translateY(-4px) scale(0.98); }
-                                        to { opacity: 1; transform: translateY(0) scale(1); }
-                                      }
-                                    `}</style>
-                                    <div
-                                      onPointerDown={(e) => e.stopPropagation()}
-                                      style={{ animation: "sidebarFileMenuIn 140ms cubic-bezier(0.16, 1, 0.3, 1)" }}
-                                      className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-20 py-1"
-                                    >
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleTogglePin(file);
-                                        }}
-                                      >
-                                        {pinnedPaths.includes(file.path) ? (
-                                          <IoPin size={15} className="shrink-0 text-blue-500 dark:text-blue-400" />
-                                        ) : (
-                                          <IoPinOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        )}
-                                        <span className="flex-1 text-left">
-                                          {pinnedPaths.includes(file.path) ? "Unpin from home" : "Pin to home"}
-                                        </span>
-                                      </button>
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void handleLinkNotes(file);
-                                        }}
-                                      >
-                                        <MdOutlineDescription size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Link notes</span>
-                                        {linkedDocsByPath.has(file.path) && (linkedDocsByPath.get(file.path)!.length >= 2) && (
-                                          <IoChevronForward
-                                            size={12}
-                                            className={`shrink-0 text-neutral-400 dark:text-neutral-500 transition-transform ${linkDocsMenuOpenFor === file.path ? 'rotate-90' : ''}`}
-                                          />
-                                        )}
-                                      </button>
-                                      {linkDocsMenuOpenFor === file.path && (
-                                        <div className="mx-1.5 mb-1 max-h-40 overflow-y-auto rounded-lg bg-gray-50 dark:bg-neutral-900/60 py-0.5">
-                                          {(linkedDocsByPath.get(file.path) ?? []).map((doc) => (
-                                            <button
-                                              key={doc.id}
-                                              className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setOpenMenu(null);
-                                                setLinkDocsMenuOpenFor(null);
-                                                setSelectedFile(null);
-                                                setDocsScreen({ mode: "editor", docId: doc.id });
-                                              }}
-                                            >
-                                              {doc.title || "Untitled document"}
-                                            </button>
-                                          ))}
-                                          <button
-                                            className="w-full text-left pl-6 pr-3 py-1.5 text-xs truncate hover:bg-gray-100 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setLinkDocsMenuOpenFor(null);
-                                              void (async () => {
-                                                try {
-                                                  const id = crypto.randomUUID();
-                                                  const title = `Notes for ${file.name}`;
-                                                  const bytes = Array.from(Y.encodeStateAsUpdate(new Y.Doc()));
-                                                  await invoke("create_doc", { id, title, bytes });
-                                                  await invoke("link_doc_to_file", { id, filePath: file.path });
-                                                  await refreshDocsIndex();
-                                                  setOpenMenu(null);
-                                                  setSelectedFile(null);
-                                                  setDocsScreen({ mode: "editor", docId: id });
-                                                } catch (error) {
-                                                  console.error("Failed to create linked notes:", error);
-                                                  setError(`Failed to create linked notes: ${error}`);
-                                                }
-                                              })();
-                                            }}
-                                          >
-                                            + New linked doc
-                                          </button>
-                                        </div>
-                                      )}
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          startRename(file);
-                                        }}
-                                      >
-                                        <IoCreateOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Rename</span>
-                                      </button>
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void handleCopyFilePath(file);
-                                        }}
-                                      >
-                                        <IoCopyOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Copy path</span>
-                                      </button>
-                                      {getFileCategory(file.name) === "image" && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleCopyFileImage(file);
-                                          }}
-                                        >
-                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Copy image</span>
-                                        </button>
-                                      )}
-                                       {isConvertibleCategory(getFileCategory(file.name)) && (
-                                         <button
-                                            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              setConversionFile(file);
-                                              setOpenMenu(null);
-                                            }}
-                                          >
-                                          <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Convert</span>
-                                        </button>
-                                       )}
-
-                                      {/* Only when a board is actually open (boardEditorRef) and
-                                          this is an image - see handleAddFilesToBoard. */}
-                                      {boardScreen?.mode === "editor" && getFileCategory(file.name) === "image" && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleAddFilesToBoard(filesToActOn(file));
-                                          }}
-                                        >
-                                          <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">
-                                            {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
-                                          </span>
-                                        </button>
-                                      )}
-
-                                      {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) beside this one. */}
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          const rect = e.currentTarget.getBoundingClientRect();
-                                          setTransferMenu({ files: filesToActOn(file), anchor: { left: rect.right + 4, top: rect.top } });
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                        <IoFolderOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">
-                                          {filesToActOn(file).length > 1 ? `Move or copy ${filesToActOn(file).length} items…` : "Move or copy to…"}
-                                        </span>
-                                        <IoChevronForward size={12} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                      </button>
-                                      {/* A project file is an edit list, not media a phone can play -
-                                          Save renders it first. */}
-                                      {!isVideoProjectPath(file.path) && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            openPhoneTransfer(filesToActOn(file).filter((f) => !isVideoProjectPath(f.path)));
-                                            setOpenMenu(null);
-                                          }}
-                                        >
-                                          <IoPhonePortraitOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">
-                                            {filesToActOn(file).length > 1 ? `Transfer ${filesToActOn(file).length} to phone` : "Transfer to phone"}
-                                          </span>
-                                        </button>
-                                      )}
-                                      {getFileCategory(file.name) === "video" && !isVideoProjectPath(file.path) && (
-                                        <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleSetThumbnail(file);
-                                          }}
-                                        >
-                                          <IoImageOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                          <span className="flex-1 text-left">Set thumbnail…</span>
-                                        </button>
-                                      )}
-
-                                      <button
-                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setInfoFile({ path: file.path, name: file.name });
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                        <IoInformationCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                                        <span className="flex-1 text-left">Info</span>
-                                      </button>
-
-                                      <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />
-                                      <button
-                                          className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteFile(file);
-                                          }}
-                                        >
-                                        <IoTrashOutline size={15} className="shrink-0" />
-                                        <span className="flex-1 text-left">Delete</span>
-                                      </button>
-                                    </div>
-                                  </>
-                                )}
-                              </div>
-                              </div>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  ))
+                  <SidebarFileTree
+                    activeFileCategory={activeFileCategory}
+                    filteredEntries={filteredEntries}
+                    filteredTrashItems={filteredTrashItems}
+                    firstUnpinnedIndex={firstUnpinnedIndex}
+                    isSearchingFiles={isSearchingFiles}
+                    fileSearchQuery={fileSearchQuery}
+                    isGridView={isGridView}
+                    isLoading={activeFileCategory === "trash" ? isLoadingTrash : isLoadingFiles}
+                    selectedPath={selectedFile?.sourcePath}
+                    selectedFolder={selectedFolder}
+                    selectedFilePaths={selectedFilePaths}
+                    editingVideo={editingVideoRef.current}
+                    boardScreen={boardScreen}
+                    pinnedFolders={pinnedFolders}
+                    folderSorts={folderSorts}
+                    setFolderSorts={setFolderSorts}
+                    pinnedPaths={pinnedPaths}
+                    linkedDocsByPath={linkedDocsByPath}
+                    openMenu={openMenu}
+                    addMenuFor={addMenuFor}
+                    linkDocsMenuOpenFor={linkDocsMenuOpenFor}
+                    renamingFile={renamingFile}
+                    renameInGallery={renameInGallery}
+                    creatingFolderIn={creatingFolderIn}
+                    newFolderValue={newFolderValue}
+                    draggingFiles={draggingFiles}
+                    draggingFolder={draggingFolder}
+                    dragOverFolder={dragOverFolder}
+                    {...sidebarTreeActions}
+                  />
                 )}
                 </div>
                 </div>
               </div>
             )}
           </div>
+
+          {tidyOpen && (
+            <TidyLibraryDialog
+              files={allLibraryFiles}
+              folderOf={folderOfPath}
+              // handleMoveFiles answers how many failed; the dialog wants how many moved.
+              onMove={async (list, folder) => list.length - (await handleMoveFiles(list, folder, true))}
+              onDone={() => void handleDirectoryFiles()}
+              onClose={() => setTidyOpen(false)}
+            />
+          )}
 
           {infoTrashItem && (
             <FileInfoModal
@@ -5770,16 +5195,22 @@ const setScreen = () => {
               resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
               onCreate={handleCreateVideoProject}
               onClose={() => setIsNewVideoProjectOpen(false)}
+              hidden={isNewVideoDialogHidden}
             />
           )}
+          {isMakingVideo && <ProjectPrepOverlay onFinished={handleMakingVideoFinished} />}
           {videoEditorScreen?.mode === "home" ? (
             <VideoEditorHome
               videos={libraryVideoFiles}
               recentPaths={recentPaths}
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
-              onOpenVideo={(file) => void handleOpenVideoInEditor(file)}
-              onOpenExternalVideo={() => void handleOpenExternalVideoForEditing()}
+              onOpenVideo={(file, intent) => void handleOpenVideoInEditor(file, intent)}
+              onOpenExternalVideo={(intent) => void handleOpenExternalVideoForEditing(intent)}
               onCreateVideo={() => setIsNewVideoProjectOpen(true)}
+              onSendToPhone={openPhoneTransfer}
+              externalDrag={editorHomeDrag}
+              droppedPaths={editorHomeDrop}
+              onTidyUp={() => setTidyOpen(true)}
             />
           ) : mindmapScreen ? (
             <ErrorBoundary
@@ -5911,6 +5342,7 @@ const setScreen = () => {
                           onSelectOverlay={setSelectedOverlayId}
                           selectedImageOverlayId={selectedImageOverlayId}
                           onSelectImageOverlay={setSelectedImageOverlayId}
+                          isPlaying={playerIsPlaying}
                           isPlacingText={isPlacingText}
                           onPlacementConsumed={() => setIsPlacingText(false)}
                           onAddTextOverlay={editStore.addTextOverlay}
@@ -5996,6 +5428,14 @@ const setScreen = () => {
                             getVideoElement={getMainVideoElement}
                             resolveClipUrl={resolveTimelineClipUrl}
                           />
+                          {/* The video's intro / outro, on the assembled video as export draws them. */}
+                          <EdgeTransitionPreviewLayer
+                            frameRect={frameRect}
+                            edges={editStore.edgeTransitions}
+                            totalDuration={totalOutputDuration}
+                            getOutputTime={getExactOutputTime}
+                            getVideoElement={getMainVideoElement}
+                          />
                           {/* Adjustment layers on the video itself - beneath blur regions and every
                               overlay, where export applies them. */}
                           <AdjustmentLayersLayer mode="under" frameRect={frameRect} layers={editStore.adjustmentLayers} currentOutputTime={currentOutputTime} getOutputTime={getExactOutputTime} />
@@ -6035,6 +5475,20 @@ const setScreen = () => {
                           </div>
                         )}
                         <KeystrokeLayer frameRect={fullFrame} chips={keyChips} style={keystrokeStyle} getOutputTime={getExactOutputTime} fallbackTime={currentOutputTime} />
+                        {/* The canvas as the phone's screen - its corners, camera and app areas (guides only). */}
+                        {editStore.canvas && phonePreview && <PhonePreviewLayer canvas={editStore.canvas} width={fullFrame.width} height={fullFrame.height} isPlaying={playerIsPlaying} />}
+                        {/* Rearranging the selected layer's split screen, right over the picture. */}
+                        {selectedSplit && !playerIsPlaying && (
+                          <div className="absolute left-0 right-0 flex justify-center pointer-events-none" style={{ top: Math.max(6, fullFrame.height * 0.055), zIndex: 70 }}>
+                            <SplitArrangeBar
+                              settings={selectedSplit.settings}
+                              cells={selectedSplit.cells}
+                              frameAspect={frameRect.width / Math.max(1, frameRect.height)}
+                              onChange={(change) => editStore.updateSplitGroup({ group: selectedSplit.group, ...change }, frameRect.width / Math.max(1, frameRect.height))}
+                              onEdit={() => window.dispatchEvent(new CustomEvent("briefcast:edit-split", { detail: { group: selectedSplit.group } }))}
+                            />
+                          </div>
+                        )}
                         {/* Above PiP and every other overlay - same stacking as the export, where the
                             captions are the last video stage (export_trimmed_video). */}
                         {editStore.captions?.settings.enabled && captionLines.length > 0 && (
@@ -6159,6 +5613,7 @@ const setScreen = () => {
                 // The master bus in use takes every sound through it - this one included.
                 meterTrack={mixerSession.open || !isNeutralMaster(editStore.master)}
                 activeClipEffects={activeClipEffects}
+                frameBackground={canvasBlur ? "blur" : null}
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
@@ -6581,7 +6036,7 @@ const setScreen = () => {
         {pendingUpdate && (
           <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
         )}
-        <TelemetryNotice />
+        <TelemetryNotice /> 
       </div>
     </div>
     </ToolPanelOpenContext.Provider>

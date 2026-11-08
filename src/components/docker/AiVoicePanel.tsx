@@ -15,9 +15,12 @@
 //              speech for music that ducks under it, one "AI voice" strip in the mixer. Changing the
 //              words and making it again REPLACES the take it placed (same start); "Add as another"
 //              keeps both. Saying the same thing in the same voice again is instant.
+//   History    every voice-over made, this video's first (where each sits), then the rest of the
+//              library. Clicking one brings back its words, voice and pace, and makes it the take
+//              "Replace" re-makes in place - so a line can be fixed long after it was made.
 import { convertFileSrc } from "@tauri-apps/api/core";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IoAdd, IoCheckmark, IoCloudDownloadOutline, IoLockClosedOutline, IoPause, IoPlay, IoRefresh, IoSparkles, IoStop } from "react-icons/io5";
+import { IoAdd, IoCheckmark, IoChevronDown, IoChevronForward, IoCloudDownloadOutline, IoLockClosedOutline, IoPause, IoPlay, IoRefresh, IoSparkles, IoStop } from "react-icons/io5";
 import {
   cancelTts,
   cancelTtsDownload,
@@ -30,16 +33,20 @@ import {
   onTtsDownload,
   onTtsProgress,
   PAUSE_STYLES,
+  pauseStyleFor,
   readVoicePrefs,
   SpokenFile,
   ttsPreview,
   ttsRelease,
   ttsStatus,
+  ttsHistory,
   ttsSynthesize,
   TtsStatus,
   VoiceMeta,
+  VoiceOverEntry,
   VOICES,
   wordCount,
+  wordsFromFileName,
   writeVoicePrefs,
 } from "../../utils/aiVoice";
 
@@ -52,6 +59,8 @@ interface AiVoicePanelProps {
   // Places the finished takes at `at` and removes the pieces `replaces` names (same contract as the
   // Record tab); returns the new pieces' ids.
   onTakes: (takes: { path: string; seconds: number; label: string }[], at: number, replaces: string[]) => string[];
+  // The audio pieces in this video's edit - which voice-overs in the history are on it, and where.
+  pieces: { id: string; src: string; startTime: number }[];
 }
 
 const LABEL = "AI voice";
@@ -72,7 +81,9 @@ function tileStyle(id: string): React.CSSProperties {
 
 type Placed = { ids: string[]; at: number; seconds: number; file: SpokenFile; voice: string };
 
-const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, onTimelinePlay, onSeek, onTakes }) => {
+const samePath = (a: string, b: string) => a.replace(/\//g, "\\").toLowerCase() === b.replace(/\//g, "\\").toLowerCase();
+
+const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, onTimelinePlay, onSeek, onTakes, pieces }) => {
   const initial = useMemo(readVoicePrefs, []);
   const [text, setText] = useState(initial.text);
   const [voice, setVoice] = useState(initial.voice);
@@ -89,7 +100,15 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
 
   const audioRef = useRef<HTMLAudioElement>(null);
   // What the one audio element is playing: a voice's sample, or the placed take.
-  const [playing, setPlaying] = useState<{ kind: "sample"; voice: string } | { kind: "take" } | null>(null);
+  const [playing, setPlaying] = useState<{ kind: "sample"; voice: string } | { kind: "take" } | { kind: "history"; path: string } | null>(null);
+  const [history, setHistory] = useState<VoiceOverEntry[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const refreshHistory = useCallback(() => {
+    ttsHistory()
+      .then(setHistory)
+      .catch((e) => console.warn("Couldn't list voice-overs:", e));
+  }, []);
+  useEffect(refreshHistory, [refreshHistory]);
   const [sampleLoading, setSampleLoading] = useState<string | null>(null);
 
   const refreshStatus = useCallback(() => {
@@ -181,11 +200,102 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
       const ids = onTakes([{ path: file.path, seconds: file.seconds, label: LABEL }], at, replacing ? replacing.ids : []);
       placedFrom.current = requestKey;
       setPlaced({ ids, at, seconds: file.seconds, file, voice });
+      refreshHistory();
     } catch (e) {
       if (!isCancelled(e)) setError(e instanceof Error ? e.message : String(e));
     } finally {
       setMaking(null);
     }
+  };
+
+  // A voice-over from the history: its words, voice and pace back in the editor, and - when it's on
+  // this video - it becomes the take "Replace" re-makes where it sits. One made before scripts were
+  // kept brings back its voice only; paste the words and Replace still lands in its place.
+  const recall = (entry: VoiceOverEntry) => {
+    if (busy) return;
+    const recalledSpeed = entry.speed !== null ? Math.min(MAX_SPEED, Math.max(MIN_SPEED, entry.speed)) : null;
+    if (entry.text !== null) setText(entry.text);
+    if (entry.voice && VOICES.some((v) => v.id === entry.voice)) setVoice(entry.voice);
+    if (recalledSpeed !== null) setSpeed(recalledSpeed);
+    if (entry.pause !== null) setPause(pauseStyleFor(entry.pause));
+    const onVideo = pieces.filter((p) => samePath(p.src, entry.path));
+    if (onVideo.length === 0) {
+      placedFrom.current = "";
+      setPlaced(null);
+      return;
+    }
+    const at = Math.min(...onVideo.map((p) => p.startTime));
+    // Up to date only while the editor holds exactly what made it.
+    placedFrom.current =
+      entry.text !== null && entry.voice && recalledSpeed !== null && entry.pause !== null
+        ? `${entry.voice}|${recalledSpeed.toFixed(2)}|${pauseStyleFor(entry.pause)}|${entry.text.trim()}`
+        : "";
+    setPlaced({ ids: onVideo.map((p) => p.id), at, seconds: entry.seconds, file: { path: entry.path, seconds: entry.seconds, cached: true }, voice: entry.voice ?? voice });
+    onSeek(at);
+  };
+
+  // The history's voice-over, again, at the playhead - the file is reused, nothing is re-made.
+  const placeAgain = (entry: VoiceOverEntry) => {
+    const ids = onTakes([{ path: entry.path, seconds: entry.seconds, label: LABEL }], placeAt, []);
+    placedFrom.current = "";
+    setPlaced({ ids, at: placeAt, seconds: entry.seconds, file: { path: entry.path, seconds: entry.seconds, cached: true }, voice: entry.voice ?? voice });
+  };
+
+  // Where each voice-over sits on this video (its earliest piece), or null when it isn't on it.
+  const startOf = (entry: VoiceOverEntry): number | null => {
+    const on = pieces.filter((p) => samePath(p.src, entry.path));
+    return on.length > 0 ? Math.min(...on.map((p) => p.startTime)) : null;
+  };
+
+  const historyRow = (entry: VoiceOverEntry) => {
+    const at = startOf(entry);
+    const isPlaying = playing?.kind === "history" && playing.path === entry.path;
+    const isPlaced = placed !== null && samePath(placed.file.path, entry.path);
+    const name = VOICES.find((v) => v.id === entry.voice)?.name;
+    return (
+      <div
+        key={entry.path}
+        role="button"
+        tabIndex={0}
+        onClick={() => recall(entry)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") recall(entry);
+        }}
+        title={entry.text !== null ? "Bring back these words, voice and pace - then Replace re-makes it in place" : "Made before scripts were kept: brings back its voice - paste the words, then Replace re-makes it in place"}
+        className={`group flex items-start gap-1.5 p-1.5 rounded-md cursor-pointer outline-none ${isPlaced ? "bg-teal-500/15 ring-1 ring-teal-400/50" : "bg-white/[0.03] hover:bg-white/[0.07] focus-visible:ring-1 focus-visible:ring-white/30"}`}
+      >
+        <button
+          type="button"
+          title={isPlaying ? "Stop" : "Listen"}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isPlaying) audioRef.current?.pause();
+            else playUrl(entry.path, { kind: "history", path: entry.path });
+          }}
+          className="shrink-0 mt-0.5 h-6 w-6 rounded-full flex items-center justify-center bg-white/10 text-white/85 hover:bg-white/20"
+        >
+          {isPlaying ? <IoPause size={10} /> : <IoPlay size={10} className="ml-0.5" />}
+        </button>
+        <div className="min-w-0 flex-1 leading-snug">
+          <div className={`text-[11px] line-clamp-2 ${entry.text !== null ? "text-white/85" : "text-white/55 italic"}`}>{entry.text ?? `${wordsFromFileName(entry.path)}…`}</div>
+          <div className="text-[9.5px] text-white/40 tabular-nums">
+            {name ?? "AI voice"} · {entry.seconds.toFixed(1)}s{at !== null && ` · at ${clock(at)}`}
+            {entry.text === null && " · words not saved"}
+          </div>
+        </div>
+        <button
+          type="button"
+          title={`Place it again at ${clock(placeAt)} - instant, nothing is re-made`}
+          onClick={(e) => {
+            e.stopPropagation();
+            placeAgain(entry);
+          }}
+          className="shrink-0 mt-0.5 h-6 w-6 rounded-md flex items-center justify-center text-white/45 hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 focus:opacity-100"
+        >
+          <IoAdd size={13} />
+        </button>
+      </div>
+    );
   };
 
   // Ctrl/Cmd+Enter from the script box.
@@ -294,7 +404,7 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
           <span className="flex-1">Voice</span>
           <span className="normal-case tracking-normal">{selected.accent} · {selected.gender}</span>
         </div>
-        <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label="Voice">
+        <div className="grid grid-cols-2 @[520px]:grid-cols-3 gap-1.5" role="radiogroup" aria-label="Voice">
           {VOICES.map((v) => {
             const on = v.id === voice;
             const isPlaying = playing?.kind === "sample" && playing.voice === v.id;
@@ -439,6 +549,27 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
       )}
 
       {error && <p className="text-[11px] leading-snug text-red-300/90">{error}</p>}
+
+      {history.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <button type="button" onClick={() => setHistoryOpen((o) => !o)} className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-white/40 hover:text-white/70">
+            {historyOpen ? <IoChevronDown size={11} /> : <IoChevronForward size={11} />}
+            <span className="flex-1 text-left">History</span>
+            <span className="normal-case tracking-normal">{history.filter((h) => startOf(h) !== null).length} on this video</span>
+          </button>
+          {historyOpen && (
+            <>
+              {history
+                .filter((h) => startOf(h) !== null)
+                .sort((a, b) => startOf(a)! - startOf(b)!)
+                .map(historyRow)}
+              {history.some((h) => startOf(h) === null) && <div className="pt-1 text-[9.5px] uppercase tracking-wide text-white/30">Earlier</div>}
+              {history.filter((h) => startOf(h) === null).map(historyRow)}
+            </>
+          )}
+        </div>
+      )}
+
       <p className="text-[10px] leading-snug text-white/35">
         Made on this PC and saved in your library's Voice-overs folder. Music dips under it automatically, and it gets its own “{LABEL}” strip in the mixer.
       </p>

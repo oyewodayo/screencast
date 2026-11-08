@@ -45,7 +45,8 @@ const statusLine = (job: ExportJob): string => {
     case "rendering":
       return `${Math.floor(job.progress)}%${job.etaSec !== undefined ? ` · ${formatEta(job.etaSec)}` : ""}`;
     case "done":
-      return job.resultPath ? fileName(job.resultPath) : "Saved";
+      // Saved without a chosen location: in the library's Exports folder (export_output_path).
+      return job.resultPath ? `${/[\\/]Exports[\\/][^\\/]+$/i.test(job.resultPath) ? "In Exports · " : ""}${fileName(job.resultPath)}` : "Saved";
     case "failed":
       return job.error ?? "Failed";
     case "cancelled":

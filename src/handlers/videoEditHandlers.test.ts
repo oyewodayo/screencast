@@ -5,6 +5,7 @@
 // unchanged; if one of these breaks, the app's actual editing behavior changed, not just plumbing.
 import { describe, expect, it } from "vitest";
 import {
+  reorderTarget,
   insertFreezeFrame,
   reverseClip,
   unreverseClip,
@@ -336,6 +337,20 @@ describe("deleteClipAt / reorderClip / insertClip", () => {
     const clips = [makeClip({ id: "a" }), makeClip({ id: "b" }), makeClip({ id: "c" })];
     const result = reorderClip(clips, 0, 2);
     expect(result.map((c) => c.id)).toEqual(["b", "c", "a"]);
+  });
+
+  // A drag drops into a slot (insert before clip i, or after the last); reorderTarget turns that into
+  // reorderClip's index. Each case is what a person dragging expects to see.
+  it("a drop slot lands the clip exactly where it was dropped, in either direction", () => {
+    const ids = ["a", "b", "c", "d"];
+    const clips = ids.map((id) => makeClip({ id }));
+    const drop = (from: number, slot: number) => reorderClip(clips, from, reorderTarget(from, slot)).map((c) => c.id).join("");
+    expect(drop(1, 1)).toBe("abcd"); // let go where it started
+    expect(drop(1, 2)).toBe("abcd"); // a small nudge right, not past the neighbour: nothing moves
+    expect(drop(1, 3)).toBe("acbd"); // just past the right neighbour: swaps with it, one place
+    expect(drop(1, 4)).toBe("acdb"); // past everything: the end
+    expect(drop(2, 1)).toBe("acbd"); // left past one neighbour
+    expect(drop(2, 0)).toBe("cabd"); // all the way to the front
   });
 
   it("reorderClip clamps an out-of-range target index", () => {

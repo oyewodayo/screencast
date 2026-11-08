@@ -15,7 +15,10 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::command;
 
-use super::responsiveness::{blocking, serial};
+use super::responsiveness::serial;
+// Only the Windows share path awaits blocking work (the others are fire-and-forget).
+#[cfg(target_os = "windows")]
+use super::responsiveness::blocking;
 
 // Each share gets its own subfolder so the file keeps the document's clean title as its name
 // ("Project proposal.pdf" is what the recipient sees) without colliding with an earlier share.
@@ -243,8 +246,10 @@ pub async fn share_file_native(window: tauri::WebviewWindow, path: String, title
     }
 }
 
+// Simple MAPI (the Windows mail path) is what reports Opened / Cancelled.
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub enum EmailOutcome {
     /// The mail client's compose window opened with the file attached.
     Opened,
