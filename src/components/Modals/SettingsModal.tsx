@@ -1453,7 +1453,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     <>Pause and resume a recording without losing your place - paused time is never included in the finished video.</>,
                     <>Take a Full Screen, Monitor, or Window screenshot from the same target picker recording uses.</>,
                     <>Overlay one or more webcams onto a screen recording - choose their shape, corner position, and size.</>,
-                    <>Capture system audio ("what you hear") alongside your mic (Windows only).</>,
+                    <>Capture system audio ("what you hear") alongside your mic (Windows and Linux; on a Mac it needs a virtual audio device such as BlackHole).</>,
                   ]} />
                 </Section>
 
