@@ -97,7 +97,8 @@ import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
-import { addCloseGuard, addReleaseBlocker, installCloseGuards, quitApp } from "../utils/closeGuards";
+import { addCloseGuard, addReleaseBlocker, HIDDEN_TO_TRAY_EVENT, installCloseGuards, quitApp } from "../utils/closeGuards";
+import { stopAllPlayback } from "../utils/previewHead";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
@@ -2467,6 +2468,24 @@ const setScreen = () => {
 			disposed = true;
 			void unlisten.then((fn) => fn());
 		};
+	}, []);
+
+	// Closing to the tray only hides the window - the page keeps running - so a video playing in it
+	// carried on, heard but not seen. Whatever plays stops as the window goes, as it would if the window
+	// really closed; it stays paused when Briefcast is opened again. The player is paused through its
+	// own controls so the editor's other layers stop with it. Live camera previews are left alone:
+	// they're streams rather than playback, and a paused one would come back frozen.
+	useEffect(() => {
+		const stopPlayback = () => {
+			if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
+			// The timeline, the mixer's audition and the panels' previews.
+			stopAllPlayback();
+			document.querySelectorAll<HTMLMediaElement>("video, audio").forEach((el) => {
+				if (!el.paused && !el.srcObject) el.pause();
+			});
+		};
+		window.addEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
+		return () => window.removeEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
 	}, []);
 
 	// One update check per launch, delayed so it never competes with startup work (device probes,

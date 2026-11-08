@@ -46,6 +46,13 @@ export function claimPlayback(owner: PlaybackOwner) {
   stoppers.forEach((stop, other) => other !== owner && stop());
 }
 
+// Every player stops - the window is going away (hidden to the tray), so nothing should go on playing
+// unseen. Includes the mixer's audition and the panels' previews, which play outside the page's
+// <video>/<audio> elements and so can't be found any other way.
+export function stopAllPlayback() {
+  stoppers.forEach((stop) => stop());
+}
+
 const SHOW_KEY = "briefcast.audioPanel.showPlayingLine";
 export const readShowPlayingLine = (): boolean => {
   try {

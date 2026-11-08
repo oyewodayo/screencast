@@ -116,6 +116,34 @@ describe("release to the tray", () => {
   });
 });
 
+describe("hiding to the tray", () => {
+  it("tells the page to stop playback before the window hides", async () => {
+    const guards = await setup({ closeToTray: true, releaseWindowInTray: false });
+    const order: string[] = [];
+    (globalThis.window as unknown as { dispatchEvent: (e: { type: string }) => boolean }).dispatchEvent = (e) => {
+      order.push(`event:${e.type}`);
+      return true;
+    };
+    win.hide.mockImplementationOnce(async () => {
+      order.push("hide");
+      visible = false;
+    });
+    await clickClose();
+    expect(order).toEqual([`event:${guards.HIDDEN_TO_TRAY_EVENT}`, "hide"]);
+  });
+
+  it("does not signal anything when the close button quits instead", async () => {
+    const guards = await setup({ closeToTray: false });
+    const events: string[] = [];
+    (globalThis.window as unknown as { dispatchEvent: (e: { type: string }) => boolean }).dispatchEvent = (e) => {
+      events.push(e.type);
+      return true;
+    };
+    await clickClose();
+    expect(events).not.toContain(guards.HIDDEN_TO_TRAY_EVENT);
+  });
+});
+
 describe("quitting", () => {
   it("runs guards in quit mode and destroys the window", async () => {
     const guards = await setup({ closeToTray: false });

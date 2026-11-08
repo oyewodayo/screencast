@@ -50,6 +50,11 @@ export function addReleaseBlocker(blocker: ReleaseBlocker): () => void {
   };
 }
 
+/** Dispatched on `window` just before the close button hides Briefcast to the tray. Hiding keeps
+ * the page alive, so anything playing in it would carry on, heard but not seen - listeners stop it
+ * (Dashboard pauses the player), as closing a window is expected to. */
+export const HIDDEN_TO_TRAY_EVENT = "briefcast:hidden-to-tray";
+
 /** How long Briefcast sits in the tray before its window is released - reopening within it is
  * instant, and a quick hide-and-reopen never pays for a rebuild. */
 export const RELEASE_AFTER_MS = 60_000;
@@ -127,6 +132,8 @@ async function hideToTray(): Promise<boolean> {
     updateSettings({ closeToTray: keep });
     if (!keep) return false;
   }
+  // Before hiding, so the sound stops the moment the window goes.
+  window.dispatchEvent(new CustomEvent(HIDDEN_TO_TRAY_EVENT));
   await appWindow.hide();
   scheduleRelease(RELEASE_AFTER_MS);
   return true;
