@@ -605,8 +605,7 @@ mod tests {
 
         let out = dir.join("cutout.webm");
         let run = std::time::Instant::now();
-        let mut last = 0.0;
-        cut_out(env, &model, &ffmpeg, &ffprobe, source.to_str().unwrap(), None, &out, &cancel, &|p| last = p).expect("the video is cut out");
+        cut_out(env, &model, &ffmpeg, &ffprobe, source.to_str().unwrap(), None, &out, &cancel, &|_| {}).expect("the video is cut out");
         println!("cut out 30 frames in {:.1}s", run.elapsed().as_secs_f64());
         assert!(std::fs::metadata(&out).map(|m| m.len() > 1000).unwrap_or(false), "a WebM was written");
         // Thirty frames in, thirty out.
