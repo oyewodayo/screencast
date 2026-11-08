@@ -257,28 +257,39 @@ fn require_v4l2_path(name: &str) -> Result<String, String> {
     find_v4l2_path(&devices, name).ok_or_else(|| format!("Camera '{}' not found", name))
 }
 
+// One camera's input, by the name the device list gave it.
+pub(crate) fn camera_input_args(device: &str, size: &str) -> Result<Vec<String>, String> {
+    Ok(vec!["-f".to_string(), "v4l2".to_string(), "-video_size".to_string(), size.to_string(), "-i".to_string(), require_v4l2_path(device)?])
+}
+
 // Adds one video-only v4l2 input per selected camera, then a -filter_complex chaining an overlay
 // stage per camera onto the screen capture — mirrors win.rs's add_overlay_args for dshow, using
 // the same shared, camera-count-aware filter-graph builder rather than a single-camera one.
-fn add_camera_overlay_args(args: &mut Vec<String>, form_data: &FormData) -> Result<(), String> {
-    let overlay_size = map_overlay_size(&form_data.overlay_size);
-
-    for device in &form_data.video_devices {
-        let camera_path = require_v4l2_path(device)?;
-        args.extend(vec![
-            "-f".to_string(),
-            "v4l2".to_string(),
-            "-video_size".to_string(),
-            overlay_size.clone(),
-            "-i".to_string(),
-            camera_path,
-        ]);
+fn add_camera_overlay_args(app_handle: &AppHandle, args: &mut Vec<String>, form_data: &FormData) -> Result<(), String> {
+    for (index, device) in form_data.video_devices.iter().enumerate() {
+        // The first camera with a live background (camera_effects.rs) comes from that feed instead -
+        // already cropped to the bubble and composited. If the feed can't start, the camera is
+        // recorded as it is rather than the recording failing.
+        if index == 0 {
+            if let Some(effect) = &form_data.camera_effect {
+                match crate::commands::camera_effects::ensure_feed(app_handle, device, &form_data.overlay_shape, &form_data.overlay_size, effect, true) {
+                    Ok((port, w, h)) => {
+                        args.extend(crate::commands::camera_effects::feed_input_args(port, w, h));
+                        continue;
+                    }
+                    Err(e) => log::warn!("Live camera background unavailable, recording the camera as it is: {}", e),
+                }
+            }
+        }
+        args.extend(camera_input_args(device, &map_overlay_size(&form_data.overlay_size))?);
     }
 
     let filter_complex = build_camera_overlay_filter_complex(
         &form_data.overlay_shape,
         &form_data.overlay_position,
         &form_data.overlay_size,
+        &form_data.overlay_border,
+        &form_data.overlay_border_color,
         form_data.video_devices.len(),
         resolved_max_width(form_data),
         None,
@@ -309,7 +320,7 @@ pub async fn recording_with_output_sva(
     let has_camera_overlay = !form_data.video_devices.is_empty();
     if has_camera_overlay {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_camera_overlay_args(&mut args, form_data)?;
+        add_camera_overlay_args(app_handle, &mut args, form_data)?;
         // Pulse can't be bundled into the screen or camera input the way avfoundation/dshow
         // combine video+audio in one -i — it's always its own input on Linux. With
         // filter_complex already in play for the video composite, the output stream selection

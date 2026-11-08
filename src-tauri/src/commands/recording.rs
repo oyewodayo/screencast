@@ -1268,6 +1268,26 @@ pub fn map_overlay_size(size: &str) -> String {
     }
 }
 
+// The ffmpeg input that opens one camera by the name the device list gave it (dshow on Windows, v4l2 on
+// Linux, avfoundation on a Mac) - for the live camera effects, which read the camera themselves.
+pub(crate) fn camera_input_args(app_handle: &AppHandle, device: &str, size: &str) -> Result<Vec<String>, String> {
+    let size = map_overlay_size(size);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app_handle;
+        Ok(vec!["-f".to_string(), "dshow".to_string(), "-video_size".to_string(), size, "-i".to_string(), format!("video={device}")])
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app_handle;
+        linux::camera_input_args(device, &size)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::camera_input_args(app_handle, device, &size)
+    }
+}
+
 // How a camera bubble looks, as chosen in the Screen Options modal. Sizes, margins and border
 // thickness are all fractions of the recorded frame's width, so a bubble looks the same at 1080p
 // and at 4K - and so the modal's preview (CameraOverlayPreview.tsx, which mirrors every number
@@ -1483,11 +1503,13 @@ pub fn build_camera_overlay_filter_complex(
     shape: &str,
     position: &str,
     size: &str,
+    border: &str,
+    border_color: &str,
     camera_count: usize,
     max_width: i32,
     crop: Option<(i32, i32, i32, i32)>,
 ) -> String {
-    let style = OverlayStyle { shape, position, size, border: "none", border_color: "#ffffff" };
+    let style = OverlayStyle { shape, position, size, border, border_color };
     build_camera_overlay_filter_complex_from(
         &style,
         camera_count,

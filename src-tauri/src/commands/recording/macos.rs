@@ -110,6 +110,13 @@ fn find_index(devices: &[AvDevice], name: &str) -> Option<u32> {
     devices.iter().find(|d| d.name == name).map(|d| d.index)
 }
 
+// One camera's input, by the name the device list gave it - for the live camera effects.
+pub(crate) fn camera_input_args(app_handle: &AppHandle, device: &str, size: &str) -> Result<Vec<String>, String> {
+    let (video_devices, _) = list_avfoundation_devices(app_handle)?;
+    let index = find_index(&video_devices, device).ok_or_else(|| format!("Camera '{}' not found", device))?;
+    Ok(vec!["-f".to_string(), "avfoundation".to_string(), "-video_size".to_string(), size.to_string(), "-i".to_string(), av_input_spec(Some(index), None)])
+}
+
 fn find_screen_index(devices: &[AvDevice]) -> Option<u32> {
     devices
         .iter()
@@ -136,6 +143,7 @@ fn av_input_spec(video_index: Option<u32>, audio_index: Option<u32>) -> String {
 // build_camera_overlay_filter_complex's own doc comment for why cropping has to be baked into
 // this same filter_complex rather than a separate -vf.
 fn add_camera_overlay_args(
+    app_handle: &AppHandle,
     args: &mut Vec<String>,
     form_data: &FormData,
     video_devices: &[AvDevice],
@@ -143,7 +151,21 @@ fn add_camera_overlay_args(
 ) -> Result<(), String> {
     let overlay_size = map_overlay_size(&form_data.overlay_size);
 
-    for device in &form_data.video_devices {
+    for (position, device) in form_data.video_devices.iter().enumerate() {
+        // The first camera with a live background (camera_effects.rs) comes from that feed instead -
+        // already cropped to the bubble and composited. If the feed can't start, the camera is
+        // recorded as it is rather than the recording failing.
+        if position == 0 {
+            if let Some(effect) = &form_data.camera_effect {
+                match crate::commands::camera_effects::ensure_feed(app_handle, device, &form_data.overlay_shape, &form_data.overlay_size, effect, true) {
+                    Ok((port, w, h)) => {
+                        args.extend(crate::commands::camera_effects::feed_input_args(port, w, h));
+                        continue;
+                    }
+                    Err(e) => log::warn!("Live camera background unavailable, recording the camera as it is: {}", e),
+                }
+            }
+        }
         let index = find_index(video_devices, device)
             .ok_or_else(|| format!("Camera '{}' not found", device))?;
         args.extend(vec![
@@ -160,6 +182,8 @@ fn add_camera_overlay_args(
         &form_data.overlay_shape,
         &form_data.overlay_position,
         &form_data.overlay_size,
+        &form_data.overlay_border,
+        &form_data.overlay_border_color,
         form_data.video_devices.len(),
         resolved_max_width(form_data),
         crop.map(|(x, y, w, h)| (w, h, x, y)),
@@ -395,7 +419,7 @@ pub async fn recording_with_output_sva(
             av_input_spec(Some(screen_index), None),
         ];
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
-        add_camera_overlay_args(&mut args, form_data, &video_devices, crop)?;
+        add_camera_overlay_args(app_handle, &mut args, form_data, &video_devices, crop)?;
         // The screen input above was left audio-less (its side of av_input_spec was None) so the
         // mic gets its own dedicated input instead - same reasoning as win.rs's sva mode keeping
         // camera and audio as separate dshow inputs rather than trying to bundle mic audio onto

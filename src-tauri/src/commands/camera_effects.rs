@@ -168,23 +168,10 @@ fn start_feed(app_handle: &AppHandle, device: &str, size: &str, (w, h): (u32, u3
     }
     let ffmpeg = get_ffmpeg_path(app_handle)?;
     let crop = if w == h { "crop='min(iw,ih)':'min(iw,ih)'" } else { "crop='min(iw,ih*4/3)':'min(ih,iw*3/4)'" };
-    let capture_args: Vec<String> = [
-        "-v".to_string(),
-        "error".into(),
-        "-f".into(),
-        "dshow".into(),
-        "-video_size".into(),
-        crate::commands::recording::map_overlay_size(size),
-        "-i".into(),
-        format!("video={device}"),
-        "-an".into(),
-        "-vf".into(),
-        format!("{crop},scale={w}:{h},format=rgb24"),
-        "-f".into(),
-        "rawvideo".into(),
-        "pipe:1".into(),
-    ]
-    .to_vec();
+    // The camera by its name, however this system opens one (dshow, v4l2, avfoundation).
+    let mut capture_args: Vec<String> = vec!["-v".to_string(), "error".into()];
+    capture_args.extend(crate::commands::recording::camera_input_args(app_handle, device, size)?);
+    capture_args.extend(["-an".to_string(), "-vf".into(), format!("{crop},scale={w}:{h},format=rgb24"), "-f".into(), "rawvideo".into(), "pipe:1".into()]);
     let capture: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -417,10 +404,8 @@ fn serve_frames(s: &Shared, listener: TcpListener, frame_bytes: usize) {
     }
 }
 
-// ffmpeg input arguments reading the feed - in place of the camera's own dshow input. Its frames
+// ffmpeg input arguments reading the feed - in place of the camera's own input. Its frames
 // are stamped as they arrive, so the bubble stays in step with the screen and the mic.
-// The live camera background is Windows-only so far (it feeds a dshow input).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn feed_input_args(port: u16, w: u32, h: u32) -> Vec<String> {
     [
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-video_size", &format!("{w}x{h}"), "-framerate", &format!("{FEED_FPS}"),
