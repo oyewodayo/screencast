@@ -109,6 +109,7 @@ import { useGradeLut } from "../utils/gradeLuts";
 import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../utils/clipTiming";
 import { OverlayKeyframe, keyframeAt, keyframeStateAt, upsertKeyframe } from "../utils/keyframes";
 import TransitionPreviewLayer from "../components/video/TransitionPreviewLayer";
+import EdgeTransitionPreviewLayer from "../components/video/EdgeTransitionPreviewLayer";
 import ClipFxLayer from "../components/video/ClipFxLayer";
 import { forgetTimelineBootstrap } from "../components/docker/VideoTimelineDocker";
 import ClipHandoffLayer, { ClipHandoffApi } from "../components/video/ClipHandoffLayer";
@@ -5426,6 +5427,14 @@ const setScreen = () => {
                             getPlaybackState={getPlayerPlaybackState}
                             getVideoElement={getMainVideoElement}
                             resolveClipUrl={resolveTimelineClipUrl}
+                          />
+                          {/* The video's intro / outro, on the assembled video as export draws them. */}
+                          <EdgeTransitionPreviewLayer
+                            frameRect={frameRect}
+                            edges={editStore.edgeTransitions}
+                            totalDuration={totalOutputDuration}
+                            getOutputTime={getExactOutputTime}
+                            getVideoElement={getMainVideoElement}
                           />
                           {/* Adjustment layers on the video itself - beneath blur regions and every
                               overlay, where export applies them. */}

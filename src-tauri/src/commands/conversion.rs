@@ -3392,6 +3392,11 @@ pub struct KeepSegment {
     // segments'. Filled in by export_trimmed_video; never sent by the frontend.
     #[serde(skip)]
     pub fit_blur: Option<usize>,
+    // A still already fitted (and mirrored) into the frame before it's repeated into a stream
+    // (still_image_input_chain), so its effect chain starts after that. Filled in by
+    // export_trimmed_video; never sent by the frontend.
+    #[serde(skip)]
+    pub prefitted: bool,
 }
 
 fn has_pointer_layers(seg: &KeepSegment) -> bool {
@@ -5900,7 +5905,7 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
             extra.push_str(",hflip");
         }
     };
-    if pointer.is_none() {
+    if pointer.is_none() && !seg.prefitted {
         fit_and_flip(&mut extra);
     }
     // The grade, then the colour preset - the preview's order: GradeCanvas draws the graded frame
@@ -5940,6 +5945,39 @@ fn segment_effect_chain(seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64
         extra.push_str(",setsar=1");
     }
     extra
+}
+
+// A still's picture as a stream: the photo decoded ONCE (a plain single-frame input), fitted into
+// the frame once when `seg.prefitted` (its fit + mirror, which segment_effect_chain then leaves out),
+// and that one frame repeated at IMAGE_SEGMENT_FPS for `seconds` - [img{i}], which the segment's
+// chain reads in place of [{i}:v]. `-loop 1` on the input instead decoded and rescaled the full-size
+// photo for every single output frame: a 12 MP phone photo is ~50 ms to decode and as much again to
+// scale (and its blurred backdrop more), thirty times a second of the clip. Frame timestamps are
+// exactly the looped input's (n / fps), so Ken Burns and every trim land on the same frames.
+fn still_image_input_chain(i: usize, seg: &KeepSegment, out_w: Option<i64>, out_h: Option<i64>, seconds: f64) -> String {
+    let frames = (seconds * IMAGE_SEGMENT_FPS).ceil().max(1.0) as i64;
+    let mut fit = String::new();
+    if seg.prefitted {
+        if let (Some(w), Some(h)) = (out_w, out_h) {
+            match seg.fit_blur {
+                Some(k) => fit.push_str(&frame_fit_blur_chain(w, h, true, &format!("fb{k}"))),
+                None => fit.push_str(&frame_fit_chain(w, h, true)),
+            }
+        }
+        if seg.flip_horizontal.unwrap_or(false) {
+            fit.push_str(",hflip");
+        }
+    }
+    format!(
+        "[{i}:v]null{fit},loop=loop={}:size=1:start=0,setpts=N/({fps:.3}*TB)[img{i}];",
+        frames - 1,
+        fps = IMAGE_SEGMENT_FPS
+    )
+}
+
+// Where a segment's picture comes from in the graph: its input, or a still's repeated frame.
+fn segment_input_label(i: usize, seg: &KeepSegment) -> String {
+    if is_still_image_path(&seg.source_path) { format!("[img{i}]") } else { format!("[{i}:v]") }
 }
 
 // One left-to-right fold step joining segment `i` ([v{i}]/[a{i}]) onto everything folded so far
@@ -5992,6 +6030,79 @@ fn transition_fold_step(
         None => format!("[{cur_v}][{cur_a}][v{i}][a{i}]concat=n=2:v=1:a=1[{next_v}][{next_a}];"),
     };
     (step, next_v, next_a)
+}
+
+// The video's intro and outro: a transition in from black over its first seconds and out to black
+// over its last (videoEditTypes.ts's EdgeTransitions). They belong to the video, not to a clip, so
+// they stay at its edges whatever the clip order - and a single clip can have them.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeTransitions {
+    #[serde(default)]
+    pub intro: Option<ClipTransitionIn>,
+    #[serde(default)]
+    pub outro: Option<ClipTransitionIn>,
+}
+
+// Label suffixes for the edge transitions' windows, apart from every segment index (the fold's
+// windows use the incoming segment's index, transition_window_graph suffixes everything with it).
+const EDGE_INTRO_TAG: usize = 1_000_000;
+const EDGE_OUTRO_TAG: usize = 1_000_001;
+
+// Each edge's window in seconds, from a video `total` seconds long: unset or non-positive is none.
+// Alone, an edge takes at most 90% of the video (a clip transition's clamp); with both, 45% each,
+// so they never overlap. Mirrored by edgeTransitionWindows (videoEditTypes.ts) for the preview.
+fn edge_windows(edges: &EdgeTransitions, total: f64) -> (Option<f64>, Option<f64>) {
+    let want = |t: &Option<ClipTransitionIn>| t.as_ref().map(|t| t.duration).filter(|d| d.is_finite() && *d > 0.0);
+    let (intro, outro) = (want(&edges.intro), want(&edges.outro));
+    let share = if intro.is_some() && outro.is_some() { 0.45 } else { 0.9 };
+    let fit = |d: f64| d.min(total * share).max(0.05);
+    (intro.map(fit), outro.map(fit))
+}
+
+// Draws the intro and outro onto `[src]` - the whole assembled video, `total` output seconds, at
+// `fps` and fitted to w x h - into `[out]`. Black is the other picture: the intro is a transition
+// FROM black into the video's first `d` seconds, the outro one FROM its last `d` seconds into black.
+// Both go through transition_window_graph exactly as a cut between clips does, so every transition
+// and look works at the edges too, and the video's length never changes. Picture only - the sound
+// plays as it is, as at a cut.
+fn edge_transition_graph(src: &str, out: &str, edges: &EdgeTransitions, total: f64, fps: f64, (w, h): (i64, i64)) -> String {
+    let (intro_d, outro_d) = edge_windows(edges, total);
+    let black = |label: String, d: f64| format!("color=c=black:s={w}x{h}:r={fps:.3}:d={d:.6},format=yuv420p,settb=AVTB,setsar=1[{label}];");
+    let window = |tr: &ClipTransitionIn, k: usize, d: f64| {
+        let look = tr.look.clone().unwrap_or_default();
+        transition_window_graph(sanitize_transition_name(&tr.transition_type), k, d, fps, (w, h), &look)
+    };
+    // The joins keep their last frame (eof_action=pass): a drawn transition's frames can end
+    // without a duration, which `fps` would otherwise round away - a frame short at the very end.
+    let mut g = format!("[{src}]fps={fps:.3},settb=AVTB,format=yuv420p,setsar=1[edg];");
+    let mut cur = "edg";
+    if let (Some(d), Some(tr)) = (intro_d, edges.intro.as_ref()) {
+        let k = EDGE_INTRO_TAG;
+        g.push_str(&format!(
+            "[{cur}]split[eh{k}][er{k}];[eh{k}]trim=end={d:.6}[head{k}];[er{k}]trim=start={d:.6},setpts=PTS-STARTPTS[rest{k}];{}{}\
+             [tr{k}][rest{k}]concat=n=2:v=1:a=0,fps={fps:.3}:eof_action=pass,settb=AVTB[edgein];",
+            black(format!("old{k}"), d),
+            window(tr, k, d)
+        ));
+        cur = "edgein";
+    }
+    if let (Some(d), Some(tr)) = (outro_d, edges.outro.as_ref()) {
+        let k = EDGE_OUTRO_TAG;
+        let start = (total - d).max(0.0);
+        // The outgoing picture is padded with its last frame, so it's a full `d` long even if the
+        // assembled video comes up a frame short of `total`.
+        g.push_str(&format!(
+            "[{cur}]split[eb{k}][et{k}];[eb{k}]trim=end={start:.6}[body{k}];\
+             [et{k}]trim=start={start:.6},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={d:.3},trim=end={d:.6}[old{k}];{}{}\
+             [body{k}][tr{k}]concat=n=2:v=1:a=0,fps={fps:.3}:eof_action=pass,settb=AVTB[edgeout];",
+            black(format!("head{k}"), d),
+            window(tr, k, d)
+        ));
+        cur = "edgeout";
+    }
+    g.push_str(&format!("[{cur}]null[{out}];"));
+    g
 }
 
 // BT.601 limited-range Y, Cb, Cr of an 8-bit RGB colour.
@@ -7434,6 +7545,8 @@ pub async fn export_trimmed_video(
     keystrokes: Option<SpriteTrack>,
     // Stage scenes rendered for this export (StageLayerSpec); None = none.
     stage_layers: Option<Vec<StageLayerSpec>>,
+    // The video's intro / outro (EdgeTransitions); None = neither.
+    edge_transitions: Option<EdgeTransitions>,
     // Set by the background export queue (exportQueue.ts): the run gets its own cancel state
     // (cancel_export_job), progress events keyed "export-job:<id>", a live preview frame
     // (export-job-preview events) and below-normal CPU priority so editing stays smooth meanwhile.
@@ -7491,29 +7604,16 @@ pub async fn export_trimmed_video(
         Some(p) => PathBuf::from(p),
         None => export_output_path(&output_base_path)?,
     };
-    // An image segment is a single still looped into a constant-rate stream long enough to cover
-    // its own [start,end) window plus any transition tail out of it - trim= below then cuts it
-    // exactly like a video segment.
+    // An image segment is a single still, repeated in the graph into a constant-rate stream long
+    // enough to cover its own [start,end) window plus any transition tail out of it
+    // (still_image_input_chain) - trim= then cuts it exactly like a video segment.
     let mut inputs: Vec<InputSpec> = segments
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            if is_still_image_path(&s.source_path) {
-                let tail = segments.get(i + 1).and_then(transition_window).map(|d| tail_source_seconds(s, d)).unwrap_or(0.0);
-                InputSpec {
-                    path: s.source_path.clone(),
-                    pre_args: vec![
-                        "-loop".into(),
-                        "1".into(),
-                        "-framerate".into(),
-                        format!("{}", IMAGE_SEGMENT_FPS),
-                        "-t".into(),
-                        format!("{:.3}", s.end + tail + 0.5),
-                    ],
-                }
-            } else {
-                InputSpec::plain(s.source_path.clone())
-            }
+            // A still is read as its single frame and repeated in the graph (still_image_input_chain).
+            let _ = i;
+            InputSpec::plain(s.source_path.clone())
         })
         .collect();
 
@@ -7826,6 +7926,10 @@ pub async fn export_trimmed_video(
     // used, so a timeline with no transitions set takes the exact same, already-proven path it did
     // before this feature existed.
     let has_transitions = segments.iter().skip(1).any(|s| s.transition_in.is_some());
+    // An intro or outro: drawn on the assembled video (edge_transition_graph), so it needs the
+    // filter graph and an output frame, like a transition between clips.
+    let edge_transitions = edge_transitions.filter(|e| edge_windows(e, 1.0) != (None, None));
+    let has_edge_transitions = edge_transitions.is_some();
 
     // Plain cuts (nothing drawn, nothing re-timed or re-coloured) keep the source's own video
     // wherever whole GOPs survive - smart_render_export. "small" asks for recompression and
@@ -7841,6 +7945,7 @@ pub async fn export_trimmed_video(
         && !has_adjustments
         && !has_clip_effects
         && !has_transitions
+        && !has_edge_transitions
         && video_fx_filters.is_empty()
         && master_filters.is_empty()
         && captions_ass_path.is_none()
@@ -7890,6 +7995,7 @@ pub async fn export_trimmed_video(
         && !has_pip_overlays
         && !has_adjustments
         && !has_clip_effects
+        && !has_edge_transitions
         && captions_ass_path.is_none()
         && output_frame.is_none()
         && !fit_to_frame
@@ -8054,7 +8160,7 @@ pub async fn export_trimmed_video(
         // Falls back to a real probe only when the frontend didn't already resolve this AND some
         // segment actually needs it (crop/Ken Burns) - see probe_video_dimensions' own doc comment.
         let dimensions_probe_handle =
-            if (video_width.is_none() || video_height.is_none()) && (has_clip_effects || has_transitions) {
+            if (video_width.is_none() || video_height.is_none()) && (has_clip_effects || has_transitions || has_edge_transitions) {
                 let ffprobe_path = ffprobe_path.clone();
                 // A real video's size beats a photo's as the output frame - photos come in any
                 // size/orientation, and an odd dimension would also break yuv420p encoding.
@@ -8126,11 +8232,25 @@ pub async fn export_trimmed_video(
         // source already that size).
         let fit_frame = has_image_segments
             || unique_source_paths.len() > 1
-            || ((has_transitions || fit_to_frame) && video_width.is_some() && video_height.is_some());
+            || ((has_transitions || has_edge_transitions || fit_to_frame) && video_width.is_some() && video_height.is_some());
+        // With an intro/outro, the clips assemble into [prebase] and edge_transition_graph draws
+        // them on it into [base].
+        let base_label = if has_edge_transitions { "prebase" } else { "base" };
         // A canvas with the "Blur" background: every clip over a blurred copy of itself.
         if fit_to_frame && frame_background.as_deref() == Some("blur") {
             for (i, seg) in segments.iter_mut().enumerate() {
                 seg.fit_blur = Some(i);
+            }
+        }
+        // Stills: decoded once, fitted once, repeated (still_image_input_chain) - fitted before the
+        // repeat unless an editor-drawn pointer has to go on under the fit.
+        for (i, seg) in segments.iter_mut().enumerate() {
+            seg.prefitted = is_still_image_path(&seg.source_path) && fit_frame && pointer_fragments[i].is_none();
+        }
+        for (i, seg) in segments.iter().enumerate() {
+            if is_still_image_path(&seg.source_path) {
+                let tail = segments.get(i + 1).and_then(transition_window).map(|d| tail_source_seconds(seg, d)).unwrap_or(0.0);
+                filter.push_str(&still_image_input_chain(i, seg, video_width, video_height, seg.end + tail + 0.5));
             }
         }
 
@@ -8139,8 +8259,8 @@ pub async fn export_trimmed_video(
         if segments.len() == 1 {
             let seg = &segments[0];
             let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[0].as_deref(), stab_paths[0].as_deref(), pointer_fragments[0].as_deref());
-            let (end, vignette) = segment_vignette(seg, video_width, video_height, "base", 0);
-            filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain("[0:v]", seg, &extra)));
+            let (end, vignette) = segment_vignette(seg, video_width, video_height, base_label, 0);
+            filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain(&segment_input_label(0, seg), seg, &extra)));
             filter.push_str(&segment_audio_chain(
                 segment_has_audio[0],
                 0,
@@ -8158,7 +8278,7 @@ pub async fn export_trimmed_video(
             for (i, seg) in segments.iter().enumerate() {
                 let extra = segment_effect_chain(seg, video_width, video_height, fit_frame, lut_paths[i].as_deref(), stab_paths[i].as_deref(), pointer_fragments[i].as_deref());
                 let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("v{i}"), i);
-                filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain(&format!("[{i}:v]"), seg, &extra)));
+                filter.push_str(&format!("{}[{end}];{vignette}", segment_video_chain(&segment_input_label(i, seg), seg, &extra)));
                 filter.push_str(&segment_audio_chain(
                     segment_has_audio[i],
                     i,
@@ -8169,7 +8289,7 @@ pub async fn export_trimmed_video(
                 concat_inputs.push_str(&format!("[v{0}][a{0}]", i));
             }
             filter.push_str(&format!(
-                "{}concat=n={}:v=1:a=1[base][outa];",
+                "{}concat=n={}:v=1:a=1[{base_label}][outa];",
                 concat_inputs,
                 segments.len()
             ));
@@ -8201,7 +8321,7 @@ pub async fn export_trimmed_video(
                         let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("full{i}"), i);
                         filter.push_str(&format!(
                             "{},fps={:.3},settb=AVTB[{end}];{vignette}",
-                            segment_video_chain_with_tail(&format!("[{i}:v]"), seg, &extra, tail_source_seconds(seg, d)),
+                            segment_video_chain_with_tail(&segment_input_label(i, seg), seg, &extra, tail_source_seconds(seg, d)),
                             target_fps
                         ));
                         filter.push_str(&transition_tail(
@@ -8217,7 +8337,7 @@ pub async fn export_trimmed_video(
                         let (end, vignette) = segment_vignette(seg, video_width, video_height, &format!("v{i}"), i);
                         filter.push_str(&format!(
                             "{},fps={:.3},settb=AVTB[{end}];{vignette}",
-                            segment_video_chain(&format!("[{i}:v]"), seg, &extra),
+                            segment_video_chain(&segment_input_label(i, seg), seg, &extra),
                             target_fps
                         ));
                     }
@@ -8255,7 +8375,16 @@ pub async fn export_trimmed_video(
                 cur_v = next_v;
                 cur_a = next_a;
             }
-            filter.push_str(&format!("[{cur_v}]copy[base];[{cur_a}]acopy[outa];"));
+            filter.push_str(&format!("[{cur_v}]copy[{base_label}];[{cur_a}]acopy[outa];"));
+        }
+        if let Some(edges) = &edge_transitions {
+            let total: f64 = segments.iter().map(segment_output_duration).sum();
+            match video_width.zip(video_height) {
+                Some(frame) => filter.push_str(&edge_transition_graph("prebase", "base", edges, total, video_fps, frame)),
+                // No frame size to draw at (it couldn't be determined) - left out, as a transition
+                // between clips falls back to what it can draw without one.
+                None => filter.push_str("[prebase]null[base];"),
+            }
         }
 
         // Blur regions are chained onto [base] first, ahead of the text/image overlay loop below,
@@ -10005,6 +10134,7 @@ mod tests {
             pointer_layers: None,
             source_fps: None,
             fit_blur: None,
+            prefitted: false,
             fx: None,
         }
     }
@@ -11165,6 +11295,128 @@ mod tests {
             g.push_str(&format!("[{cv}]format=yuv420p[outv];[{ca}]anull[outa]"));
             let name = if seeking { "seek" } else { "plain" };
             std::fs::write(format!("{dir}/export_{name}.txt"), format!("{}\n{g}", inputs.join("|"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_still_is_decoded_and_fitted_once_then_repeated() {
+        let seg = KeepSegment { source_path: "photo.jpg".into(), end: 3.0, flip_horizontal: Some(true), prefitted: true, ..base_segment() };
+        let chain = still_image_input_chain(2, &seg, Some(1920), Some(1080), 3.5);
+        assert!(chain.starts_with("[2:v]null,scale=1920:1080:force_original_aspect_ratio=decrease"), "{chain}");
+        assert!(chain.contains(",hflip,loop=loop=104:size=1:start=0,setpts=N/(30.000*TB)[img2];"), "{chain}");
+        // Its effect chain then starts after the fit and mirror.
+        let extra = segment_effect_chain(&seg, Some(1920), Some(1080), true, None, None, None);
+        assert!(!extra.contains("scale=1920:1080:force") && !extra.contains("hflip"), "{extra}");
+        assert_eq!(segment_input_label(2, &seg), "[img2]");
+        assert_eq!(segment_input_label(2, &base_segment()), "[2:v]");
+        // Not fitted first (a pointer goes on under the fit): repeated raw, fitted in its chain.
+        let raw = KeepSegment { prefitted: false, ..seg };
+        assert!(still_image_input_chain(0, &raw, Some(1920), Some(1080), 1.0).starts_with("[0:v]null,loop=loop=29:"));
+    }
+
+    // Not a unit test: renders a 4000x3000 photo through a Ken Burns zoom with the blurred canvas
+    // background both ways - `-loop 1` (decoded and fitted every frame) and still_image_input_chain
+    // (once) - with the ffmpeg in $FFMPEG_DIR, checking the frames match and printing both times.
+    #[test]
+    #[ignore]
+    fn a_still_rendered_once_matches_the_looped_input() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        let tmp = std::env::temp_dir().join(format!("briefcast_still_once_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let photo = tmp.join("photo.jpg");
+        let made = Command::new(&ffmpeg).args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=4000x3000:d=1", "-frames:v", "1", "-q:v", "3"]).arg(&photo).status().unwrap();
+        assert!(made.success());
+        let mut seg = KeepSegment {
+            source_path: photo.to_string_lossy().into_owned(),
+            end: 4.0,
+            ken_burns: Some(ClipKenBurns { preset: "zoom-in".into(), intensity: Some(0.5), target_x: None, target_y: None, span: None }),
+            fit_blur: Some(0),
+            source_fps: Some(IMAGE_SEGMENT_FPS),
+            ..base_segment()
+        };
+        let render = |seg: &KeepSegment, once: bool| -> (Vec<u8>, f64) {
+            let extra = segment_effect_chain(seg, Some(1280), Some(720), true, None, None, None);
+            let (input, pre): (Vec<String>, String) = if once {
+                (vec!["-i".into(), seg.source_path.clone()], still_image_input_chain(0, seg, Some(1280), Some(720), 4.5))
+            } else {
+                (["-loop", "1", "-framerate", "30", "-t", "4.5", "-i"].iter().map(|s| s.to_string()).chain([seg.source_path.clone()]).collect(), String::new())
+            };
+            let graph = format!("{pre}{},format=rgb24,scale=160:90[out]", segment_video_chain(&segment_input_label(0, seg).replace("[img0]", if once { "[img0]" } else { "[0:v]" }), seg, &extra));
+            let started = std::time::Instant::now();
+            let out = Command::new(&ffmpeg).args(["-v", "error"]).args(&input).args(["-filter_complex", &graph, "-map", "[out]", "-f", "rawvideo", "pipe:1"]).output().unwrap();
+            assert!(out.status.success(), "{}\n{graph}", String::from_utf8_lossy(&out.stderr));
+            (out.stdout, started.elapsed().as_secs_f64())
+        };
+        let (looped, t_looped) = render(&seg, false);
+        seg.prefitted = true;
+        let (once, t_once) = render(&seg, true);
+        println!("looped input {t_looped:.2}s, decoded once {t_once:.2}s");
+        assert_eq!(looped.len(), once.len(), "same number of frames");
+        let worst = looped.iter().zip(&once).map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs()).max().unwrap_or(0);
+        assert!(worst <= 2, "frames differ by up to {worst}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn edge(name: &str, duration: f64) -> Option<ClipTransitionIn> {
+        Some(ClipTransitionIn { transition_type: name.into(), duration, look: None })
+    }
+
+    #[test]
+    fn edge_windows_never_overlap_and_ignore_empty_durations() {
+        let both = EdgeTransitions { intro: edge("fade", 3.0), outro: edge("fade", 3.0) };
+        assert_eq!(edge_windows(&both, 4.0), (Some(1.8), Some(1.8)));
+        assert_eq!(edge_windows(&both, 20.0), (Some(3.0), Some(3.0)));
+        let intro_only = EdgeTransitions { intro: edge("fade", 3.0), outro: None };
+        assert_eq!(edge_windows(&intro_only, 2.0), (Some(1.8), None));
+        let empty = EdgeTransitions { intro: edge("fade", 0.0), outro: edge("fade", f64::NAN) };
+        assert_eq!(edge_windows(&empty, 10.0), (None, None));
+    }
+
+    #[test]
+    fn edge_transitions_draw_from_and_to_black_without_changing_the_length() {
+        let edges = EdgeTransitions { intro: edge("colorsweep", 1.0), outro: edge("'; drop", 0.5) };
+        let g = edge_transition_graph("prebase", "base", &edges, 10.0, 30.0, (1280, 720));
+        // Intro: black is the outgoing picture, the video's first second the incoming one.
+        let k = EDGE_INTRO_TAG;
+        assert!(g.contains(&format!("color=c=black:s=1280x720:r=30.000:d=1.000000,format=yuv420p,settb=AVTB,setsar=1[old{k}]")), "{g}");
+        assert!(g.contains(&format!("trim=end=1.000000[head{k}]")) && g.contains(&format!("[tr{k}][rest{k}]concat=n=2")), "{g}");
+        // Outro: the last half second gives way to black; an unknown name is a crossfade, never raw.
+        let k = EDGE_OUTRO_TAG;
+        assert!(g.contains(&format!("trim=start=9.500000,setpts=PTS-STARTPTS")) && g.contains(&format!("[old{k}]")), "{g}");
+        assert!(g.contains(&format!("d=0.500000,format=yuv420p,settb=AVTB,setsar=1[head{k}]")) && g.contains(&format!("[body{k}][tr{k}]concat=n=2")), "{g}");
+        assert!(!g.contains("drop") && g.ends_with("[edgeout]null[base];"), "{g}");
+        // Neither: a pass-through.
+        let none = edge_transition_graph("prebase", "base", &EdgeTransitions::default(), 10.0, 30.0, (1280, 720));
+        assert!(none.ends_with("[edg]null[base];"), "{none}");
+    }
+
+    // Not a unit test: renders a 4s test pattern through an intro and an outro with the ffmpeg in
+    // $FFMPEG_DIR, checking the length is unchanged, the first and last frames are black, the middle
+    // is the untouched video and every transition kind renders at an edge.
+    #[test]
+    #[ignore]
+    fn edge_transitions_render() {
+        let Ok(dir) = std::env::var("FFMPEG_DIR") else { return };
+        let ffmpeg = PathBuf::from(&dir).join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        // YAVG of frame n of [base], or -1 when there's no such frame.
+        let luma_at = |graph: &str, n: usize| -> f64 {
+            let full = format!("testsrc2=s=320x180:r=30:d=4,format=yuv420p,settb=AVTB[prebase];{graph}[base];[base]select='eq(n,{n})',signalstats,metadata=print:key=lavfi.signalstats.YAVG[y]");
+            let out = Command::new(&ffmpeg).args(["-v", "info", "-hide_banner", "-filter_complex", &full, "-map", "[y]", "-f", "null", "-"]).output().unwrap();
+            let log = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{log}");
+            log.lines().find_map(|l| l.split("YAVG=").nth(1)).and_then(|v| v.trim().parse().ok()).unwrap_or(-1.0)
+        };
+        for name in ALLOWED_TRANSITIONS {
+            let edges = EdgeTransitions { intro: edge(name, 1.0), outro: edge(name, 1.0) };
+            let g = edge_transition_graph("prebase", "base", &edges, 4.0, 30.0, (320, 180));
+            let g = g.trim_end_matches("[base];").to_string();
+            let (first, mid, last) = (luma_at(&g, 0), luma_at(&g, 60), luma_at(&g, 119));
+            assert!(mid > 60.0, "{name}: the middle should be the untouched video - {mid}");
+            assert!((0.0..40.0).contains(&first), "{name}: the first frame should still be (nearly) black - {first}");
+            assert!((0.0..40.0).contains(&last), "{name}: the last frame should be (nearly) black - {last}");
+            // There's no 121st frame: the length is exactly the video's.
+            assert!(luma_at(&g, 120) < 0.0, "{name}: the video grew past 4s");
         }
     }
 

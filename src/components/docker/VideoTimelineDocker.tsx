@@ -53,7 +53,7 @@ import {
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, IMAGE_CLIP_EXTENSIONS, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, ClipTransitionIn, IMAGE_CLIP_EXTENSIONS, TransitionEdge, edgeTransitionWindows, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
 import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
 import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
@@ -75,7 +75,7 @@ import MusicLibraryPanel from "./MusicLibraryPanel";
 import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
 import { BUILTIN_SFX_TRACKS, TRANSITION_SOUNDS, builtinSfxFile } from "../../utils/builtinSfx";
 import { computeSpeechTimeline, DEFAULT_DUCK_LEVEL, duckGainAt, isDucked, isSpeechOverlay, TimeRange } from "../../utils/musicDucking";
-import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION } from "./ClipEffectsPopover";
+import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION, DEFAULT_EDGE_TRANSITION_DURATION, rememberTransitionTab } from "./ClipEffectsPopover";
 import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
 import AudioChipContextMenu, { AudioSaveFormat } from "./AudioChipContextMenu";
 import AutomationLine from "./AutomationLine";
@@ -135,7 +135,7 @@ import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, unrouteEle
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
 import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
-import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
+import { fadeLevel, joinFades, NO_FADES, type FadeCurve, type PieceFades } from "../../utils/audioJoins";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
@@ -198,6 +198,10 @@ const TIMELINE_LANE_CSS = `
 .tl-bracket::before, .tl-bracket::after { content: ""; position: absolute; left: 50%; width: 1px; height: 22%; background: rgba(0,0,0,0.55); transform: translateX(-50%); }
 .tl-bracket::before { top: 28%; }
 .tl-bracket::after { bottom: 28%; }
+.tl-fade-knob { opacity: 0; transition: opacity 120ms ease-out, transform 120ms ease-out; }
+.tl-fade-knob:hover { transform: scale(1.25); }
+.tl-clip:hover .tl-fade-knob, .tl-fade-knob[data-on="true"] { opacity: 1; }
+.tl-lane.tl-lane-dragging .tl-fade-knob { opacity: 0 !important; }
 `;
 // "4.5s", or "1:05" from a minute up - the selected clip's length on its corner.
 const formatClipLength = (seconds: number): string => {
@@ -348,7 +352,105 @@ const ActionButton: React.FC<{
 // re-decodes) whenever the visible window (trimStart/duration, from drag or resize) or pixel size
 // changes, so a live trim drag updates the waveform every frame from already-decoded data.
 // `visible`: the part of the chip (its own px) to draw - a canvas can't be millions of px wide.
-const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({ overlay, widthPx, heightPx, visible }) => {
+// A fade's gain `x` seconds into it - the curves export gives afade (fade_curve, conversion.rs):
+// straight for a fade set in the panel, a quarter sine for an automatic equal-power crossfade.
+const fadeGain = (x: number, d: number, curve: FadeCurve): number => {
+  if (d <= 0) return 1;
+  const t = Math.max(0, Math.min(1, x / d));
+  return curve === "equalPower" ? Math.sin((t * Math.PI) / 2) : t;
+};
+const sameFades = (a: PieceFades | undefined, b: PieceFades | undefined) =>
+  a === b || (!!a && !!b && a.fadeIn === b.fadeIn && a.fadeOut === b.fadeOut && a.fadeInCurve === b.fadeInCurve && a.fadeOutCurve === b.fadeOutCurve);
+
+// An audio piece's fades as they'll be heard (joinFades - its own, plus join crossfades), drawn on
+// the chip the way editors show them: the stretch above the fade's curve shaded, the curve a line.
+const AudioFadeShade: React.FC<{ side: "in" | "out"; seconds: number; curve: FadeCurve; pxPerSec: number; widthPx: number; heightPx: number }> = ({ side, seconds, curve, pxPerSec, widthPx, heightPx }) => {
+  const w = Math.min(widthPx, seconds * pxPerSec);
+  if (w < 1.5 || heightPx <= 0) return null;
+  const steps = 16;
+  const pts: string[] = [];
+  for (let k = 0; k <= steps; k++) {
+    const x = (k / steps) * w;
+    const gain = fadeGain(side === "in" ? x : w - x, w, curve);
+    pts.push(`${x.toFixed(1)},${(heightPx * (1 - gain)).toFixed(1)}`);
+  }
+  const line = pts.join(" ");
+  const area = side === "in" ? `0,0 ${w.toFixed(1)},0 ${line}` : `${line} ${w.toFixed(1)},0 0,0`;
+  return (
+    <svg className="absolute top-0 pointer-events-none z-[3]" style={{ [side === "in" ? "left" : "right"]: 0 }} width={w} height={heightPx} viewBox={`0 0 ${w} ${heightPx}`}>
+      <polygon points={area} fill="rgba(0,0,0,0.42)" />
+      <polyline points={line} fill="none" stroke="rgba(255,255,255,0.75)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+};
+
+// A fade's knob at the chip's top corner: drag it inward to fade in (or out) over longer, double-
+// click to take the fade away. Shows the length while it moves. One undo step per drag (the store
+// merges a run of the same edit).
+const AudioFadeKnob: React.FC<{
+  side: "in" | "out";
+  seconds: number;
+  maxSeconds: number;
+  pxPerSec: number;
+  widthPx: number;
+  shown: boolean;
+  onChange: (seconds: number) => void;
+}> = ({ side, seconds, maxSeconds, pxPerSec, widthPx, shown, onChange }) => {
+  const drag = useRef<{ x: number; from: number; last: number } | null>(null);
+  const [live, setLive] = useState<number | null>(null);
+  const fadePx = Math.min(widthPx, seconds * pxPerSec);
+  const size = 10;
+  const left = side === "in" ? Math.max(2, Math.min(widthPx - size - 2, fadePx - size / 2)) : Math.max(2, Math.min(widthPx - size - 2, widthPx - fadePx - size / 2));
+  const label = (s: number) => `Fade ${side} ${s < 10 ? s.toFixed(2) : s.toFixed(1)}s`;
+  return (
+    <div
+      // Over the trim handle (z-12), which keeps the rest of the edge below this corner.
+      className="tl-fade-knob absolute z-[13] cursor-ew-resize"
+      data-on={shown || live !== null ? "true" : undefined}
+      title={`${seconds > 0 ? label(seconds) : `Fade ${side}`} - drag to change, double-click to remove`}
+      style={{ left, top: 3, width: size, height: size }}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        drag.current = { x: e.clientX, from: seconds, last: seconds };
+        setLive(seconds);
+      }}
+      onPointerMove={(e) => {
+        const d = drag.current;
+        if (!d) return;
+        const dx = (e.clientX - d.x) / pxPerSec;
+        const next = Math.round(Math.max(0, Math.min(maxSeconds, d.from + (side === "in" ? dx : -dx))) * 20) / 20;
+        if (next === d.last) return;
+        d.last = next;
+        setLive(next);
+        onChange(next);
+      }}
+      onPointerUp={(e) => {
+        drag.current = null;
+        setLive(null);
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }}
+      onPointerCancel={() => {
+        drag.current = null;
+        setLive(null);
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onChange(0);
+      }}
+    >
+      <span className="block w-full h-full rounded-full bg-white shadow-[0_1px_3px_rgba(0,0,0,0.6)] ring-1 ring-black/40" />
+      {live !== null && (
+        <span className={`absolute -top-[2px] ${side === "in" ? "left-[14px]" : "right-[14px]"} px-1 rounded-sm bg-black/80 text-[9px] leading-[13px] font-semibold tabular-nums text-white whitespace-nowrap pointer-events-none`}>
+          {label(live)}
+        </span>
+      )}
+    </div>
+  );
+};
+
+const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number]; fades?: PieceFades }> = React.memo(({ overlay, widthPx, heightPx, visible, fades }) => {
   const [vFrom, vTo] = [Math.max(0, visible[0]), Math.min(widthPx, visible[1])];
   const vWidth = Math.max(0, vTo - vFrom);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -384,13 +486,17 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
     const buckets = Math.max(8, Math.floor(vWidth / 2));
     const windowed = sliceWaveformWindow(peaks, overlay.sourceDuration, overlay.trimStart + vFrom * secPerPx, vWidth * secPerPx, buckets);
     const barWidth = vWidth / buckets;
-    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    // Through a fade the bars taper exactly as the sound does (the same gain the mix applies).
+    ctx.fillStyle = overlay.muted ? "rgba(212,212,216,0.55)" : "rgba(204,251,241,0.88)";
     windowed.forEach((amp, i) => {
-      const barHeight = Math.max(1, amp * heightPx);
+      const t = (vFrom + (i + 0.5) * barWidth) * secPerPx;
+      const gain = fades ? fadeLevel(fades, t, duration) : 1;
+      const barHeight = Math.max(1, amp * gain * heightPx);
       ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
     });
     // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
-  }, [peaks, widthPx, heightPx, vFrom, vWidth, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, canvasRestoreTick]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peaks, widthPx, heightPx, vFrom, vWidth, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, overlay.muted, fades?.fadeIn, fades?.fadeOut, fades?.fadeInCurve, fades?.fadeOutCurve, canvasRestoreTick]);
 
   return <canvas ref={canvasRef} className="absolute top-0 pointer-events-none" style={{ left: vFrom, width: vWidth, height: heightPx }} />;
 }, (prev, next) =>
@@ -398,7 +504,8 @@ const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heig
   prev.widthPx === next.widthPx &&
   prev.heightPx === next.heightPx &&
   prev.visible[0] === next.visible[0] &&
-  prev.visible[1] === next.visible[1]
+  prev.visible[1] === next.visible[1] &&
+  sameFades(prev.fades, next.fades)
 );
 
 // The audio panel's preview position on its own track (previewHead.ts) - a line with the time, moved
@@ -2465,6 +2572,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     return o;
   });
   const audioRows = packAudioRows(renderAudioOverlays);
+  // Every piece's fades as heard (its own plus join crossfades) - drawn on its chip.
+  const audioFades = joinFades(renderAudioOverlays);
   // The piece whose volume line is open for drawing - its row grows to give the line room.
   const [automationOpenId, setAutomationOpenId] = useState<string | null>(null);
   const automationRow = automationOpenId ? audioRows.rowOf.get(automationOpenId) ?? null : null;
@@ -3854,6 +3963,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     else if (!previewOwnsPlayRef.current) stopPickPreview();
   }, [isPlaying, stopPickPreview]);
   useEffect(() => stopPickPreview, [stopPickPreview]);
+  // Sets the video's intro / outro; a newly picked one plays straight away, as a cut's does.
+  const setEdgeTransition = (edge: TransitionEdge, transition: ClipTransitionIn | null) => {
+    const isNew = !!transition && transition.type !== editStore.edgeTransitions[edge]?.type;
+    editStore.setEdgeTransition(edge, transition);
+    if (!isNew || !transition) return;
+    const total = totalOutputDuration;
+    const windows = edgeTransitionWindows({ ...editStore.edgeTransitions, [edge]: transition }, total);
+    if (edge === "intro") playPickPreview(0, Math.min(total, (windows.intro ?? 0) + 0.8));
+    else playPickPreview(Math.max(0, total - (windows.outro ?? 0) - 0.8), total);
+  };
   const previewPick = (clipIndex: number, patch: StoreClipPatch) => {
     const clip = renderClips[clipIndex];
     if (!clip) return;
@@ -4287,6 +4406,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               transitionIn: type ? { type, duration: menuClip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION } : undefined,
             })
           }
+          edgeTransitions={editStore.edgeTransitions}
+          onSetEdgeTransition={(edge, type) => {
+            const current = editStore.edgeTransitions[edge];
+            setEdgeTransition(edge, type ? { type, duration: current?.duration ?? DEFAULT_EDGE_TRANSITION_DURATION, ...(current?.look ? { look: current.look } : {}) } : null);
+          }}
           onSetMotion={(preset) =>
             editStore.updateClipEffects(menuClip.id, {
               kenBurns: preset ? { ...menuClip.kenBurns, preset, intensity: menuClip.kenBurns?.intensity ?? DEFAULT_KEN_BURNS_INTENSITY } : undefined,
@@ -5453,6 +5577,54 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 );
               })}
 
+              {/* The video's intro / outro (EdgeTransitions): the same soft light over the stretch it
+                  plays across - the first or last seconds of the whole video - and its name under
+                  that edge, which opens the edge clip's Transition tab. */}
+              {laneClips.length > 0 &&
+                !laneClips.some((c) => c.id === "__pending__") &&
+                (["intro", "outro"] as const).map((edge) => {
+                  const transition = editStore.edgeTransitions[edge];
+                  const seconds = edgeTransitionWindows(editStore.edgeTransitions, totalOutputDuration)[edge];
+                  if (!transition || seconds === null) return null;
+                  const intro = edge === "intro";
+                  const width = seconds * pxPerSec;
+                  const left = intro ? 0 : totalOutputDuration * pxPerSec - width;
+                  const name = TRANSITION_PRESETS.find((p) => p.value === transition.type)?.label ?? "Transition";
+                  const label = `${intro ? "Intro" : "Outro"} · ${name}`;
+                  const edgeClip = intro ? baseClips[0] : baseClips[baseClips.length - 1];
+                  return (
+                    <React.Fragment key={`edge-${edge}`}>
+                      <div
+                        className={`absolute inset-y-1 pointer-events-none z-[5] ${intro ? "rounded-l-md bg-gradient-to-r" : "rounded-r-md bg-gradient-to-l"} from-white/25 to-white/0`}
+                        style={{ left, width }}
+                      />
+                      <div
+                        className="absolute top-1/2 -translate-y-1/2 w-[18px] h-[18px] flex items-center justify-center rounded-full bg-white shadow-[0_1px_4px_rgba(0,0,0,0.5)] ring-1 ring-black/30 z-[11] pointer-events-none"
+                        style={intro ? { left: 3 } : { left: left + width - 21 }}
+                      >
+                        <IoSwapHorizontalOutline size={10} className="text-neutral-800" />
+                      </div>
+                      <button
+                        type="button"
+                        title={`${label} · ${seconds.toFixed(1)}s - click to change`}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          if (!edgeClip) return;
+                          rememberTransitionTab();
+                          setSelectedClipId(edgeClip.id);
+                          setEffectsPopoverAnchor(null);
+                          const anchor = { left: e.clientX, top: e.clientY - 8 };
+                          requestAnimationFrame(() => setEffectsPopoverAnchor(anchor));
+                        }}
+                        className="absolute z-20 px-1.5 rounded-full bg-neutral-800/95 text-[9px] leading-[13px] font-medium text-neutral-100 whitespace-nowrap shadow ring-1 ring-white/10 hover:bg-neutral-700"
+                        style={intro ? { left: 2, bottom: -6 } : { right: `calc(100% - ${left + width - 2}px)`, bottom: -6 }}
+                      >
+                        {label}
+                      </button>
+                    </React.Fragment>
+                  );
+                })}
+
               {/* A rendered merge in progress: a fast spinner on every break point between the clips it's
                   joining, and a Cancel under each (where a transition's name usually sits) that stops
                   the render and leaves the timeline as it was. */}
@@ -5660,13 +5832,21 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 rowOf.set(sc.id, r);
               }
               return (
-                <div className={`relative border-t border-neutral-800 ${renderScenes.length === 0 ? "hidden" : ""}`} style={{ height: Math.max(1, rowEnds.length) * ROW }}>
+                <div
+                  className={`tl-lane relative border-t border-neutral-800 ${sceneDrag?.isDragging || sceneEdgeDrag ? "tl-lane-dragging" : ""} ${renderScenes.length === 0 ? "hidden" : ""}`}
+                  style={{ height: Math.max(1, rowEnds.length) * ROW }}
+                >
                   {renderScenes.map((sc) => {
-                    const left = sc.startTime * pxPerSec;
                     const duration = sceneDuration(sc);
-                    const width = Math.max(1, duration * pxPerSec);
+                    // Inset by half the gap each side, as clips and audio pieces are.
+                    const fullWidth = Math.max(1, duration * pxPerSec);
+                    const inset = fullWidth > CLIP_GAP * 4 ? CLIP_GAP / 2 : 0;
+                    const left = sc.startTime * pxPerSec + inset;
+                    const width = fullWidth - 2 * inset;
                     const top = (rowOf.get(sc.id) ?? 0) * ROW + 3;
+                    const height = ROW - 6;
                     const isSelected = selectedSceneId === sc.id;
+                    const isDragging = sceneDrag?.isDragging === true && sceneDrag.id === sc.id;
                     const starts = stageBeatStarts(sc);
                     const local = currentOutputTime - sc.startTime;
                     const title = sc.name ?? (sc.elements.find((el) => el.kind === "text")?.props.text ?? "Scene");
@@ -5678,23 +5858,57 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                           onPointerUp={endSceneDrag}
                           onPointerCancel={endSceneDrag}
                           title={`${title} - ${sc.beats.length} beat${sc.beats.length === 1 ? "" : "s"}, ${duration.toFixed(1)}s. Drag to move it.`}
-                          className={`absolute rounded-md overflow-hidden border flex flex-col cursor-grab active:cursor-grabbing transition-colors ${
-                            isSelected ? "border-white bg-teal-700/80 shadow-[0_0_0_1px_rgba(255,255,255,0.35)]" : "border-teal-500/70 bg-teal-950/70 hover:bg-teal-900/70"
-                          }`}
-                          style={{ left, width, top, height: ROW - 6 }}
+                          className={`tl-clip group/scene absolute rounded-md overflow-hidden flex flex-col cursor-grab active:cursor-grabbing bg-gradient-to-b ${
+                            isSelected ? "from-teal-700/90 to-teal-900/90" : "from-teal-900/80 to-teal-950/90"
+                          } ${isDragging ? "z-20 shadow-[0_6px_16px_rgba(0,0,0,0.55)]" : ""}`}
+                          style={{ left, width, top, height, transform: isDragging ? "translateY(-2px)" : undefined, transition: "box-shadow 150ms, transform 150ms" }}
                         >
-                          <span className="flex-1 min-h-0 flex items-center gap-1 px-1.5 text-[11px] text-white">
+                          <span className="flex-1 min-h-0 flex items-center gap-1 px-2 text-[11px] font-medium text-white/95">
                             <IoLayersOutline size={11} className="shrink-0 text-teal-200" />
                             <span className="truncate">{title}</span>
                           </span>
                           {/* The beats, each as long as it holds; the one under the playhead lit. */}
-                          <span className="flex gap-px h-[4px] mx-px mb-px">
+                          <span className="flex gap-px h-[4px] mx-1 mb-1">
                             {sc.beats.map((b, i) => {
                               const on = local >= starts[i] && local < starts[i] + b.hold;
-                              return <span key={b.id} className={`rounded-[1px] ${on ? "bg-white" : isSelected ? "bg-teal-200/70" : "bg-teal-400/50"}`} style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }} />;
+                              return (
+                                <span
+                                  key={b.id}
+                                  className={`rounded-full transition-colors duration-150 ${on ? "bg-white" : isSelected ? "bg-amber-200/70" : "bg-teal-300/45"}`}
+                                  style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }}
+                                />
+                              );
                             })}
                           </span>
+                          {/* The edge, as the clips' and audio's: faint, brighter on hover, yellow selected. */}
+                          <span
+                            className={`pointer-events-none absolute inset-0 z-[7] rounded-md ring-inset transition-shadow duration-150 ${
+                              isSelected || isDragging ? "ring-2 ring-amber-400" : "ring-1 ring-teal-300/25 group-hover/scene:ring-white/40"
+                            }`}
+                          />
+                          {isSelected && width >= 72 && (
+                            <span className="pointer-events-none absolute top-0.5 right-3 z-[7] px-1 rounded-sm bg-black/60 text-[9px] leading-[13px] font-semibold tabular-nums text-amber-300">
+                              {formatClipLength(duration)}
+                            </span>
+                          )}
                         </div>
+                        {/* The end handle - right after its scene, so CSS reveals it on hover: a grip,
+                            or the yellow bracket once selected. */}
+                        <div
+                          onPointerDown={beginSceneEdgeDrag(sc, "end")}
+                          onPointerMove={handleSceneEdgeDragMove}
+                          onPointerUp={endSceneEdgeDrag}
+                          onPointerCancel={endSceneEdgeDrag}
+                          title="Drag to change how long the last beat holds"
+                          data-on={isSelected ? "true" : undefined}
+                          className={`tl-h absolute ${isSelected ? "z-[12]" : "z-10"} flex items-center justify-end cursor-ew-resize`}
+                          style={{ left: left + width - HANDLE_GRAB_PX, top, height, width: HANDLE_GRAB_PX }}
+                        >
+                          <span className={isSelected ? "tl-bracket tl-bracket-end" : "tl-grip mr-[3px]"} />
+                        </div>
+                        {/* Where one beat gives way to the next: a faint notch down by the beats (clear of the
+                            title), a bright full-height line on hover -
+                            drag it to change how long the beat before holds. */}
                         {starts.slice(1).map((at, i) => (
                           <div
                             key={sc.beats[i + 1].id}
@@ -5703,23 +5917,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                             onPointerUp={endSceneEdgeDrag}
                             onPointerCancel={endSceneEdgeDrag}
                             title={`Beat ${i + 2} begins here - drag to change how long beat ${i + 1} holds`}
-                            className="group absolute w-2 -ml-1 cursor-ew-resize z-10 flex justify-center"
-                            style={{ left: left + at * pxPerSec, top, height: ROW - 6 }}
+                            className="group absolute w-2 -ml-1 cursor-ew-resize z-10 flex justify-center items-end pb-[3px] hover:pb-0"
+                            style={{ left: left + at * pxPerSec, top, height }}
                           >
-                            <span className="w-px h-full bg-white/0 group-hover:bg-white/60" />
+                            <span className={`w-px rounded-full transition-all duration-100 h-[9px] group-hover:h-full group-hover:w-[2px] ${isSelected ? "bg-amber-200/60 group-hover:bg-amber-300" : "bg-white/25 group-hover:bg-white/80"}`} />
                           </div>
                         ))}
-                        <div
-                          onPointerDown={beginSceneEdgeDrag(sc, "end")}
-                          onPointerMove={handleSceneEdgeDragMove}
-                          onPointerUp={endSceneEdgeDrag}
-                          onPointerCancel={endSceneEdgeDrag}
-                          title="Drag to change how long the last beat holds"
-                          className="group absolute w-2.5 -ml-2 cursor-ew-resize z-10 flex items-center justify-center"
-                          style={{ left: left + width, top, height: ROW - 6 }}
-                        >
-                          <span className={`w-[3px] h-3 rounded-full ${isSelected ? "bg-white" : "bg-teal-300/70"} group-hover:bg-white`} />
-                        </div>
                       </React.Fragment>
                     );
                   })}
@@ -5881,21 +6084,32 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 edge handles that trim into the source (resizeAudioOverlayTime) instead of just
                 retiming an empty box. */}
             <div
-              className={`relative border-t border-neutral-800 ${renderAudioOverlays.length === 0 ? "hidden" : ""}`}
+              className={`tl-lane relative border-t border-neutral-800 ${audioOverlayDrag?.isDragging || audioOverlayResizeDrag ? "tl-lane-dragging" : ""} ${renderAudioOverlays.length === 0 ? "hidden" : ""}`}
               style={{ height: audioRowTop(audioRows.rowCount) }}
             >
               {renderAudioOverlays.map((overlay) => {
-                const left = overlay.startTime * pxPerSec;
-                const width = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                // Inset by half the gap each side, so pieces that butt up (a split song) read apart.
+                const fullLeft = overlay.startTime * pxPerSec;
+                const fullWidth = Math.max(1, (overlay.endTime - overlay.startTime) * pxPerSec);
+                const inset = fullWidth > CLIP_GAP * 4 ? CLIP_GAP / 2 : 0;
+                const left = fullLeft + inset;
+                const width = fullWidth - 2 * inset;
                 const row = audioRows.rowOf.get(overlay.id) ?? 0;
                 const top = audioRowTop(row) + 4;
                 const height = audioRowHeight(row) - 8;
                 const isSelected = selectedAudioOverlayId === overlay.id || audioSelection.includes(overlay.id);
+                const isDragging = audioOverlayDrag?.isDragging === true && audioOverlayDrag.id === overlay.id;
                 const automationOpen = automationOpenId === overlay.id;
                 const fileName = overlay.src.split(/[\\/]/).pop() ?? overlay.src;
+                const fades = audioFades.get(overlay.id);
+                const length = overlay.endTime - overlay.startTime;
+                const ownIn = overlay.fadeInSec ?? 0;
+                const ownOut = overlay.fadeOutSec ?? 0;
+                const knobs = !automationOpen && toolMode !== "razor" && width >= 44;
+                const handleStyle = { top, height };
                 return (
+                  <React.Fragment key={overlay.id}>
                   <div
-                    key={overlay.id}
                     data-audio-chip={overlay.id}
                     onPointerDown={beginAudioOverlayDrag(overlay)}
                     onContextMenu={(e) => {
@@ -5918,13 +6132,38 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         ? `${fileName} — click to cut here`
                         : `${overlay.label ? `${overlay.label} — ` : ""}${fileName}${automationOpen ? "" : " · double-click to draw its volume"}`
                     }
-                    className={`absolute rounded overflow-hidden border-2 bg-neutral-800 ${toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"} ${
-                      isSelected ? "border-dashed border-white" : "border-teal-400"
-                    } ${overlay.muted ? "opacity-50" : ""}`}
-                    style={{ left, width, top, height }}
+                    className={`tl-clip group/audio absolute rounded-md overflow-hidden bg-gradient-to-b from-teal-800/80 to-teal-950/90 ${toolMode === "razor" ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"} ${
+                      overlay.muted ? "opacity-50 saturate-0" : ""
+                    } ${isDragging ? "z-20 shadow-[0_6px_16px_rgba(0,0,0,0.55)]" : ""}`}
+                    style={{ left, width, top, height, transform: isDragging ? "translateY(-2px)" : undefined, transition: "box-shadow 150ms, transform 150ms" }}
                   >
-                    {/* The cleaned file's waveform once it's in - the noise floor visibly drops. */}
-                    <AudioChipWaveform overlay={{ ...overlay, src: playedSrc(overlay) }} widthPx={width} heightPx={height - 4} visible={[drawWindow.from - left, drawWindow.to - left]} />
+                    {/* The cleaned file's waveform once it's in - the noise floor visibly drops - tapering
+                        through its fades as the sound does. */}
+                    <AudioChipWaveform overlay={{ ...overlay, src: playedSrc(overlay) }} widthPx={width} heightPx={height} visible={[drawWindow.from - left, drawWindow.to - left]} fades={fades} />
+                    {fades && fades.fadeIn > 0 && <AudioFadeShade side="in" seconds={fades.fadeIn} curve={fades.fadeInCurve} pxPerSec={pxPerSec} widthPx={width} heightPx={height} />}
+                    {fades && fades.fadeOut > 0 && <AudioFadeShade side="out" seconds={fades.fadeOut} curve={fades.fadeOutCurve} pxPerSec={pxPerSec} widthPx={width} heightPx={height} />}
+                    {knobs && (
+                      <>
+                        <AudioFadeKnob
+                          side="in"
+                          seconds={ownIn}
+                          maxSeconds={Math.max(0, length - ownOut)}
+                          pxPerSec={pxPerSec}
+                          widthPx={width}
+                          shown={isSelected}
+                          onChange={(fadeInSec) => editStore.updateAudioOverlayContent(overlay.id, { fadeInSec: fadeInSec > 0 ? fadeInSec : undefined })}
+                        />
+                        <AudioFadeKnob
+                          side="out"
+                          seconds={ownOut}
+                          maxSeconds={Math.max(0, length - ownIn)}
+                          pxPerSec={pxPerSec}
+                          widthPx={width}
+                          shown={isSelected}
+                          onChange={(fadeOutSec) => editStore.updateAudioOverlayContent(overlay.id, { fadeOutSec: fadeOutSec > 0 ? fadeOutSec : undefined })}
+                        />
+                      </>
+                    )}
                     {/* Where it dips under the voice (music ducking). */}
                     {isDucked(overlay) && speechRanges.length > 0 && (
                       <DuckShade
@@ -6004,38 +6243,49 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       />
                     )}
                     {overlay.label && !automationOpen && (
-                      <span className="absolute left-1.5 top-0 text-[9px] font-medium leading-tight text-white bg-black/60 px-1 rounded-b pointer-events-none">
+                      <span className="absolute left-1.5 top-0.5 z-[4] text-[9px] font-semibold leading-[13px] text-white/95 bg-black/55 px-1 rounded-sm pointer-events-none" style={{ marginLeft: ownIn > 0 ? Math.min(width / 2, ownIn * pxPerSec) : undefined }}>
                         {overlay.label}
                       </span>
                     )}
+                    {/* The edge, over the waveform: faint, brighter on hover, yellow selected - as the
+                        video clips above. */}
+                    <span
+                      className={`pointer-events-none absolute inset-0 z-[7] rounded-md ring-inset transition-shadow duration-150 ${
+                        isSelected || isDragging ? "ring-2 ring-amber-400" : "ring-1 ring-teal-300/25 group-hover/audio:ring-white/40"
+                      }`}
+                    />
+                    {isSelected && width >= 56 && !automationOpen && (
+                      <span className="pointer-events-none absolute bottom-0.5 right-2 z-[7] px-1 rounded-sm bg-black/70 text-[9px] leading-[13px] font-semibold tabular-nums text-amber-300">
+                        {formatClipLength(length)}
+                      </span>
+                    )}
                   </div>
-                );
-              })}
-              {renderAudioOverlays.map((overlay) => {
-                const left = overlay.startTime * pxPerSec;
-                const width = (overlay.endTime - overlay.startTime) * pxPerSec;
-                const row = audioRows.rowOf.get(overlay.id) ?? 0;
-                const handleStyle = { top: audioRowTop(row) + 4, height: audioRowHeight(row) - 8 };
-                return (
-                  <React.Fragment key={`audio-overlay-resize-${overlay.id}`}>
-                    <div
-                      onPointerDown={beginAudioOverlayResizeDrag(overlay, "start")}
-                      onPointerMove={handleAudioOverlayResizeDragMove}
-                      onPointerUp={endAudioOverlayResizeDrag}
-                      onPointerCancel={endAudioOverlayResizeDrag}
-                      title="Drag to trim this audio's start"
-                      className="absolute w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ ...handleStyle, left }}
-                    />
-                    <div
-                      onPointerDown={beginAudioOverlayResizeDrag(overlay, "end")}
-                      onPointerMove={handleAudioOverlayResizeDragMove}
-                      onPointerUp={endAudioOverlayResizeDrag}
-                      onPointerCancel={endAudioOverlayResizeDrag}
-                      title="Drag to trim this audio's end"
-                      className="absolute w-2 -ml-1 bg-teal-400 hover:bg-teal-300 rounded cursor-ew-resize z-10"
-                      style={{ ...handleStyle, left: left + width }}
-                    />
+                  {/* Trim handles - siblings right after their piece, so CSS reveals them on its hover
+                      (the video lane's grips and brackets). They trim into the source. */}
+                  <div
+                    onPointerDown={beginAudioOverlayResizeDrag(overlay, "start")}
+                    onPointerMove={handleAudioOverlayResizeDragMove}
+                    onPointerUp={endAudioOverlayResizeDrag}
+                    onPointerCancel={endAudioOverlayResizeDrag}
+                    title="Drag to trim this audio's start"
+                    data-on={isSelected ? "true" : undefined}
+                    className={`tl-h absolute ${isSelected ? "z-[12]" : "z-10"} flex items-center justify-start cursor-ew-resize`}
+                    style={{ ...handleStyle, left, width: HANDLE_GRAB_PX }}
+                  >
+                    <span className={isSelected ? "tl-bracket tl-bracket-start" : "tl-grip ml-[3px]"} />
+                  </div>
+                  <div
+                    onPointerDown={beginAudioOverlayResizeDrag(overlay, "end")}
+                    onPointerMove={handleAudioOverlayResizeDragMove}
+                    onPointerUp={endAudioOverlayResizeDrag}
+                    onPointerCancel={endAudioOverlayResizeDrag}
+                    title="Drag to trim this audio's end"
+                    data-on={isSelected ? "true" : undefined}
+                    className={`tl-h absolute ${isSelected ? "z-[12]" : "z-10"} flex items-center justify-end cursor-ew-resize`}
+                    style={{ ...handleStyle, left: left + width - HANDLE_GRAB_PX, width: HANDLE_GRAB_PX }}
+                  >
+                    <span className={isSelected ? "tl-bracket tl-bracket-end" : "tl-grip mr-[3px]"} />
+                  </div>
                   </React.Fragment>
                 );
               })}
@@ -6129,6 +6379,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     }
                   : undefined
               }
+              atEdges={{ first: clipIndex === 0, last: clipIndex === editStore.clips.length - 1 }}
+              edgeTransitions={editStore.edgeTransitions}
+              onSetEdgeTransition={setEdgeTransition}
               onClose={() => setEffectsPopoverAnchor(null)}
             />
           );

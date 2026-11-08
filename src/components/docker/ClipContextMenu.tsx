@@ -31,7 +31,7 @@ import {
 } from "react-icons/io5";
 import { MdFlip } from "react-icons/md";
 import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
-import { Clip, ColorFilterPreset, KenBurnsPreset, TransitionType } from "../../utils/videoEditTypes";
+import { Clip, ColorFilterPreset, EdgeTransitions, KenBurnsPreset, TransitionEdge, TransitionType } from "../../utils/videoEditTypes";
 import { COLOR_FILTER_PRESETS, KEN_BURNS_PRESETS, TRANSITION_PRESETS } from "../../utils/videoColorFilters";
 import { clipOutputDuration } from "../../utils/clipTiming";
 
@@ -66,6 +66,9 @@ interface ClipContextMenuProps {
   onToggleReverse: () => void;
   onMove: (target: ClipMoveTarget) => void;
   onSetTransition: (type: TransitionType | null) => void;
+  // The video's intro (on the first clip) / outro (on the last) - EdgeTransitions.
+  edgeTransitions: EdgeTransitions;
+  onSetEdgeTransition: (edge: TransitionEdge, type: TransitionType | null) => void;
   onSetMotion: (preset: KenBurnsPreset | null) => void;
   onSetColor: (preset: ColorFilterPreset) => void;
   onSetLength: (seconds: number) => void;
@@ -83,7 +86,7 @@ const IMAGE_LENGTHS = [0.1, 0.2, 0.3, 0.5, 1, 2, 3, 5, 8, 10, 15];
 const ALL_IMAGE_LENGTHS = [0.1, 0.2, 0.3, 0.5, 1, 2];
 const lengthLabel = (sec: number) => (sec < 1 ? `${sec}s` : `${sec} second${sec === 1 ? "" : "s"}`);
 
-type SubmenuId = "insert" | "move" | "transition" | "motion" | "color" | "length";
+type SubmenuId = "insert" | "move" | "transition" | "intro" | "outro" | "motion" | "color" | "length";
 
 const itemClass =
   "w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-xs text-neutral-200 hover:bg-white/10 disabled:text-neutral-500 disabled:hover:bg-transparent disabled:cursor-default outline-none focus-visible:bg-white/10";
@@ -174,7 +177,16 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
     </button>
   );
 
-  const transitionLabel = clip.transitionIn ? TRANSITION_PRESETS.find((p) => p.value === clip.transitionIn?.type)?.label ?? "On" : null;
+  const presetLabel = (t: { type: TransitionType } | undefined) => (t ? TRANSITION_PRESETS.find((p) => p.value === t.type)?.label ?? "On" : null);
+  const transitionLabel = presetLabel(clip.transitionIn);
+  const edges = props.edgeTransitions;
+  // One clip at a time - the intro / outro belong to the video, not to a selection.
+  const atStart = index === 0 && !many;
+  const atEnd = index === clipCount - 1 && !many;
+  const edgeChoices = (edge: TransitionEdge) => [
+    choice("none", "None", !edges[edge], () => props.onSetEdgeTransition(edge, null)),
+    ...TRANSITION_PRESETS.map((p) => choice(p.value, p.label, edges[edge]?.type === p.value, () => props.onSetEdgeTransition(edge, p.value))),
+  ];
   const motionLabel = clip.kenBurns ? KEN_BURNS_PRESETS.find((p) => p.value === clip.kenBurns?.preset)?.label ?? "On" : null;
   const colorLabel = clip.colorFilter && clip.colorFilter.preset !== "none" ? COLOR_FILTER_PRESETS.find((p) => p.value === clip.colorFilter?.preset)?.label ?? null : null;
   const lengthSec = clipOutputDuration(clip);
@@ -198,6 +210,10 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
           choice("none", "None", !clip.transitionIn, () => props.onSetTransition(null)),
           ...TRANSITION_PRESETS.map((p) => choice(p.value, p.label, clip.transitionIn?.type === p.value, () => props.onSetTransition(p.value))),
         ];
+      case "intro":
+        return edgeChoices("intro");
+      case "outro":
+        return edgeChoices("outro");
       case "motion":
         return [
           choice("none", "None", !clip.kenBurns, () => props.onSetMotion(null)),
@@ -282,7 +298,10 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
       )}
       {submenuItem("move", <IoMoveOutline size={14} />, "Move", null, clipCount < 2)}
       <div className="my-1 border-t border-white/10" />
-      {submenuItem("transition", <IoSwapHorizontalOutline size={14} />, "Transition in", index === 0 ? null : transitionLabel, index === 0)}
+      {atStart
+        ? submenuItem("intro", <IoSwapHorizontalOutline size={14} />, "Intro (from black)", presetLabel(edges.intro))
+        : submenuItem("transition", <IoSwapHorizontalOutline size={14} />, "Transition in", index === 0 ? null : transitionLabel, index === 0)}
+      {atEnd && submenuItem("outro", <IoSwapHorizontalOutline size={14} className="-scale-x-100" />, "Outro (to black)", presetLabel(edges.outro))}
       {submenuItem("motion", <IoScanOutline size={14} />, "Motion", motionLabel)}
       {submenuItem("color", <IoColorPaletteOutline size={14} />, "Color", colorLabel)}
       {isImage && submenuItem("length", <IoTimeOutline size={14} />, "Length", `${lengthSec.toFixed(1)}s`)}

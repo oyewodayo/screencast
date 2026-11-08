@@ -14,7 +14,7 @@ import { CaptionLine, buildCaptionLines, buildCaptionsAss, buildSrt, defaultCapt
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { addCloseGuard, addReleaseBlocker } from "../utils/closeGuards";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipCrop, ClipTransitionIn, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
+import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipCrop, ClipTransitionIn, EdgeTransitions, TransitionEdge, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
 import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
 import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
@@ -132,6 +132,9 @@ import { beatOutputTimes, fitImageClipsToBeats } from "../utils/beatSync";
 import { loadTitleFonts } from "../utils/titleFonts";
 import { BLUR_SIGMA_FRACTION, blurNeedsMask, renderBlurMaskToPng, imageOverlayAnimates, renderImageOverlayToPng, renderImageRevealFrames, renderTextOverlayToPng, renderTextRevealFrames } from "../utils/videoOverlayRender";
 import { isTextReveal } from "../utils/textReveal";
+
+// One shared empty value, so a video with no intro/outro hands consumers a stable reference.
+const NO_EDGE_TRANSITIONS: EdgeTransitions = Object.freeze({});
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 // An audio overlay can hang past the video's end, but must start at least this far before it.
@@ -364,6 +367,10 @@ export interface UseVideoEditStoreResult {
   // how the editor draws the recorded pointer and the shortcut chips (patches over the defaults).
   screenStyle: ScreenStyle | null;
   setScreenStyle: (style: ScreenStyle | null) => void;
+  // The video's intro / outro (EdgeTransitions): set, change or (null) remove one. One undo step
+  // per change; a dragged duration slider's run merges into one.
+  edgeTransitions: EdgeTransitions;
+  setEdgeTransition: (edge: TransitionEdge, transition: ClipTransitionIn | null) => void;
   pointerStyle: Partial<PointerStyle> | undefined;
   updatePointerStyle: (patch: Partial<PointerStyle>) => void;
   keystrokeStyle: Partial<KeystrokeStyle> | undefined;
@@ -823,6 +830,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     keystrokeStyle: current.keystrokeStyle,
     scenes: current.scenes ?? [],
     canvas: current.canvas ?? null,
+    edgeTransitions: current.edgeTransitions,
     ...patch,
   });
 
@@ -1702,6 +1710,18 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     },
     [pushCommand]
   );
+  const setEdgeTransition = useCallback(
+    (edge: TransitionEdge, transition: ClipTransitionIn | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const next: EdgeTransitions = { ...(current.edgeTransitions ?? {}) };
+      if (transition) next[edge] = transition;
+      else delete next[edge];
+      const edgeTransitions = next.intro || next.outro ? next : undefined;
+      pushCommand(snapshot(current, {}), snapshot(current, { edgeTransitions }), "edit-edge-transition");
+    },
+    [pushCommand]
+  );
   const updatePointerStyle = useCallback(
     (patch: Partial<PointerStyle>) => {
       const current = stateRef.current;
@@ -2507,6 +2527,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           screenStyle,
           keystrokes,
           stageLayers,
+          edgeTransitions: current.edgeTransitions ?? null,
         },
         sourcePath,
         durationSec: totalOutputDuration(current.clips),
@@ -2726,6 +2747,8 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     setVideoTrackHidden,
     screenStyle: state?.screenStyle ?? null,
     setScreenStyle,
+    edgeTransitions: state?.edgeTransitions ?? NO_EDGE_TRANSITIONS,
+    setEdgeTransition,
     pointerStyle: state?.pointerStyle,
     updatePointerStyle,
     keystrokeStyle: state?.keystrokeStyle,

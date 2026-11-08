@@ -19,8 +19,8 @@ import { hasGrade } from "../../utils/colorGrade";
 import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
 import { createPortal } from "react-dom";
 import { IoClose } from "react-icons/io5";
-import { Clip, ClipFxKind, ClipGrade, ColorFilterPreset, GradeLookName, KenBurnsPreset, TransitionType, isImageClipPath } from "../../utils/videoEditTypes";
-import TransitionGrid from "./TransitionGrid";
+import { Clip, ClipFxKind, ClipGrade, ClipTransitionIn, ColorFilterPreset, EdgeTransitions, GradeLookName, KenBurnsPreset, TransitionEdge, isImageClipPath } from "../../utils/videoEditTypes";
+import TransitionGrid, { BLACK } from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
@@ -48,8 +48,59 @@ interface ClipEffectsPopoverProps {
   onUpdate: (patch: ClipEffectsPatch) => void;
   // Puts a built-in sound (TRANSITION_SOUNDS) on the timeline at this clip's cut.
   onAddTransitionSound?: (soundId: string) => void;
+  // Where this clip sits: first and/or last on the timeline - the edges the video's intro / outro
+  // play at (EdgeTransitions), offered on the Transition tab for a single selected clip there.
+  atEdges?: { first: boolean; last: boolean };
+  edgeTransitions?: EdgeTransitions;
+  onSetEdgeTransition?: (edge: TransitionEdge, transition: ClipTransitionIn | null) => void;
   onClose: () => void;
 }
+
+// An intro / outro can run longer than a cut between clips - a slow fade in, a long sweep.
+export const EDGE_TRANSITION_MAX_SECONDS = 3;
+export const DEFAULT_EDGE_TRANSITION_DURATION = 1;
+
+// One transition's picker: live tiles, then its duration and look once one is chosen. `children`:
+// extra rows under it (the cut's sounds).
+const TransitionPicker: React.FC<{
+  heading: string;
+  hint: string;
+  value: ClipTransitionIn | undefined;
+  outgoing: Clip | typeof BLACK | undefined;
+  incoming: Clip | typeof BLACK;
+  maxDuration: number;
+  defaultDuration?: number;
+  onChange: (transition: ClipTransitionIn | undefined) => void;
+  children?: React.ReactNode;
+}> = ({ heading, hint, value, outgoing, incoming, maxDuration, defaultDuration = DEFAULT_TRANSITION_DURATION, onChange, children }) => {
+  const type = value?.type ?? null;
+  const duration = value?.duration ?? defaultDuration;
+  const look = value?.look;
+  return (
+    <div className="flex flex-col gap-1.5" title={hint}>
+      <span className="text-[10px] uppercase tracking-wide text-white/40">{heading}</span>
+      {/* The look carries over between transitions that understand it (a leak's colour to a flash...). */}
+      <TransitionGrid value={type} look={look} outgoing={outgoing} incoming={incoming} onChange={(t) => onChange(t ? { type: t, duration, ...(look ? { look } : {}) } : undefined)} />
+      {type !== null && (
+        <label className="flex items-center gap-2 text-[11px] pt-0.5">
+          <span className="w-12 shrink-0 text-white/60">Duration</span>
+          <input
+            type="range"
+            min={0.2}
+            max={maxDuration}
+            step={0.05}
+            value={Math.min(duration, maxDuration)}
+            onChange={(e) => onChange({ ...value, type, duration: Number(e.target.value) })}
+            className="flex-1 accent-blue-400"
+          />
+          <span className="w-10 shrink-0 text-right tabular-nums text-white/60">{duration.toFixed(2)}s</span>
+        </label>
+      )}
+      {type !== null && transitionHasLook(type) && <TransitionLookControls type={type} look={look} onChange={(next) => onChange({ type, duration, look: next })} />}
+      {children}
+    </div>
+  );
+};
 
 type EffectsTab = "look" | "motion" | "fx" | "sound" | "transition";
 const TABS: { value: EffectsTab; label: string; title: string }[] = [
@@ -60,6 +111,15 @@ const TABS: { value: EffectsTab; label: string; title: string }[] = [
   { value: "transition", label: "Transition", title: "How this clip comes in from the one before" },
 ];
 const TAB_STORAGE_KEY = "briefcast.clipEffects.tab";
+
+// Opens the popover on its Transition tab next time it mounts (a timeline intro/outro marker).
+export function rememberTransitionTab(): void {
+  try {
+    localStorage.setItem(TAB_STORAGE_KEY, "transition");
+  } catch {
+    // storage unavailable - it opens on its default tab
+  }
+}
 
 const PresetRow: React.FC<{ children: React.ReactNode }> = ({ children }) => <div className="flex flex-wrap gap-1">{children}</div>;
 
@@ -75,7 +135,20 @@ const PresetButton: React.FC<{ active: boolean; onClick: () => void; children: R
   </button>
 );
 
-const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPrecedingClip, previousClip, isOnScreen, anchor, selectedCount, onUpdate, onAddTransitionSound, onClose }) => {
+const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
+  clip,
+  hasPrecedingClip,
+  previousClip,
+  isOnScreen,
+  anchor,
+  selectedCount,
+  onUpdate,
+  onAddTransitionSound,
+  atEdges,
+  edgeTransitions,
+  onSetEdgeTransition,
+  onClose,
+}) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
   // Docked into the sidebar's Tools tab when it's there - see ToolPanelHost.tsx.
   const dockHost = useToolPanelHost();
@@ -128,21 +201,18 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
       // not remembered this time
     }
   };
+  // The video's intro / outro, on the clip at that edge - one clip at a time (a multi-selection's
+  // edits land on every clip, and the intro isn't any one clip's).
+  const single = (selectedCount ?? 1) <= 1 && !!onSetEdgeTransition;
+  const showIntro = single && !!atEdges?.first;
+  const showOutro = single && !!atEdges?.last;
   // Which tabs hold something switched on for this clip.
   const active: Record<EffectsTab, boolean> = {
     look: (clip.colorFilter?.preset ?? "none") !== "none" || hasGrade(clip.grade),
     motion: !!clip.kenBurns || !!clip.stabilize,
     fx: !!clip.fx,
     sound: !!clip.muted,
-    transition: !!clip.transitionIn && hasPrecedingClip,
-  };
-
-  const transitionType = clip.transitionIn?.type ?? null;
-  const transitionDuration = clip.transitionIn?.duration ?? DEFAULT_TRANSITION_DURATION;
-  const transitionLook = clip.transitionIn?.look;
-  const setTransitionType = (type: TransitionType | null) => {
-    // The look carries over between transitions that understand it (a leak's colour to a flash...).
-    onUpdate({ transitionIn: type ? { type, duration: transitionDuration, ...(transitionLook ? { look: transitionLook } : {}) } : undefined });
+    transition: (!!clip.transitionIn && hasPrecedingClip) || (showIntro && !!edgeTransitions?.intro) || (showOutro && !!edgeTransitions?.outro),
   };
 
   return createPortal(
@@ -323,55 +393,68 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({ clip, hasPreced
         </div>
       )}
 
-      {tab === "transition" &&
-        (hasPrecedingClip ? (
-          <div className="flex flex-col gap-1.5" title="Plays over the start of this clip, as the previous clip keeps playing out - in the preview and the export alike">
-            <span className="text-[10px] uppercase tracking-wide text-white/40">Transition (with previous clip)</span>
-            <TransitionGrid value={transitionType} look={transitionLook} outgoing={previousClip} incoming={clip} onChange={setTransitionType} />
-            {transitionType !== null && (
-              <label className="flex items-center gap-2 text-[11px] pt-0.5">
-                <span className="w-12 shrink-0 text-white/60">Duration</span>
-                <input
-                  type="range"
-                  min={0.2}
-                  max={1.5}
-                  step={0.05}
-                  value={transitionDuration}
-                  onChange={(e) => onUpdate({ transitionIn: { ...clip.transitionIn, type: transitionType, duration: Number(e.target.value) } })}
-                  className="flex-1 accent-blue-400"
-                />
-                <span className="w-10 shrink-0 text-right tabular-nums text-white/60">{transitionDuration.toFixed(2)}s</span>
-              </label>
-            )}
-            {transitionType !== null && transitionHasLook(transitionType) && (
-              <TransitionLookControls
-                type={transitionType}
-                look={transitionLook}
-                onChange={(look) => onUpdate({ transitionIn: { type: transitionType, duration: transitionDuration, look } })}
-              />
-            )}
-            {onAddTransitionSound && (
-              <div className="flex items-start gap-2 text-[11px] pt-1">
-                <span className="w-12 shrink-0 pt-1 text-white/60">Sound</span>
-                <div className="flex-1 min-w-0 flex flex-wrap gap-1">
-                  {TRANSITION_SOUNDS.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      title={`Add a ${s.label.toLowerCase()} timed to this cut (as its own audio track)`}
-                      onClick={() => onAddTransitionSound(s.id)}
-                      className="h-6 px-1.5 rounded text-[11px] bg-white/[0.06] text-white/70 hover:text-white hover:bg-white/10"
-                    >
-                      ＋ {s.label}
-                    </button>
-                  ))}
+      {tab === "transition" && (
+        <div className="flex flex-col gap-3">
+          {hasPrecedingClip && (
+            <TransitionPicker
+              heading="Transition (with previous clip)"
+              hint="Plays over the start of this clip, as the previous clip keeps playing out - in the preview and the export alike"
+              value={clip.transitionIn}
+              outgoing={previousClip}
+              incoming={clip}
+              maxDuration={1.5}
+              onChange={(transitionIn) => onUpdate({ transitionIn })}
+            >
+              {onAddTransitionSound && (
+                <div className="flex items-start gap-2 text-[11px] pt-1">
+                  <span className="w-12 shrink-0 pt-1 text-white/60">Sound</span>
+                  <div className="flex-1 min-w-0 flex flex-wrap gap-1">
+                    {TRANSITION_SOUNDS.map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        title={`Add a ${s.label.toLowerCase()} timed to this cut (as its own audio track)`}
+                        onClick={() => onAddTransitionSound(s.id)}
+                        className="h-6 px-1.5 rounded text-[11px] bg-white/[0.06] text-white/70 hover:text-white hover:bg-white/10"
+                      >
+                        ＋ {s.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <p className="text-[11px] leading-snug text-white/50">This is the first clip - there's nothing before it to transition from. Select a later clip to set how it comes in.</p>
-        ))}
+              )}
+            </TransitionPicker>
+          )}
+          {showIntro && (
+            <div className={hasPrecedingClip ? "pt-2 border-t border-white/10" : undefined}>
+              <TransitionPicker
+                heading="Intro (in from black)"
+                hint="How the video starts: this clip comes in from black. It stays at the start of the video whichever clip is first."
+                value={edgeTransitions?.intro}
+                outgoing={BLACK}
+                incoming={clip}
+                maxDuration={EDGE_TRANSITION_MAX_SECONDS}
+                defaultDuration={DEFAULT_EDGE_TRANSITION_DURATION}
+                onChange={(t) => onSetEdgeTransition?.("intro", t ?? null)}
+              />
+            </div>
+          )}
+          {showOutro && (
+            <div className={showIntro || hasPrecedingClip ? "pt-2 border-t border-white/10" : undefined}>
+              <TransitionPicker
+                heading="Outro (out to black)"
+                hint="How the video ends: this clip goes out to black. It stays at the end of the video whichever clip is last."
+                value={edgeTransitions?.outro}
+                outgoing={clip}
+                incoming={BLACK}
+                maxDuration={EDGE_TRANSITION_MAX_SECONDS}
+                defaultDuration={DEFAULT_EDGE_TRANSITION_DURATION}
+                onChange={(t) => onSetEdgeTransition?.("outro", t ?? null)}
+              />
+            </div>
+          )}
+        </div>
+      )}
     </div>,
     dockHost ?? document.body
   );

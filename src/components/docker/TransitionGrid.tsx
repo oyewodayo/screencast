@@ -2,7 +2,8 @@
 //
 // The transition picker in Clip effects: a grid of live tiles, each playing its transition on a
 // loop - from the previous clip's last frame into this clip's opening frame when those can be
-// captured, from two drawn stand-in pictures until then. Every tile is drawn by the same
+// captured, from two drawn stand-in pictures until then (and from / to black for the video's intro
+// and outro). Every tile is drawn by the same
 // renderTransitionFrame the player's preview uses (with this clip's current look - colour,
 // strength, direction), so what a tile shows is what the clip will do.
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -83,12 +84,33 @@ const Tile: React.FC<{
   );
 };
 
+// A side of the transition that's black: the video's intro comes in from it, its outro goes out to it.
+export const BLACK = "black" as const;
+type Side = Clip | typeof BLACK;
+
+let blackStillUrl: string | null = null;
+const blackStill = (): string => {
+  if (!blackStillUrl) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 16;
+    canvas.height = 9;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, 16, 9);
+    }
+    blackStillUrl = canvas.toDataURL();
+  }
+  return blackStillUrl;
+};
+
 interface TransitionGridProps {
   value: TransitionType | null;
   look: TransitionLook | undefined;
-  // The clip the transition comes from (its last frame) and the one it leads into.
-  outgoing: Clip | undefined;
-  incoming: Clip;
+  // The clip the transition comes from (its last frame) and the one it leads into - or black, for
+  // the video's intro (from black) and outro (to black).
+  outgoing: Side | undefined;
+  incoming: Side;
   onChange: (type: TransitionType | null) => void;
 }
 
@@ -96,13 +118,21 @@ const TransitionGrid: React.FC<TransitionGridProps> = ({ value, look, outgoing, 
   const [stills, setStills] = useState<[string, string]>(placeholderStills);
   const [hoveredType, setHoveredType] = useState<TransitionType | null>(null);
 
-  const outgoingKey = outgoing ? `${outgoing.sourcePath}|${outgoing.end}` : "";
-  const incomingKey = `${incoming.sourcePath}|${incoming.start}`;
+  const outgoingKey = outgoing === BLACK ? BLACK : outgoing ? `${outgoing.sourcePath}|${outgoing.end}` : "";
+  const incomingKey = incoming === BLACK ? BLACK : `${incoming.sourcePath}|${incoming.start}`;
   useEffect(() => {
     let cancelled = false;
     const [oldFallback, newFallback] = placeholderStills();
-    const before = outgoing ? clipStill(outgoing.sourcePath, Math.max(outgoing.start, outgoing.end - 1 / 30)).catch(() => oldFallback) : Promise.resolve(oldFallback);
-    const after = clipStill(incoming.sourcePath, incoming.start + Math.min(0.3, (incoming.end - incoming.start) / 4)).catch(() => newFallback);
+    const before =
+      outgoing === BLACK
+        ? Promise.resolve(blackStill())
+        : outgoing
+          ? clipStill(outgoing.sourcePath, Math.max(outgoing.start, outgoing.end - 1 / 30)).catch(() => oldFallback)
+          : Promise.resolve(oldFallback);
+    const after =
+      incoming === BLACK
+        ? Promise.resolve(blackStill())
+        : clipStill(incoming.sourcePath, incoming.start + Math.min(0.3, (incoming.end - incoming.start) / 4)).catch(() => newFallback);
     Promise.all([before, after]).then((pair) => !cancelled && setStills(pair));
     return () => {
       cancelled = true;

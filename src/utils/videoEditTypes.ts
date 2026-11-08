@@ -206,6 +206,29 @@ export interface ClipTransitionIn {
                      // produce an invalid ffmpeg offset.
 }
 
+// The video's intro and outro: a transition in from black over its first seconds, and out to black
+// over its last. They belong to the video rather than to a clip - so they stay at its edges whatever
+// the clip order, and a single clip can have them. Export: edge_transition_graph (conversion.rs);
+// preview: EdgeTransitionPreviewLayer. Both draw them with the same machinery as a cut between
+// clips, black standing in for the other picture.
+export interface EdgeTransitions {
+  intro?: ClipTransitionIn;
+  outro?: ClipTransitionIn;
+}
+export type TransitionEdge = keyof EdgeTransitions;
+
+// Each edge's window in output seconds, for a video `total` seconds long - the same clamp as
+// edge_windows (conversion.rs): alone, at most 90% of the video; with both, 45% each, so they never
+// overlap. null = none.
+export function edgeTransitionWindows(edges: EdgeTransitions | undefined, total: number): { intro: number | null; outro: number | null } {
+  const want = (t: ClipTransitionIn | undefined) => (t && Number.isFinite(t.duration) && t.duration > 0 ? t.duration : null);
+  const intro = want(edges?.intro);
+  const outro = want(edges?.outro);
+  const share = intro !== null && outro !== null ? 0.45 : 0.9;
+  const fit = (d: number) => Math.max(0.05, Math.min(d, Math.max(0, total) * share));
+  return { intro: intro === null ? null : fit(intro), outro: outro === null ? null : fit(outro) };
+}
+
 export interface Clip {
   id: string;
   sourcePath: string;
@@ -874,6 +897,8 @@ export interface VideoEditState {
   // Motion-graphics scenes (Stage - src/utils/stage): elements moving through beats, drawn over the
   // video and its tracks, beneath blur regions, pictures and text. Undefined = none.
   scenes?: StageScene[];
+  // The video's intro / outro (EdgeTransitions). Undefined = neither.
+  edgeTransitions?: EdgeTransitions;
   updatedAt: string;
 }
 
@@ -900,6 +925,7 @@ export interface EditableFields {
   keystrokeStyle?: Partial<KeystrokeStyle>;
   scenes?: StageScene[];
   canvas?: CanvasFormat | null;
+  edgeTransitions?: EdgeTransitions;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -954,6 +980,7 @@ export interface VideoEditCommand {
     | "find-hide"
     | "edit-screen-style"
     | "edit-canvas"
+    | "edit-edge-transition"
     | "edit-split"
     | "add-scene"
     | "edit-scene"
