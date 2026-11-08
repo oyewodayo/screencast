@@ -73,7 +73,6 @@ import { placeStickerSet, stickerBox } from "../../utils/stickerSets";
 import AudioOverlayPopover from "./AudioOverlayPopover";
 import MusicLibraryPanel from "./MusicLibraryPanel";
 import { libraryInfoOf, restoreMusicTrack, VideoContext } from "../../utils/musicLibrary";
-import { BUILTIN_SFX_TRACKS, TRANSITION_SOUNDS, builtinSfxFile } from "../../utils/builtinSfx";
 import { computeSpeechTimeline, DEFAULT_DUCK_LEVEL, duckGainAt, isDucked, isSpeechOverlay, TimeRange } from "../../utils/musicDucking";
 import ClipEffectsPopover, { DEFAULT_COLOR_INTENSITY, DEFAULT_KEN_BURNS_INTENSITY, DEFAULT_TRANSITION_DURATION, DEFAULT_EDGE_TRANSITION_DURATION, rememberTransitionTab } from "./ClipEffectsPopover";
 import ClipContextMenu, { ClipMoveTarget } from "./ClipContextMenu";
@@ -136,6 +135,8 @@ import { Audition, type AuditionPiece, type AuditionState } from "../../utils/au
 import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
 import { fadeLevel, joinFades, NO_FADES, type FadeCurve, type PieceFades } from "../../utils/audioJoins";
+import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundLabel, type CutSounds } from "../../utils/cutSounds";
+import { CutSoundPlayer } from "../../utils/cutSoundPlayer";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
@@ -3963,6 +3964,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     else if (!previewOwnsPlayRef.current) stopPickPreview();
   }, [isPlaying, stopPickPreview]);
   useEffect(() => stopPickPreview, [stopPickPreview]);
+  // Switches sound on every cut on (or changes it) - turning it on plays the first few cuts, so the
+  // switch is heard at once.
+  const setCutSounds = (patch: Partial<CutSounds> | null) => {
+    const turningOn = patch !== null && !editStore.cutSounds;
+    editStore.setCutSounds(patch);
+    if (!turningOn) return;
+    const first = cutSoundCues(editStore.clips, editStore.edgeTransitions, { ...DEFAULT_CUT_SOUNDS, ...patch })[0];
+    if (first) playPickPreview(Math.max(0, first.at - 1), Math.min(totalOutputDuration, first.at + 2.5));
+  };
   // Sets the video's intro / outro; a newly picked one plays straight away, as a cut's does.
   const setEdgeTransition = (edge: TransitionEdge, transition: ClipTransitionIn | null) => {
     const isNew = !!transition && transition.type !== editStore.edgeTransitions[edge]?.type;
@@ -4099,6 +4109,12 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     };
   }, [anyDucked, editStore.clips, editStore.videoAudioMuted, editStore.audioOverlays]);
 
+  // Every cut's sound and when it plays (cutSounds.ts) - preview, timeline dots and mixer strip.
+  const cutCues = useMemo(
+    () => cutSoundCues(editStore.clips, editStore.edgeTransitions, editStore.cutSounds ?? undefined),
+    [editStore.clips, editStore.edgeTransitions, editStore.cutSounds]
+  );
+
   // Every piece's fades as played: its own, plus a crossfade where pieces of one track overlap and a
   // click-proof edge fade where one is cut mid-sound (audioJoins.ts) - the export's, exactly.
   const pieceFades = useMemo(() => joinFades(editStore.audioOverlays), [editStore.audioOverlays]);
@@ -4174,6 +4190,39 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     syncAudioOverlaysRef.current();
   }, [currentOutputTime, isPlaying, editStore.audioOverlays, mixerSession, timelineMuted]);
 
+  // ---- Sound on every cut (cutSounds.ts) -------------------------------------------------------
+  // Queued on the audio clock while the timeline plays (CutSoundPlayer), re-queued on a seek or
+  // drift; silent with the timeline, its strip muted, or another strip soloed.
+  const cutSoundPlayerRef = useRef<CutSoundPlayer | null>(null);
+  const cutPlayer = () => (cutSoundPlayerRef.current ??= new CutSoundPlayer());
+  useEffect(() => () => cutSoundPlayerRef.current?.dispose(), []);
+  useEffect(() => {
+    if (cutCues.length) cutPlayer().preload(cutCues);
+  }, [cutCues]);
+  const cutSoundsSilenced = !editStore.cutSounds || !!editStore.cutSounds.muted || timelineMuted || silencedBySolo(mixerSession, CUT_SOUNDS_CHANNEL);
+  useEffect(() => {
+    cutSoundPlayerRef.current?.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
+  }, [cutSoundsSilenced, editStore.cutSounds?.volume]);
+  useEffect(() => {
+    const player = cutSoundPlayerRef.current;
+    if (!isPlaying || cutCues.length === 0) {
+      player?.stop();
+      return;
+    }
+    const p = cutPlayer();
+    p.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
+    const now = () => getExactOutputTime?.() ?? currentOutputTime;
+    p.play(cutCues, now());
+    const timer = window.setInterval(() => p.check(cutCues, now()), 200);
+    return () => {
+      window.clearInterval(timer);
+      p.stop();
+    };
+    // currentOutputTime is read live through getExactOutputTime; a change of it alone isn't a reason
+    // to re-queue (check() catches seeks).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, cutCues]);
+
   // The mixer's play: the selected pieces on their own, on their own clock (audition.ts) - the
   // timeline stays where it is. Rebuilt when the selection changes; stopped by the timeline starting,
   // the mixer closing, or the editor going.
@@ -4247,6 +4296,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         ducking: pieces.some(isDucked) ? { read: () => duckNowRef.current.get(key) ?? 1, levelDb: 20 * Math.log10(pieces.find(isDucked)?.duckLevel ?? DEFAULT_DUCK_LEVEL) } : undefined,
       });
     }
+    // Sound on every cut - all the cut sounds together, one strip (cutSounds.ts).
+    if (editStore.cutSounds) {
+      channels.push({
+        key: CUT_SOUNDS_CHANNEL,
+        name: CUT_SOUNDS_LABEL,
+        kind: "audio",
+        volume: editStore.cutSounds.volume,
+        muted: !!editStore.cutSounds.muted,
+        fx: undefined,
+        meterIds: [],
+        detail: `${cutCues.length} cut${cutCues.length === 1 ? "" : "s"}`,
+      });
+    }
     for (const p of editStore.pipOverlays) {
       if (p.muted !== false) continue;
       channels.push({
@@ -4260,7 +4322,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       });
     }
     return channels;
-  }, [editStore.videoAudioVolume, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.audioOverlays, editStore.pipOverlays]);
+  }, [editStore.videoAudioVolume, editStore.videoAudioMuted, editStore.videoAudioFx, editStore.audioOverlays, editStore.pipOverlays, editStore.cutSounds, cutCues.length]);
 
   useEffect(() => {
     if (!isPlaying || editStore.audioOverlays.length === 0) return;
@@ -4407,6 +4469,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             })
           }
           edgeTransitions={editStore.edgeTransitions}
+          cutSoundsOn={!!editStore.cutSounds}
+          onToggleCutSounds={() => setCutSounds(editStore.cutSounds ? null : {})}
           onSetEdgeTransition={(edge, type) => {
             const current = editStore.edgeTransitions[edge];
             setEdgeTransition(edge, type ? { type, duration: current?.duration ?? DEFAULT_EDGE_TRANSITION_DURATION, ...(current?.look ? { look: current.look } : {}) } : null);
@@ -5625,6 +5689,50 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                   );
                 })}
 
+              {/* Sound on every cut: where each sound is. On a transition, a small amber dot on its
+                  button; on a plain cut, an amber speaker of its own - which opens that cut's
+                  Transition tab, where its sound is picked. */}
+              {cutCues.length > 0 &&
+                !laneClips.some((c) => c.id === "__pending__") &&
+                cutCues.map((cue) => {
+                  const index = cue.key === "intro" ? 0 : cue.key === "outro" ? baseClips.length - 1 : baseClips.findIndex((c) => c.id === cue.key);
+                  if (index < 0) return null;
+                  const name = cutSoundLabel(cue.soundId);
+                  // The button it sits on: the cut's (or the intro's / outro's).
+                  const onButton = cue.key === "intro" || cue.key === "outro" || !!baseClips[index].transitionIn;
+                  const x =
+                    cue.key === "intro" ? 3 + 9 : cue.key === "outro" ? totalOutputDuration * pxPerSec - 21 + 9 : (outputStarts[index] ?? 0) * pxPerSec;
+                  if (onButton) {
+                    return (
+                      <span
+                        key={`cutsound-${cue.key}`}
+                        title={`Sound: ${name}`}
+                        className="absolute z-[13] w-[9px] h-[9px] rounded-full bg-amber-400 ring-[1.5px] ring-neutral-900 pointer-events-none"
+                        style={{ left: x + 4, top: "calc(50% - 13px)" }}
+                      />
+                    );
+                  }
+                  return (
+                    <button
+                      key={`cutsound-${cue.key}`}
+                      type="button"
+                      title={`Sound: ${name} - click to change`}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        rememberTransitionTab();
+                        setSelectedClipId(baseClips[index].id);
+                        setEffectsPopoverAnchor(null);
+                        const anchor = { left: e.clientX, top: e.clientY - 8 };
+                        requestAnimationFrame(() => setEffectsPopoverAnchor(anchor));
+                      }}
+                      className="absolute z-[13] top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 flex items-center justify-center rounded-full bg-amber-400 text-neutral-900 shadow-[0_1px_4px_rgba(0,0,0,0.5)] ring-1 ring-black/30 hover:scale-110 transition-transform"
+                      style={{ left: x }}
+                    >
+                      <IoVolumeHighOutline size={9} />
+                    </button>
+                  );
+                })}
+
               {/* A rendered merge in progress: a fast spinner on every break point between the clips it's
                   joining, and a Cancel under each (where a transition's name usually sits) that stops
                   the render and leaves the timeline as it was. */}
@@ -6363,22 +6471,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 previewPick(clipIndex, patch);
                 updateSelectedClips(patch);
               }}
-              onAddTransitionSound={
-                clipIndex > 0
-                  ? (soundId) => {
-                      const sound = TRANSITION_SOUNDS.find((s) => s.id === soundId);
-                      const track = BUILTIN_SFX_TRACKS.find((t) => t.id === soundId);
-                      if (!sound || !track) return;
-                      const start = Math.max(0, (outputStarts[clipIndex] ?? 0) - sound.lead);
-                      builtinSfxFile(soundId)
-                        .then((path) => {
-                          const id = editStore.addAudioOverlay(path, track.duration, start, start + track.duration, { label: track.title, library: libraryInfoOf(track) });
-                          setSelectedAudioOverlayId(id);
-                        })
-                        .catch((err) => console.error("Couldn't make the transition sound", err));
-                    }
-                  : undefined
-              }
+              cutSounds={editStore.cutSounds}
+              onSetCutSounds={setCutSounds}
+              onSetEdgeSound={editStore.setEdgeSound}
+              cutCount={cutCues.length}
               atEdges={{ first: clipIndex === 0, last: clipIndex === editStore.clips.length - 1 }}
               edgeTransitions={editStore.edgeTransitions}
               onSetEdgeTransition={setEdgeTransition}
@@ -6456,16 +6552,19 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           channels={mixerChannels}
           focusKey={mixerFocus}
           onVolume={(key, volume) => {
-            if (key === VIDEO_CHANNEL) editStore.setVideoAudioVolume(volume);
+            if (key === CUT_SOUNDS_CHANNEL) editStore.setCutSounds({ volume });
+            else if (key === VIDEO_CHANNEL) editStore.setVideoAudioVolume(volume);
             else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { volume });
             else editStore.updateAudioChannel(key, { volume });
           }}
           onMute={(key, muted) => {
-            if (key === VIDEO_CHANNEL) editStore.setVideoAudioMuted(muted);
+            if (key === CUT_SOUNDS_CHANNEL) editStore.setCutSounds({ muted });
+            else if (key === VIDEO_CHANNEL) editStore.setVideoAudioMuted(muted);
             else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { muted });
             else editStore.updateAudioChannel(key, { muted });
           }}
           onFx={(key, fx) => {
+            if (key === CUT_SOUNDS_CHANNEL) return; // a strip of short effects - nothing to shape
             if (key === VIDEO_CHANNEL) editStore.setVideoAudioFx(fx);
             else if (key.startsWith("pip:")) editStore.updatePipOverlayContent(key.slice(4), { fx: isNeutralFx(fx) ? undefined : fx });
             else editStore.updateAudioChannel(key, { fx });

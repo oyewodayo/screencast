@@ -18,6 +18,7 @@ import type { MusicTrack } from "./musicLibrary";
 import type { TextRevealSettings } from "./textReveal";
 import { lookPatch, titleStyle } from "./titleStyles";
 import { makeAudioOverlay, makeImageOverlay, makeTextOverlay } from "../handlers/videoEditHandlers";
+import { DEFAULT_CUT_SOUNDS } from "./cutSounds";
 import {
   AdjustmentLayer,
   AudioLibraryInfo,
@@ -808,7 +809,10 @@ export function buildStyledProject(imagePaths: string[], frame: VideoProjectFram
   // ---- frame overlays, on top of everything ----
   if (template && options.overlays) for (const kind of template.overlays) imageOverlays.push(makeImageOverlay("", 0, 0, 1, 1, 0, total, makeAsset(kind)));
 
-  return { ...base, clips, audioOverlays, imageOverlays, textOverlays, adjustmentLayers };
+  // A style that moves between shots comes with its sounds: a matching whoosh on every cut
+  // (cutSounds.ts) - switched off in one click if it isn't wanted.
+  const cutSounds = clips.some((c) => c.transitionIn) ? { ...DEFAULT_CUT_SOUNDS, plainCuts: false } : undefined;
+  return { ...base, clips, audioOverlays, imageOverlays, textOverlays, adjustmentLayers, ...(cutSounds ? { cutSounds } : {}) };
 }
 
 // One brand card over [start, end): a backdrop, the logo (or the name standing in for it) with its

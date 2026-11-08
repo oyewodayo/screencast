@@ -23,6 +23,7 @@ import type { OverlayAsset } from "./videoAssets";
 import type { TextRevealSettings } from "./textReveal";
 import type { ImageRevealSettings } from "./imageReveal";
 import type { ScreenStyle } from "./screenStyle";
+import type { CutSounds } from "./cutSounds";
 import type { CanvasFormat } from "./canvasFormats";
 import type { SplitMember } from "./splitLayouts";
 import type { PointerStyle } from "./pointerTrack";
@@ -214,8 +215,10 @@ export interface ClipTransitionIn {
 export interface EdgeTransitions {
   intro?: ClipTransitionIn;
   outro?: ClipTransitionIn;
+  // Their cut sounds (cutSounds.ts) when not the automatic one: a sound id, or null for none.
+  sounds?: { intro?: string | null; outro?: string | null };
 }
-export type TransitionEdge = keyof EdgeTransitions;
+export type TransitionEdge = "intro" | "outro";
 
 // Each edge's window in output seconds, for a video `total` seconds long - the same clamp as
 // edge_windows (conversion.rs): alone, at most 90% of the video; with both, 45% each, so they never
@@ -248,6 +251,10 @@ export interface Clip {
   speedRamp?: ClipSpeedRamp;
   kenBurns?: ClipKenBurns;
   transitionIn?: ClipTransitionIn;
+  // The sound on the cut INTO this clip (cutSounds.ts), when the video has cut sounds on: a sound
+  // id picked for this cut, null for none here; undefined = the automatic one. Belongs to the cut
+  // the way transitionIn does, so it moves with it.
+  cutSound?: string | null;
   crop?: ClipCrop;
   // Horizontal mirror of the clip's own frame - applied first, before crop/Ken Burns, in both the
   // live preview (VideoPlayer's CSS transform) and export (conversion.rs's segment_effect_chain),
@@ -899,6 +906,8 @@ export interface VideoEditState {
   scenes?: StageScene[];
   // The video's intro / outro (EdgeTransitions). Undefined = neither.
   edgeTransitions?: EdgeTransitions;
+  // Sound on every cut (cutSounds.ts). Undefined = off.
+  cutSounds?: CutSounds;
   updatedAt: string;
 }
 
@@ -926,6 +935,7 @@ export interface EditableFields {
   scenes?: StageScene[];
   canvas?: CanvasFormat | null;
   edgeTransitions?: EdgeTransitions;
+  cutSounds?: CutSounds;
 }
 
 // Whole-state before/after snapshots rather than PDF-annotations-style per-object diffs - split/
@@ -981,6 +991,7 @@ export interface VideoEditCommand {
     | "edit-screen-style"
     | "edit-canvas"
     | "edit-edge-transition"
+    | "edit-cut-sounds"
     | "edit-split"
     | "add-scene"
     | "edit-scene"

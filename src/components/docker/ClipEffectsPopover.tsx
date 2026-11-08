@@ -14,18 +14,20 @@
 import React, { useState } from "react";
 import { ColorGrid, FxGrid, LookGrid, MotionGrid } from "./EffectPreviewGrids";
 import { DEFAULT_CLIP_FX_INTENSITY } from "../../utils/clipFx";
-import { TRANSITION_SOUNDS } from "../../utils/builtinSfx";
+import { builtinSfxFile } from "../../utils/builtinSfx";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { CUT_SOUND_CHOICES, autoCutSound, cutSoundLabel, type CutSounds } from "../../utils/cutSounds";
 import { hasGrade } from "../../utils/colorGrade";
 import TransitionLookControls, { transitionHasLook } from "./TransitionLookControls";
 import { createPortal } from "react-dom";
-import { IoClose } from "react-icons/io5";
+import { IoClose, IoVolumeHighOutline } from "react-icons/io5";
 import { Clip, ClipFxKind, ClipGrade, ClipTransitionIn, ColorFilterPreset, EdgeTransitions, GradeLookName, KenBurnsPreset, TransitionEdge, isImageClipPath } from "../../utils/videoEditTypes";
 import TransitionGrid, { BLACK } from "./TransitionGrid";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, SelectionCountBadge, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
 import ColorGradeControls from "./ColorGradeControls";
 
-export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "flipHorizontal" | "muted" | "fx">>;
+export type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "kenBurns" | "transitionIn" | "cutSound" | "flipHorizontal" | "muted" | "fx">>;
 
 export const DEFAULT_STABILIZE_STRENGTH = 0.5;
 
@@ -46,8 +48,13 @@ interface ClipEffectsPopoverProps {
   // `clip`'s values, and every change is applied to all of them.
   selectedCount?: number;
   onUpdate: (patch: ClipEffectsPatch) => void;
-  // Puts a built-in sound (TRANSITION_SOUNDS) on the timeline at this clip's cut.
-  onAddTransitionSound?: (soundId: string) => void;
+  // Sound on every cut (cutSounds.ts): the video's setting (null = off) and its switch / changes.
+  cutSounds?: CutSounds | null;
+  onSetCutSounds?: (patch: Partial<CutSounds> | null) => void;
+  // The intro's / outro's own cut sound (undefined = automatic, null = none).
+  onSetEdgeSound?: (edge: TransitionEdge, sound: string | null | undefined) => void;
+  // How many cuts have a sound now (the switch's summary).
+  cutCount?: number;
   // Where this clip sits: first and/or last on the timeline - the edges the video's intro / outro
   // play at (EdgeTransitions), offered on the Transition tab for a single selected clip there.
   atEdges?: { first: boolean; last: boolean };
@@ -55,6 +62,92 @@ interface ClipEffectsPopoverProps {
   onSetEdgeTransition?: (edge: TransitionEdge, transition: ClipTransitionIn | null) => void;
   onClose: () => void;
 }
+
+// Plays a cut sound once, as it's picked - so choosing one is by ear.
+let soundPreview: HTMLAudioElement | null = null;
+function previewCutSound(id: string): void {
+  builtinSfxFile(id)
+    .then((path) => {
+      soundPreview?.pause();
+      soundPreview = new Audio(convertFileSrc(path));
+      soundPreview.volume = 0.8;
+      return soundPreview.play();
+    })
+    .catch(() => {
+      // just not heard this time
+    });
+}
+
+// The whole video's switch: a matching sound at every change of picture.
+const CutSoundsCard: React.FC<{ settings: CutSounds | null; cuts: number; onChange: (patch: Partial<CutSounds> | null) => void }> = ({ settings, cuts, onChange }) => (
+  <div className={`flex flex-col gap-2 p-2 rounded-md ring-1 ${settings ? "bg-amber-400/[0.07] ring-amber-300/30" : "bg-white/[0.04] ring-white/10"}`}>
+    <label className="flex items-center gap-2 cursor-pointer select-none">
+      <IoVolumeHighOutline size={15} className={`shrink-0 ${settings ? "text-amber-300" : "text-white/50"}`} />
+      <span className="flex-1 min-w-0">
+        <span className="block text-[12px] font-medium text-white/90">Sound on every cut</span>
+        <span className="block text-[10px] leading-snug text-white/45">
+          {settings ? `${cuts} cut${cuts === 1 ? "" : "s"} - each sound matches its transition and moves with it` : "A matching whoosh, swoosh or flash wherever the picture changes - for the whole video"}
+        </span>
+      </span>
+      <input type="checkbox" role="switch" checked={!!settings} onChange={(e) => onChange(e.target.checked ? {} : null)} className="sr-only" />
+      <span className={`relative w-8 h-[18px] shrink-0 rounded-full transition-colors ${settings ? "bg-amber-400" : "bg-white/20"}`}>
+        <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow transition-[left] duration-150 ${settings ? "left-[16px]" : "left-[2px]"}`} />
+      </span>
+    </label>
+    {settings && (
+      <>
+        <label className="flex items-center gap-2 text-[11px] text-white/70 cursor-pointer select-none" title="Cuts with no transition get a sound too">
+          <input type="checkbox" checked={settings.plainCuts} onChange={(e) => onChange({ plainCuts: e.target.checked })} className="accent-amber-400" />
+          Plain cuts too
+        </label>
+        <label className="flex items-center gap-2 text-[11px]">
+          <span className="w-12 shrink-0 text-white/60">Volume</span>
+          <input type="range" min={0} max={1} step={0.01} value={settings.volume} onChange={(e) => onChange({ volume: Number(e.target.value) })} className="flex-1 accent-amber-400" />
+          <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(settings.volume * 100)}%</span>
+        </label>
+      </>
+    )}
+  </div>
+);
+
+// One cut's sound: the automatic one (named), any of the cut sounds, or none.
+const CutSoundRow: React.FC<{ value: string | null | undefined; auto: string | null; onChange: (sound: string | null | undefined) => void }> = ({ value, auto, onChange }) => {
+  const chip = (key: string, label: string, active: boolean, pick: () => void, title?: string) => (
+    <button
+      key={key}
+      type="button"
+      title={title}
+      onClick={pick}
+      className={`h-6 px-1.5 rounded text-[11px] transition-colors ${active ? "text-amber-200 bg-amber-400/15 ring-1 ring-amber-300/50" : "text-white/70 bg-white/[0.06] hover:text-white hover:bg-white/10"}`}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="flex items-start gap-2 text-[11px] pt-1">
+      <span className="w-12 shrink-0 pt-1 text-white/60">Sound</span>
+      <div className="flex-1 min-w-0 flex flex-wrap gap-1">
+        {chip(
+          "auto",
+          auto ? `Auto - ${cutSoundLabel(auto)}` : "Auto - none",
+          value === undefined,
+          () => {
+            onChange(undefined);
+            if (auto) previewCutSound(auto);
+          },
+          "The sound that matches this transition"
+        )}
+        {CUT_SOUND_CHOICES.map((c) =>
+          chip(c.id, c.label, value === c.id, () => {
+            onChange(c.id);
+            previewCutSound(c.id);
+          })
+        )}
+        {chip("none", "None", value === null, () => onChange(null), "No sound on this cut")}
+      </div>
+    </div>
+  );
+};
 
 // An intro / outro can run longer than a cut between clips - a slow fade in, a long sweep.
 export const EDGE_TRANSITION_MAX_SECONDS = 3;
@@ -143,7 +236,10 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
   anchor,
   selectedCount,
   onUpdate,
-  onAddTransitionSound,
+  cutSounds,
+  onSetCutSounds,
+  onSetEdgeSound,
+  cutCount,
   atEdges,
   edgeTransitions,
   onSetEdgeTransition,
@@ -395,6 +491,7 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
 
       {tab === "transition" && (
         <div className="flex flex-col gap-3">
+          {onSetCutSounds && <CutSoundsCard settings={cutSounds ?? null} cuts={cutCount ?? 0} onChange={onSetCutSounds} />}
           {hasPrecedingClip && (
             <TransitionPicker
               heading="Transition (with previous clip)"
@@ -405,23 +502,12 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
               maxDuration={1.5}
               onChange={(transitionIn) => onUpdate({ transitionIn })}
             >
-              {onAddTransitionSound && (
-                <div className="flex items-start gap-2 text-[11px] pt-1">
-                  <span className="w-12 shrink-0 pt-1 text-white/60">Sound</span>
-                  <div className="flex-1 min-w-0 flex flex-wrap gap-1">
-                    {TRANSITION_SOUNDS.map((s) => (
-                      <button
-                        key={s.id}
-                        type="button"
-                        title={`Add a ${s.label.toLowerCase()} timed to this cut (as its own audio track)`}
-                        onClick={() => onAddTransitionSound(s.id)}
-                        className="h-6 px-1.5 rounded text-[11px] bg-white/[0.06] text-white/70 hover:text-white hover:bg-white/10"
-                      >
-                        ＋ {s.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+              {cutSounds && (
+                <CutSoundRow
+                  value={clip.cutSound}
+                  auto={clip.transitionIn ? autoCutSound(clip.transitionIn.type) : cutSounds.plainCuts ? autoCutSound(null) : null}
+                  onChange={(cutSound) => onUpdate({ cutSound })}
+                />
               )}
             </TransitionPicker>
           )}
@@ -436,7 +522,11 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
                 maxDuration={EDGE_TRANSITION_MAX_SECONDS}
                 defaultDuration={DEFAULT_EDGE_TRANSITION_DURATION}
                 onChange={(t) => onSetEdgeTransition?.("intro", t ?? null)}
-              />
+              >
+                {cutSounds && edgeTransitions?.intro && (
+                  <CutSoundRow value={edgeTransitions.sounds?.intro} auto={autoCutSound(edgeTransitions.intro.type)} onChange={(sound) => onSetEdgeSound?.("intro", sound)} />
+                )}
+              </TransitionPicker>
             </div>
           )}
           {showOutro && (
@@ -450,7 +540,11 @@ const ClipEffectsPopover: React.FC<ClipEffectsPopoverProps> = ({
                 maxDuration={EDGE_TRANSITION_MAX_SECONDS}
                 defaultDuration={DEFAULT_EDGE_TRANSITION_DURATION}
                 onChange={(t) => onSetEdgeTransition?.("outro", t ?? null)}
-              />
+              >
+                {cutSounds && edgeTransitions?.outro && (
+                  <CutSoundRow value={edgeTransitions.sounds?.outro} auto={autoCutSound(edgeTransitions.outro.type)} onChange={(sound) => onSetEdgeSound?.("outro", sound)} />
+                )}
+              </TransitionPicker>
             </div>
           )}
         </div>

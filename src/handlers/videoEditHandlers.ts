@@ -74,7 +74,7 @@ export function clipIndexAt(clips: Clip[], sourcePath: string, sourceTime: numbe
 // A piece [start, end] cut out of `clip`: every setting carried over (look, grade, motion, speed,
 // audio, reverse...), its speed ramp and Ken Burns move narrowed to the part of them this piece
 // covers - so the pieces of a clip together play exactly as it did. Only the first piece keeps the
-// transition (the rest join their neighbour by a plain cut).
+// transition and the cut's sound (the rest join their neighbour by a plain cut).
 export function clipPiece(clip: Clip, start: number, end: number, opts: { id?: string; first: boolean }): Clip {
   const piece: Clip = { ...clip, id: opts.id ?? crypto.randomUUID(), start, end, transitionIn: opts.first ? clip.transitionIn : undefined };
   if (clip.speedRamp) piece.speedRamp = { ...clip.speedRamp, span: subSpan(clip, clip.speedRamp.span, start, end) };
@@ -82,6 +82,7 @@ export function clipPiece(clip: Clip, start: number, end: number, opts: { id?: s
   if (!piece.speedRamp?.span) delete piece.speedRamp?.span;
   if (!piece.kenBurns?.span) delete piece.kenBurns?.span;
   if (!piece.transitionIn) delete piece.transitionIn;
+  if (!opts.first) delete piece.cutSound;
   return piece;
 }
 
@@ -277,7 +278,7 @@ export function mergeClipsInPlace(clips: Clip[], ids: string[]): Clip[] | null {
     if (indices[k] !== indices[k - 1] + 1) return null; // not side by side on the timeline
     if (cur.sourcePath !== prev.sourcePath || isImageClipPath(cur.sourcePath)) return null;
     if (Math.abs(cur.start - prev.end) > MERGE_GAP_EPSILON_SEC) return null; // something was cut out between
-    if (cur.transitionIn || cur.speedRamp || prev.speedRamp || cur.reversedFrom || prev.reversedFrom || !sameSettings(prev, cur)) return null;
+    if (cur.transitionIn || cur.cutSound !== undefined || cur.speedRamp || prev.speedRamp || cur.reversedFrom || prev.reversedFrom || !sameSettings(prev, cur)) return null;
   }
   const merged: Clip = { ...run[0], end: run[run.length - 1].end };
   return [...clips.slice(0, indices[0]), merged, ...clips.slice(indices[indices.length - 1] + 1)];
@@ -339,7 +340,7 @@ export function resizeClipEdge(clips: Clip[], id: string, edge: "start" | "end",
 // transition) - same "one function, Partial<T> patch" shape as updateOverlay, but standalone
 // since Clip (unlike every overlay type) has no updatedAt for anything to read back, so it can't
 // reuse updateOverlay<T extends {id,updatedAt}> as-is.
-export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>): Clip[] {
+export function updateClip(clips: Clip[], id: string, patch: Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "cutSound" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>): Clip[] {
   return clips.map((c) => (c.id === id ? { ...c, ...patch } : c));
 }
 

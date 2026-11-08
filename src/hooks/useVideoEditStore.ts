@@ -5,7 +5,9 @@ import { hasShapeOrMask, layerMaskGreyPng, revealMaskMotion } from "../utils/lay
 import { compactTracks, exportFades, freeTrack, isTrackHidden, pipTrack, stackOrder } from "../utils/videoTracks";
 import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/audioFx";
 import { automationForExport, type GainPoint } from "../utils/audioAutomation";
-import { joinFades, NO_FADES } from "../utils/audioJoins";
+import { EDGE_FADE_SEC, joinFades, NO_FADES } from "../utils/audioJoins";
+import { DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundPieces, type CutSounds } from "../utils/cutSounds";
+import { builtinSfxFile } from "../utils/builtinSfx";
 import { cleanedTrackPath, isCleaned } from "../utils/audioTrackCleanup";
 import { isNeutralMaster, masterForExport, type MasterBus } from "../utils/masterBus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -219,7 +221,7 @@ type AudioOverlayContentPatch = Partial<Pick<AudioOverlay, "volume" | "fadeInSec
 // with its part, title, licence, beats and ducking already decided).
 export type NewAudioOverlayExtras = Partial<Pick<AudioOverlay, "trimStart" | "label" | "library" | "bpm" | "beats" | "fadeInSec" | "fadeOutSec" | "volume" | "duckUnderSpeech" | "duckLevel" | "recorded">>;
 type PipOverlayContentPatch = Partial<Pick<PipOverlay, "x" | "y" | "width" | "height" | "shape" | "cornerRadius" | "crop" | "volume" | "muted" | "blendMode" | "fx" | "opacity" | "fadeIn" | "fadeOut" | "chromaKey" | "mask" | "cutout">>;
-type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>;
+type ClipEffectsPatch = Partial<Pick<Clip, "colorFilter" | "grade" | "stabilize" | "speedRamp" | "kenBurns" | "transitionIn" | "cutSound" | "crop" | "flipHorizontal" | "speed" | "noiseReduction" | "audioCleanup" | "muted" | "fx">>;
 
 export interface UseVideoEditStoreResult {
   loading: boolean;
@@ -371,6 +373,12 @@ export interface UseVideoEditStoreResult {
   // per change; a dragged duration slider's run merges into one.
   edgeTransitions: EdgeTransitions;
   setEdgeTransition: (edge: TransitionEdge, transition: ClipTransitionIn | null) => void;
+  // The intro's / outro's cut sound: a sound id, null for none, undefined for the automatic one.
+  setEdgeSound: (edge: TransitionEdge, sound: string | null | undefined) => void;
+  // Sound on every cut (cutSounds.ts): null when off. `setCutSounds(patch)` switches it on (with
+  // the defaults) or changes it; `setCutSounds(null)` switches it off, keeping each cut's own pick.
+  cutSounds: CutSounds | null;
+  setCutSounds: (patch: Partial<CutSounds> | null) => void;
   pointerStyle: Partial<PointerStyle> | undefined;
   updatePointerStyle: (patch: Partial<PointerStyle>) => void;
   keystrokeStyle: Partial<KeystrokeStyle> | undefined;
@@ -831,6 +839,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     scenes: current.scenes ?? [],
     canvas: current.canvas ?? null,
     edgeTransitions: current.edgeTransitions,
+    cutSounds: current.cutSounds,
     ...patch,
   });
 
@@ -1722,6 +1731,29 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     },
     [pushCommand]
   );
+  const setEdgeSound = useCallback(
+    (edge: TransitionEdge, sound: string | null | undefined) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const sounds = { ...(current.edgeTransitions?.sounds ?? {}) };
+      if (sound === undefined) delete sounds[edge];
+      else sounds[edge] = sound;
+      const edgeTransitions: EdgeTransitions = { ...(current.edgeTransitions ?? {}) };
+      if (Object.keys(sounds).length) edgeTransitions.sounds = sounds;
+      else delete edgeTransitions.sounds;
+      pushCommand(snapshot(current, {}), snapshot(current, { edgeTransitions }), "edit-cut-sounds");
+    },
+    [pushCommand]
+  );
+  const setCutSounds = useCallback(
+    (patch: Partial<CutSounds> | null) => {
+      const current = stateRef.current;
+      if (!current) return;
+      const cutSounds = patch === null ? undefined : { ...DEFAULT_CUT_SOUNDS, ...(current.cutSounds ?? {}), on: true, ...patch };
+      pushCommand(snapshot(current, {}), snapshot(current, { cutSounds }), "edit-cut-sounds");
+    },
+    [pushCommand]
+  );
   const updatePointerStyle = useCallback(
     (patch: Partial<PointerStyle>) => {
       const current = stateRef.current;
@@ -2468,6 +2500,29 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           fx: fxForExport(o.fx),
           gain: automationForExport(o),
         }));
+      // Sound on every cut (cutSounds.ts): each cue as one more piece of audio, at the cut sounds'
+      // own volume - unless that channel is muted in the mixer.
+      if (current.cutSounds?.on && !current.cutSounds.muted && current.cutSounds.volume > 0) {
+        const total = totalOutputDuration(current.clips);
+        const pieces = await cutSoundPieces(cutSoundCues(current.clips, current.edgeTransitions, current.cutSounds), total, builtinSfxFile);
+        for (const piece of pieces) {
+          audioOverlays.push({
+            sourcePath: piece.sourcePath,
+            startTime: piece.startTime,
+            endTime: piece.endTime,
+            trimStart: piece.trimStart,
+            volume: current.cutSounds.volume,
+            // A sound cut short (at the video's edges) gets the click-proof edge fade.
+            fadeIn: piece.trimStart > 0 ? EDGE_FADE_SEC : 0,
+            fadeOut: EDGE_FADE_SEC,
+            fadeInCurve: "equalPower" as const,
+            fadeOutCurve: "equalPower" as const,
+            duck: undefined,
+            fx: null,
+            gain: null,
+          });
+        }
+      }
 
       // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
       // per-line PNGs - hundreds of timed lines, each re-drawn per word for emphasis, is exactly
@@ -2749,6 +2804,9 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     setScreenStyle,
     edgeTransitions: state?.edgeTransitions ?? NO_EDGE_TRANSITIONS,
     setEdgeTransition,
+    setEdgeSound,
+    cutSounds: state?.cutSounds?.on ? state.cutSounds : null,
+    setCutSounds,
     pointerStyle: state?.pointerStyle,
     updatePointerStyle,
     keystrokeStyle: state?.keystrokeStyle,

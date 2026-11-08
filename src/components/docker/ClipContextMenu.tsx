@@ -18,6 +18,7 @@ import {
   IoPlayCircleOutline,
   IoSparklesOutline,
   IoSwapHorizontalOutline,
+  IoVolumeHighOutline,
   IoTimeOutline,
   IoTrashOutline,
   IoCheckmark,
@@ -75,6 +76,9 @@ interface ClipContextMenuProps {
   // Sets every image clip on the timeline to one length.
   onSetAllImageLengths: (seconds: number) => void;
   onToggleMirror: () => void;
+  // Sound on every cut, for the whole video (cutSounds.ts).
+  cutSoundsOn: boolean;
+  onToggleCutSounds: () => void;
   onOpenEffects: () => void;
   onReveal: () => void;
   onDelete: () => void;
@@ -305,6 +309,11 @@ const ClipContextMenu: React.FC<ClipContextMenuProps> = (props) => {
       {submenuItem("motion", <IoScanOutline size={14} />, "Motion", motionLabel)}
       {submenuItem("color", <IoColorPaletteOutline size={14} />, "Color", colorLabel)}
       {isImage && submenuItem("length", <IoTimeOutline size={14} />, "Length", `${lengthSec.toFixed(1)}s`)}
+      <button type="button" onClick={act(props.onToggleCutSounds)} className={itemClass} title="A matching sound wherever the picture changes, for the whole video">
+        <IoVolumeHighOutline size={14} />
+        <span className="flex-1">Sound on every cut</span>
+        {props.cutSoundsOn && <IoCheckmark size={12} className="text-teal-400" />}
+      </button>
       <button type="button" onClick={act(props.onToggleMirror)} className={itemClass}>
         <MdFlip size={14} />
         <span className="flex-1">Mirror</span>
