@@ -574,12 +574,17 @@ mod tests {
     // Not a unit test (it downloads ~32 MB): the whole engine on THIS system - the pinned wheel is fetched
     // and unpacked, ONNX Runtime loads, and a short video is cut out frame by frame through ffmpeg. Run with
     // `cargo test --lib the_engine_ -- --ignored --nocapture`; needs ffmpeg on the PATH (or $FFMPEG_DIR).
+    // On a slow connection, put the wheel (as onnxruntime-1.24.4.whl) and the model in a folder and point
+    // $BRIEFCAST_ENGINE_TEST_DIR at it: whatever verifies there isn't downloaded again.
     #[test]
     #[ignore]
     fn the_engine_downloads_loads_and_cuts_out_a_video_on_this_system() {
         assert!(ENGINE_SUPPORTED, "this system has no engine");
-        let dir = std::env::temp_dir().join(format!("briefcast_engine_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let seeded = std::env::var_os("BRIEFCAST_ENGINE_TEST_DIR").map(PathBuf::from);
+        let dir = seeded.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("briefcast_engine_test_{}", std::process::id())));
+        if seeded.is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         std::fs::create_dir_all(&dir).unwrap();
         let cancel = AtomicBool::new(false);
         let started = std::time::Instant::now();
@@ -587,7 +592,9 @@ mod tests {
         ensure_engine_dlls(&dir, &cancel, "cancelled", &|_| {}).expect("the engine downloads and unpacks");
         assert!(engine_dlls_ready(&dir), "every library verifies against its pin");
         let model = dir.join(MODEL_ASSET.file_name);
-        download_asset(&MODEL_ASSET, &model, &cancel, "cancelled", &|_| {}).expect("the model downloads");
+        if !is_valid_install(&model, &MODEL_ASSET) {
+            download_asset(&MODEL_ASSET, &model, &cancel, "cancelled", &|_| {}).expect("the model downloads");
+        }
         println!("engine and model ready in {:.1}s", started.elapsed().as_secs_f64());
 
         let env = ort_environment(&dir).expect("ONNX Runtime loads");
@@ -615,7 +622,9 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
-        let _ = std::fs::remove_dir_all(&dir);
+        if seeded.is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
