@@ -527,22 +527,37 @@ Annotation, Files, and PDF Annotator:
 **Windows** is the best-tested platform: it has installers, and Briefcast bundles its own
 ffmpeg and the other tools it shells out to.
 
-**macOS and Linux** have installers too, from v0.1.5 (a universal .dmg; an .AppImage and a
-.deb), built by the release workflow - and they still build and run from source. CI builds and
-tests both on every push, and on Linux a real screen + microphone recording has been checked
-end to end (X11 capture with PulseAudio, Ubuntu 22.04); the macOS code has not yet been run on
-real hardware. On these platforms Briefcast uses the
-ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
-startup if the ffmpeg it finds is too old or missing an encoder. The speech engine (whisper.cpp,
-which does the captions, editing by transcript and filler-word removal) is built per system by
-`scripts/build-whisper-engine.sh` and bundled in those installers, as the RNNoise model for "Remove
-noise" is on every system; the speech model itself (~150 MB) downloads the first time it's used.
-The Linux engine has been run against a real recording; the macOS one is built by the release
-workflow but has not been run on real hardware. Not available there yet: the
-screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
-auto-zoom, the live preview while recording cameras only, USB phone transfer, and email
-through a desktop mail client. Linux screen capture needs X11 (or XWayland); under a pure
-Wayland session there is nothing to capture.
+**macOS and Linux** have installers too (a universal .dmg; an .AppImage and a .deb), built by the
+release workflow - and they still build and run from source. CI builds and tests both on every
+push. On Linux a real screen + microphone recording has been checked end to end (X11 capture with
+PulseAudio, Ubuntu 22.04), and so have the speech engine, the AI engine and the clipboard; **the
+macOS code has not been run on real hardware**. On these systems Briefcast uses the ffmpeg and
+libheif installed on the system rather than bundled copies (an app started from Finder doesn't see
+Homebrew's folders, so those are searched too), and tells you at startup if the ffmpeg is too old or
+missing an encoder.
+
+Parity with Windows, feature by feature:
+
+- **Works:** recording (screen, window, camera, mic; system sound through a PulseAudio monitor on
+  Linux, a virtual device such as BlackHole on a Mac), the editor, transitions, effects, photo videos,
+  exports, captions, editing by transcript and filler-word removal (whisper.cpp, built per system by
+  `scripts/build-whisper-engine.sh` and bundled; the ~150 MB speech model downloads on first use),
+  "Remove noise" (the RNNoise model is committed in `models/rnnoise`), sharing - links, the
+  clipboard as text and as files, the chat apps that are installed, email with the file attached
+  (Mail on a Mac, `xdg-email` on Linux) - companion files hidden in Finder / `.hidden`, the camera
+  bubble's border, and the phone's Wi-Fi transfer.
+- **On Linux (x86-64) and Apple Silicon Macs (macOS 14+):** background removal, face matching, the
+  AI voice and the live camera background, on one ONNX Runtime engine downloaded on first use - on
+  the CPU, so slower than Windows' DirectML. The version pinned here publishes no Intel Mac build.
+- **Linux only:** picking a colour from the screen (X11).
+- **Windows only, so far:** the editable pointer, click ripples, shortcut keys on screen and
+  auto-zoom at clicks (they hook the mouse and keyboard); the privacy blur; USB phone transfer; the
+  screenshot picker's overlay (the simpler capture is used elsewhere); the Windows share window;
+  and "Download as PDF" for documents - WebKit, the web engine there, doesn't draw CSS page-margin
+  boxes, which is what puts a document's headers, footers and page numbers on a printed page, so a
+  PDF made from it would silently leave them out (Word, Markdown and web-page export are complete).
+  Linux screen capture needs X11 (or XWayland); under a pure Wayland session there is nothing to
+  capture.
 
 ## Prerequisites
 
