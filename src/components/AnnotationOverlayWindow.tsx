@@ -69,9 +69,8 @@ interface Stroke extends AnnotationInk {
   baked?: BakedInk | null;
 }
 
-// A predicted pointer position further than this from the real one is a bad guess (a flick, a
-// sudden stop) and is ignored.
-const MAX_PREDICTION_PX = 48;
+// Slop distance to differentiate a stationary tap from a stroke.
+
 
 const STYLE_ICONS: Record<AnnotationStyle, React.ReactNode> = {
   pen: <IoPencil size={14} />,
@@ -95,9 +94,7 @@ const AnnotationOverlayWindow = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
-  // Where the pointer is about to be (PointerEvent.getPredictedEvents) - drawn as the live
-  // stroke's last stretch, never stored in it, so the ink's tip keeps up with the hand.
-  const predictedTailRef = useRef<AnnotationStrokePoint[]>([]);
+
   const rafRef = useRef<number | null>(null);
   const wakeTimerRef = useRef<number | null>(null);
 
@@ -263,8 +260,7 @@ const AnnotationOverlayWindow = () => {
     }
     const current = currentStrokeRef.current;
     if (current) {
-      const tail = predictedTailRef.current;
-      drawAnnotationInk(ctx, tail.length > 0 ? { ...current, points: current.points.concat(tail) } : current, 1);
+      drawAnnotationInk(ctx, current, 1);
     }
     if (fadingOut) requestRender();
     else if (Number.isFinite(nextFadeAt)) wakeTimerRef.current = window.setTimeout(requestRender, Math.max(0, nextFadeAt - now));
@@ -320,19 +316,10 @@ const AnnotationOverlayWindow = () => {
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    // Hovering counts too: the hand follows the cursor whether or not a stroke is in progress -
-    // drawn where the pointer is about to be rather than where it was, which is what makes it feel
-    // stuck to the cursor instead of chasing it a frame or two behind.
-    const predicted = (e.nativeEvent.getPredictedEvents?.() ?? []).filter(
-      (ev) => Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) <= MAX_PREDICTION_PX
-    );
-    const lead = predicted.length > 0 ? predicted[predicted.length - 1] : e;
-    pointerRef.current?.move(lead.clientX, lead.clientY);
+    // 1:1 real-time cursor tracking: exactly at (clientX, clientY) with 0 latency and 0 jitter.
+    pointerRef.current?.move(e.clientX, e.clientY);
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
-    predictedTailRef.current = e.shiftKey
-      ? []
-      : predicted.map((ev) => ({ x: ev.clientX, y: ev.clientY, pressure: ev.pressure > 0 ? ev.pressure : 0.5 }));
     const press = pressRef.current;
     if (press && !press.moved && Math.hypot(e.clientX - press.x, e.clientY - press.y) > TAP_SLOP_PX) press.moved = true;
 
@@ -352,14 +339,21 @@ const AnnotationOverlayWindow = () => {
       return;
     }
 
-    // Coalesced events: a stylus reports far more often than the screen refreshes.
+    // Coalesced events: gather smooth sub-frame stylus or mouse movements
     const coalesced = e.nativeEvent.getCoalescedEvents?.() ?? [];
-    for (const ev of coalesced.length > 0 ? coalesced : [e.nativeEvent]) {
-      stroke.points.push({
-        x: ev.clientX,
-        y: ev.clientY,
-        pressure: ev.pressure > 0 ? ev.pressure : 0.5,
-      });
+    const events = coalesced.length > 0 ? coalesced : [e.nativeEvent];
+    for (const ev of events) {
+      const last = stroke.points[stroke.points.length - 1];
+      const pressure = ev.pressure > 0 ? ev.pressure : 0.5;
+      if (!last) {
+        stroke.points.push({ x: ev.clientX, y: ev.clientY, pressure });
+      } else {
+        const dist = Math.hypot(ev.clientX - last.x, ev.clientY - last.y);
+        // Filter out redundant/duplicate micro-jitter (< 1.2px) so spline calculation remains buttery smooth
+        if (dist >= 1.2) {
+          stroke.points.push({ x: ev.clientX, y: ev.clientY, pressure });
+        }
+      }
     }
     requestRender();
   };
@@ -368,13 +362,25 @@ const AnnotationOverlayWindow = () => {
     pointerRef.current?.setPressed(false);
     const press = pressRef.current;
     pressRef.current = null;
-    predictedTailRef.current = [];
     setDrawing(false);
-    if (!currentStrokeRef.current) return;
+    const stroke = currentStrokeRef.current;
+    if (!stroke) return;
+
+    if (e) {
+      const last = stroke.points[stroke.points.length - 1];
+      if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) >= 0.5) {
+        stroke.points.push({
+          x: e.clientX,
+          y: e.clientY,
+          pressure: e.pressure > 0 ? e.pressure : 0.5,
+        });
+      }
+    }
+
     // A cancel (e.g. the OS taking the pointer) isn't a tap, so no ring.
     if (e?.type === 'pointerup' && press && !press.moved) pointerRef.current?.tap(press.x, press.y);
-    currentStrokeRef.current.finishedAt = performance.now();
-    strokesRef.current.push(currentStrokeRef.current);
+    stroke.finishedAt = performance.now();
+    strokesRef.current.push(stroke);
     currentStrokeRef.current = null;
     requestRender();
   };

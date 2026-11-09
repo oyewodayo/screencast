@@ -89,11 +89,10 @@ export interface AnnotationInk {
 // filled rather than stroked, which is what gives it a real marker/stylus feel instead of a
 // uniform-width polyline (same technique as PdfAnnotator's pen tool).
 //
-// Low streamline on purpose: streamline pulls each point back toward the one before it, and at 0.5
-// the ink's tip visibly trailed the pointer - drawing felt like dragging the line behind the pen.
-// The outline is kept per stroke and size, and only re-traced when its points change, so a stroke
-// already on screen costs nothing to trace again.
-const STREAMLINE = 0.15;
+// Balanced streamline (0.45) and smoothing (0.55) eliminate jagged mouse jitter and staircase steps
+// while keeping the stroke fluidly responsive under the hand pointer without lagging.
+// Caps ensure round ends on strokes and clean tap dots.
+const STREAMLINE = 0.45;
 const outlines = new WeakMap<AnnotationInk, Map<string, { points: AnnotationStrokePoint[]; count: number; path: Path2D }>>();
 
 const tracePath = (ink: AnnotationInk, size: number, thinning: number): Path2D => {
@@ -107,9 +106,11 @@ const tracePath = (ink: AnnotationInk, size: number, thinning: number): Path2D =
     {
       size,
       thinning,
-      smoothing: 0.5,
+      smoothing: 0.55,
       streamline: STREAMLINE,
       simulatePressure: pts.every((p) => p.pressure === 0.5),
+      start: { cap: true, taper: 0 },
+      end: { cap: true, taper: 0 },
     }
   );
   const path = new Path2D();

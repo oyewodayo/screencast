@@ -111,30 +111,28 @@ const AnnotationPointer = forwardRef<AnnotationPointerHandle, AnnotationPointerP
     setPressed: (pressed) => {
       const body = bodyRef.current;
       if (!body) return;
-      // Every press/release restarts its own short animation (cancelling whatever is still
-      // playing) rather than easing toward a resting value - a CSS transition would still be
-      // mid-way when the next tap lands, so five fast taps looked like one. The inline transform
-      // is the resting pose (held while drawing); the animation is the visible stab into it.
+      // Hotspot stays 100% pinned to (0,0) with transformOrigin: '0 0'.
+      // Squeeze subtly on the origin without translation so the fingertip never detaches or dances.
       body.getAnimations().forEach((a) => a.cancel());
       if (pressed) {
-        body.style.transform = 'translateY(-3px) scale(0.9)';
+        body.style.transform = 'scale(0.94)';
         body.animate(
           [
-            { transform: 'translateY(0) scale(1)' },
-            { transform: 'translateY(-6px) scale(0.78)', offset: 0.4 },
-            { transform: 'translateY(-3px) scale(0.9)' },
+            { transform: 'scale(1)' },
+            { transform: 'scale(0.90)', offset: 0.35 },
+            { transform: 'scale(0.94)' },
           ],
-          { duration: 110, easing: 'ease-out' }
+          { duration: 80, easing: 'ease-out' }
         );
       } else {
-        body.style.transform = 'translateY(0) scale(1)';
+        body.style.transform = 'scale(1)';
         body.animate(
           [
-            { transform: 'translateY(-3px) scale(0.9)' },
-            { transform: 'translateY(1px) scale(1.05)', offset: 0.5 },
-            { transform: 'translateY(0) scale(1)' },
+            { transform: 'scale(0.94)' },
+            { transform: 'scale(1.02)', offset: 0.5 },
+            { transform: 'scale(1)' },
           ],
-          { duration: 100, easing: 'ease-out' }
+          { duration: 80, easing: 'ease-out' }
         );
       }
     },
