@@ -4,7 +4,7 @@
 // label with its controls - refresh, new folder, hide empty folders, sort, list or grid, and
 // previous/next with audio's repeat/shuffle/autoplay - and the bulk action bar for ticked files.
 // Split out of Dashboard; the file list itself is SidebarFileTree.
-import React, { type Dispatch, type SetStateAction } from "react";
+import React, { memo, type Dispatch, type SetStateAction } from "react";
 import {
   IoBuildOutline,
   IoChevronBack,
@@ -124,10 +124,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
           type="button"
           title={label}
           onClick={() => selectFileCategory(category)}
-          className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
+          className={`flex flex-col items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] cursor-pointer select-none active:scale-95 transition-all duration-75 ${
             activeFileCategory === category
-              ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-              : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
+              ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 font-medium"
+              : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100/70 dark:hover:bg-neutral-800"
           }`}
         >
           {icon}
@@ -138,10 +138,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
         type="button"
         title="Trash"
         onClick={handleOpenTrash}
-        className={`flex flex-col items-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
+        className={`flex flex-col items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] cursor-pointer select-none active:scale-95 transition-all duration-75 ${
           activeFileCategory === "trash"
-            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800"
+            ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 font-medium"
+            : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100/70 dark:hover:bg-neutral-800"
         }`}
       >
         <IoTrashOutline size={18} />
@@ -200,13 +200,13 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
         tabs, does not scroll with the file list beneath it. */}
     <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-neutral-700 shrink-0">
       <h3 className="font-semibold text-gray-700 dark:text-neutral-300 text-sm truncate">{sidebarHeaderLabel}</h3>
-      <div className="flex items-center gap-0.5 shrink-0">
+      <div className="flex items-center gap-1 shrink-0">
         <button
           type="button"
           title="Refresh files"
           onClick={handleRefreshFiles}
           disabled={isRefreshingFiles}
-          className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 disabled:opacity-50"
+          className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75 disabled:opacity-50 disabled:pointer-events-none"
         >
           <IoRefresh size={15} className={isRefreshingFiles ? "animate-spin" : ""} />
         </button>
@@ -215,7 +215,7 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
             type="button"
             title="Get files from phone"
             onClick={openPhoneReceive}
-            className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+            className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75"
           >
             <IoPhonePortraitOutline size={15} />
           </button>
@@ -225,7 +225,7 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
             type="button"
             title="New folder"
             onClick={() => startCreateFolder("")}
-            className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+            className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75"
           >
             <MdCreateNewFolder size={16} />
           </button>
@@ -237,7 +237,7 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
             onClick={() =>
               setFileSortMode((prev) => (prev === "name-asc" ? "name-desc" : prev === "name-desc" ? "type" : "name-asc"))
             }
-            className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+            className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75"
           >
             <IoSwapVerticalOutline size={15} />
           </button>
@@ -251,10 +251,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
               setSidebarViewMode(next);
               saveSidebarViewMode(next);
             }}
-            className={`p-1 rounded transition-colors ${
+            className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 ${
               isGridView
-                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
             }`}
           >
             {isGridView ? <IoListOutline size={15} /> : <IoGridOutline size={15} />}
@@ -265,10 +265,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
             type="button"
             title={hideEmptyFolders ? `Show folders with no ${activeFileCategory} files` : `Hide folders with no ${activeFileCategory} files`}
             onClick={() => setHideEmptyFolders((prev) => !prev)}
-            className={`p-1 rounded transition-colors ${
+            className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 ${
               hideEmptyFolders
-                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
             }`}
           >
             {hideEmptyFolders ? <IoEyeOffOutline size={15} /> : <IoEyeOutline size={15} />}
@@ -290,10 +290,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
                 : "Show tools for this file"
             }
             onClick={() => setDockerMode((prev) => (prev === "record" ? "file-tools" : "record"))}
-            className={`p-1 rounded transition-colors disabled:opacity-30 disabled:pointer-events-none ${
+            className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 disabled:opacity-30 disabled:pointer-events-none ${
               dockerMode === "file-tools"
-                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10"
-                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+                ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
             }`}
           >
             <IoBuildOutline size={15} />
@@ -307,10 +307,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
                   type="button"
                   title={`Repeat: ${audioRepeatMode === "off" ? "off" : audioRepeatMode === "all" ? "all" : "one"}`}
                   onClick={cycleAudioRepeatMode}
-                  className={`relative p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                  className={`relative w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 ${
                     audioRepeatMode !== "off"
-                      ? "text-blue-600 dark:text-blue-400"
-                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                      ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
                   }`}
                 >
                   <IoRepeatOutline size={14} />
@@ -324,10 +324,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
                   type="button"
                   title={`Shuffle: ${audioShuffle ? "on" : "off"}`}
                   onClick={() => setAudioShuffle((prev) => !prev)}
-                  className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                  className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 ${
                     audioShuffle
-                      ? "text-blue-600 dark:text-blue-400"
-                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                      ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
                   }`}
                 >
                   <IoShuffleOutline size={14} />
@@ -336,10 +336,10 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
                   type="button"
                   title={`Autoplay next track: ${audioAutoplayNext ? "on" : "off"}`}
                   onClick={() => setAudioAutoplayNext((prev) => !prev)}
-                  className={`p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 ${
+                  className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none active:scale-90 transition-all duration-75 ${
                     audioAutoplayNext
-                      ? "text-blue-600 dark:text-blue-400"
-                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400"
+                      ? "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 active:bg-blue-100"
+                      : "text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:bg-gray-200 dark:active:bg-neutral-700"
                   }`}
                 >
                   <IoPlayForwardOutline size={14} />
@@ -351,7 +351,7 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
               type="button"
               title="Previous (←)"
               onClick={() => (activeFileCategory === "audio" ? navigateAudio(-1) : navigateImage(-1))}
-              className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+              className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75"
             >
               <IoChevronBack size={14} />
             </button>
@@ -359,7 +359,7 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
               type="button"
               title="Next (→)"
               onClick={() => (activeFileCategory === "audio" ? navigateAudio(1) : navigateImage(1))}
-              className="p-1 rounded text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800"
+              className="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer select-none text-gray-500 dark:text-neutral-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-neutral-800 active:scale-90 active:bg-gray-200 dark:active:bg-neutral-700 transition-all duration-75"
             >
               <IoChevronForward size={14} />
             </button>
@@ -429,4 +429,4 @@ const SidebarHeader: React.FC<SidebarHeaderProps> = ({
   </>
 );
 
-export default SidebarHeader;
+export default memo(SidebarHeader);

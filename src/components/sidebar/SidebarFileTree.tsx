@@ -134,6 +134,7 @@ export interface SidebarFileTreeProps {
   toggleFileSelected: (path: string) => void;
   setAddMenuFor: Dispatch<SetStateAction<string | null>>;
   setConversionFile: Dispatch<SetStateAction<{ path: string; name: string } | null>>;
+  setCompressionFile: Dispatch<SetStateAction<{ path: string; name: string } | null>>;
   setCreatingFolderIn: Dispatch<SetStateAction<string | null>>;
   setDocsScreen: Dispatch<SetStateAction<DocsScreen | null>>;
   setDraggingFiles: Dispatch<SetStateAction<FileEntry[] | null>>;
@@ -220,6 +221,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setCreatingFolderIn,
     setDocsScreen,
     setDraggingFiles,
@@ -280,6 +282,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setDocsScreen,
     setDraggingFiles,
     setDragOverFolder,

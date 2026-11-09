@@ -2357,9 +2357,24 @@ async fn finish_assembly(
         let mut captured = Vec::new();
         for (path, timing) in &video_parts {
             match timing {
-                Some(t) if t.lock().unwrap_or_else(|p| p.into_inner()).frames() > 0 => captured.push((path.clone(), t.clone())),
+                Some(t) => {
+                    let guard = t.lock().unwrap_or_else(|p| p.into_inner());
+                    if guard.has_frames() {
+                        drop(guard);
+                        captured.push((path.clone(), t.clone()));
+                    }
+                }
                 _ => {}
             }
+        }
+        if let Some(probe) = ffprobe_path.as_deref() {
+            captured.retain(|(path, _)| {
+                let valid = assembly::probe_video_params(probe, path).is_some();
+                if !valid {
+                    warn!("Discarding unreadable/corrupted capture part: {:?}", path);
+                }
+                valid
+            });
         }
         let (video_input, segments) = match captured.as_slice() {
             [] => None,
@@ -2515,7 +2530,7 @@ fn join_video_parts(
     let matching = params.iter().all(|p| p.is_some() && *p == params[0]);
     let mut paths: Vec<PathBuf> = parts.iter().map(|(p, _)| p.clone()).collect();
     if !matching {
-        let size = params[0].as_deref().and_then(assembly::probed_size)?;
+        let size = params.iter().flatten().find_map(|p| assembly::probed_size(p))?;
         warn!("The restarted capture's parts differ ({:?}), re-encoding them to {:?} to join them", params, size);
         for path in paths.iter_mut() {
             let normalized = path.with_extension("norm.mkv");
@@ -2583,6 +2598,7 @@ async fn discard_start(
     click_capture: &Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
     input_capture: &Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
 ) {
+    crate::commands::camera_effects::release_after_recording();
     if let Some(capture) = input_capture.lock().await.take() {
         let _ = crate::services::responsiveness::blocking(move || capture.stop()).await;
     }
@@ -2801,6 +2817,9 @@ async fn stop_recording_inner(
 
     info!("Recording stopped");
 
+    // The live camera background (if this recording used it) has nothing left to feed.
+    crate::commands::camera_effects::release_after_recording();
+
     // Drop the last preview frame now that there is nothing live to preview. The reader thread
     // has already ended with ffmpeg's stdout closing; this just stops the final frame lingering
     // into whatever recording comes next.
@@ -2997,6 +3016,9 @@ async fn stop_recording_inner(
     if let Err(e) = create_or_replace_rec_completed_modal(app_handle.clone(), &modal_path, status, error).await {
         warn!("Recording finished, but the completion popup could not be updated: {}", e);
     }
+
+    // Ensure camera effects are released even if an early return occurred inside finished
+    crate::commands::camera_effects::release_after_recording();
 
     finished
 }

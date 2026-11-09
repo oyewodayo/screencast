@@ -49,6 +49,7 @@ interface VideoFolderGalleryProps {
   // Opens the file Info panel (FileInfoModal, owned by Dashboard.tsx).
   onShowInfo: (file: GalleryFile) => void;
   onConvertFile: (file: GalleryFile) => void;
+  onCompressFile?: (file: GalleryFile) => void;
   // Rename is inline (matches the sidebar's own inline rename), so its state is lifted to
   // Dashboard.tsx - one rename in flight at a time, shared with the sidebar list, rather than a
   // second parallel rename state living only here.
@@ -85,6 +86,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
   onDeleteFile,
   onShowInfo,
   onConvertFile,
+  onCompressFile,
   renamingFile,
   onStartRename,
   onCommitRename,
@@ -437,6 +439,16 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
             }}
           >
             Convert
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onCompressFile?.(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Compress
           </button>
           {!isVideoProjectPath(contextMenu.file.path) && (
             <button

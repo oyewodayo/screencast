@@ -78,6 +78,7 @@ interface Props {
   activeFileIsPlaying: boolean;
   onTogglePlayActiveFile: () => void;
   onConvertFile: (file: DockerFile) => void;
+  onCompressFile?: (file: DockerFile) => void;
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." for the open file (MoveCopyMenu.tsx).
@@ -251,6 +252,7 @@ const BottomDocker = ({
   activeFileIsPlaying,
   onTogglePlayActiveFile,
   onConvertFile,
+  onCompressFile,
   onRenameFile,
   onDeleteFile,
   fileTransfer,
@@ -718,6 +720,7 @@ const BottomDocker = ({
             isPlaying={activeFileIsPlaying}
             onTogglePlay={onTogglePlayActiveFile}
             onConvert={onConvertFile}
+            onCompress={onCompressFile}
             onRename={onRenameFile}
             onDelete={onDeleteFile}
             fileTransfer={fileTransfer}

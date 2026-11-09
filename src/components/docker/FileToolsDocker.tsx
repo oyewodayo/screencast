@@ -12,11 +12,12 @@ import {
   IoCheckmark,
   IoFolderOutline,
   IoPhonePortraitOutline,
+  IoContractOutline,
 } from "react-icons/io5";
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import MoveCopyMenu, { FileTransferOptions } from "./MoveCopyMenu";
 import type { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
-import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
+import { getFileCategory, isConvertibleCategory, isCompressibleCategory } from "../../utils/fileCategory";
 import { FILE_TOOLS_COPY } from "./fileToolsConfig";
 import VideoTimelineDocker from "./VideoTimelineDocker";
 import { UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
@@ -61,6 +62,7 @@ interface FileToolsDockerProps {
   isPlaying: boolean;
   onTogglePlay: () => void;
   onConvert: (file: DockerFile) => void;
+  onCompress?: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." (MoveCopyMenu.tsx) - absent hides it.
@@ -145,6 +147,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
   isPlaying,
   onTogglePlay,
   onConvert,
+  onCompress,
   onRename,
   onDelete,
   fileTransfer,
@@ -201,6 +204,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
         isPlaying={isPlaying}
         onTogglePlay={onTogglePlay}
         onConvert={onConvert}
+        onCompress={onCompress}
         onRename={onRename}
         onDelete={onDelete}
         fileTransfer={fileTransfer}
@@ -245,7 +249,7 @@ const FileToolsDocker: React.FC<FileToolsDockerProps> = ({
     );
   }
 
-  return <FileToolsDockerGeneric file={file} category={category} copy={copy} onConvert={onConvert} onRename={onRename} onDelete={onDelete} fileTransfer={fileTransfer} />;
+  return <FileToolsDockerGeneric file={file} category={category} copy={copy} onConvert={onConvert} onCompress={onCompress} onRename={onRename} onDelete={onDelete} fileTransfer={fileTransfer} />;
 };
 
 // The original generic panel (info + rename/convert/reveal/delete), still used for audio/image/
@@ -257,11 +261,12 @@ const FileToolsDockerGeneric: React.FC<{
   category: ReturnType<typeof getFileCategory>;
   copy: (typeof FILE_TOOLS_COPY)[keyof typeof FILE_TOOLS_COPY] | null;
   onConvert: (file: DockerFile) => void;
+  onCompress?: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." (MoveCopyMenu.tsx) - absent hides it.
   fileTransfer?: FileTransferOptions;
-}> = ({ file, category, copy, onConvert, onRename, onDelete, fileTransfer }) => {
+}> = ({ file, category, copy, onConvert, onCompress, onRename, onDelete, fileTransfer }) => {
   const [info, setInfo] = useState<FileInfo>({});
   const [transferAnchor, setTransferAnchor] = useState<PopoverAnchor | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
@@ -328,7 +333,7 @@ const FileToolsDockerGeneric: React.FC<{
     <div className="docker-panel w-full flex flex-wrap items-end justify-between gap-4 overflow-auto">
       <div className="docker-fields-row flex flex-wrap items-end gap-3">
         <div>
-          <div className="docker-field-label p-1 text-sm">Rename</div>
+          <div className="docker-field-label px-0.5 pb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400">Rename</div>
           <div className="flex items-center gap-1">
             <input
               type="text"
@@ -337,23 +342,23 @@ const FileToolsDockerGeneric: React.FC<{
               onKeyDown={(e) => {
                 if (e.key === "Enter") commitRename();
               }}
-              className="p-2.5 rounded text-sm bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700"
+              className="px-2.5 py-1 rounded text-xs bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 border border-neutral-200 dark:border-neutral-700 h-[32px] focus:outline-none focus:border-blue-400"
             />
             <button
               type="button"
               onClick={commitRename}
               disabled={isRenaming || !trimmedRenameValue || trimmedRenameValue === baseName(file.name)}
               title="Save name"
-              className="p-2.5 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none"
+              className="w-[32px] h-[32px] flex items-center justify-center rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none active:scale-95 transition-all shadow-sm"
             >
-              <IoCheckmark />
+              <IoCheckmark size={14} />
             </button>
           </div>
         </div>
 
         <div>
-          <div className="docker-field-label p-1 text-sm">Info</div>
-          <div className="flex items-center gap-3 p-2.5 rounded-md text-xs bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-700 min-h-[42px]">
+          <div className="docker-field-label px-0.5 pb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400">Info</div>
+          <div className="flex items-center gap-3 px-2.5 py-1 rounded-md text-xs bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-700 h-[32px]">
             {category === "pdf" ? (
               <span className="text-neutral-400 dark:text-neutral-500 italic">No file info for PDFs</span>
             ) : loadingInfo ? (
@@ -362,19 +367,19 @@ const FileToolsDockerGeneric: React.FC<{
               <>
                 {info.duration && (
                   <span className="flex items-center gap-1">
-                    <IoTimeOutline />
+                    <IoTimeOutline size={13} />
                     {info.duration}
                   </span>
                 )}
                 {info.resolution && (
                   <span className="flex items-center gap-1">
-                    <IoResizeOutline />
+                    <IoResizeOutline size={13} />
                     {info.resolution}
                   </span>
                 )}
                 {info.size && (
                   <span className="flex items-center gap-1">
-                    <IoServerOutline />
+                    <IoServerOutline size={13} />
                     {info.size}
                   </span>
                 )}
@@ -387,14 +392,23 @@ const FileToolsDockerGeneric: React.FC<{
       </div>
 
       <div className="flex flex-col items-end gap-2">
-        <div className="docker-actions-row flex items-end gap-2">
+        <div className="docker-actions-row flex items-end gap-1.5">
           {isConvertibleCategory(category) && (
             <button
               type="button"
               onClick={() => onConvert(file)}
-              className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700 active:scale-95 transition-all shadow-sm"
             >
-              <IoSwapHorizontalOutline /> Convert
+              <IoSwapHorizontalOutline size={14} /> Convert
+            </button>
+          )}
+          {isCompressibleCategory(category) && onCompress && (
+            <button
+              type="button"
+              onClick={() => onCompress(file)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700 active:scale-95 transition-all shadow-sm"
+            >
+              <IoContractOutline size={14} /> Compress
             </button>
           )}
           {fileTransfer && (
@@ -404,32 +418,32 @@ const FileToolsDockerGeneric: React.FC<{
                 const rect = e.currentTarget.getBoundingClientRect();
                 setTransferAnchor({ left: rect.left, top: rect.bottom + 4 });
               }}
-              className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700 active:scale-95 transition-all shadow-sm"
             >
-              <IoFolderOutline /> Move / Copy
+              <IoFolderOutline size={14} /> Move / Copy
             </button>
           )}
           {fileTransfer && transferAnchor && <MoveCopyMenu files={[file]} options={fileTransfer} anchor={transferAnchor} onClose={() => setTransferAnchor(null)} />}
           <button
             type="button"
             onClick={() => openPhoneTransfer([file])}
-            className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700 active:scale-95 transition-all shadow-sm"
           >
-            <IoPhonePortraitOutline /> Transfer
+            <IoPhonePortraitOutline size={14} /> Transfer
           </button>
           <button
             type="button"
             onClick={handleShowInFolder}
-            className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700 active:scale-95 transition-all shadow-sm"
           >
-            <IoFolderOpenOutline /> Show in folder
+            <IoFolderOpenOutline size={14} /> Show in folder
           </button>
           <button
             type="button"
             onClick={() => onDelete(file)}
-            className="flex items-center gap-1.5 p-2.5 rounded-md text-sm border border-red-200 dark:border-red-500/30 bg-white dark:bg-neutral-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border border-red-200 dark:border-red-500/30 bg-white dark:bg-neutral-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 active:scale-95 transition-all shadow-sm"
           >
-            <IoTrashOutline /> Delete
+            <IoTrashOutline size={14} /> Delete
           </button>
         </div>
         {copy && <p className="text-xs text-neutral-400 dark:text-neutral-500 max-w-xs text-right">{copy.blurb}</p>}

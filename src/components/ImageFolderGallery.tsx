@@ -49,6 +49,7 @@ interface ImageFolderGalleryProps {
   // Opens the file Info panel (FileInfoModal, owned by Dashboard.tsx).
   onShowInfo: (file: GalleryFile) => void;
   onConvertFile: (file: GalleryFile) => void;
+  onCompressFile?: (file: GalleryFile) => void;
   // Rename is inline (matches the sidebar's own inline rename), so its state is lifted to
   // Dashboard.tsx - one rename in flight at a time, shared with the sidebar list, rather than a
   // second parallel rename state living only here.
@@ -84,6 +85,7 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
   onDeleteFile,
   onShowInfo,
   onConvertFile,
+  onCompressFile,
   renamingFile,
   onStartRename,
   onCommitRename,
@@ -469,6 +471,16 @@ const ImageFolderGallery: React.FC<ImageFolderGalleryProps> = ({
             }}
           >
             Convert
+          </button>
+          <button
+            type="button"
+            className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => {
+              onCompressFile?.(contextMenu.file);
+              setContextMenu(null);
+            }}
+          >
+            Compress
           </button>
           {/* Opens the shared Move/Copy menu (MoveCopyMenu.tsx) - for the whole selection when
               this tile is part of one, the same rule as the sidebar's own file menu. */}

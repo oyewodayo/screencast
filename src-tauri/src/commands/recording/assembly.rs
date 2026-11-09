@@ -80,6 +80,10 @@ impl FrameTiming {
         self.frames
     }
 
+    pub(crate) fn has_frames(&self) -> bool {
+        self.frames > 0 && self.offset_hns.is_some() && self.first_pts.is_some() && self.last_pts.is_some()
+    }
+
     fn other_line(&mut self, line: String) {
         if self.tail.len() >= 40 {
             self.tail.pop_front();

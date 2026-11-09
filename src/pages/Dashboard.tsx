@@ -61,6 +61,7 @@ import AudioOnlyStage from "../components/video/AudioOnlyStage";
 import ClipCropOverlay from "../components/video/ClipCropOverlay";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import ConversionDialog from "../components/ConversionDialog";
+import CompressionDialog from "../components/CompressionDialog";
 import BulkConversionDialog, { BulkConversionSummary } from "../components/BulkConversionDialog";
 import PdfAnnotator from "../components/PdfAnnotator";
 import ImageEditor from "../components/ImageEditor";
@@ -922,6 +923,7 @@ const Dashboard = () => {
     setIsCroppingClip(false);
   }, [selectedFile?.path]);
 const [conversionFile, setConversionFile] = useState<{path: string; name: string} | null>(null);
+const [compressionFile, setCompressionFile] = useState<{path: string; name: string} | null>(null);
 // File whose "Info" panel (FileInfoModal) is open, from the sidebar file menu.
 const [infoFile, setInfoFile] = useState<{path: string; name: string} | null>(null);
 // Same panel for a Trash row, which is addressed by its trashed name rather than a live path.
@@ -4778,7 +4780,11 @@ const setScreen = () => {
     setSelectedFolder(null);
     // Mid-edit these tabs only switch which files the sidebar lists - reopening the
     // category's last file would replace the editor with it.
-    if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") void restoreLastOpenedForCategory(category);
+    if (!editingVideoRef.current && videoEditorScreen?.mode !== "editing") {
+      setTimeout(() => {
+        void restoreLastOpenedForCategory(category);
+      }, 0);
+    }
   };
   const railGroups = [
     ...(showToolsSidebar
@@ -4883,6 +4889,7 @@ const setScreen = () => {
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setCreatingFolderIn,
     setDocsScreen,
     setDraggingFiles,
@@ -5200,6 +5207,37 @@ const setScreen = () => {
                   setVideoEditorScreen((prev) => (prev && getFileCategory(newFileName) === "video" ? { mode: "editing" } : null));
                 } catch (error) {
                   console.error('Error loading converted file:', error);
+                }
+              }}
+            />
+          )}
+
+          {/* Compression Dialog */}
+          {compressionFile && (
+            <CompressionDialog
+              filePath={compressionFile.path}
+              fileName={compressionFile.name}
+              onClose={() => setCompressionFile(null)}
+              onCompressed={async (newPath, newFileName) => {
+                setCompressionFile(null);
+                await handleDirectoryFiles();
+                try {
+                  const absolutePath = await invoke<string>("convert_file_path_to_url", { 
+                    filepath: newPath 
+                  });
+                  const fileUrl = convertFileSrc(absolutePath);
+                  
+                  setSelectedFile({
+                    path: fileUrl,
+                    name: newFileName,
+                    sourcePath: newPath
+                  });
+                  setBoardScreen(null);
+                  setDocsScreen(null);
+                  setWhiteboardScreen(null);
+                  setVideoEditorScreen((prev) => (prev && getFileCategory(newFileName) === "video" ? { mode: "editing" } : null));
+                } catch (error) {
+                  console.error('Error loading compressed file:', error);
                 }
               }}
             />
@@ -5713,6 +5751,7 @@ const setScreen = () => {
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
+              onCompressFile={(file) => setCompressionFile(file)}
               renamingFile={renameInGallery ? renamingFile : null}
               onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
@@ -5735,6 +5774,7 @@ const setScreen = () => {
               onDeleteFile={handleDeleteFile}
               onShowInfo={(file) => setInfoFile(file)}
               onConvertFile={(file) => setConversionFile(file)}
+              onCompressFile={(file) => setCompressionFile(file)}
               renamingFile={renameInGallery ? renamingFile : null}
               onStartRename={(file) => startRename(file, true)}
               onCommitRename={commitRename}
@@ -5946,6 +5986,7 @@ const setScreen = () => {
         activeFileIsPlaying={playerIsPlaying}
         onTogglePlayActiveFile={() => videoPlayerRef.current?.togglePlay()}
         onConvertFile={(file) => setConversionFile(file)}
+        onCompressFile={(file) => setCompressionFile(file)}
         onRenameFile={renameFile}
         onDeleteFile={handleDeleteFile}
         fileTransfer={fileTransferOptions}

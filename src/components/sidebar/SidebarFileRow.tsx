@@ -27,14 +27,15 @@ import { MdOutlineDescription } from "react-icons/md";
 import SidebarFileIcon from "../SidebarFileIcon";
 import InlineRenameInput from "../InlineRenameInput";
 import { FileNameText } from "../SidebarResize";
-import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
+import { getFileCategory, isConvertibleCategory, isCompressibleCategory } from "../../utils/fileCategory";
+import { IoContractOutline } from "react-icons/io5";
 import { isVideoProjectPath } from "../../utils/videoEditTypes";
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import type { DocSummary } from "../../utils/docTypes";
 import type { FileEntry } from "../../utils/libraryEntries";
 import type { SidebarFileTreeProps } from "./SidebarFileTree";
 
-export type SidebarRowActions = Pick<SidebarFileTreeProps, "addMediaToVideo" | "cancelRename" | "categoryIcon" | "categoryIconColorClassName" | "commitRename" | "filesToActOn" | "handleAddFilesToBoard" | "handleCopyFileImage" | "handleCopyFilePath" | "handleDeleteFile" | "handleLinkNotes" | "handleSetThumbnail" | "handleSidebarFilePointerDown" | "handleSidebarFilePointerMove" | "handleTogglePin" | "refreshDocsIndex" | "resolveImageThumbnailUrl" | "resolveVideoThumbnailUrl" | "startRename" | "toggleFileSelected" | "setAddMenuFor" | "setConversionFile" | "setDocsScreen" | "setDraggingFiles" | "setDragOverFolder" | "setError" | "setInfoFile" | "setLinkDocsMenuOpenFor" | "setOpenMenu" | "setSelectedFile" | "setTransferMenu"> & {
+export type SidebarRowActions = Pick<SidebarFileTreeProps, "addMediaToVideo" | "cancelRename" | "categoryIcon" | "categoryIconColorClassName" | "commitRename" | "filesToActOn" | "handleAddFilesToBoard" | "handleCopyFileImage" | "handleCopyFilePath" | "handleDeleteFile" | "handleLinkNotes" | "handleSetThumbnail" | "handleSidebarFilePointerDown" | "handleSidebarFilePointerMove" | "handleTogglePin" | "refreshDocsIndex" | "resolveImageThumbnailUrl" | "resolveVideoThumbnailUrl" | "startRename" | "toggleFileSelected" | "setAddMenuFor" | "setConversionFile" | "setCompressionFile" | "setDocsScreen" | "setDraggingFiles" | "setDragOverFolder" | "setError" | "setInfoFile" | "setLinkDocsMenuOpenFor" | "setOpenMenu" | "setSelectedFile" | "setTransferMenu"> & {
   // The tree's tap: lights the row at once, opens the file after that's painted.
   tapFile: (file: FileEntry) => (e: React.PointerEvent) => void;
 };
@@ -86,6 +87,7 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setDocsScreen,
     setDraggingFiles,
     setDragOverFolder,
@@ -413,6 +415,19 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
                   >
                   <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                   <span className="flex-1 text-left">Convert</span>
+                </button>
+               )}
+               {isCompressibleCategory(getFileCategory(file.name)) && (
+                 <button
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setCompressionFile(file);
+                      setOpenMenu(null);
+                    }}
+                  >
+                  <IoContractOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                  <span className="flex-1 text-left">Compress</span>
                 </button>
                )}
 

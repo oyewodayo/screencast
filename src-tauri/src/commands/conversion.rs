@@ -187,7 +187,7 @@ fn next_version_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
     dir.join(format!("{} - v{}.{}", name, highest + 1, ext))
 }
 
-fn unique_output_path(path: PathBuf) -> PathBuf {
+pub(crate) fn unique_output_path(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
     }
@@ -219,13 +219,13 @@ fn unique_output_path(path: PathBuf) -> PathBuf {
 // path (empty pre_args); export_trimmed_video's overlay PNGs are the one case that needs
 // `-loop 1 -t <duration>` ahead of theirs, to turn a single still frame into a looped stream long
 // enough to composite across the whole output - see its own comment for why.
-struct InputSpec {
+pub(crate) struct InputSpec {
     path: String,
     pre_args: Vec<String>,
 }
 
 impl InputSpec {
-    fn plain(path: String) -> Self {
+    pub(crate) fn plain(path: String) -> Self {
         Self {
             path,
             pre_args: Vec::new(),
@@ -235,7 +235,7 @@ impl InputSpec {
     // The file that has to be on disk for this input to open. An image-sequence input (an
     // animated overlay's frames - write_temp_overlay_sequence) is a printf pattern, not a file:
     // it's there when its first frame is.
-    fn existing_path(&self) -> PathBuf {
+    pub(crate) fn existing_path(&self) -> PathBuf {
         if self.pre_args.iter().any(|a| a == "-start_number") {
             PathBuf::from(self.path.replace("%06d", "000000"))
         } else {
@@ -253,7 +253,7 @@ impl InputSpec {
 // itself, for a multi-input export it's the output file's own base path, since there's no one
 // "the input" to name it after and the frontend already keys its progress listener off whatever
 // it originally requested the export under.
-async fn run_conversion(
+pub(crate) async fn run_conversion(
     app_handle: &AppHandle,
     window: &Window,
     state: &ConversionState,
@@ -263,6 +263,32 @@ async fn run_conversion(
     codec_args: &[&str],
 ) -> Result<String, String> {
     run_conversion_timed(app_handle, window, state, inputs, progress_key, output, codec_args, None).await
+}
+
+pub(crate) async fn run_conversion_low_priority(
+    app_handle: &AppHandle,
+    window: &Window,
+    state: &ConversionState,
+    inputs: &[InputSpec],
+    progress_key: &str,
+    output: PathBuf,
+    codec_args: &[&str],
+) -> Result<String, String> {
+    run_conversion_with(
+        app_handle,
+        window,
+        state,
+        inputs,
+        progress_key,
+        output,
+        codec_args,
+        None,
+        &RunExtras {
+            low_priority: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 // The same, with the output's length known up front (an export of cuts from a long recording):
@@ -1180,7 +1206,7 @@ pub async fn convert_image(
 // already uses to reach jpeg/webp/bmp. ffmpeg is perfectly reliable at that second step; the only
 // thing it couldn't be trusted with was reading the HEIC file in the first place.
 #[cfg(windows)]
-async fn convert_heic_windows(
+pub(crate) async fn convert_heic_windows(
     app_handle: &AppHandle,
     window: &Window,
     state: &ConversionState,
@@ -1323,7 +1349,7 @@ async fn convert_heic_windows(
 // hand off to the normal ffmpeg image2 pipeline unless PNG is what was actually asked for), just a
 // single tier since there's no OS-built-in HEIC decoder to try before falling back to libheif here.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn convert_heic_unix(
+pub(crate) async fn convert_heic_unix(
     app_handle: &AppHandle,
     window: &Window,
     state: &ConversionState,

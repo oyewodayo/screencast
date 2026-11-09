@@ -23,6 +23,7 @@ pub(crate) mod commands {
     pub mod audio_tracks;
     pub mod background_removal;
     pub mod camera_effects;
+    pub mod compression;
     pub mod conversion;
     pub mod derived_images;
     pub mod embedded_scan;

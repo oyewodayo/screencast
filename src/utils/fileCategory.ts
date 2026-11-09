@@ -41,6 +41,14 @@ export const CONVERTIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio"
 export const isConvertibleCategory = (category: FileCategory | null): category is "video" | "audio" | "image" =>
   category !== null && (CONVERTIBLE_CATEGORIES as readonly FileCategory[]).includes(category);
 
+// All file categories in Briefcast can be compressed:
+// - Video, Audio, and Image: smart media compression via ffmpeg & image codecs
+// - PDF and Document: efficient ZIP deflation compression
+export const COMPRESSIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio", "image", "pdf", "document"];
+
+export const isCompressibleCategory = (category: FileCategory | null): category is FileCategory =>
+  category !== null && (COMPRESSIBLE_CATEGORIES as readonly FileCategory[]).includes(category);
+
 // Video extensions that are real media files - everything in the video category except Video
 // Editor projects (.briefvideo), which only the editor itself can open. What a "pick a video to
 // use as a clip/PiP source" dialog should offer.

@@ -49,6 +49,7 @@ import {
   IoDownloadOutline,
   IoDocumentTextOutline,
   IoPhonePortraitOutline,
+  IoContractOutline,
 } from "react-icons/io5";
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import { DockerFile } from "./FileToolsDocker";
@@ -840,6 +841,7 @@ interface VideoTimelineDockerProps {
   isPlaying: boolean;
   onTogglePlay: () => void;
   onConvert: (file: DockerFile) => void;
+  onCompress?: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." in the "..." menu (MoveCopyMenu.tsx) - absent hides it.
@@ -966,6 +968,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   isPlaying,
   onTogglePlay,
   onConvert,
+  onCompress,
   onRename,
   onDelete,
   fileTransfer,
@@ -5217,6 +5220,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         }}
                       >
                         <IoSwapHorizontalOutline size={13} /> Convert
+                      </button>
+                    )}
+                    {!isProject && onCompress && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onCompress(file);
+                        }}
+                      >
+                        <IoContractOutline size={13} /> Compress
                       </button>
                     )}
                     {fileTransfer && (
