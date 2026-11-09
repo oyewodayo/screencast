@@ -96,11 +96,9 @@ pub struct AppState {
     // Click-tracking session for the recording currently in progress, if FormData.track_clicks
     // asked for one - Windows-only, see services/click_tracker.rs's own doc comment. stop_recording
     // stops it and writes its collected clicks to a sidecar JSON file next to the finished video.
-    #[cfg(target_os = "windows")]
     click_capture: Arc<Mutex<Option<crate::services::click_tracker::ClickCapture>>>,
     // The pointer/shortcut recording for the recording in progress (FormData.track_pointer /
     // track_keys - services/input_tracker.rs), written to "<name>.pointer.json" at stop.
-    #[cfg(target_os = "windows")]
     input_capture: Arc<Mutex<Option<crate::services::input_tracker::InputCapture>>>,
     // Screen<->camera view-switch events for the recording currently in progress, logged by the
     // record_view_switch command as the user toggles the live recording bar's "Screen"/"Camera"

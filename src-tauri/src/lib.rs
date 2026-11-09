@@ -122,14 +122,9 @@ pub(crate) mod services {
     pub mod audio_capture;
     // Default cleanup of every recording's audio - see the module's own doc comment.
     pub mod audio_enhance;
-    // A Win32 low-level mouse hook, Windows-only for the same reason audio_capture above is
-    // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
-    // crate dependency could reuse) - see the module's own doc comment for why this needed no new
-    // Cargo dependency at all.
-    #[cfg(target_os = "windows")]
+    // Mouse click tracking for the editor's auto-zoom on click.
     pub mod click_tracker;
     // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
-    #[cfg(target_os = "windows")]
     pub mod input_tracker;
     // The annotation overlay's privacy blur - live acrylic regions you can still type through.
     // Stubbed off Windows inside the module, so its commands register everywhere.

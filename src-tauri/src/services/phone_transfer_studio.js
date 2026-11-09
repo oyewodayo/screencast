@@ -34,6 +34,8 @@
   }
   document.addEventListener("visibilitychange", syncWakeLock);
   BC.on("tab", syncWakeLock);
+  window.addEventListener("focus", syncWakeLock);
+  document.addEventListener("click", () => { if (wantAwake() && !wakeLock) syncWakeLock(); }, { passive: true });
 
   // ---- The desktop's state, mirrored (Dashboard sends it as "remote_state").
   let pc = { recording: false, paused: false, elapsedMs: 0, canSwitchView: false, view: "screen", editing: null, playing: false, time: 0, duration: 0, canUndo: false, canRedo: false, mode: "sva", cameraSource: "none", phoneCam: "waiting" };
@@ -169,7 +171,7 @@
   document.querySelectorAll("#rec-modes .mode").forEach((b) => b.addEventListener("click", () => {
     if (pc.recording || b.disabled) return;
     pc.mode = b.dataset.mode; // shown at once; the computer's next state confirms it
-    BC.haptic(10);
+    BC.haptic(25);
     BC.send({ type: "remote", action: "record.mode", value: b.dataset.mode });
     // A mode with no camera doesn't need this phone's camera on - and the computer gets its own back.
     if (cam && !CAMERA_MODES.includes(pc.mode)) stopPhoneCam(true);

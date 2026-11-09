@@ -20,27 +20,19 @@
 // Positions are the recorded area's own pixels at the moment the recording started; a window
 // recording re-reads the window's place every 50 ms, so the path follows the window when it moves.
 // Times are QPC instants (audio_capture::now_hns), mapped onto the final file at stop - pauses cut.
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
-
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW, PatBlt, ReleaseDC, SelectObject, BITMAP, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLACKNESS, DIB_RGB_COLORS, HBRUSH, HGDIOBJ, ROP_CODE, WHITENESS,
-};
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, GetMessageW, KillTimer, PostThreadMessageW, SetTimer,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, HCURSOR, HHOOK, HICON, ICONINFO, KBDLLHOOKSTRUCT, MSG,
-    MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-};
 
+#[cfg(target_os = "windows")]
 use crate::services::audio_capture::now_hns;
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn now_hns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_nanos() / 100) as i64)
+        .unwrap_or(0)
+}
 
 // Movement kept at most this often (a 1000 Hz mouse would otherwise log 3.6 million points an
 // hour); the editor's path is built at the same rate.
@@ -56,6 +48,7 @@ const KEEPALIVE_HNS: i64 = 10_000_000;
 const OWN_HOTKEYS: [&[&str]; 5] = [&["Ctrl", "Shift", "R"], &["Ctrl", "Shift", "H"], &["Ctrl", "Shift", "B"], &["Ctrl", "Shift", "D"], &["Alt", "Shift", "V"]];
 
 // What's being recorded: a fixed area of the screen, or a window (followed as it moves).
+#[derive(Clone)]
 pub enum Area {
     Fixed { x: i32, y: i32, width: i32, height: i32 },
     Window { hwnd: Option<isize>, title: String, title_bar: bool, x: i32, y: i32, width: i32, height: i32 },
@@ -80,6 +73,37 @@ pub struct InputLog {
     pub cursors: Vec<CursorBitmap>,
     pub keys: Vec<(i64, Vec<String>)>,
 }
+
+#[cfg(target_os = "windows")]
+pub use win::InputCapture;
+
+#[cfg(target_os = "macos")]
+pub use mac::InputCapture;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub use fallback::InputCapture;
+
+#[cfg(target_os = "windows")]
+mod win {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW, PatBlt, ReleaseDC, SelectObject, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, BLACKNESS, DIB_RGB_COLORS, HBRUSH, HGDIOBJ, ROP_CODE, WHITENESS,
+    };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, GetMessageW, KillTimer, PostThreadMessageW, SetTimer,
+        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, HCURSOR, HHOOK, HICON, ICONINFO, KBDLLHOOKSTRUCT, MSG,
+        MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN,
+        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    };
 
 #[derive(Default)]
 struct Modifiers {
@@ -548,6 +572,131 @@ impl InputCapture {
         self.handle.join().ok().flatten()
     }
 }
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
+    type CGFloat = f64;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: CGFloat,
+        y: CGFloat,
+    }
+
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+        fn CFRelease(cf: *mut c_void);
+    }
+
+    pub struct InputCapture {
+        running: Arc<AtomicBool>,
+        handle: JoinHandle<Option<InputLog>>,
+        pub started_hns: i64,
+    }
+
+    impl InputCapture {
+        pub fn start(area: Area, track_pointer: bool, _track_keys: bool) -> Result<Self, String> {
+            let started = now_hns();
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+
+            let (rect, base) = match area {
+                Area::Fixed { x, y, width, height } => ((x, y, width, height), (width.max(1), height.max(1))),
+                Area::Window { x, y, width, height, .. } => ((x, y, width, height), (width.max(1), height.max(1))),
+            };
+
+            let handle = std::thread::spawn(move || -> Option<InputLog> {
+                let mut moves = Vec::new();
+                let mut clicks = Vec::new();
+                let mut was_down = false;
+                let mut last_pos = (-9999.0f32, -9999.0f32);
+                let mut last_pushed = i64::MIN / 2;
+
+                while r.load(Ordering::Relaxed) {
+                    let now = now_hns();
+                    let is_down = unsafe { CGEventSourceButtonState(0, 0) };
+                    unsafe {
+                        let event = CGEventCreate(std::ptr::null_mut());
+                        if !event.is_null() {
+                            let loc = CGEventGetLocation(event);
+                            CFRelease(event);
+
+                            let (ox, oy, w, h) = rect;
+                            let (bw, bh) = base;
+                            let ax = ((loc.x - ox as f64) / w.max(1) as f64 * bw as f64) as f32;
+                            let ay = ((loc.y - oy as f64) / h.max(1) as f64 * bh as f64) as f32;
+
+                            if track_pointer {
+                                let moved = (ax - last_pos.0).abs() >= 1.0 || (ay - last_pos.1).abs() >= 1.0;
+                                let keepalive = now - last_pushed >= KEEPALIVE_HNS;
+                                if moved || keepalive {
+                                    moves.push((now, ax, ay));
+                                    last_pos = (ax, ay);
+                                    last_pushed = now;
+                                }
+                            }
+
+                            if is_down && !was_down {
+                                clicks.push((now, ax, ay, 0));
+                            }
+                        }
+                    }
+                    was_down = is_down;
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+
+                Some(InputLog {
+                    width: base.0,
+                    height: base.1,
+                    moves,
+                    clicks,
+                    shapes: Vec::new(),
+                    cursors: Vec::new(),
+                    keys: Vec::new(),
+                })
+            });
+
+            Ok(Self { running, handle, started_hns: started })
+        }
+
+        pub fn stop(self) -> Option<InputLog> {
+            self.running.store(false, Ordering::Relaxed);
+            self.handle.join().ok().flatten()
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+mod fallback {
+    use super::*;
+
+    pub struct InputCapture {
+        pub started_hns: i64,
+    }
+
+    impl InputCapture {
+        pub fn start(_area: Area, _track_pointer: bool, _track_keys: bool) -> Result<Self, String> {
+            Ok(Self { started_hns: now_hns() })
+        }
+        pub fn stop(self) -> Option<InputLog> {
+            None
+        }
+    }
+}
 
 impl InputLog {
     /// The "<name>.pointer.json" sidecar, every time placed on the final file by `to_output` (QPC
@@ -607,9 +756,10 @@ impl InputLog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use super::win::*;
 
     fn mods(f: impl Fn(&mut Modifiers)) -> Modifiers {
         let mut m = Modifiers::default();
