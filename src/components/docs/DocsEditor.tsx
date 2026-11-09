@@ -83,6 +83,8 @@ import "./docFonts.css";
 import "./docLayout.css";
 import "../board/boardFonts.css";
 
+const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
 interface DocsEditorProps {
   docId: string;
   onBack: () => void;
@@ -826,10 +828,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         showNotice({ text: `Saved ${saved.split(/[\\/]/).pop()}`, path: saved }, 10000);
       } catch (err) {
         console.error(`Failed to export document as .${kind}:`, err);
-        showNotice({ text: err instanceof Error ? err.message : String(err), error: true }, 8000);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (kind === "pdf" && (msg.includes("web engine") || msg.includes("isn't available on this system"))) {
+          showNotice({ text: "Opening system print dialog to Save as PDF…" }, 5000);
+          handlePrint();
+          return;
+        }
+        showNotice({ text: msg, error: true }, 8000);
       }
     },
-    [editor, store.title, writeExport, showNotice]
+    [editor, store.title, writeExport, showNotice, handlePrint]
   );
 
   // "Copy contents" in the Share dialog: the same self-contained HTML as the .html export (images
@@ -1207,7 +1215,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           <button type="button" onClick={handlePrint} className={menuItemClass}>
             <MdPrint size={18} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
             <span className="flex-1">Print…</span>
-            <span className="text-xs text-neutral-400">Ctrl+P</span>
+            <span className="text-xs text-neutral-400">{isMac ? "⌘P" : "Ctrl+P"}</span>
           </button>
         </Dropdown>
       </header>

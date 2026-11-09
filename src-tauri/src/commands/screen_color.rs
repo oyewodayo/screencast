@@ -189,11 +189,145 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::ScreenSample;
+    use std::ffi::c_void;
+
+    type CGFloat = f64;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: CGFloat,
+        y: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: CGFloat,
+        height: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+    type CGImageRef = *mut c_void;
+    type CFDataRef = *mut c_void;
+    type CGDataProviderRef = *mut c_void;
+
+    const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+    const K_CG_NULL_WINDOW_ID: u32 = 0;
+    const K_CG_WINDOW_IMAGE_DEFAULT: u32 = 0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        fn CGWindowListCreateImage(
+            screen_bounds: CGRect,
+            list_options: u32,
+            window_id: u32,
+            image_options: u32,
+        ) -> CGImageRef;
+        fn CGImageGetWidth(image: CGImageRef) -> usize;
+        fn CGImageGetHeight(image: CGImageRef) -> usize;
+        fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+        fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+        fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
+        fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+        fn CFDataGetLength(data: CFDataRef) -> isize;
+        fn CFRelease(cf: *mut c_void);
+    }
+
+    pub fn sample(radius: u32) -> Result<ScreenSample, String> {
+        let size = radius * 2 + 1;
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return Err("Couldn't read the pointer position".into());
+            }
+            let loc = CGEventGetLocation(event);
+            CFRelease(event);
+
+            let rect = CGRect {
+                origin: CGPoint {
+                    x: loc.x - radius as f64,
+                    y: loc.y - radius as f64,
+                },
+                size: CGSize {
+                    width: size as f64,
+                    height: size as f64,
+                },
+            };
+
+            let img = CGWindowListCreateImage(
+                rect,
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
+                K_CG_NULL_WINDOW_ID,
+                K_CG_WINDOW_IMAGE_DEFAULT,
+            );
+            if img.is_null() {
+                return Err("Screen read failed: couldn't capture display image".into());
+            }
+
+            let img_w = CGImageGetWidth(img);
+            let img_h = CGImageGetHeight(img);
+            let bytes_per_row = CGImageGetBytesPerRow(img);
+            let provider = CGImageGetDataProvider(img);
+            if provider.is_null() {
+                CFRelease(img);
+                return Err("Screen read failed: no image provider".into());
+            }
+            let data = CGDataProviderCopyData(provider);
+            CFRelease(img);
+            if data.is_null() {
+                return Err("Screen read failed: no image data".into());
+            }
+
+            let ptr = CFDataGetBytePtr(data);
+            let len = CFDataGetLength(data) as usize;
+            let raw_bytes = std::slice::from_raw_parts(ptr, len);
+
+            let mut rgb = vec![0u8; (size * size * 3) as usize];
+            if img_w > 0 && img_h > 0 {
+                for r in 0..size as usize {
+                    let src_y = (r * img_h / size as usize).min(img_h - 1);
+                    for c in 0..size as usize {
+                        let src_x = (c * img_w / size as usize).min(img_w - 1);
+                        let offset = src_y * bytes_per_row + src_x * 4;
+                        if offset + 3 <= len {
+                            let b = raw_bytes[offset];
+                            let g = raw_bytes[offset + 1];
+                            let r_val = raw_bytes[offset + 2];
+                            let out_idx = (r * size as usize + c) * 3;
+                            rgb[out_idx] = r_val;
+                            rgb[out_idx + 1] = g;
+                            rgb[out_idx + 2] = b;
+                        }
+                    }
+                }
+            }
+
+            CFRelease(data);
+            Ok(ScreenSample { size, rgb })
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::ScreenSample;
 
     pub fn sample(_radius: u32) -> Result<ScreenSample, String> {
-        Err("Picking a colour from the screen isn't available on macOS yet".into())
+        Err("Picking a colour from the screen isn't available on this platform".into())
     }
 }

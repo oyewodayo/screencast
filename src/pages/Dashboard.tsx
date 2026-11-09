@@ -2966,7 +2966,11 @@ const setScreen = () => {
 		'record-toggle': () => handleRecordingToggleHotkey(),
 		'panel-buttons-toggle': toggleRecordingPanelButtons,
 		'snip': () => {
-			startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+			startSnip().then((started) => {
+				if (!started) {
+					void handleTakeScreenshot({ screen_size: 'fullscreen', format: 'png', quality: 'high', window_title: 'Full Screen' });
+				}
+			}).catch((err) => setError(`Couldn't start a screenshot: ${err}`));
 		},
 		'annotation-toggle': () => {
 			if (annotationEnabled) void toggleAnnotationDrawMode();
@@ -3017,7 +3021,11 @@ const setScreen = () => {
 				if (recordingHotkeyRef.current.isRecording) handleRecordingToggleHotkey();
 				break;
 			case "screenshot":
-				startSnip().catch((err) => setError(`Couldn't start a screenshot: ${err}`));
+				startSnip().then((started) => {
+					if (!started) {
+						void handleTakeScreenshot({ screen_size: 'fullscreen', format: 'png', quality: 'high', window_title: 'Full Screen' });
+					}
+				}).catch((err) => setError(`Couldn't start a screenshot: ${err}`));
 				break;
 			case "quit":
 				void quitApp();
