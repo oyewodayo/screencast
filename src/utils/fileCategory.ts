@@ -43,7 +43,8 @@ export const isConvertibleCategory = (category: FileCategory | null): category i
 
 // All file categories in Briefcast can be compressed:
 // - Video, Audio, and Image: smart media compression via ffmpeg & image codecs
-// - PDF and Document: efficient ZIP deflation compression
+// - PDF: stream & object structure optimization (kept as a viewable .pdf)
+// - Document: efficient ZIP deflation compression
 export const COMPRESSIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio", "image", "pdf", "document"];
 
 export const isCompressibleCategory = (category: FileCategory | null): category is FileCategory =>

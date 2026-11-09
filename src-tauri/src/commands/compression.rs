@@ -321,8 +321,8 @@ pub async fn compress_to_zip(
         None => {
             let parent = first.parent().map(PathBuf::from).unwrap_or_default();
             if input_paths.len() == 1 {
-                let file_name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "archive".to_string());
-                parent.join(format!("{}.zip", file_name))
+                let stem = first.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "archive".to_string());
+                parent.join(format!("{}_compressed.zip", stem))
             } else {
                 parent.join("archive.zip")
             }
@@ -484,6 +484,53 @@ pub async fn compress_file(
 
     Ok(CompressionResult {
         output_path: result_path,
+        new_file_name,
+        original_size,
+        compressed_size,
+    })
+}
+
+
+#[tauri::command]
+pub async fn save_compressed_blob(
+    input_path: String,
+    bytes: Vec<u8>,
+    output_ext: String,
+    preserve_original: bool,
+) -> Result<CompressionResult, String> {
+    let input = PathBuf::from(&input_path);
+    if !input.exists() {
+        return Err(format!("Input file does not exist: {}", input_path));
+    }
+
+    let original_size = std::fs::metadata(&input)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    let parent = input.parent().map(PathBuf::from).unwrap_or_default();
+    let ext = output_ext.trim_start_matches('.');
+    let target = parent.join(format!("{}_compressed.{}", stem, ext));
+    let output = unique_output_path(target);
+
+    std::fs::write(&output, &bytes)
+        .map_err(|e| format!("Failed to save compressed file: {}", e))?;
+
+    if !preserve_original {
+        let _ = std::fs::remove_file(&input);
+    }
+
+    let compressed_size = bytes.len() as u64;
+    let new_file_name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(CompressionResult {
+        output_path: output.to_string_lossy().to_string(),
         new_file_name,
         original_size,
         compressed_size,

@@ -5221,6 +5221,9 @@ const setScreen = () => {
               onCompressed={async (newPath, newFileName) => {
                 setCompressionFile(null);
                 await handleDirectoryFiles();
+                if (getFileExtension(newFileName) === "zip") {
+                  return;
+                }
                 try {
                   const absolutePath = await invoke<string>("convert_file_path_to_url", { 
                     filepath: newPath 
@@ -5392,8 +5395,8 @@ const setScreen = () => {
                 onBack={() => setSelectedFile(null)}
                 onOpenWithBoard={() => handleOpenImageWithBoard(selectedFile)}
               />
-            ) : getFileCategory(selectedFile.name) === "document" ? (
-              // .docx/.md/.txt (e.g. Docs' own Export menu output) have no in-app renderer, unlike
+            ) : getFileCategory(selectedFile.name) === "document" || getFileExtension(selectedFile.name) === "zip" ? (
+              // .docx/.md/.txt/.zip have no in-app renderer, unlike
               // pdf/image/video above - hand off to the OS's own default app rather than pretending
               // to preview them.
               <div key={selectedFile.path} className="w-full h-full flex flex-col items-center justify-center gap-3 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-300">

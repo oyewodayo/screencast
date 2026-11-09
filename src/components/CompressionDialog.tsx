@@ -59,6 +59,80 @@ export const useMediaCompression = () => {
     };
   }, []);
 
+  const compressPdf = async (params: {
+    inputPath: string;
+    preserveOriginal: boolean;
+  }): Promise<CompressionResult> => {
+    try {
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: "",
+        progress: 15,
+        status: "starting",
+        message: "Reading PDF document...",
+      });
+
+      const buffer = await invoke<ArrayBuffer>("read_file_bytes", { path: params.inputPath });
+
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: "",
+        progress: 40,
+        status: "processing",
+        message: "Optimizing PDF structure & object streams...",
+      });
+
+      const { PDFDocument } = await import("pdf-lib");
+      const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: "",
+        progress: 75,
+        status: "processing",
+        message: "Compressing and packing PDF streams...",
+      });
+
+      const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
+
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: "",
+        progress: 90,
+        status: "processing",
+        message: "Saving compressed PDF...",
+      });
+
+      const result = await invoke<CompressionResult>("save_compressed_blob", {
+        inputPath: params.inputPath,
+        bytes: Array.from(compressedBytes),
+        outputExt: "pdf",
+        preserveOriginal: params.preserveOriginal,
+      });
+
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: result.outputPath,
+        progress: 100,
+        status: "completed",
+        message: "PDF compression complete",
+      });
+
+      setIsCompressing(false);
+      return result;
+    } catch (err: any) {
+      setIsCompressing(false);
+      setCompressionProgress({
+        input_path: params.inputPath,
+        output_path: "",
+        progress: 0,
+        status: "failed",
+        message: err?.message || String(err),
+      });
+      throw err;
+    }
+  };
+
   const compressFile = async (params: {
     inputPath: string;
     quality?: CompressionLevel;
@@ -70,6 +144,12 @@ export const useMediaCompression = () => {
   }): Promise<CompressionResult> => {
     setIsCompressing(true);
     setCompressionProgress(null);
+
+    const ext = params.inputPath.split(".").pop()?.toLowerCase() ?? "";
+    if (ext === "pdf") {
+      return compressPdf(params);
+    }
+
     try {
       const result = await invoke<CompressionResult>("compress_file", {
         inputPath: params.inputPath,
@@ -186,6 +266,8 @@ const CompressionDialog: React.FC<CompressionDialogProps> = ({
       ? "Compress Image"
       : category === "audio"
       ? "Compress Audio"
+      : category === "pdf"
+      ? "Compress PDF"
       : "Compress File";
 
   if (isMinimized) {
@@ -377,6 +459,17 @@ const CompressionDialog: React.FC<CompressionDialogProps> = ({
         {!completedResult && (
           <div className="space-y-4 mb-5">
             {/* Compression Preset Selection */}
+            {category === "pdf" ? (
+              <div className="p-4 rounded-xl bg-blue-50/70 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20 text-xs text-blue-900 dark:text-blue-200 space-y-1.5">
+                <div className="font-semibold text-sm flex items-center gap-1.5 text-blue-700 dark:text-blue-300">
+                  <IoContractOutline size={16} />
+                  <span>Lossless PDF Stream & Object Optimization</span>
+                </div>
+                <p className="text-neutral-600 dark:text-neutral-400 leading-relaxed text-[11px]">
+                  Compresses internal PDF object streams and optimizes cross-reference tables without rasterizing or degrading text, vector equations, or diagrams. The compressed file remains a genuine, viewable PDF document (<code className="font-semibold text-blue-600 dark:text-blue-400">.pdf</code>).
+                </p>
+              </div>
+            ) : (
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-500 dark:text-neutral-400 mb-2">
                 Compression Level
@@ -428,6 +521,7 @@ const CompressionDialog: React.FC<CompressionDialogProps> = ({
                 </button>
               </div>
             </div>
+            )}
 
             {/* Advanced Settings Toggle */}
             {(category === "video" || category === "image" || category === "audio") && (

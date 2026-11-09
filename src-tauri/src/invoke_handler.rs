@@ -134,6 +134,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::compression::compress_image,
         commands::compression::compress_audio,
         commands::compression::compress_to_zip,
+        commands::compression::save_compressed_blob,
         commands::conversion::export_trimmed_video,
         commands::conversion::get_export_frame_rate,
         commands::stage_render::stage_render_open,
