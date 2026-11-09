@@ -2237,6 +2237,7 @@ async fn start_recording_inner(
         let output = match dispatch_recording(&app_handle, state.clone(), &output_path, &form_data).await {
             Ok(output) => output,
             Err(e) => {
+                crate::commands::camera_effects::release_after_recording();
                 #[cfg(target_os = "windows")]
                 discard_start(&assembly_state, &click_capture, &input_capture).await;
                 return Err(e);
@@ -2268,6 +2269,7 @@ async fn start_recording_inner(
 
     if let Some(status) = early_exit_status {
         *output_path_state.lock().await = None;
+        crate::commands::camera_effects::release_after_recording();
         #[cfg(target_os = "windows")]
         discard_start(&assembly_state, &click_capture, &input_capture).await;
         return Err(format!(
