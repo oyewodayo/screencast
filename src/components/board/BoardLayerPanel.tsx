@@ -6,7 +6,7 @@
 // see and manage stacking order without relying on "click the exact overlapping tile" on the canvas,
 // and click a row to select that item directly - handy once several items overlap and picking the
 // right one by clicking the canvas gets fiddly.
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoShapesOutline, IoText } from "react-icons/io5";
 import { TbBlur, TbGripVertical } from "react-icons/tb";
 import { BoardItem, BoardShape } from "../../utils/boardTypes";
@@ -62,22 +62,106 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
   // BoardEditor.tsx and onStepReorder both work in) via `items.length - 1 - displayIndex`.
   const frontToBack = [...items].reverse();
 
-  // Drag-and-drop reorder state - `draggingId` is the row currently being dragged (dimmed while in
-  // flight), `dragOverId` is whichever row the pointer is currently over (gets a highlight so the
-  // drop target is obvious before release). Both cleared on drop AND on dragend, so a drag cancelled
-  // by Escape/dropping outside the list never leaves a stuck highlight.
+  // Drag-and-drop reorder state powered by pointer events so it works seamlessly inside WebView2 / Tauri.
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
 
+  const pointerDragRef = useRef<{
+    id: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    isDragging: boolean;
+  } | null>(null);
+
+  const handlePointerDown = (id: string, e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    pointerDragRef.current = {
+      id,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      isDragging: false,
+    };
+  };
+
+  const handlePointerMove = (id: string, e: React.PointerEvent) => {
+    const drag = pointerDragRef.current;
+    if (!drag || drag.id !== id) return;
+
+    if (!drag.isDragging) {
+      if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) >= 4) {
+        drag.isDragging = true;
+        setDraggingId(id);
+      } else {
+        return;
+      }
+    }
+
+    const elements = document.elementsFromPoint(e.clientX, e.clientY);
+    const targetEl = elements.find(
+      (el) => el.getAttribute("data-board-layer-id") && el.getAttribute("data-board-layer-id") !== id
+    );
+    const targetId = targetEl ? targetEl.getAttribute("data-board-layer-id") : null;
+    setDragOverId(targetId);
+  };
+
+  const handlePointerUp = (id: string, e: React.PointerEvent) => {
+    const drag = pointerDragRef.current;
+    if (!drag || drag.id !== id) return;
+
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(drag.pointerId);
+    } catch (_) {}
+
+    if (drag.isDragging) {
+      if (dragOverId && dragOverId !== id) {
+        onReorder(id, dragOverId);
+      }
+    } else {
+      if (e.shiftKey) {
+        const next = new Set(selectedIds);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        onSelect(next);
+      } else {
+        onSelect(new Set([id]));
+      }
+    }
+
+    pointerDragRef.current = null;
+    setDraggingId(null);
+    setDragOverId(null);
+  };
+
+  const handlePointerCancel = (id: string, e: React.PointerEvent) => {
+    const drag = pointerDragRef.current;
+    if (!drag || drag.id !== id) return;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(drag.pointerId);
+    } catch (_) {}
+    pointerDragRef.current = null;
+    setDraggingId(null);
+    setDragOverId(null);
+  };
+
   return (
-    <div className="w-64 shrink-0 flex flex-col border-l border-neutral-200/80 dark:border-neutral-800 bg-white dark:bg-neutral-900">
-      <div className="shrink-0 flex items-center justify-between px-3.5 py-3 border-b border-neutral-200/80 dark:border-neutral-800">
-        <span className="text-sm font-semibold text-neutral-800 dark:text-neutral-100">Layers</span>
+    <div className="absolute top-3 right-3 bottom-[calc(var(--docker-height,60px)+10px)] w-64 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 z-30 animate-[boardPanelIn_180ms_ease-out]">
+      <style>{"@keyframes boardPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
+      <div className="shrink-0 flex items-center justify-between px-3.5 h-11 border-b border-black/[0.05] dark:border-white/[0.06]">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-100">Layers</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 font-mono">
+            {frontToBack.length}
+          </span>
+        </div>
         <button
           type="button"
           onClick={onClose}
           title="Hide layers panel"
-          className="w-6 h-6 flex items-center justify-center rounded-md text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-700 dark:hover:text-neutral-200 transition-colors"
+          className="w-6 h-6 flex items-center justify-center rounded-md text-neutral-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.07] hover:text-neutral-700 dark:hover:text-neutral-200 transition-colors"
         >
           <IoCloseOutline size={16} />
         </button>
@@ -92,56 +176,33 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
           return (
             <div
               key={item.id}
-              draggable
-              onDragStart={(e) => {
-                e.dataTransfer.effectAllowed = "move";
-                setDraggingId(item.id);
-              }}
-              onDragEnd={() => {
-                setDraggingId(null);
-                setDragOverId(null);
-              }}
-              onDragOver={(e) => {
-                if (!draggingId || draggingId === item.id) return;
-                e.preventDefault();
-                if (dragOverId !== item.id) setDragOverId(item.id);
-              }}
-              onDragLeave={(e) => {
-                if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-                if (dragOverId === item.id) setDragOverId(null);
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                if (draggingId && draggingId !== item.id) onReorder(draggingId, item.id);
-                setDraggingId(null);
-                setDragOverId(null);
-              }}
-              onClick={(e) => {
-                if (e.shiftKey) {
-                  const next = new Set(selectedIds);
-                  if (next.has(item.id)) next.delete(item.id);
-                  else next.add(item.id);
-                  onSelect(next);
-                } else {
-                  onSelect(new Set([item.id]));
-                }
-              }}
-              className={`group flex items-center gap-1 px-2 py-1.5 rounded-lg cursor-pointer transition-colors border-t-2 ${
-                isDragOver ? "border-t-blue-500" : "border-t-transparent"
+              data-board-layer-id={item.id}
+              onPointerDown={(e) => handlePointerDown(item.id, e)}
+              onPointerMove={(e) => handlePointerMove(item.id, e)}
+              onPointerUp={(e) => handlePointerUp(item.id, e)}
+              onPointerCancel={(e) => handlePointerCancel(item.id, e)}
+              className={`group flex items-center gap-1 px-2 py-1.5 rounded-lg cursor-pointer transition-colors border-t-2 touch-none ${
+                isDragOver ? "border-t-blue-500 bg-blue-500/5 dark:bg-blue-500/10" : "border-t-transparent"
               } ${
                 draggingId === item.id
-                  ? "opacity-40"
+                  ? "opacity-35 scale-[0.98] bg-neutral-100 dark:bg-neutral-800"
                   : isSelected
                     ? "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300"
                     : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
               }`}
             >
-              <TbGripVertical size={13} className="shrink-0 text-neutral-300 dark:text-neutral-600 cursor-grab" />
-              <span className={`shrink-0 ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"}`}>{KIND_ICON[item.kind]}</span>
-              <span className={`min-w-0 flex-1 truncate text-sm ${item.locked ? "italic text-neutral-400 dark:text-neutral-500" : ""}`}>{layerLabel(item)}</span>
+              <div
+                className="shrink-0 p-0.5 cursor-grab active:cursor-grabbing text-neutral-300 dark:text-neutral-600 group-hover:text-neutral-500 transition-colors"
+                title="Drag up or down to reorder"
+              >
+                <TbGripVertical size={13} className="pointer-events-none" />
+              </div>
+              <span className={`shrink-0 pointer-events-none ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"}`}>{KIND_ICON[item.kind]}</span>
+              <span className={`min-w-0 flex-1 truncate text-sm pointer-events-none ${item.locked ? "italic text-neutral-400 dark:text-neutral-500" : ""}`}>{layerLabel(item)}</span>
               <button
                 type="button"
                 title={item.locked ? "Unlock - re-enables dragging/resizing on the canvas" : "Lock - can't be clicked, dragged, or resized on the canvas until unlocked"}
+                onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
                   onToggleLock(item.id);
@@ -154,7 +215,10 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
               >
                 {item.locked ? <IoLockClosed size={12} /> : <IoLockOpenOutline size={12} />}
               </button>
-              <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+              <div
+                onPointerDown={(e) => e.stopPropagation()}
+                className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity"
+              >
                 <button
                   type="button"
                   title="Move forward one"

@@ -3,25 +3,20 @@
 // Microphone → whisper → document pipeline for Docs dictation (editor side: docDictationExtension.ts;
 // text rules: dictationText.ts).
 //
-// The previous version recorded one MediaRecorder blob for the whole session and only transcribed
-// it after Stop, so nothing reliable appeared until the user finished talking - and long dictation
-// meant a long wait. Here the mic is read as raw PCM, cut into utterances at natural pauses by a
-// small energy-based voice-activity detector with an adaptive noise floor, and each utterance is
-// transcribed as soon as it ends while recording continues. Side benefits:
-//   - silence is never sent to whisper, which is where its "Thank you." hallucinations come from;
-//   - chunks are already 16kHz mono WAV, so the backend skips its ffmpeg pass;
-//   - each chunk carries the document text before the cursor as whisper's prompt, and the language
-//     auto-detected on the first chunk is locked for the rest (detection on a two-word utterance
-//     is unreliable).
-//
-// The Web Speech API, where the WebView has a working one, only drives a grey interim preview at
-// the cursor; whisper's text is what actually gets inserted.
+// Reads the mic as raw 16kHz mono PCM, filters it through a speech-band (100–3800 Hz) + zero-crossing
+// voice-activity detector with an adaptive noise floor, streams rolling word-by-word previews while
+// the user speaks, and cuts utterances at natural pauses.
 import { MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Editor } from "@tiptap/core";
 import { applyDictationOps, documentTextBeforeDictation } from "../utils/docDictationExtension";
-import { buildWhisperPrompt, isLikelyHallucination, parseDictation, stripNonSpeech } from "../utils/dictationText";
+import {
+  buildWhisperPrompt,
+  isLikelyHallucination,
+  parseDictation,
+  stripNonSpeech,
+} from "../utils/dictationText";
 
 export type DictationPhase = "idle" | "starting" | "listening" | "finishing";
 
@@ -50,15 +45,18 @@ export const DICTATION_LANGUAGES: { code: string; label: string }[] = [
 const LANGUAGE_STORAGE_KEY = "briefcast.docs.dictationLanguage";
 const DETECTED_STORAGE_KEY = "briefcast.docs.dictationDetectedLanguage";
 const SAMPLE_RATE = 16000;
-const FRAME_SIZE = 1024; // ScriptProcessor buffer at the context rate
-const PRE_ROLL_MS = 300; // audio kept from before speech onset so the first syllable isn't clipped
-const END_SILENCE_MS = 550; // pause that ends an utterance - long enough for a breath between clauses
-const SOFT_MAX_MS = 15000; // past this, cut at the next short pause
-const SOFT_SILENCE_MS = 250;
-const HARD_MAX_MS = 28000; // whisper's window is 30s
-const MIN_SPEECH_MS = 280; // shorter "utterances" are clicks/coughs
-const PREVIEW_MIN_SPEECH_MS = 600; // first grey preview once there is this much speech
-const PREVIEW_INTERVAL_MS = 900; // then refresh it this often (a run takes ~0.3-0.8s)
+const FRAME_SIZE = 1024; // ScriptProcessor buffer at the context rate (~64ms at 16kHz)
+const PRE_ROLL_MS = 160; // audio kept from before speech onset so the first consonant isn't clipped
+const END_SILENCE_MS = 340; // pause that ends a short utterance
+const CLAUSE_MAX_MS = 1750; // past ~1.75s, cut on a brief clause pause
+const CLAUSE_SILENCE_MS = 210;
+const SOFT_MAX_MS = 3800; // past ~3.8s, cut on any short word-boundary pause
+const SOFT_SILENCE_MS = 140;
+const HARD_MAX_MS = 7500; // cap chunk length so real-time dictation never stalls on a long monologue
+const MIN_SPEECH_MS = 240; // shorter bursts are mouse clicks / breaths
+const PREVIEW_MIN_SPEECH_MS = 320; // start rolling word-by-word preview after ~0.32s of speech
+const PREVIEW_INTERVAL_MS = 460; // refresh rolling preview every ~0.46s while speaking
+const WORD_TICK_MS = 30; // word-by-word reveal cadence for smooth real-time typing feel
 
 // Disabled for the rest of the session once the engine reports it can't run (WebView2 ships the
 // API surface without a working backend on many machines).
@@ -69,7 +67,12 @@ interface SpeechRecognitionLike {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
-  onresult: ((event: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }> }) => void) | null;
+  onresult:
+    | ((event: {
+        resultIndex: number;
+        results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
+      }) => void)
+    | null;
   onerror: ((event: { error: string }) => void) | null;
   onend: (() => void) | null;
   start: () => void;
@@ -79,7 +82,10 @@ interface SpeechRecognitionLike {
 
 function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
   if (webSpeechUnavailable) return null;
-  const w = window as typeof window & { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor };
+  const w = window as typeof window & {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
@@ -100,6 +106,16 @@ function readStoredDetectedLanguage(): string | null {
   } catch {
     return null;
   }
+}
+
+function browserFallbackLanguage(): string {
+  try {
+    const nav = (navigator.language || "en").split("-")[0].toLowerCase();
+    if (DICTATION_LANGUAGES.some((l) => l.code === nav && l.code !== "auto")) return nav;
+  } catch {
+    // ignore
+  }
+  return "en";
 }
 
 function languageLabel(code: string | null): string | null {
@@ -159,9 +175,56 @@ function concat(frames: Float32Array[]): Float32Array {
   return out;
 }
 
+// Computes speech-band RMS (approx 100 Hz – 3800 Hz) and Zero-Crossing Rate so 50/60 Hz hum,
+// breath puffs, and high-frequency mouse/keyboard clicks don't trigger false speech segments.
+function analyzeSpeechFrame(frame: Float32Array): { bandRms: number; zcr: number } {
+  const n = frame.length;
+  if (n === 0) return { bandRms: 0, zcr: 0 };
+
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += frame[i];
+  mean /= n;
+
+  // 1-pole high-pass (~110 Hz at 16kHz) + 1-pole low-pass (~3800 Hz at 16kHz)
+  const hpAlpha = 0.955;
+  const lpAlpha = 0.62;
+  let prevX = frame[0] - mean;
+  let hpY = 0;
+  let lpY = 0;
+  let prevLpY = 0;
+  let sumSq = 0;
+  let zeroCrossings = 0;
+
+  for (let i = 0; i < n; i++) {
+    const x = frame[i] - mean;
+    hpY = hpAlpha * (hpY + x - prevX);
+    prevX = x;
+    lpY = lpY + lpAlpha * (hpY - lpY);
+    sumSq += lpY * lpY;
+    if (i > 0 && ((lpY >= 0 && prevLpY < 0) || (lpY < 0 && prevLpY >= 0))) {
+      zeroCrossings++;
+    }
+    prevLpY = lpY;
+  }
+
+  return {
+    bandRms: Math.sqrt(sumSq / n),
+    zcr: zeroCrossings / n,
+  };
+}
+
+interface PreviewSnapshot {
+  segmentId: number;
+  speechMs: number;
+  lang: string;
+  promise: Promise<{ text: string; language: string | null } | null>;
+}
+
 interface Utterance {
+  segmentId: number;
   samples: Float32Array;
   speechMs: number;
+  reusePreview?: Promise<{ text: string; language: string | null } | null>;
 }
 
 interface Session {
@@ -195,7 +258,9 @@ export default function useDocDictation(editor: Editor | null, title: string): D
   const [pending, setPending] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
   const [language, setLanguageState] = useState<string>(readStoredLanguage);
-  const [detectedLanguage, setDetectedLanguage] = useState<string | null>(() => languageLabel(readStoredDetectedLanguage()));
+  const [detectedLanguage, setDetectedLanguage] = useState<string | null>(() =>
+    languageLabel(readStoredDetectedLanguage())
+  );
 
   const editorRef = useRef(editor);
   editorRef.current = editor;
@@ -206,18 +271,84 @@ export default function useDocDictation(editor: Editor | null, title: string): D
 
   const levelRef = useRef(0);
   const sessionRef = useRef<Session | null>(null);
-  // Auto mode's detected language, kept across sessions: whisper's detection pass costs ~1.1s per
-  // phrase on its own (measured: 0.75s with -l en vs 1.9s with -l auto for the same 6s clip), so
-  // only the very first phrase ever pays it. Picking a language in the menu clears it.
   const lockedLanguageRef = useRef<string | null>(readStoredDetectedLanguage());
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const pendingRef = useRef(0);
   const disposedRef = useRef(false);
   const stopRef = useRef<() => void>(() => {});
   const messageTimerRef = useRef<number | null>(null);
-  const previewRunRef = useRef<Promise<void>>(Promise.resolve());
-  // True once the Web Speech API has produced results this session - it then owns the preview.
+  const previewRunRef = useRef<Promise<unknown>>(Promise.resolve());
+  const latestPreviewRef = useRef<PreviewSnapshot | null>(null);
   const webSpeechLiveRef = useRef(false);
+
+  // Word-by-word progressive preview ticker state so multi-word interim updates type out smoothly.
+  const previewTargetWordsRef = useRef<string[]>([]);
+  const previewShownCountRef = useRef(0);
+  const previewTickTimerRef = useRef<number | null>(null);
+
+  const clearPreviewTicker = useCallback(() => {
+    if (previewTickTimerRef.current !== null) {
+      window.clearTimeout(previewTickTimerRef.current);
+      previewTickTimerRef.current = null;
+    }
+  }, []);
+
+  const setPreviewImmediate = useCallback(
+    (text: string) => {
+      clearPreviewTicker();
+      const cleaned = text.trim();
+      previewTargetWordsRef.current = cleaned ? cleaned.split(/\s+/) : [];
+      previewShownCountRef.current = previewTargetWordsRef.current.length;
+      if (!disposedRef.current) {
+        editorRef.current?.commands.setDictationPreview(cleaned);
+      }
+    },
+    [clearPreviewTicker]
+  );
+
+  const streamPreviewWords = useCallback(
+    (fullText: string) => {
+      if (disposedRef.current) return;
+      const cleaned = fullText.trim();
+      if (!cleaned) {
+        setPreviewImmediate("");
+        return;
+      }
+      const nextWords = cleaned.split(/\s+/);
+      const prevWords = previewTargetWordsRef.current;
+
+      let common = 0;
+      const maxCheck = Math.min(previewShownCountRef.current, prevWords.length, nextWords.length);
+      while (common < maxCheck && prevWords[common] === nextWords[common]) {
+        common++;
+      }
+
+      previewTargetWordsRef.current = nextWords;
+      previewShownCountRef.current = Math.max(1, common + 1);
+      editorRef.current?.commands.setDictationPreview(
+        nextWords.slice(0, previewShownCountRef.current).join(" ")
+      );
+
+      clearPreviewTicker();
+      const step = () => {
+        if (disposedRef.current) return;
+        const target = previewTargetWordsRef.current;
+        if (previewShownCountRef.current < target.length) {
+          previewShownCountRef.current += 1;
+          editorRef.current?.commands.setDictationPreview(
+            target.slice(0, previewShownCountRef.current).join(" ")
+          );
+          previewTickTimerRef.current = window.setTimeout(step, WORD_TICK_MS);
+        } else {
+          previewTickTimerRef.current = null;
+        }
+      };
+      if (previewShownCountRef.current < nextWords.length) {
+        previewTickTimerRef.current = window.setTimeout(step, WORD_TICK_MS);
+      }
+    },
+    [clearPreviewTicker, setPreviewImmediate]
+  );
 
   const flashMessage = useCallback((text: string | null, ms = 4000) => {
     if (messageTimerRef.current !== null) window.clearTimeout(messageTimerRef.current);
@@ -249,20 +380,29 @@ export default function useDocDictation(editor: Editor | null, title: string): D
   }, []);
 
   const transcribe = useCallback(
-    async ({ samples, speechMs }: Utterance) => {
+    async ({ samples, speechMs, reusePreview }: Utterance) => {
       const ed = editorRef.current;
       if (!ed || disposedRef.current) return;
       const requested = languageRef.current;
       const lang = requested === "auto" ? lockedLanguageRef.current ?? "auto" : requested;
+      const precedingText = documentTextBeforeDictation(ed);
       try {
-        const result = await invoke<{ text: string; language: string | null }>("transcribe_doc_audio", {
-          audioBytes: Array.from(encodeWav(samples)),
-          mimeType: "audio/wav",
-          language: lang,
-          prompt: buildWhisperPrompt(titleRef.current, documentTextBeforeDictation(ed)),
-        });
-        if (disposedRef.current) return;
-        if (requested === "auto" && result.language && !lockedLanguageRef.current && speechMs > 1200) {
+        let result: { text: string; language: string | null } | null = null;
+        if (reusePreview) {
+          result = await reusePreview;
+        }
+        if (!result) {
+          const prompt =
+            speechMs >= 650 ? buildWhisperPrompt(titleRef.current, precedingText) : "";
+          result = await invoke<{ text: string; language: string | null }>("transcribe_doc_audio", {
+            audioBytes: Array.from(encodeWav(samples)),
+            mimeType: "audio/wav",
+            language: lang,
+            prompt: prompt || null,
+          });
+        }
+        if (disposedRef.current || !result) return;
+        if (requested === "auto" && result.language && !lockedLanguageRef.current && speechMs > 900) {
           lockedLanguageRef.current = result.language;
           try {
             localStorage.setItem(DETECTED_STORAGE_KEY, result.language);
@@ -270,25 +410,39 @@ export default function useDocDictation(editor: Editor | null, title: string): D
             // per-viewer convenience only
           }
         }
-        const effective = lang === "auto" ? result.language ?? "en" : lang;
-        if (isLikelyHallucination(result.text, speechMs)) return;
+
+        const effective = lang === "auto" ? result.language ?? browserFallbackLanguage() : lang;
+        if (
+          isLikelyHallucination(result.text, speechMs, {
+            title: titleRef.current,
+            precedingText,
+          })
+        ) {
+          if (pendingRef.current <= 1) setPreviewImmediate("");
+          return;
+        }
+
         const ops = parseDictation(result.text, { commands: effective === "en" });
         const target = editorRef.current;
-        if (!target || ops.length === 0) return;
+        if (!target || ops.length === 0) {
+          if (pendingRef.current <= 1) setPreviewImmediate("");
+          return;
+        }
+        // Clear preview in the exact same turn that committed text lands so there is never a blank gap.
+        setPreviewImmediate("");
         if (applyDictationOps(target, ops)) stopRef.current();
       } catch (err) {
         console.error("Dictation chunk failed:", err);
+        setPreviewImmediate("");
         flashMessage(err instanceof Error ? err.message : String(err), 6000);
       }
     },
-    [flashMessage]
+    [flashMessage, setPreviewImmediate]
   );
 
   const enqueue = useCallback(
     (utterance: Utterance) => {
       updatePending(1);
-      if (!disposedRef.current) editorRef.current?.commands.setDictationPreview("");
-      // Waits out any in-flight preview first so the two whisper runs don't split the CPU.
       queueRef.current = queueRef.current
         .then(() => previewRunRef.current)
         .then(() => transcribe(utterance))
@@ -297,73 +451,109 @@ export default function useDocDictation(editor: Editor | null, title: string): D
     [transcribe, updatePending]
   );
 
-  const startPreview = useCallback((onUtteranceCut: { current: () => void }): SpeechRecognitionLike | null => {
-    const Recognition = getSpeechRecognitionCtor();
-    if (!Recognition) return null;
-    let recognition: SpeechRecognitionLike;
-    try {
-      recognition = new Recognition();
-    } catch {
-      webSpeechUnavailable = true;
-      return null;
-    }
-    let base = 0;
-    let latestLength = 0;
-    let running = true;
-    onUtteranceCut.current = () => {
-      base = latestLength;
-    };
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = languageRef.current === "auto" ? navigator.language || "en-US" : languageRef.current;
-    recognition.onresult = (event) => {
-      webSpeechLiveRef.current = true;
-      latestLength = event.results.length;
-      let text = "";
-      for (let i = base; i < event.results.length; i++) text += event.results[i][0]?.transcript ?? "";
-      editorRef.current?.commands.setDictationPreview(text.trim());
-    };
-    recognition.onerror = (event) => {
-      if (["network", "not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(event.error)) {
+  const startPreview = useCallback(
+    (onUtteranceCut: { current: () => void }): SpeechRecognitionLike | null => {
+      const Recognition = getSpeechRecognitionCtor();
+      if (!Recognition) return null;
+      let recognition: SpeechRecognitionLike;
+      try {
+        recognition = new Recognition();
+      } catch {
         webSpeechUnavailable = true;
-        running = false;
+        return null;
       }
-    };
-    recognition.onend = () => {
-      base = 0;
-      latestLength = 0;
-      if (!running || !sessionRef.current) return;
+      let base = 0;
+      let latestLength = 0;
+      let running = true;
+      onUtteranceCut.current = () => {
+        base = latestLength;
+      };
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang =
+        languageRef.current === "auto" ? navigator.language || "en-US" : languageRef.current;
+      recognition.onresult = (event) => {
+        webSpeechLiveRef.current = true;
+        latestLength = event.results.length;
+        let text = "";
+        for (let i = base; i < event.results.length; i++) {
+          text += event.results[i][0]?.transcript ?? "";
+        }
+        streamPreviewWords(text.trim());
+      };
+      recognition.onerror = (event) => {
+        if (
+          [
+            "network",
+            "not-allowed",
+            "service-not-allowed",
+            "audio-capture",
+            "language-not-supported",
+          ].includes(event.error)
+        ) {
+          webSpeechUnavailable = true;
+          running = false;
+        }
+      };
+      recognition.onend = () => {
+        base = 0;
+        latestLength = 0;
+        if (!running || !sessionRef.current) return;
+        try {
+          recognition.start();
+        } catch {
+          // engine still winding down - the preview is optional
+        }
+      };
       try {
         recognition.start();
       } catch {
-        // engine still winding down - the preview is optional
+        return null;
       }
-    };
-    try {
-      recognition.start();
-    } catch {
-      return null;
-    }
-    return recognition;
-  }, []);
+      return recognition;
+    },
+    [streamPreviewWords]
+  );
 
-  // Interim text for the grey preview only - never inserted, so no commands/context fitting.
-  const previewTranscribe = useCallback(async (samples: Float32Array, lang: string): Promise<string> => {
-    const ed = editorRef.current;
-    if (!ed) return "";
-    try {
-      const result = await invoke<{ text: string; language: string | null }>("transcribe_doc_audio", {
-        audioBytes: Array.from(encodeWav(samples)),
-        mimeType: "audio/wav",
-        language: lang,
-        prompt: buildWhisperPrompt(titleRef.current, documentTextBeforeDictation(ed)),
-      });
-      const text = stripNonSpeech(result.text).replace(/\s+/g, " ").trim();
-      return isLikelyHallucination(text, PREVIEW_MIN_SPEECH_MS) ? "" : text;
-    } catch {
-      return ""; // the final transcription reports errors; a failed preview just shows nothing
-    }
-  }, []);
+  // Interim whisper run for rolling word-by-word preview (and reusable by final `transcribe()`
+  // when no further speech frames arrive before the utterance cuts).
+  const previewTranscribe = useCallback(
+    async (
+      samples: Float32Array,
+      lang: string,
+      speechMs: number
+    ): Promise<{ text: string; language: string | null } | null> => {
+      const ed = editorRef.current;
+      if (!ed) return null;
+      const precedingText = documentTextBeforeDictation(ed);
+      try {
+        const prompt = speechMs >= 650 ? buildWhisperPrompt(titleRef.current, precedingText) : "";
+        const result = await invoke<{ text: string; language: string | null }>(
+          "transcribe_doc_audio",
+          {
+            audioBytes: Array.from(encodeWav(samples)),
+            mimeType: "audio/wav",
+            language: lang,
+            prompt: prompt || null,
+          }
+        );
+        const text = stripNonSpeech(result.text).replace(/\s+/g, " ").trim();
+        if (
+          !text ||
+          isLikelyHallucination(text, speechMs, {
+            title: titleRef.current,
+            precedingText,
+          })
+        ) {
+          return null;
+        }
+        return { text: result.text, language: result.language };
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
 
   const stop = useCallback(() => {
     const session = sessionRef.current;
@@ -384,8 +574,9 @@ export default function useDocDictation(editor: Editor | null, title: string): D
         // already stopped
       }
     }
+    clearPreviewTicker();
     levelRef.current = 0;
-    if (disposedRef.current) return; // unmounting - the editor may already be destroyed
+    if (disposedRef.current) return;
     setSpeaking(false);
     editorRef.current?.commands.pauseDictation();
     if (pendingRef.current > 0) {
@@ -394,7 +585,7 @@ export default function useDocDictation(editor: Editor | null, title: string): D
       editorRef.current?.commands.endDictation();
       setPhase("idle");
     }
-  }, []);
+  }, [clearPreviewTicker]);
   stopRef.current = stop;
 
   const start = useCallback(async () => {
@@ -406,16 +597,29 @@ export default function useDocDictation(editor: Editor | null, title: string): D
     }
     setPhase("starting");
     webSpeechLiveRef.current = false;
+    latestPreviewRef.current = null;
     flashMessage(null);
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
     } catch (err) {
       setPhase(pendingRef.current > 0 ? "finishing" : "idle");
       const name = err instanceof DOMException ? err.name : "";
-      flashMessage(name === "NotAllowedError" ? "Microphone permission denied" : name === "NotFoundError" ? "No microphone found" : String(err), 6000);
+      flashMessage(
+        name === "NotAllowedError"
+          ? "Microphone permission denied"
+          : name === "NotFoundError"
+            ? "No microphone found"
+            : String(err),
+        6000
+      );
       return;
     }
     if (disposedRef.current) {
@@ -438,34 +642,57 @@ export default function useDocDictation(editor: Editor | null, title: string): D
     mute.connect(ctx.destination);
 
     const frameMs = (FRAME_SIZE / ctx.sampleRate) * 1000;
-    const preRollFrames = Math.ceil(PRE_ROLL_MS / frameMs);
+    const preRollFrames = Math.max(2, Math.ceil(PRE_ROLL_MS / frameMs));
     const preRoll: Float32Array[] = [];
     let segment: Float32Array[] | null = null;
     let segmentMs = 0;
     let speechMs = 0;
     let silenceMs = 0;
-    let noiseFloor = 0.008;
+    let maxSpeechRms = 0;
+    let noiseFloor = 0.006;
     let speakingNow = false;
     const utteranceCut = { current: () => {} };
-    // Rolling whisper preview of the utterance in progress - the grey words-as-you-speak text,
-    // replaced by the final transcript once the pause comes. `segmentId` drops a preview that
-    // returns after its utterance was already cut.
     let segmentId = 0;
     let lastPreviewAtMs = 0;
     let previewInFlight = false;
 
+    const trimTrailingSilence = (frames: Float32Array[], trailingSilenceMs: number): Float32Array => {
+      const dropFrames = Math.max(0, Math.floor((trailingSilenceMs - 140) / frameMs));
+      const keep = Math.max(1, frames.length - dropFrames);
+      return concat(frames.slice(0, keep));
+    };
+
     const maybePreview = () => {
       if (!segment || previewInFlight || webSpeechLiveRef.current || pendingRef.current > 0) return;
-      if (speechMs < PREVIEW_MIN_SPEECH_MS || segmentMs - lastPreviewAtMs < PREVIEW_INTERVAL_MS) return;
-      const lang = languageRef.current === "auto" ? lockedLanguageRef.current : languageRef.current;
-      if (!lang) return; // auto-detect would add ~1.1s per preview - wait for the first phrase to lock it
+      if (speechMs < PREVIEW_MIN_SPEECH_MS || segmentMs - lastPreviewAtMs < PREVIEW_INTERVAL_MS) {
+        return;
+      }
+      if (maxSpeechRms < Math.max(0.014, noiseFloor * 3.0)) return;
+
+      const lang =
+        languageRef.current === "auto"
+          ? lockedLanguageRef.current ?? browserFallbackLanguage()
+          : languageRef.current;
+
       lastPreviewAtMs = segmentMs;
       previewInFlight = true;
       const id = segmentId;
-      const samples = concat(segment);
-      const run = previewTranscribe(samples, lang)
-        .then((text) => {
-          if (id === segmentId && segment && text && !disposedRef.current) editorRef.current?.commands.setDictationPreview(text);
+      const snapshotSpeechMs = speechMs;
+      const samples = trimTrailingSilence(segment, silenceMs);
+
+      const promise = previewTranscribe(samples, lang, snapshotSpeechMs);
+      latestPreviewRef.current = {
+        segmentId: id,
+        speechMs: snapshotSpeechMs,
+        lang,
+        promise,
+      };
+      const run = promise
+        .then((res) => {
+          if (id === segmentId && segment && res?.text && !disposedRef.current) {
+            const cleaned = stripNonSpeech(res.text).replace(/\s+/g, " ").trim();
+            if (cleaned) streamPreviewWords(cleaned);
+          }
         })
         .finally(() => {
           previewInFlight = false;
@@ -475,31 +702,51 @@ export default function useDocDictation(editor: Editor | null, title: string): D
 
     const cut = () => {
       if (!segment) return;
+      const finishedSegmentId = segmentId;
       segmentId += 1;
       lastPreviewAtMs = 0;
-      // Keep ~300ms of the trailing silence; whisper does better with a little tail.
-      const keep = Math.max(0, segment.length - Math.max(0, Math.floor((silenceMs - 300) / frameMs)));
-      const frames = segment.slice(0, keep);
+      const samples = trimTrailingSilence(segment, silenceMs);
       const ms = speechMs;
+      const peak = maxSpeechRms;
+      const currentNoiseFloor = noiseFloor;
       segment = null;
-      segmentMs = speechMs = silenceMs = 0;
+      segmentMs = speechMs = silenceMs = maxSpeechRms = 0;
       utteranceCut.current();
-      if (ms >= MIN_SPEECH_MS) enqueue({ samples: concat(frames), speechMs: ms });
-      else editorRef.current?.commands.setDictationPreview("");
+
+      if (ms < MIN_SPEECH_MS || peak < Math.max(0.014, currentNoiseFloor * 3.1)) {
+        if (pendingRef.current === 0) {
+          setPreviewImmediate("");
+        }
+        return;
+      }
+
+      const snap = latestPreviewRef.current;
+      const requested = languageRef.current;
+      const canReuseSnap =
+        snap &&
+        snap.segmentId === finishedSegmentId &&
+        Math.abs(ms - snap.speechMs) <= frameMs * 1.1 &&
+        (requested !== "auto" || lockedLanguageRef.current !== null);
+
+      enqueue({
+        segmentId: finishedSegmentId,
+        samples,
+        speechMs: ms,
+        reusePreview: canReuseSnap ? snap.promise : undefined,
+      });
     };
 
     processor.onaudioprocess = (event) => {
       const frame = downsample(event.inputBuffer.getChannelData(0), ctx.sampleRate);
-      let sum = 0;
-      for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
-      const rms = Math.sqrt(sum / Math.max(1, frame.length));
+      const { bandRms, zcr } = analyzeSpeechFrame(frame);
 
-      // Noise floor follows quiet frames quickly and loud ones very slowly, so it tracks a fan or
-      // room tone without ever climbing to speech level.
-      noiseFloor = rms < noiseFloor ? noiseFloor * 0.85 + rms * 0.15 : noiseFloor * 0.998 + rms * 0.002;
-      const threshold = Math.max(0.01, noiseFloor * 3);
-      const isSpeech = rms > threshold;
-      levelRef.current = Math.min(1, rms / Math.max(0.05, threshold * 4));
+      noiseFloor =
+        bandRms < noiseFloor
+          ? noiseFloor * 0.85 + bandRms * 0.15
+          : noiseFloor * 0.997 + bandRms * 0.003;
+      const threshold = Math.max(0.011, noiseFloor * 3.0);
+      const isSpeech = bandRms > threshold && zcr >= 0.008 && zcr <= 0.45;
+      levelRef.current = Math.min(1, bandRms / Math.max(0.045, threshold * 3.8));
 
       if (isSpeech !== speakingNow) {
         speakingNow = isSpeech;
@@ -514,6 +761,7 @@ export default function useDocDictation(editor: Editor | null, title: string): D
         segmentMs = segment.length * frameMs;
         speechMs = frameMs;
         silenceMs = 0;
+        maxSpeechRms = bandRms;
         return;
       }
 
@@ -522,10 +770,18 @@ export default function useDocDictation(editor: Editor | null, title: string): D
       if (isSpeech) {
         speechMs += frameMs;
         silenceMs = 0;
+        if (bandRms > maxSpeechRms) maxSpeechRms = bandRms;
       } else {
         silenceMs += frameMs;
       }
-      if (silenceMs >= END_SILENCE_MS || (segmentMs >= SOFT_MAX_MS && silenceMs >= SOFT_SILENCE_MS) || segmentMs >= HARD_MAX_MS) cut();
+
+      const shouldCut =
+        silenceMs >= END_SILENCE_MS ||
+        (speechMs >= CLAUSE_MAX_MS && silenceMs >= CLAUSE_SILENCE_MS) ||
+        (segmentMs >= SOFT_MAX_MS && silenceMs >= SOFT_SILENCE_MS) ||
+        segmentMs >= HARD_MAX_MS;
+
+      if (shouldCut) cut();
       else maybePreview();
     };
 
@@ -533,14 +789,22 @@ export default function useDocDictation(editor: Editor | null, title: string): D
     sessionRef.current = { stream, ctx, processor, recognition, flush: cut };
     ed.chain().focus().beginDictation().run();
     setPhase("listening");
-  }, [enqueue, flashMessage, phase, previewTranscribe, startPreview]);
+  }, [
+    enqueue,
+    flashMessage,
+    phase,
+    previewTranscribe,
+    setPreviewImmediate,
+    startPreview,
+    streamPreviewWords,
+  ]);
 
   const toggle = useCallback(() => {
     if (sessionRef.current) stop();
     else void start();
   }, [start, stop]);
 
-  // First-run model download and per-chunk progress come from the backend as events.
+  // First-run model download, detected language, and real-time partial segment streaming from backend.
   useEffect(() => {
     let disposed = false;
     const unlisteners: (() => void)[] = [];
@@ -552,8 +816,11 @@ export default function useDocDictation(editor: Editor | null, title: string): D
     track(
       listen<{ downloaded: number; total: number }>("whisper-model-download", (event) => {
         const { downloaded, total } = event.payload;
-        if (downloaded < total) setMessage(`Downloading speech model (one time) ${Math.round((downloaded / total) * 100)}%`);
-        else setMessage(null);
+        if (downloaded < total) {
+          setMessage(`Downloading speech model (one time) ${Math.round((downloaded / total) * 100)}%`);
+        } else {
+          setMessage(null);
+        }
       })
     );
     track(
@@ -561,20 +828,50 @@ export default function useDocDictation(editor: Editor | null, title: string): D
         setDetectedLanguage(event.payload);
       })
     );
+    track(
+      listen<string>("docs-dictation-partial", (event) => {
+        if (!sessionRef.current || webSpeechLiveRef.current) return;
+        const ed = editorRef.current;
+        if (!ed) return;
+        const cleaned = stripNonSpeech(event.payload).replace(/\s+/g, " ").trim();
+        if (
+          cleaned &&
+          !isLikelyHallucination(cleaned, PREVIEW_MIN_SPEECH_MS, {
+            title: titleRef.current,
+            precedingText: documentTextBeforeDictation(ed),
+          })
+        ) {
+          streamPreviewWords(cleaned);
+        }
+      })
+    );
     return () => {
       disposed = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, []);
+  }, [streamPreviewWords]);
 
   useEffect(() => {
     disposedRef.current = false;
     return () => {
       disposedRef.current = true;
+      clearPreviewTicker();
       stopRef.current();
       if (messageTimerRef.current !== null) window.clearTimeout(messageTimerRef.current);
     };
-  }, []);
+  }, [clearPreviewTicker]);
 
-  return { phase, speaking, pending, message, language, detectedLanguage, levelRef, setLanguage, start, stop, toggle };
+  return {
+    phase,
+    speaking,
+    pending,
+    message,
+    language,
+    detectedLanguage,
+    levelRef,
+    setLanguage,
+    start,
+    stop,
+    toggle,
+  };
 }

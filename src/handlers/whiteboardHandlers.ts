@@ -3937,6 +3937,45 @@ export function reorderPageItems(
   return { nodes: nextNodes, edges: nextEdges };
 }
 
+// Reorders items in the unified page layer stack by moving `draggedId` to `targetId`'s position.
+// Works in display order (front-to-back, highest rank first) so dropping onto a target places the
+// dragged item directly into that target's visual layer slot.
+export function reorderPageItemsByDrag(
+  page: { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] },
+  draggedId: string,
+  targetId: string
+): { nodes: WhiteboardNode[]; edges: WhiteboardEdge[] } {
+  if (draggedId === targetId) return { nodes: page.nodes, edges: page.edges };
+  const ranks = resolvePageLayerOrder(page);
+  type TaggedItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
+  const unified: TaggedItem[] = [
+    ...page.nodes.map((item): TaggedItem => ({ kind: "node", item })),
+    ...page.edges.map((item): TaggedItem => ({ kind: "edge", item })),
+  ].sort((a, b) => (ranks.get(a.item.id) ?? 0) - (ranks.get(b.item.id) ?? 0));
+
+  // Display list is front-to-back (highest rank first)
+  const displayList = [...unified].reverse();
+  const from = displayList.findIndex((x) => x.item.id === draggedId);
+  const to = displayList.findIndex((x) => x.item.id === targetId);
+  if (from === -1 || to === -1) return { nodes: page.nodes, edges: page.edges };
+
+  const [moved] = displayList.splice(from, 1);
+  displayList.splice(to, 0, moved);
+
+  // Paint order is back-to-front (lowest rank first)
+  const paintOrder = [...displayList].reverse();
+  const nextNodes: WhiteboardNode[] = [];
+  const nextEdges: WhiteboardEdge[] = [];
+  paintOrder.forEach((entry, zIndex) => {
+    if (entry.kind === "node") {
+      nextNodes.push({ ...entry.item, zIndex });
+    } else {
+      nextEdges.push({ ...entry.item, zIndex });
+    }
+  });
+  return { nodes: nextNodes, edges: nextEdges };
+}
+
 // Re-adds a deleted node's cascade-deleted edges too, in one shot - invertCommand alone can't
 // express "add-node AND add-edge (several)" as a single WhiteboardCommand (the command union has
 // no such combined type), so useWhiteboardStore's undo calls this instead of invertCommand for a

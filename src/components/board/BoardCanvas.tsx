@@ -13,8 +13,8 @@
 // keeps a whole drag gesture to exactly one undo step.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IoCopyOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
-import { TbStackBack, TbStackFront } from "react-icons/tb";
+import { IoCopyOutline, IoDownloadOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
+import { TbScissors, TbStackBack, TbStackFront } from "react-icons/tb";
 import { BoardDocument, BoardImage, BoardItem, BoardText } from "../../utils/boardTypes";
 import {
   applyGroupResize,
@@ -81,6 +81,7 @@ interface BoardCanvasProps {
   // already generically handles the CSS/buffer size mismatch this introduces, so no other pointer
   // math below needs to know zoom exists.
   zoom: number;
+  removingBackgroundId?: string | null;
   imageBitmaps: Map<string, HTMLImageElement>;
   selectedIds: Set<string>;
   onSelect: (ids: Set<string>) => void;
@@ -92,6 +93,8 @@ interface BoardCanvasProps {
   // just a faster, no-side-panel-required path to them, and also what stops WebView2's native
   // "Save image as / Copy image / Inspect" context menu from appearing over board tiles at all.
   onReplaceImage: (image: BoardImage) => void;
+  onRemoveBackground?: (image: BoardImage) => void;
+  onDownloadImage?: (image: BoardImage) => void;
   onBringToFront: (ids: Set<string>) => void;
   onSendToBack: (ids: Set<string>) => void;
   onDuplicateItem: (item: BoardItem) => void;
@@ -101,12 +104,15 @@ interface BoardCanvasProps {
 const BoardCanvas: React.FC<BoardCanvasProps> = ({
   doc,
   zoom,
+  removingBackgroundId,
   imageBitmaps,
   selectedIds,
   onSelect,
   onEditImage,
   onBatchEditImages,
   onReplaceImage,
+  onRemoveBackground,
+  onDownloadImage,
   onBringToFront,
   onSendToBack,
   onDuplicateItem,
@@ -431,7 +437,53 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
     }
 
     const drag = dragRef.current;
-    if (!drag) return;
+    if (!drag) {
+      const { x, y } = pointerToCanvasSpace(e);
+      const hitRadius = HANDLE_HIT_RADIUS / zoom;
+      let nextCursor = "default";
+
+      if (selectedIds.size === 1) {
+        const image = doc.images.find((img) => selectedIds.has(img.id));
+        if (image && !image.locked) {
+          const rotateHandle = rotateHandlePoint(image, ROTATE_HANDLE_OFFSET / zoom);
+          if (Math.hypot(x - rotateHandle.x, y - rotateHandle.y) <= hitRadius) {
+            nextCursor = "grab";
+          } else {
+            const handles = resizeHandlePoints(image);
+            for (const corner of Object.keys(handles) as ResizeCorner[]) {
+              if (Math.hypot(x - handles[corner].x, y - handles[corner].y) <= hitRadius) {
+                nextCursor = corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize";
+                break;
+              }
+            }
+            if (nextCursor === "default" && hitTestBoardItem([image], x, y)) {
+              nextCursor = "move";
+            }
+          }
+        }
+      } else if (selectedIds.size > 1) {
+        const selectedItems = doc.images.filter((img) => selectedIds.has(img.id));
+        if (selectedItems.length > 1) {
+          const bounds = groupBoundingBox(selectedItems);
+          const groupCenter = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+          const rotateHandlePos = { x: groupCenter.x, y: bounds.y - ROTATE_HANDLE_OFFSET / zoom };
+          if (Math.hypot(x - rotateHandlePos.x, y - rotateHandlePos.y) <= hitRadius) {
+            nextCursor = "grab";
+          } else if (hitTestBoardItem(selectedItems, x, y)) {
+            nextCursor = "move";
+          }
+        }
+      }
+
+      if (e.currentTarget.style.cursor !== nextCursor) {
+        e.currentTarget.style.cursor = nextCursor;
+      }
+      return;
+    }
+
+    if (drag.mode === "rotate") {
+      e.currentTarget.style.cursor = "grabbing";
+    }
     const { x, y } = pointerToCanvasSpace(e);
     const dx = x - drag.startX;
     const dy = y - drag.startY;
@@ -561,6 +613,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   };
 
   const endDrag = (): void => {
+    if (canvasRef.current) canvasRef.current.style.cursor = "default";
     if (marqueeRef.current) {
       marqueeRef.current = null;
       setMarqueeRect(null);
@@ -605,7 +658,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
           has a positioned ancestor to place itself against with plain left/top math - no change to
           how this sits in BoardEditor.tsx's own centering flex container, since the wrapper is the
           same box the bare canvas used to be. */}
-      <div className="relative shrink-0" style={{ width: bufferWidth * zoom, height: bufferHeight * zoom }}>
+      <div className="relative shrink-0 m-auto" style={{ width: bufferWidth * zoom, height: bufferHeight * zoom }}>
         <canvas
           ref={canvasRef}
           style={{
@@ -691,6 +744,48 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
             }}
           />
         )}
+
+        {removingBackgroundId && (() => {
+          const item = doc.images.find((img) => img.id === removingBackgroundId);
+          if (!item) return null;
+          const cornerRadius = ((item as BoardImage).cornerRadius ?? 0) * zoom;
+          return (
+            <div
+              style={{
+                position: "absolute",
+                left: (padding + item.x) * zoom,
+                top: (padding + item.y) * zoom,
+                width: item.width * zoom,
+                height: item.height * zoom,
+                transform: `rotate(${item.rotation}rad)`,
+                transformOrigin: "center",
+                pointerEvents: "none",
+                borderRadius: cornerRadius,
+                overflow: "hidden",
+                zIndex: 40,
+              }}
+              className="flex flex-col items-center justify-center select-none animate-[boardBgRemovalPulse_2s_ease-in-out_infinite]"
+            >
+              <style>{`
+                @keyframes boardBgRemovalPulse {
+                  0%, 100% { background-color: rgba(59, 130, 246, 0.28); box-shadow: 0 0 24px rgba(59, 130, 246, 0.6), inset 0 0 16px rgba(59, 130, 246, 0.4); }
+                  33% { background-color: rgba(168, 85, 247, 0.38); box-shadow: 0 0 32px rgba(168, 85, 247, 0.7), inset 0 0 22px rgba(168, 85, 247, 0.45); }
+                  66% { background-color: rgba(236, 72, 153, 0.32); box-shadow: 0 0 28px rgba(236, 72, 153, 0.65), inset 0 0 18px rgba(236, 72, 153, 0.4); }
+                }
+                @keyframes boardBgRemovalScan {
+                  0% { top: 0%; opacity: 0.2; }
+                  50% { opacity: 1; }
+                  100% { top: 100%; opacity: 0.2; }
+                }
+              `}</style>
+              <div className="absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_12px_#22d3ee] animate-[boardBgRemovalScan_1.8s_ease-in-out_infinite]" />
+              <div className="relative z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-neutral-900/85 backdrop-blur-md text-white text-xs font-medium shadow-2xl border border-white/20">
+                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-cyan-400 rounded-full animate-spin" />
+                <span>Removing background…</span>
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {contextMenu &&
@@ -698,20 +793,48 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
           <div
             onPointerDown={(e) => e.stopPropagation()}
             style={{ position: "fixed", top: contextMenu.y, left: contextMenu.x }}
-            className="w-44 py-1 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-neutral-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 z-[9999]"
+            className="w-52 py-1 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-neutral-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 z-[9999]"
           >
             {contextMenu.item.kind === "image" && (
-              <button
-                type="button"
-                onClick={() => {
-                  onReplaceImage(contextMenu.item as BoardImage);
-                  setContextMenu(null);
-                }}
-                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
-              >
-                <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
-                Replace image
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onReplaceImage(contextMenu.item as BoardImage);
+                    setContextMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+                >
+                  <IoSwapHorizontalOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                  Replace image
+                </button>
+                {onRemoveBackground && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onRemoveBackground(contextMenu.item as BoardImage);
+                      setContextMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+                  >
+                    <TbScissors size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                    Remove background
+                  </button>
+                )}
+                {onDownloadImage && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onDownloadImage(contextMenu.item as BoardImage);
+                      setContextMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+                  >
+                    <IoDownloadOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                    Download image
+                  </button>
+                )}
+              </>
             )}
             <button
               type="button"
@@ -719,7 +842,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
                 onDuplicateItem(contextMenu.item);
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
             >
               <IoCopyOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
               Duplicate
@@ -730,7 +853,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
                 onBringToFront(new Set([contextMenu.item.id]));
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
             >
               <TbStackFront size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
               Bring to front
@@ -741,7 +864,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
                 onSendToBack(new Set([contextMenu.item.id]));
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 transition-colors"
             >
               <TbStackBack size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
               Send to back
@@ -753,7 +876,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
                 onDeleteItem(contextMenu.item);
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-left whitespace-nowrap text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
             >
               <IoTrashOutline size={15} className="shrink-0" />
               Delete{" "}

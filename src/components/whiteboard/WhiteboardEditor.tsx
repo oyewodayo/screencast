@@ -31,6 +31,7 @@ import {
   IoGridOutline,
   IoCropOutline,
   IoImageOutline,
+  IoLayersOutline,
   IoRefreshOutline,
   IoSwapHorizontalOutline,
   IoMagnetOutline,
@@ -59,15 +60,19 @@ import {
   LayerReorderAction,
   renderWhiteboardToCanvas,
   reorderPageItems,
+  reorderPageItemsByDrag,
   resolveEdgeEndpoints,
   shapeOutlineFor,
   CYLINDER_CAP_RATIO,
   SERIES_FILL_OPACITY,
 } from "../../handlers/whiteboardHandlers";
-import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
+import { importImageFromBlob, importImageFromPath, measureImage, whiteboardAssetPath, whiteboardAssetUrl } from "../../utils/whiteboardImageCache";
 import { isTypingInField, measureTextBlock, readPastePayload, writeInternalMarker } from "../../utils/canvasClipboard";
+import { removeImageBackground } from "../../utils/backgroundRemoval";
+import { TbScissors } from "react-icons/tb";
 import WhiteboardCanvas, { WhiteboardCanvasHandle } from "./WhiteboardCanvas";
 import WhiteboardStylePanel from "./WhiteboardStylePanel";
+import WhiteboardLayerPanel from "./WhiteboardLayerPanel";
 import LinksControl from "../links/LinksControl";
 import ColorInput from "../common/ColorInput";
 
@@ -610,6 +615,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<Set<string>>(new Set());
+  const [showLayerPanel, setShowLayerPanel] = useState(false);
   // A "table" node's own live cell/row/column selection, lifted up from WhiteboardCanvas.tsx (see
   // its own onTableRangeChange prop) so WhiteboardStylePanel.tsx's "Cell" background/border-style
   // controls know which cells to act on - the panel otherwise has no selection concept below "which
@@ -632,6 +638,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   // Right-click context menu (export selection as PNG, delete) - opened by WhiteboardCanvas.tsx's
   // onItemContextMenu once a node/edge right-click has already updated the selection to match.
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
+  const [removingBackgroundNodeId, setRemovingBackgroundNodeId] = useState<string | null>(null);
   const [exportingSelection, setExportingSelection] = useState(false);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
@@ -770,6 +777,99 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       store.reorderItems(reordered.nodes, reordered.edges);
     },
     [page, selectedNodeIds, selectedEdgeIds, store]
+  );
+
+  const handleDragReorder = useCallback(
+    (draggedId: string, targetId: string) => {
+      if (!page || draggedId === targetId) return;
+      const reordered = reorderPageItemsByDrag(page, draggedId, targetId);
+      store.reorderItems(reordered.nodes, reordered.edges);
+    },
+    [page, store]
+  );
+
+  const handleStepReorderItem = useCallback(
+    (id: string, direction: "forward" | "backward") => {
+      if (!page) return;
+      const reordered = reorderPageItems(page, new Set([id]), direction);
+      store.reorderItems(reordered.nodes, reordered.edges);
+    },
+    [page, store]
+  );
+
+  const handleSelectLayerItem = useCallback(
+    (id: string, kind: "node" | "edge", multi: boolean) => {
+      if (multi) {
+        if (kind === "node") {
+          setSelectedNodeIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          });
+        } else {
+          setSelectedEdgeIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          });
+        }
+      } else {
+        if (kind === "node") {
+          setSelectedNodeIds(new Set([id]));
+          setSelectedEdgeIds(new Set());
+        } else {
+          setSelectedEdgeIds(new Set([id]));
+          setSelectedNodeIds(new Set());
+        }
+      }
+    },
+    []
+  );
+
+  const handleToggleLockItem = useCallback(
+    (id: string, kind: "node" | "edge") => {
+      if (!page) return;
+      if (kind === "node") {
+        const node = page.nodes.find((n) => n.id === id);
+        if (node) store.editNode(node, { ...node, locked: !node.locked });
+      } else {
+        const edge = page.edges.find((e) => e.id === id);
+        if (edge) store.editEdge(edge, { ...edge, locked: !edge.locked });
+      }
+    },
+    [page, store]
+  );
+
+  const handleDeleteLayerItem = useCallback(
+    (id: string, kind: "node" | "edge") => {
+      if (!page) return;
+      if (kind === "node") {
+        const node = page.nodes.find((n) => n.id === id);
+        if (node) {
+          store.deleteNode(node);
+          setSelectedNodeIds((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }
+      } else {
+        const edge = page.edges.find((e) => e.id === id);
+        if (edge) {
+          store.deleteEdge(edge);
+          setSelectedEdgeIds((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }
+      }
+    },
+    [page, store]
   );
 
   // Group/Ungroup are plain batchEditNodes calls that set/clear WhiteboardNode.groupId - no
@@ -1019,6 +1119,51 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       }
     },
     [briefcastDir, whiteboardId, store]
+  );
+
+  const handleRemoveImageBackground = useCallback(
+    async (node: WhiteboardNode) => {
+      if (!briefcastDir || !node.assetFileName || removingBackgroundNodeId) return;
+      setRemovingBackgroundNodeId(node.id);
+      try {
+        const assetPath = whiteboardAssetPath(briefcastDir, whiteboardId, node.assetFileName);
+        const cutoutDataUrl = await removeImageBackground(assetPath);
+        const naturalSize = await new Promise<{ width: number; height: number }>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+          img.onerror = () => reject(new Error("Failed to decode cutout image"));
+          img.src = cutoutDataUrl;
+        });
+        const comma = cutoutDataUrl.indexOf(",");
+        const base64 = comma >= 0 ? cutoutDataUrl.slice(comma + 1) : cutoutDataUrl;
+        const binaryString = atob(base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const assetId = crypto.randomUUID();
+        const assetFileName = await invoke<string>("save_whiteboard_image", {
+          whiteboardId,
+          assetId,
+          extension: "png",
+          bytes: Array.from(bytes),
+        });
+        store.editNode(node, {
+          ...node,
+          assetFileName,
+          naturalWidth: naturalSize.width,
+          naturalHeight: naturalSize.height,
+          fillColor: null,
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        console.error("Failed to remove image background:", err);
+        setImageError(err instanceof Error ? err.message : "Failed to remove image background");
+      } finally {
+        setRemovingBackgroundNodeId(null);
+      }
+    },
+    [briefcastDir, whiteboardId, removingBackgroundNodeId, store]
   );
 
   // The Fill section's "Image" fill - same import path as Insert/Replace image, but it only returns
@@ -1566,6 +1711,13 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <IoMagnetOutline size={16} />
         </ToolbarButton>
         <div className="flex-1" />
+        <ToolbarButton
+          title={showLayerPanel ? "Hide layers" : "Layers"}
+          active={showLayerPanel}
+          onClick={() => setShowLayerPanel((v) => !v)}
+        >
+          <IoLayersOutline size={16} />
+        </ToolbarButton>
         <LinksControl self={{ kind: "whiteboard", id: whiteboardId }} title={doc.name} variant="header" />
         {store.isSaving && <span className="text-xs text-gray-400 dark:text-neutral-500 mr-2">Saving…</span>}
         {exportError && <span className="text-xs text-red-500 dark:text-red-400 mr-2">{exportError}</span>}
@@ -1620,6 +1772,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       <div className="relative flex-1 min-h-0" ref={canvasHostRef}>
         <WhiteboardCanvas
           ref={canvasRef}
+          removingBackgroundNodeId={removingBackgroundNodeId}
           imageSrcFor={imageSrcFor}
           onImageDrop={(files, docPoint) => void addImagesFromBlobs(files, docPoint)}
           croppingNodeId={croppingNodeId}
@@ -1677,7 +1830,21 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onItemContextMenu={(nodeIds, edgeIds, point) => setContextMenu({ x: point.x, y: point.y, nodeIds, edgeIds })}
           onTableRangeChange={(nodeId, range) => setTableRangeSelection(range ? { nodeId, range } : null)}
         />
+        {showLayerPanel && page && (
+          <WhiteboardLayerPanel
+            page={page}
+            selectedNodeIds={selectedNodeIds}
+            selectedEdgeIds={selectedEdgeIds}
+            onSelectItem={handleSelectLayerItem}
+            onStepReorder={handleStepReorderItem}
+            onReorder={handleDragReorder}
+            onToggleLock={handleToggleLockItem}
+            onDelete={handleDeleteLayerItem}
+            onClose={() => setShowLayerPanel(false)}
+          />
+        )}
         <WhiteboardStylePanel
+          offsetRight={showLayerPanel}
           selectedNodes={selectedNodes}
           selectedEdges={selectedEdges}
           pageNodes={page.nodes}
@@ -1703,6 +1870,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           onGroup={handleGroup}
           onUngroup={handleUngroup}
           onReplaceImage={(node) => void handleReplaceImage(node)}
+          onRemoveBackground={(node) => void handleRemoveImageBackground(node)}
+          isRemovingBackground={Boolean(removingBackgroundNodeId && selectedNodes.some((n) => n.id === removingBackgroundNodeId))}
           onPickFillImage={handlePickFillImage}
           assetUrlFor={assetUrlFor}
           onSaveExport={handleSaveExport}
@@ -1859,6 +2028,17 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
                   className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
                 >
                   <IoSwapHorizontalOutline size={14} /> Replace image…
+                </button>
+                <button
+                  type="button"
+                  disabled={removingBackgroundNodeId === node.id || node.locked}
+                  onClick={() => {
+                    setContextMenu(null);
+                    void handleRemoveImageBackground(node);
+                  }}
+                  className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+                >
+                  <TbScissors size={14} /> {removingBackgroundNodeId === node.id ? "Removing background…" : "Remove background"}
                 </button>
                 <button
                   type="button"

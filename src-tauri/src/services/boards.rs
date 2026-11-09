@@ -98,7 +98,7 @@ pub fn list_boards() -> Result<Vec<BoardSummary>, String> {
 pub fn create_board(id: String, name: String, json: String) -> Result<BoardSummary, String> {
     let _serial = crate::services::responsiveness::serial();
     let dir = board_dir(&id)?;
-    if dir.exists() {
+    if dir.join("board.json").exists() {
         return Err("A board with that id already exists".to_string());
     }
     fs::create_dir_all(dir.join("assets"))
@@ -206,6 +206,25 @@ pub fn import_board_image(
     let asset_file_name = format!("{}.{}", asset_id, ext);
     let dest = assets_dir.join(&asset_file_name);
     fs::copy(&source, &dest).map_err(|e| format!("Failed to copy image: {}", e))?;
+    Ok(asset_file_name)
+}
+
+#[command(async)]
+pub fn save_board_image_bytes(
+    board_id: String,
+    asset_id: String,
+    bytes: Vec<u8>,
+    ext: String,
+) -> Result<String, String> {
+    let _serial = crate::services::responsiveness::serial();
+    let dir = board_dir(&board_id)?;
+    let assets_dir = dir.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets folder: {}", e))?;
+
+    let asset_file_name = format!("{}.{}", asset_id, ext);
+    let dest = assets_dir.join(&asset_file_name);
+    fs::write(&dest, &bytes).map_err(|e| format!("Failed to write image asset: {}", e))?;
     Ok(asset_file_name)
 }
 

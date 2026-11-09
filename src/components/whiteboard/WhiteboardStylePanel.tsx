@@ -36,6 +36,7 @@ import {
   TbLayoutAlignMiddle,
   TbLayoutAlignTop,
   TbRotateClockwise,
+  TbScissors,
   TbShadow,
   TbShadowOff,
   TbStackBack,
@@ -291,6 +292,8 @@ interface WhiteboardStylePanelProps {
   // WhiteboardEditor (it has the file dialog and the whiteboard id this asset is imported into);
   // absent simply hides the "Replace image…" button rather than showing one that can't work.
   onReplaceImage?: (node: WhiteboardNode) => void;
+  onRemoveBackground?: (node: WhiteboardNode) => void;
+  isRemovingBackground?: boolean;
   // Crop mode, owned by WhiteboardEditor so this panel's Crop button and the canvas's own
   // double-click gesture drive the same state rather than each having their own.
   croppingNodeId?: string | null;
@@ -309,6 +312,8 @@ interface WhiteboardStylePanelProps {
   assetUrlFor?: (fileName: string) => string | null;
   // Saves an exported lattice loop through a native save dialog; resolves false if cancelled.
   onSaveExport?: (bytes: Uint8Array, extension: "mp4" | "gif") => Promise<boolean>;
+  // Offsets panel to make room for an open WhiteboardLayerPanel beside it
+  offsetRight?: boolean;
 }
 
 // A plain `value={n}`-controlled number input re-clamps AND redraws its own text on every
@@ -1100,6 +1105,8 @@ function ImageFields({
   node,
   updateNodes,
   onReplace,
+  onRemoveBackground,
+  isRemovingBackground,
   cropping,
   onToggleCrop,
   previewField,
@@ -1107,6 +1114,8 @@ function ImageFields({
   node: WhiteboardNode;
   updateNodes: (patch: Partial<WhiteboardNode>) => void;
   onReplace: () => void;
+  onRemoveBackground?: () => void;
+  isRemovingBackground?: boolean;
   cropping: boolean;
   onToggleCrop?: () => void;
   previewField: (key: keyof WhiteboardNode) => (n: number | null) => void;
@@ -1244,15 +1253,29 @@ function ImageFields({
       {/* Full-width with an icon rather than another plain text button: this is the one action in
           the image section that opens a file dialog and swaps the underlying asset, so it should
           read as a distinct, deliberate action rather than another small toggle in the row above. */}
-      <button
-        type="button"
-        onClick={onReplace}
-        title="Swap in a different picture, keeping this node's size, crop and styling"
-        className="w-full h-8 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 dark:border-neutral-600 text-xs font-medium text-gray-600 dark:text-neutral-300 hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 active:scale-[0.99] transition"
-      >
-        <IoSwapHorizontalOutline size={14} />
-        Replace image
-      </button>
+      <div className="flex flex-col gap-1.5 pt-1">
+        <button
+          type="button"
+          onClick={onReplace}
+          title="Swap in a different picture, keeping this node's size, crop and styling"
+          className="w-full h-8 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 dark:border-neutral-600 text-xs font-medium text-gray-600 dark:text-neutral-300 hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 active:scale-[0.99] transition"
+        >
+          <IoSwapHorizontalOutline size={14} />
+          Replace image
+        </button>
+        {onRemoveBackground && (
+          <button
+            type="button"
+            onClick={onRemoveBackground}
+            disabled={isRemovingBackground || node.locked}
+            title="Remove the background of this image"
+            className="w-full h-8 flex items-center justify-center gap-1.5 rounded-md border border-blue-200 dark:border-blue-500/30 bg-blue-50/60 dark:bg-blue-500/10 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-100/70 active:scale-[0.99] transition disabled:opacity-50"
+          >
+            <TbScissors size={14} />
+            {isRemovingBackground ? "Removing background…" : "Remove background"}
+          </button>
+        )}
+      </div>
     </>
   );
 }
@@ -2581,6 +2604,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   onGroup,
   onUngroup,
   onReplaceImage,
+  onRemoveBackground,
+  isRemovingBackground,
   croppingNodeId,
   onToggleCrop,
   onPreviewNodes,
@@ -2588,6 +2613,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   onPickFillImage,
   assetUrlFor,
   onSaveExport,
+  offsetRight,
 }) => {
   const updateNodes = (patch: Partial<WhiteboardNode>) => {
     if (selectedNodes.length === 0) return;
@@ -2674,7 +2700,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
       : selectedEdges.length > 0 && selectedEdges.every((e) => e.locked ?? false);
 
   return (
-    <div className="absolute top-3 right-3 bottom-3 w-[264px] bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 animate-[wbPanelIn_180ms_ease-out]">
+    <div className={`absolute top-3 ${offsetRight ? "right-[278px]" : "right-3"} bottom-3 w-[300px] bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 transition-all duration-200 animate-[wbPanelIn_180ms_ease-out]`}>
       <style>{"@keyframes wbPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
       {/* Sticky header - a long panel scrolls well past its own top, and without this there's no
           persistent indication of WHAT the controls below are acting on. */}
@@ -2756,6 +2782,21 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             </Section>
           )}
         </>
+      )}
+
+      {selectedNodes.length === 1 && selectedNodes[0].shapeType === "image" && (
+        <Section title="Image" dense>
+          <ImageFields
+            node={selectedNodes[0]}
+            updateNodes={updateNodes}
+            onReplace={onReplaceImage ? () => onReplaceImage(selectedNodes[0]) : () => {}}
+            onRemoveBackground={onRemoveBackground ? () => onRemoveBackground(selectedNodes[0]) : undefined}
+            isRemovingBackground={isRemovingBackground}
+            cropping={croppingNodeId === selectedNodes[0].id}
+            onToggleCrop={onToggleCrop ? () => onToggleCrop(selectedNodes[0]) : undefined}
+            previewField={previewField}
+          />
+        </Section>
       )}
 
       {selectedNodes.length > 0 && hasFill && (
@@ -3431,16 +3472,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               )}
             </>
           )}
-          {selectedNodes.every((n) => n.shapeType === "image") && selectedNodes.length === 1 && onReplaceImage && (
-            <ImageFields
-              node={selectedNodes[0]}
-              updateNodes={updateNodes}
-              onReplace={() => onReplaceImage(selectedNodes[0])}
-              cropping={croppingNodeId === selectedNodes[0].id}
-              onToggleCrop={onToggleCrop ? () => onToggleCrop(selectedNodes[0]) : undefined}
-              previewField={previewField}
-            />
-          )}
+
           {selectedNodes.every((n) => n.shapeType === "waterfallChart") && (
             <>
               <Field label="Colormap">

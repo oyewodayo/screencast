@@ -16,6 +16,7 @@
 // the model (15 MB, from the RVM authors' release) download on first use into
 // <app local data>/background-removal, each pinned by size and SHA-256 (asset_download.rs).
 use serde::Serialize;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -411,6 +412,118 @@ pub fn cancel_background_removal(job_id: String) {
     if let Some(flag) = running_jobs().lock().unwrap().get(&job_id) {
         flag.store(true, Ordering::SeqCst);
     }
+}
+
+// Cuts the person out of a still image (given as a filesystem path or a data URL: "data:image/...;base64,...").
+// Returns a PNG data URL: "data:image/png;base64,...".
+#[tauri::command]
+pub async fn remove_image_background(app_handle: AppHandle, source: String) -> Result<String, String> {
+    if !ENGINE_SUPPORTED {
+        return Err("Background removal isn't available on this system: it needs Windows, Linux on x86-64, or a Mac with Apple Silicon.".into());
+    }
+    let dir = engine_dir(&app_handle)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if !engine_ready(&dir) {
+            return Err("ENGINE_MISSING".to_string());
+        }
+        let env = ort_environment(&dir)?;
+        let model = dir.join(MODEL_ASSET.file_name);
+        cut_out_image(env, &model, &source)
+    })
+    .await
+    .map_err(|e| format!("Background removal stopped unexpectedly: {}", e))?
+}
+
+fn cut_out_image(env: &ort::environment::Environment, model: &Path, source: &str) -> Result<String, String> {
+    use ort::session::Session;
+    use ort::value::Tensor;
+
+    let dyn_img = if let Some(payload) = source.strip_prefix("data:") {
+        let comma = payload.find(',').ok_or("Invalid data URL")?;
+        let base64_data = &payload[comma + 1..];
+        let bytes = BASE64.decode(base64_data).map_err(|e| format!("Base64 decode failed: {e}"))?;
+        image::load_from_memory(&bytes).map_err(|e| format!("Could not load image: {e}"))?
+    } else {
+        image::open(source).map_err(|e| format!("Could not open image file: {e}"))?
+    };
+
+    let orig_w = dyn_img.width();
+    let orig_h = dyn_img.height();
+    if orig_w == 0 || orig_h == 0 {
+        return Err("Image has no pixels to cut out.".into());
+    }
+
+    // Process at original size up to 2048px on the longest side.
+    let max_dim = 2048.0;
+    let scale = (max_dim / (orig_w.max(orig_h) as f64)).min(1.0);
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    let (w, h) = (even(orig_w as f64 * scale), even(orig_h as f64 * scale));
+    let ratio = (384.0 / (w.max(h) as f32)).min(1.0);
+
+    let (wu, hu) = (w as usize, h as usize);
+    let plane = wu * hu;
+
+    let resized_rgb = if w == orig_w && h == orig_h {
+        dyn_img.to_rgb8()
+    } else {
+        image::imageops::resize(&dyn_img.to_rgb8(), w, h, image::imageops::FilterType::Triangle)
+    };
+
+    let mut chw = vec![0f32; plane * 3];
+    pixel_convert::rgb_to_planar(&resized_rgb, &mut chw);
+
+    let src_tensor = Tensor::from_array(([1usize, 3, hu, wu], chw)).map_err(|e| e.to_string())?;
+    let ratio_tensor = Tensor::from_array(([1usize], vec![ratio])).map_err(|e| e.to_string())?;
+
+    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 4);
+    let mut session = Session::builder(env)
+        .and_then(with_gpu)
+        .and_then(|b| b.with_intra_threads(threads).map_err(|e| e.into()))
+        .and_then(|mut b| b.commit_from_file(model))
+        .map_err(|e| format!("The background-removal model didn't load: {e}"))?;
+
+    let zero = || Tensor::from_array(([1usize, 1, 1, 1], vec![0f32])).map(|t| t.into_dyn());
+    let mut rec: Vec<ort::value::DynValue> = (0..4).map(|_| zero()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+
+    // Pass 1: warm up recurrent state
+    let [r1, r2, r3, r4]: [ort::value::DynValue; 4] = std::mem::take(&mut rec).try_into().map_err(|_| "recurrent state".to_string())?;
+    let mut out1 = session
+        .run(ort::inputs!["src" => src_tensor.view(), "r1i" => r1, "r2i" => r2, "r3i" => r3, "r4i" => r4, "downsample_ratio" => ratio_tensor.view()])
+        .map_err(|e| format!("Background removal inference failed: {e}"))?;
+
+    for name in ["r1o", "r2o", "r3o", "r4o"] {
+        rec.push(out1.remove(name).ok_or("recurrent state missing")?);
+    }
+    drop(out1);
+
+    // Pass 2: compute final cutout
+    let [r1, r2, r3, r4]: [ort::value::DynValue; 4] = std::mem::take(&mut rec).try_into().map_err(|_| "recurrent state".to_string())?;
+    let out2 = session
+        .run(ort::inputs!["src" => src_tensor.view(), "r1i" => r1, "r2i" => r2, "r3i" => r3, "r4i" => r4, "downsample_ratio" => ratio_tensor.view()])
+        .map_err(|e| format!("Background removal inference failed: {e}"))?;
+
+    let mut rgba = vec![0u8; plane * 4];
+    {
+        let (_, fgr) = out2["fgr"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        let (_, pha) = out2["pha"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        pixel_convert::planar_to_rgba(fgr, pha, &mut rgba);
+    }
+    drop(out2);
+
+    let cutout_img = image::RgbaImage::from_raw(w, h, rgba).ok_or("Failed to construct image from raw buffer")?;
+
+    let final_img = if w == orig_w && h == orig_h {
+        cutout_img
+    } else {
+        image::imageops::resize(&cutout_img, orig_w, orig_h, image::imageops::FilterType::Lanczos3)
+    };
+
+    let mut png_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(final_img)
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode cutout PNG: {e}"))?;
+
+    Ok(format!("data:image/png;base64,{}", BASE64.encode(&png_bytes)))
 }
 
 // Kills both ffmpeg processes on the way out, however it ends.

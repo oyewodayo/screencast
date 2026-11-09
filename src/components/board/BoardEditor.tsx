@@ -95,6 +95,7 @@ import {
   layoutImagesInRow,
   layoutImagesInSpiral,
   paddedCanvasSize,
+  renderBoardImage,
   renderBoardToCanvas,
   resolveBackgroundMode,
   resolveBoardGradient,
@@ -102,6 +103,7 @@ import {
   resolveBoardPadding,
 } from "../../handlers/boardHandlers";
 import { boardAssetPath, preloadBoardImage } from "../../utils/boardImageCache";
+import { removeImageBackground } from "../../utils/backgroundRemoval";
 import { BOARD_SIZE_PRESET_GROUPS, BOARD_SIZE_PRESETS } from "../../utils/boardCanvasSizes";
 import BoardCanvas from "./BoardCanvas";
 import BoardLayerPanel from "./BoardLayerPanel";
@@ -202,11 +204,11 @@ const BACKGROUND_MODE_META: Record<BoardBackgroundMode, { label: string; icon: R
 // until its label text wrapped internally instead ("Add images" broke into two lines). shrink-0
 // forces every chip to keep its natural width and let the CONTAINER scroll instead.
 const TOOLBAR_ICON_BTN =
-  "shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-40 disabled:pointer-events-none";
+  "shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-40 disabled:pointer-events-none";
 const TOOLBAR_CHIP =
-  "shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-700 dark:text-neutral-200 text-sm font-medium whitespace-nowrap hover:border-neutral-300 dark:hover:border-neutral-600 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-40 disabled:pointer-events-none";
+  "shrink-0 flex items-center gap-1 h-8 px-2.5 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-700 dark:text-neutral-200 text-xs font-medium whitespace-nowrap hover:border-neutral-300 dark:hover:border-neutral-600 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors disabled:opacity-40 disabled:pointer-events-none";
 const TOOLBAR_CHIP_ACTIVE =
-  "shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg border border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 text-sm font-medium whitespace-nowrap transition-colors";
+  "shrink-0 flex items-center gap-1 h-8 px-2.5 rounded-lg border border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 text-xs font-medium whitespace-nowrap transition-colors";
 
 interface BoardEditorProps {
   boardId: string;
@@ -484,6 +486,115 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       }
     },
     [boardId, store]
+  );
+
+  const [removingBackgroundId, setRemovingBackgroundId] = useState<string | null>(null);
+  const isRemovingBackground = Boolean(removingBackgroundId);
+  const handleRemoveImageBackground = useCallback(
+    async (target: BoardImage): Promise<void> => {
+      if (!briefcastDir || isRemovingBackground) return;
+      setRemovingBackgroundId(target.id);
+      try {
+        const assetPath = boardAssetPath(briefcastDir, boardId, target.assetFileName);
+        const cutoutDataUrl = await removeImageBackground(assetPath);
+        const naturalSize = await new Promise<{ width: number; height: number }>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+          img.onerror = () => reject(new Error("Failed to decode cutout image"));
+          img.src = cutoutDataUrl;
+        });
+        const comma = cutoutDataUrl.indexOf(",");
+        const base64 = comma >= 0 ? cutoutDataUrl.slice(comma + 1) : cutoutDataUrl;
+        const binaryString = atob(base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const assetId = crypto.randomUUID();
+        const assetFileName = await invoke<string>("save_board_image_bytes", {
+          boardId,
+          assetId,
+          bytes: Array.from(bytes),
+          ext: "png",
+        });
+        store.editImage(target, {
+          ...target,
+          assetFileName,
+          naturalWidth: naturalSize.width,
+          naturalHeight: naturalSize.height,
+          backgroundColor: "transparent",
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        console.error("Failed to remove background from board image:", err);
+        setImportWarning("Couldn't remove background from that image.");
+      } finally {
+        setRemovingBackgroundId(null);
+      }
+    },
+    [briefcastDir, boardId, isRemovingBackground, store]
+  );
+
+  const [isDownloadingImage, setIsDownloadingImage] = useState(false);
+  const handleDownloadImage = useCallback(
+    async (target: BoardImage): Promise<void> => {
+      if (!briefcastDir || isDownloadingImage) return;
+      setIsDownloadingImage(true);
+      try {
+        let img = imageBitmaps.get(target.assetFileName);
+        if (!img) {
+          const assetPath = boardAssetPath(briefcastDir, boardId, target.assetFileName);
+          img = new Image();
+          img.crossOrigin = "anonymous";
+          await new Promise<void>((resolve, reject) => {
+            img!.onload = () => resolve();
+            img!.onerror = () => reject(new Error("Failed to load image asset"));
+            img!.src = convertFileSrc(assetPath);
+          });
+        }
+
+        const scale = Math.max(1, Math.min(4, (target.naturalWidth || target.width) / target.width));
+        const shadow = target.shadow;
+        const shadowMargin = shadow
+          ? Math.ceil(Math.max(Math.abs(shadow.offsetX), Math.abs(shadow.offsetY)) + (shadow.blur || 0) * 2)
+          : 0;
+
+        const cos = Math.abs(Math.cos(target.rotation || 0));
+        const sin = Math.abs(Math.sin(target.rotation || 0));
+        const rotW = target.width * cos + target.height * sin;
+        const rotH = target.width * sin + target.height * cos;
+        const extraW = Math.ceil((rotW - target.width) / 2);
+        const extraH = Math.ceil((rotH - target.height) / 2);
+
+        const padX = shadowMargin + extraW;
+        const padY = shadowMargin + extraH;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.ceil((target.width + padX * 2) * scale);
+        canvas.height = Math.ceil((target.height + padY * 2) * scale);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        ctx.scale(scale, scale);
+        ctx.translate(padX - target.x, padY - target.y);
+        renderBoardImage(ctx, target, img);
+
+        const bytes = await canvasToPngBytes(canvas);
+        const safeBoardName = store.doc?.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "board";
+        const destPath = await saveFileDialog({
+          defaultPath: `${safeBoardName}-image.png`,
+          filters: [{ name: "PNG Image", extensions: ["png"] }],
+        });
+        if (!destPath) return;
+        await invoke("export_board_png_to_path", { destPath, bytes: Array.from(bytes) });
+      } catch (err) {
+        console.error("Failed to download board image:", err);
+        setExportError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsDownloadingImage(false);
+      }
+    },
+    [briefcastDir, boardId, imageBitmaps, isDownloadingImage, store.doc]
   );
 
   // Drops a new text box centered on the board's current canvas (not the viewport - the canvas can
@@ -1205,9 +1316,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           comment) - once every chip refuses to shrink, something has to give when the window is
           narrow, and a horizontal scroll on the bar itself beats any chip silently wrapping its
           own label. shrink-0 on the back button/divider too, for the same reason. */}
-      <div className="shrink-0 flex items-center gap-1.5 px-4 py-2.5 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl overflow-x-auto">
+      <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl overflow-x-auto">
         <button type="button" onClick={handleBack} title="Back to boards" className={TOOLBAR_ICON_BTN}>
-          <IoArrowBack size={17} />
+          <IoArrowBack size={16} />
         </button>
 
         <input
@@ -1215,26 +1326,26 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           value={store.doc?.name ?? ""}
           onChange={(e) => store.renameBoard(e.target.value)}
           placeholder="Untitled board"
-          className="min-w-[80px] shrink w-[180px] px-2.5 py-1.5 rounded-lg text-sm font-semibold bg-transparent border border-transparent hover:bg-neutral-100 dark:hover:bg-neutral-800 focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-400 dark:focus:border-blue-500 focus:ring-2 focus:ring-blue-500/10 outline-none text-neutral-900 dark:text-neutral-100 transition-colors"
+          className="min-w-[80px] shrink w-[150px] px-2 py-1 rounded-lg text-xs font-semibold bg-transparent border border-transparent hover:bg-neutral-100 dark:hover:bg-neutral-800 focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-400 dark:focus:border-blue-500 focus:ring-2 focus:ring-blue-500/10 outline-none text-neutral-900 dark:text-neutral-100 transition-colors"
         />
 
-        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-5 bg-neutral-200/80 dark:bg-neutral-800 mx-0.5" />
 
         <button
           type="button"
           onClick={() => void handleAddImages()}
           disabled={isImporting || !store.doc}
-          className="shrink-0 flex items-center gap-1.5 h-9 px-3 rounded-lg text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
+          className="shrink-0 flex items-center gap-1 h-8 px-2.5 rounded-lg text-xs font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
         >
-          <IoAdd size={16} /> Add images
+          <IoAdd size={14} /> Add images
         </button>
 
         <button type="button" title="Add text" onClick={handleAddText} disabled={!store.doc} className={TOOLBAR_CHIP}>
-          <IoText size={15} /> Text
+          <IoText size={13} /> Text
         </button>
 
         <button type="button" title="Add a blur region - drag it over anything you want to obscure" onClick={handleAddBlur} disabled={!store.doc} className={TOOLBAR_CHIP}>
-          <TbBlur size={15} /> Blur
+          <TbBlur size={13} /> Blur
         </button>
 
         {/* "Shape" - each preset in SHAPE_ADD_PRESETS is just createDefaultBoardShape dropped
@@ -1264,8 +1375,8 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           disabled={!store.doc}
           className={isShapeMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
         >
-          <IoShapesOutline size={15} /> Shape
-          <IoChevronDown size={12} className={`transition-transform ${isShapeMenuOpen ? "rotate-180" : ""}`} />
+          <IoShapesOutline size={13} /> Shape
+          <IoChevronDown size={11} className={`transition-transform ${isShapeMenuOpen ? "rotate-180" : ""}`} />
         </button>
         {shapeMenuAnchor &&
           createPortal(
@@ -1307,10 +1418,10 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           disabled={!store.doc}
           className={showLayerPanel ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
         >
-          <IoLayersOutline size={15} /> Layers
+          <IoLayersOutline size={13} /> Layers
         </button>
 
-        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-5 bg-neutral-200/80 dark:bg-neutral-800 mx-0.5" />
 
         {/* "Arrange" and "Background" - each a self-contained bordered "chip" trigger (not a
             shared grey pill) that opens its own portaled dropdown (see arrangeMenuAnchor's own doc
@@ -1340,7 +1451,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         >
           {ARRANGE_STYLES.find((s) => s.key === arrangeStyle)?.icon}
           Arrange
-          <IoChevronDown size={12} className={`transition-transform ${isArrangeMenuOpen ? "rotate-180" : ""}`} />
+          <IoChevronDown size={11} className={`transition-transform ${isArrangeMenuOpen ? "rotate-180" : ""}`} />
         </button>
         {arrangeMenuAnchor &&
           createPortal(
@@ -1395,9 +1506,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           disabled={!store.doc || selectedIds.size < 2}
           className={isAlignMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
         >
-          <TbLayoutAlignLeft size={15} />
+          <TbLayoutAlignLeft size={13} />
           Align
-          <IoChevronDown size={12} className={`transition-transform ${isAlignMenuOpen ? "rotate-180" : ""}`} />
+          <IoChevronDown size={11} className={`transition-transform ${isAlignMenuOpen ? "rotate-180" : ""}`} />
         </button>
         {alignMenuAnchor &&
           createPortal(
@@ -1474,7 +1585,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         >
           {BACKGROUND_MODE_META[currentBackgroundMode].icon}
           Background
-          <IoChevronDown size={12} className={`transition-transform ${isBackgroundMenuOpen ? "rotate-180" : ""}`} />
+          <IoChevronDown size={11} className={`transition-transform ${isBackgroundMenuOpen ? "rotate-180" : ""}`} />
         </button>
         {backgroundMenuAnchor &&
           store.doc &&
@@ -1482,22 +1593,22 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             <div
               onPointerDown={(e) => e.stopPropagation()}
               style={{ position: "fixed", top: backgroundMenuAnchor.top, left: backgroundMenuAnchor.left }}
-              className="w-72 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 z-[9999] p-3"
+              className="w-80 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 z-[9999] p-3"
             >
-              <div className="flex gap-1 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-900 mb-3">
+              <div className="grid grid-cols-4 gap-1 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-900 mb-3">
                 {(Object.keys(BACKGROUND_MODE_META) as BoardBackgroundMode[]).map((mode) => (
                   <button
                     key={mode}
                     type="button"
                     onClick={() => store.setBackgroundMode(mode)}
-                    className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    className={`flex items-center justify-center gap-1 px-1.5 py-1.5 rounded-md text-xs font-medium min-w-0 transition-colors ${
                       currentBackgroundMode === mode
                         ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
                         : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
                     }`}
                   >
-                    {BACKGROUND_MODE_META[mode].icon}
-                    {BACKGROUND_MODE_META[mode].label}
+                    <span className="shrink-0">{BACKGROUND_MODE_META[mode].icon}</span>
+                    <span className="truncate">{BACKGROUND_MODE_META[mode].label}</span>
                   </button>
                 ))}
               </div>
@@ -1662,9 +1773,9 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           disabled={!store.doc}
           className={isSizeMenuOpen ? TOOLBAR_CHIP_ACTIVE : TOOLBAR_CHIP}
         >
-          <TbAspectRatio size={15} />
+          <TbAspectRatio size={13} />
           Size
-          <IoChevronDown size={12} className={`transition-transform ${isSizeMenuOpen ? "rotate-180" : ""}`} />
+          <IoChevronDown size={11} className={`transition-transform ${isSizeMenuOpen ? "rotate-180" : ""}`} />
         </button>
         {sizeMenuAnchor &&
           store.doc &&
@@ -1737,7 +1848,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             document.body
           )}
 
-        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-5 bg-neutral-200/80 dark:bg-neutral-800 mx-0.5" />
 
         {/* Mat/frame border around the whole board - a pure rendering-time inset (see
             paddedCanvasSize), so this just updates live on every keystroke/spinner click, no
@@ -1747,7 +1858,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             nothing until a rearrange happens (the exact bug the old gridline-width control had).
             No grey pill wrapper here - the number input's own border already gives this cluster a
             visible edge, so a second background box around it would be redundant chrome. */}
-        <label className="shrink-0 flex items-center gap-1.5 text-xs font-medium text-neutral-500 dark:text-neutral-400" title="Board padding">
+        <label className="shrink-0 flex items-center gap-1 text-xs font-medium text-neutral-500 dark:text-neutral-400" title="Board padding">
           Padding
           <input
             type="number"
@@ -1756,7 +1867,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             value={store.doc?.padding ?? 0}
             onChange={(e) => store.setPadding(Number(e.target.value))}
             disabled={!store.doc}
-            className="w-14 h-8 px-2 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 text-xs tabular-nums outline-none focus:border-blue-400 dark:focus:border-blue-500 disabled:opacity-40 transition-colors"
+            className="w-12 h-7 px-1.5 rounded-md border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-100 text-xs tabular-nums outline-none focus:border-blue-400 dark:focus:border-blue-500 disabled:opacity-40 transition-colors"
           />
         </label>
         <button
@@ -1764,52 +1875,52 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           title={`Re-apply "${ARRANGE_STYLES.find((s) => s.key === arrangeStyle)?.label}" using the current padding value`}
           onClick={() => handleArrange(arrangeStyle)}
           disabled={!store.doc || arrangeableImageCount < 2}
-          className="shrink-0 h-8 px-2.5 rounded-lg text-xs font-semibold text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none whitespace-nowrap"
+          className="shrink-0 h-7 px-2 rounded-md text-xs font-semibold text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none whitespace-nowrap"
         >
           Apply
         </button>
 
-        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-5 bg-neutral-200/80 dark:bg-neutral-800 mx-0.5" />
 
         {/* Undo/Redo as one true two-segment control (shared border, hairline divider between the
             halves) rather than two loose buttons floating in a grey box - the visual convention
             for "this pair is one control" everywhere from Photoshop to Figma. */}
-        <div className="shrink-0 inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+        <div className="shrink-0 inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
           <button
             type="button"
             title="Undo"
             onClick={store.undo}
             disabled={!store.canUndo}
-            className="w-9 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+            className="w-8 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
           >
-            <IoArrowUndo size={16} />
+            <IoArrowUndo size={14} />
           </button>
           <button
             type="button"
             title="Redo"
             onClick={store.redo}
             disabled={!store.canRedo}
-            className="w-9 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+            className="w-8 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
           >
-            <IoArrowRedo size={16} />
+            <IoArrowRedo size={14} />
           </button>
         </div>
 
-        <div className="shrink-0 w-px h-6 bg-neutral-200/80 dark:bg-neutral-800 mx-1" />
+        <div className="shrink-0 w-px h-5 bg-neutral-200/80 dark:bg-neutral-800 mx-0.5" />
 
         {/* Zoom as a single bordered segmented control (- / value / + / fit) - same "one shared
             border, hairline dividers between segments" language as Undo/Redo above, standard for
             a zoom control in every design tool. */}
-        <div className="shrink-0 inline-flex items-center h-9 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+        <div className="shrink-0 inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
           <button
             type="button"
             title="Zoom out"
             onClick={() => setZoom((z) => Math.max(MIN_ZOOM, Math.round((z - 0.1) * 100) / 100))}
-            className="w-8 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors"
+            className="w-7 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors"
           >
-            <IoRemove size={14} />
+            <IoRemove size={13} />
           </button>
-          <div className="flex items-center gap-0.5 px-1.5 h-full bg-neutral-50/60 dark:bg-neutral-800/40">
+          <div className="flex items-center gap-0.5 px-1 h-full bg-neutral-50/60 dark:bg-neutral-800/40">
             <input
               type="number"
               min={Math.round(MIN_ZOOM * 100)}
@@ -1824,26 +1935,26 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
                 setZoom(Math.round(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value / 100)) * 100) / 100);
               }}
               title="Zoom"
-              className="w-9 bg-transparent text-neutral-800 dark:text-neutral-100 text-xs font-medium tabular-nums text-center outline-none"
+              className="w-8 bg-transparent text-neutral-800 dark:text-neutral-100 text-xs font-medium tabular-nums text-center outline-none"
             />
-            <span className="text-xs text-neutral-400 dark:text-neutral-500">%</span>
+            <span className="text-[11px] text-neutral-400 dark:text-neutral-500">%</span>
           </div>
           <button
             type="button"
             title="Zoom in"
             onClick={() => setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.1) * 100) / 100))}
-            className="w-8 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors"
+            className="w-7 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors"
           >
-            <IoAdd size={14} />
+            <IoAdd size={13} />
           </button>
           <button
             type="button"
             title="Fit to window"
             onClick={handleFitToWindow}
             disabled={!store.doc}
-            className="w-9 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+            className="w-8 h-full flex items-center justify-center text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors disabled:opacity-30 disabled:pointer-events-none"
           >
-            <IoExpandOutline size={14} />
+            <IoExpandOutline size={13} />
           </button>
         </div>
 
@@ -2009,12 +2120,15 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             <BoardCanvas
               doc={store.doc}
               zoom={zoom}
+              removingBackgroundId={removingBackgroundId}
               imageBitmaps={imageBitmaps}
               selectedIds={selectedIds}
               onSelect={setSelectedIds}
               onEditImage={store.editImage}
               onBatchEditImages={store.batchEditImages}
               onReplaceImage={(image) => void handleReplaceImage(image)}
+              onRemoveBackground={(image) => void handleRemoveImageBackground(image)}
+              onDownloadImage={(image) => void handleDownloadImage(image)}
               onBringToFront={handleBringToFront}
               onSendToBack={handleSendToBack}
               onDuplicateItem={(item) => handleDuplicateSelected(new Set([item.id]))}
@@ -2025,41 +2139,46 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           ) : (
             <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading board…</span>
           )}
+
+          {showLayerPanel && store.doc && (
+            <BoardLayerPanel
+              items={store.doc.images}
+              selectedIds={selectedIds}
+              onSelect={setSelectedIds}
+              onStepReorder={handleStepReorder}
+              onReorder={handleReorderLayer}
+              onToggleLock={handleToggleLock}
+              onClose={() => setShowLayerPanel(false)}
+            />
+          )}
+
+          {selectedImages.length > 0 && (
+            <BoardStylePanel
+              offsetRight={showLayerPanel}
+              items={selectedImages}
+              onChange={handleStyleChange}
+              onDelete={handleDeleteSelected}
+              onDuplicate={handleDuplicateSelected}
+              onBringToFront={handleBringToFront}
+              onSendToBack={handleSendToBack}
+              onApplyStyleToAllImages={handleApplyImageStyleToAll}
+              onApplyStyleToAllTexts={handleApplyTextStyleToAll}
+              onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
+              onApplyStyleToAllShapes={handleApplyShapeStyleToAll}
+              boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
+              boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
+              boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
+              boardShapeCount={store.doc?.images.filter((item) => item.kind === "shape").length ?? 0}
+              onReplaceImage={(image) => void handleReplaceImage(image)}
+              isReplacingImage={isReplacingImage}
+              onRemoveBackground={(image) => void handleRemoveImageBackground(image)}
+              isRemovingBackground={isRemovingBackground}
+              onDownloadImage={(image) => void handleDownloadImage(image)}
+              isDownloadingImage={isDownloadingImage}
+              onNudge={handleNudge}
+            />
+          )}
         </div>
-
-        {showLayerPanel && store.doc && (
-          <BoardLayerPanel
-            items={store.doc.images}
-            selectedIds={selectedIds}
-            onSelect={setSelectedIds}
-            onStepReorder={handleStepReorder}
-            onReorder={handleReorderLayer}
-            onToggleLock={handleToggleLock}
-            onClose={() => setShowLayerPanel(false)}
-          />
-        )}
-
-        {selectedImages.length > 0 && (
-          <BoardStylePanel
-            items={selectedImages}
-            onChange={handleStyleChange}
-            onDelete={handleDeleteSelected}
-            onDuplicate={handleDuplicateSelected}
-            onBringToFront={handleBringToFront}
-            onSendToBack={handleSendToBack}
-            onApplyStyleToAllImages={handleApplyImageStyleToAll}
-            onApplyStyleToAllTexts={handleApplyTextStyleToAll}
-            onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
-            onApplyStyleToAllShapes={handleApplyShapeStyleToAll}
-            boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
-            boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
-            boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
-            boardShapeCount={store.doc?.images.filter((item) => item.kind === "shape").length ?? 0}
-            onReplaceImage={(image) => void handleReplaceImage(image)}
-            isReplacingImage={isReplacingImage}
-            onNudge={handleNudge}
-          />
-        )}
       </div>
     </div>
   );

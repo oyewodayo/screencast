@@ -2735,10 +2735,12 @@ pub async fn transcribe_doc_audio(
         let seconds = std::fs::metadata(whisper_input)
             .map(|m| m.len().saturating_sub(44) as f64 / 32000.0)
             .unwrap_or(30.0);
+        let vad_model_path = crate::services::whisper_model::existing_vad_model(&app_handle);
         let language = run_whisper_text_cli(
             &app_handle,
             &whisper_path,
             &model_path,
+            vad_model_path.as_ref(),
             whisper_input,
             &output_stem,
             &lang,
@@ -2761,11 +2763,11 @@ pub async fn transcribe_doc_audio(
 
 // whisper's encoder always runs over a full 30s window (1500 frames, 50/s) unless told otherwise,
 // so a three-second dictation phrase paid for 27s of padding. Sizing the window to the clip plus a
-// margin, rounded up to 64 frames, cut a 6s phrase from ~1.6s to ~0.75s on this machine with an
-// identical transcript. Too tight a window truncates the tail, hence the 2.5s margin.
+// 1.0s tail margin, rounded up to 32 frames and clamped to a 128-frame (2.56s) floor, makes short
+// real-time dictation phrases more than twice as fast without truncating the tail.
 fn dictation_audio_ctx(seconds: f64) -> u32 {
-    let frames = ((seconds + 2.5) * 50.0).ceil() as u32;
-    (frames.div_ceil(64) * 64).clamp(256, 1500)
+    let frames = ((seconds + 1.0) * 50.0).ceil() as u32;
+    (frames.div_ceil(32) * 32).clamp(128, 1500)
 }
 
 // True for a canonical 44-byte-header PCM WAV that's already 16kHz, mono, 16-bit.
@@ -3077,6 +3079,7 @@ async fn run_whisper_text_cli(
     app_handle: &AppHandle,
     whisper_path: &PathBuf,
     model_path: &PathBuf,
+    vad_model_path: Option<&PathBuf>,
     wav_path: &PathBuf,
     output_stem: &PathBuf,
     language: &str,
@@ -3086,12 +3089,13 @@ async fn run_whisper_text_cli(
     let app_handle = app_handle.clone();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
+    let vad_model_path = vad_model_path.cloned();
     let wav_path = wav_path.clone();
     let output_stem = output_stem.clone();
     let language = language.to_string();
     let prompt = prompt.map(str::to_string);
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1).max(1))
+        .map(|n| n.get().saturating_sub(1).clamp(1, 8))
         .unwrap_or(4);
     tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = Command::new(&whisper_path);
@@ -3100,13 +3104,45 @@ async fn run_whisper_text_cli(
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
         // -bs 1 -bo 1: greedy decoding - beam search (the default 5) cost ~250ms more per phrase
-        // with no change in the transcript on short dictation clips. -ac: see
-        // dictation_audio_ctx. No -pp: a phrase finishes in well under a second, so per-percent
-        // progress events were just noise.
-        // -sns: suppress non-speech tokens ("[MUSIC]", "(laughs)") at decode time rather than only
-        // filtering them out afterwards.
+        // with no change in the transcript on short dictation clips. -sns: suppress non-speech
+        // tokens ("[MUSIC]", "(laughs)") at decode time so speech writing accuracy stays pure.
+        // -ac: see dictation_audio_ctx. No -pp: a phrase finishes in well under a second, so
+        // per-percent progress events were just noise.
+        // -nf (--no-fallback): prevents high-temperature fallback sampling (0.2..1.0) on quiet/noisy
+        // audio, which otherwise regurgitates --prompt (screen text) and takes 5x longer.
+        // -nt (--no-timestamps), -mc 64, -nth 0.50, -et 2.20, -lpt -0.80: tighter silence/entropy
+        // thresholds and shorter context for fast, hallucination-free real-time dictation.
         let audio_ctx = audio_ctx.to_string();
-        cmd.args(["-otxt", "-np", "-sns", "-bs", "1", "-bo", "1", "-ac", &audio_ctx, "-t", &threads.to_string(), "-l", &language]);
+        cmd.args([
+            "-otxt",
+            "-np",
+            "-sns",
+            "-nt",
+            "-nf",
+            "-bs",
+            "1",
+            "-bo",
+            "1",
+            "-mc",
+            "64",
+            "-nth",
+            "0.50",
+            "-et",
+            "2.20",
+            "-lpt",
+            "-0.80",
+            "-ac",
+            &audio_ctx,
+            "-t",
+            &threads.to_string(),
+            "-l",
+            &language,
+        ]);
+        if let Some(vad_path) = &vad_model_path {
+            if let Ok(vad_str) = path_to_str(vad_path) {
+                cmd.args(["--vad", "-vm", vad_str, "-vt", "0.45", "-vspd", "180", "-vp", "120"]);
+            }
+        }
         if let Some(prompt) = &prompt {
             cmd.arg("--prompt").arg(prompt);
         }
@@ -3120,11 +3156,19 @@ async fn run_whisper_text_cli(
             .map_err(|e| format!("Failed to start whisper-cli: {}", e))?;
 
         let stdout = child.stdout.take().ok_or("Failed to capture whisper-cli stdout")?;
+        let app_handle_for_stdout = app_handle.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            let mut partial = String::new();
             for line in reader.lines() {
-                if line.is_err() {
-                    break;
+                let Ok(line) = line else { break };
+                let cleaned = line.trim();
+                if !cleaned.is_empty() {
+                    if !partial.is_empty() {
+                        partial.push(' ');
+                    }
+                    partial.push_str(cleaned);
+                    let _ = app_handle_for_stdout.emit("docs-dictation-partial", partial.clone());
                 }
             }
         });

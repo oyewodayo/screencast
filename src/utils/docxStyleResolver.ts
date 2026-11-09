@@ -810,8 +810,9 @@ function hasVisibleBorder(bdrEl: Element | null): boolean {
 
 function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: string | null) => Element | null): DocxTableMeta {
   const tblPr = directChild(tbl, "tblPr");
-  // The table's own borders, else its table style's (Word's "Table Grid" keeps them there).
-  const tblBorders = directChild(tblPr, "tblBorders") ?? styleBorders(attr(directChild(tblPr, "tblStyle"), "w:val"));
+  // The table's own borders, plus its table style's (Word's "Table Grid" keeps them there).
+  const ownTblBorders = directChild(tblPr, "tblBorders");
+  const styleTblBorders = styleBorders(attr(directChild(tblPr, "tblStyle"), "w:val"));
 
   let topOrBottomVisible = false;
   let insideVOrSideVisible = false;
@@ -828,7 +829,8 @@ function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: 
     }
   };
 
-  checkBorders(tblBorders);
+  checkBorders(ownTblBorders);
+  checkBorders(styleTblBorders);
 
   const tblGrid = directChild(tbl, "tblGrid");
   const colWidthsPx: number[] = [];
@@ -842,11 +844,20 @@ function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: 
   const rows = directChildren(tbl, "tr").filter((tr) => !directChild(directChild(tr, "trPr"), "del"));
   const cells: DocxTableCellMeta[][] = [];
   const colHasContent: boolean[] = [];
-  const gridCols = Math.max(1, colWidthsPx.length);
-  // An edge's CSS: the cell's own border, else the table's outer edge or inside line. No border
-  // anywhere means none - Word draws no grid a document didn't ask for.
+  const maxRowCols = rows.reduce((max, tr) => {
+    const count = directChildren(tr, "tc").reduce((sum, tc) => {
+      const tcPr = directChild(tc, "tcPr");
+      return sum + (Math.max(1, parseInt(attr(directChild(tcPr, "gridSpan"), "w:val") ?? "1", 10) || 1));
+    }, 0);
+    return Math.max(max, count);
+  }, 1);
+  const gridCols = Math.max(1, colWidthsPx.length, maxRowCols);
+  // An edge's CSS: the cell's own border, else the table's outer edge or inside line (checking both
+  // direct tblBorders and the referenced tblStyle borders).
   const edge = (tcBorders: Element | null, own: string[], table: string): string =>
-    borderCss(own.map((n) => directChild(tcBorders, n)).find(Boolean) ?? null, theme) ?? borderCss(directChild(tblBorders, table), theme) ?? "none";
+    borderCss(own.map((n) => directChild(tcBorders, n)).find(Boolean) ?? null, theme) ??
+    borderCss(directChild(ownTblBorders, table) ?? directChild(styleTblBorders, table), theme) ??
+    "none";
 
   rows.forEach((tr, rowIdx) => {
     const rowMeta: DocxTableCellMeta[] = [];

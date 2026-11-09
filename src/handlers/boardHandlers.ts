@@ -67,7 +67,7 @@ function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w:
 // itself clipped to a matching rounded rect and cover-fit into the resulting content area. `img`
 // is null while the asset is still decoding - the caller's preload effect redraws once it's ready
 // (same "frame renders immediately, photo pops in" split the rest of this app already accepts).
-function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img: HTMLImageElement | null): void {
+export function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img: HTMLImageElement | null): void {
   ctx.save();
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
@@ -83,9 +83,12 @@ function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img:
     ctx.shadowColor = image.shadow.color;
   }
 
-  roundedRectPath(ctx, image.x, image.y, image.width, image.height, image.cornerRadius);
-  ctx.fillStyle = image.backgroundColor;
-  ctx.fill();
+  const hasBgColor = image.backgroundColor && image.backgroundColor !== "transparent" && image.backgroundColor !== "rgba(0,0,0,0)";
+  if (hasBgColor) {
+    roundedRectPath(ctx, image.x, image.y, image.width, image.height, image.cornerRadius);
+    ctx.fillStyle = image.backgroundColor;
+    ctx.fill();
+  }
 
   if (image.borderWidth > 0) {
     ctx.shadowColor = "transparent"; // shadow already applied by the fill above - don't double it on the stroke

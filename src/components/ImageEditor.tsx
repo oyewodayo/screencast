@@ -13,7 +13,7 @@
 // to observe or drive it anymore.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline } from "react-icons/io5";
+import { IoArrowBack, IoBuildOutline, IoCheckmark, IoCopyOutline, IoDownloadOutline, IoImagesOutline } from "react-icons/io5";
 import { UseImageEditStoreResult } from "../hooks/useImageEditStore";
 import { canvasToPngBytes } from "../handlers/pdfExportHandlers";
 import LinksControl from "./links/LinksControl";
@@ -32,8 +32,9 @@ import {
   transformObjectForGeometry,
   translateObject,
 } from "../handlers/imageEditHandlers";
-import { GeometrySnapshot, ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../utils/imageEditTypes";
+import { GeometrySnapshot, ImageAdjustments, ImageAnnotationObject, ImageEditTool, NEUTRAL_ADJUSTMENTS, PlacedImageObject } from "../utils/imageEditTypes";
 import { fileToDataUrl } from "../utils/imageObjectCache";
+import { removeImageBackground } from "../utils/backgroundRemoval";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
 import ImageEditorToolbar, { IconButton, SaveStatus, ZoomControl } from "./image/ImageEditorToolbar";
 
@@ -93,6 +94,8 @@ interface ImageEditorProps {
   // panel's own close button, so it's a two-way toggle rather than a plain boolean prop.
   isToolsPanelOpen: boolean;
   onToolsPanelOpenChange: (open: boolean) => void;
+  onBack?: () => void;
+  onOpenWithBoard?: () => void;
 }
 
 const isEditableTarget = (el: Element | null): boolean => {
@@ -103,7 +106,7 @@ const isEditableTarget = (el: Element | null): boolean => {
 
 const clampZoom = (z: number): number => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(z * 100) / 100));
 
-const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, store, isToolsPanelOpen, onToolsPanelOpenChange }) => {
+const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, store, isToolsPanelOpen, onToolsPanelOpenChange, onBack, onOpenWithBoard }) => {
   const canvasRef = useRef<ImageEditorCanvasHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -156,6 +159,8 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   // (toDataURL), which throws if the canvas is ever tainted (see preloadImage's crossOrigin fix
   // in imageObjectCache.ts for the concrete case that used to break this silently).
   const [geometryError, setGeometryError] = useState<string | null>(null);
+  const [isRemovingBackground, setIsRemovingBackground] = useState(false);
+  const [backgroundError, setBackgroundError] = useState<string | null>(null);
 
   const didFitZoomRef = useRef(false);
   // Read by the pinch-gesture handler below so a touchmove mid-gesture can scale from the zoom
@@ -505,6 +510,65 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
   }, [applyGeometry]);
 
   const handleCropCancel = useCallback(() => setTool("select"), []);
+
+  const handleRemoveBackground = useCallback(async () => {
+    if (!store.doc || isRemovingBackground) return;
+    const baseCanvas = canvasRef.current?.getBaseOnlyCanvas();
+    if (!baseCanvas) return;
+    setIsRemovingBackground(true);
+    setBackgroundError(null);
+    try {
+      const beforeDataUrl = baseCanvas.toDataURL("image/png");
+      const cutoutDataUrl = await removeImageBackground(beforeDataUrl);
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Failed to load background cutout"));
+        img.src = cutoutDataUrl;
+      });
+
+      const before: GeometrySnapshot = {
+        baseImageOverride: beforeDataUrl,
+        baseWidth: baseCanvas.width,
+        baseHeight: baseCanvas.height,
+        adjustments: { ...NEUTRAL_ADJUSTMENTS },
+        objects: store.doc.objects,
+      };
+      const after: GeometrySnapshot = {
+        baseImageOverride: cutoutDataUrl,
+        baseWidth: img.width,
+        baseHeight: img.height,
+        adjustments: { ...NEUTRAL_ADJUSTMENTS },
+        objects: store.doc.objects,
+      };
+      store.commitGeometry(before, after);
+    } catch (err) {
+      console.error("Failed to remove background:", err);
+      setBackgroundError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsRemovingBackground(false);
+    }
+  }, [store, isRemovingBackground]);
+
+  const handleRemovePlacedImageBackground = useCallback(async () => {
+    if (primarySelectedObject?.type !== "placed-image" || isRemovingBackground) return;
+    const target = primarySelectedObject;
+    setIsRemovingBackground(true);
+    setBackgroundError(null);
+    try {
+      const cutoutDataUrl = await removeImageBackground(target.src);
+      const after: PlacedImageObject = {
+        ...target,
+        src: cutoutDataUrl,
+      };
+      store.editObject(target, after);
+    } catch (err) {
+      console.error("Failed to remove background from placed image:", err);
+      setBackgroundError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsRemovingBackground(false);
+    }
+  }, [primarySelectedObject, store, isRemovingBackground]);
 
   const handleDeleteSelected = useCallback(() => {
     if (selectedObjects.length === 0) return;
@@ -859,14 +923,25 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
           panel instead. The tools toggle here mirrors the sidebar's own tools button (Dashboard.tsx)
           rather than replacing it - collapsing the file-list sidebar hides that one entirely, and
           this is otherwise the only way back into the panel. */}
-      <div className="shrink-0 flex items-center gap-3 px-4 py-2.5 bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-b border-black/[0.04] dark:border-white/[0.08]">
+      <div className="shrink-0 flex items-center gap-2.5 px-4 py-2.5 bg-white/75 dark:bg-neutral-900/80 backdrop-blur-xl border-b border-black/[0.04] dark:border-white/[0.08]">
+        {onBack && (
+          <IconButton title="Back" onClick={onBack}>
+            <IoArrowBack size={16} />
+          </IconButton>
+        )}
         <IconButton title={isToolsPanelOpen ? "Hide image tools" : "Show image tools"} active={isToolsPanelOpen} onClick={() => onToolsPanelOpenChange(!isToolsPanelOpen)}>
           <IoBuildOutline size={15} />
         </IconButton>
-        {title && (
-          <span className="text-sm font-medium text-neutral-600 dark:text-neutral-300 truncate min-w-0" title={title}>
-            {title}
-          </span>
+        {onOpenWithBoard && (
+          <button
+            type="button"
+            title="Open on board - arrange, style, and edit on a canvas"
+            onClick={onOpenWithBoard}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] border border-black/[0.06] dark:border-white/[0.08] transition-colors"
+          >
+            <IoImagesOutline size={14} className="text-blue-500" />
+            <span>Open with board</span>
+          </button>
         )}
         <div className="flex items-center gap-3 shrink-0 ml-auto">
           <LinksControl self={fileRef(sourcePath)} title={title ?? "Image"} variant="header" />
@@ -888,6 +963,11 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
       {geometryError && (
         <div className="shrink-0 mx-auto mt-2 px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
           Failed to apply crop/rotate/flip: {geometryError}
+        </div>
+      )}
+      {backgroundError && (
+        <div className="shrink-0 mx-auto mt-2 px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
+          Failed to remove background: {backgroundError}
         </div>
       )}
 
@@ -1056,6 +1136,9 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
             onSendToBack={handleSendToBack}
             onBringForward={handleBringForward}
             onSendBackward={handleSendBackward}
+            onRemoveBackground={handleRemoveBackground}
+            isRemovingBackground={isRemovingBackground}
+            onRemovePlacedImageBackground={handleRemovePlacedImageBackground}
             onClose={() => onToolsPanelOpenChange(false)}
           />
         )}

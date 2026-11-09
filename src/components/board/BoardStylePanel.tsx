@@ -27,6 +27,7 @@ import {
   IoColorFillOutline,
   IoContrastOutline,
   IoCopyOutline,
+  IoDownloadOutline,
   IoImageOutline,
   IoEllipseOutline,
   IoLockClosed,
@@ -38,7 +39,7 @@ import {
   IoText,
   IoTrashOutline,
 } from "react-icons/io5";
-import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbHexagon, TbLine, TbOctagon, TbPentagon, TbStar, TbTriangle } from "react-icons/tb";
+import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbHexagon, TbLine, TbOctagon, TbPentagon, TbScissors, TbStar, TbTriangle } from "react-icons/tb";
 import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardShape, BoardText } from "../../utils/boardTypes";
 import { BOARD_FONT_GROUPS, BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
 import { growTextItemToFitContent } from "../../handlers/boardHandlers";
@@ -118,11 +119,16 @@ interface BoardStylePanelProps {
   // same prop.
   onReplaceImage: (image: BoardImage) => void;
   isReplacingImage: boolean;
+  onRemoveBackground?: (image: BoardImage) => void;
+  isRemovingBackground?: boolean;
+  onDownloadImage?: (image: BoardImage) => void;
+  isDownloadingImage?: boolean;
   // Moves every selected item by (dx, dy) * step - the same function the keyboard arrow-key handler
   // calls (see BoardEditor.tsx's handleNudge), so a click here and pressing an arrow key always
   // agree on what "nudge" means. Works for any selection regardless of kind - position is the one
   // thing every board item shares, unlike the kind-specific cards below.
   onNudge: (dx: number, dy: number, step: number) => void;
+  offsetRight?: boolean;
 }
 
 // ---- Shared field primitives -------------------------------------------------------------------
@@ -243,7 +249,12 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   boardShapeCount,
   onReplaceImage,
   isReplacingImage,
+  onRemoveBackground,
+  isRemovingBackground,
+  onDownloadImage,
+  isDownloadingImage,
   onNudge,
+  offsetRight,
 }) => {
   if (items.length === 0) return null;
   const primary = items[0];
@@ -284,13 +295,11 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   };
 
   return (
-    // pb tracks --docker-height (published by BottomDocker's own ResizeObserver - see
-    // Dashboard.tsx's sidebar file list for the same pattern) so the last button (Delete) always
-    // scrolls clear of the fixed bottom icon bar instead of rendering underneath it, unclickable -
-    // this panel previously had no bottom padding at all, so a selection long enough to need
-    // scrolling left Delete permanently hidden behind that bar.
-    <div className="w-72 shrink-0 h-full overflow-y-auto overscroll-contain border-l border-neutral-200 dark:border-neutral-800 bg-neutral-50/70 dark:bg-neutral-950/40 p-3.5 pb-[var(--docker-height,64px)] flex flex-col gap-3.5">
-      <div className="flex items-center gap-2.5 px-0.5">
+    <div
+      className={`absolute top-3 ${offsetRight ? "right-[276px]" : "right-3"} bottom-[calc(var(--docker-height,60px)+10px)] w-72 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 z-30 transition-all duration-200 animate-[boardPanelIn_180ms_ease-out]`}
+    >
+      <style>{"@keyframes boardPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
+      <div className="shrink-0 p-3.5 border-b border-black/[0.05] dark:border-white/[0.06] flex items-center gap-2.5">
         <div
           className={`flex items-center justify-center w-9 h-9 rounded-xl shrink-0 text-white shadow-sm ${
             allText
@@ -314,8 +323,9 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         </div>
       </div>
 
-      <div className={CARD}>
-        <SectionHeader icon={<TbArrowsMove size={12} />} label="Position" />
+      <div className="flex-1 overflow-y-auto overscroll-contain p-3.5 pb-6 flex flex-col gap-3.5">
+        <div className={CARD}>
+          <SectionHeader icon={<TbArrowsMove size={12} />} label="Position" />
         <div className="grid grid-cols-3 grid-rows-3 gap-1 w-28 mx-auto">
           <div />
           <button
@@ -363,14 +373,47 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       </div>
 
       {allImages && imageItems.length === 1 && (
-        <button
-          type="button"
-          onClick={() => onReplaceImage(imageItems[0])}
-          disabled={isReplacingImage}
-          className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
-        >
-          <IoSwapHorizontalOutline size={15} /> {isReplacingImage ? "Replacing…" : "Replace image"}
-        </button>
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={() => onReplaceImage(imageItems[0])}
+            disabled={isReplacingImage || isRemovingBackground}
+            className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
+          >
+            <IoSwapHorizontalOutline size={15} /> {isReplacingImage ? "Replacing…" : "Replace image"}
+          </button>
+          {onRemoveBackground && (
+            <button
+              type="button"
+              onClick={() => onRemoveBackground(imageItems[0])}
+              disabled={isRemovingBackground || isReplacingImage}
+              title="Remove background - cuts people out using AI"
+              className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition-all disabled:opacity-50"
+            >
+              {isRemovingBackground ? (
+                <>
+                  <span className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Removing background…
+                </>
+              ) : (
+                <>
+                  <TbScissors size={16} /> Remove background
+                </>
+              )}
+            </button>
+          )}
+          {onDownloadImage && (
+            <button
+              type="button"
+              onClick={() => onDownloadImage(imageItems[0])}
+              disabled={isReplacingImage || isRemovingBackground || isDownloadingImage}
+              title="Download selected image"
+              className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-neutral-700 dark:text-neutral-200 bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-all disabled:opacity-50"
+            >
+              <IoDownloadOutline size={16} /> Download image
+            </button>
+          )}
+        </div>
       )}
 
       {allText && textItems.length === 1 && (
@@ -509,7 +552,33 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
             value={imageItems[0].cornerRadius}
             onChange={(v) => setImageField("cornerRadius", v)}
           />
-          <ColorField label="Frame color" value={imageItems[0].backgroundColor} onChange={(v) => setImageField("backgroundColor", v)} />
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Frame color</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  setImageField(
+                    "backgroundColor",
+                    imageItems[0].backgroundColor === "transparent" ? "#ffffff" : "transparent"
+                  )
+                }
+                title="Toggle transparent frame background"
+                className={`px-2 py-1 rounded-md text-xs font-medium transition-colors ${
+                  imageItems[0].backgroundColor === "transparent"
+                    ? "bg-blue-50 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/30"
+                    : "bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-200 dark:hover:bg-neutral-700"
+                }`}
+              >
+                Transparent
+              </button>
+              <ColorInput
+                value={imageItems[0].backgroundColor === "transparent" ? "#ffffff" : imageItems[0].backgroundColor}
+                onChange={(e) => setImageField("backgroundColor", e.target.value)}
+                className={`${SWATCH} ${imageItems[0].backgroundColor === "transparent" ? "opacity-30" : ""}`}
+              />
+            </div>
+          </div>
 
           <div className="flex items-center gap-2">
             <button
@@ -777,6 +846,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       >
         <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : kindLabel}
       </button>
+      </div>
     </div>
   );
 };

@@ -210,7 +210,17 @@ function BoxShapeBody({ node, paint }: { node: WhiteboardNode; paint: FillPaint 
 // inside that silhouette (a real border would sit outside the mask and square off an ellipse's
 // corners), and the crop is a scaled/translated `object-fit` image inside an `overflow: hidden` box.
 // whiteboardHandlers.ts's paintImageNode reproduces exactly this geometry for the PNG export.
-function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; src: string | null; cropping?: boolean }) {
+function WhiteboardImageBody({
+  node,
+  src,
+  cropping,
+  isRemovingBackground,
+}: {
+  node: WhiteboardNode;
+  src: string | null;
+  cropping?: boolean;
+  isRemovingBackground?: boolean;
+}) {
   const [failed, setFailed] = React.useState(false);
   // A changed src is a different asset (image replaced, or the library root resolved late) - clear
   // the stale failure so the new one gets its own chance to load.
@@ -254,6 +264,28 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
         }}
       />
     ) : null;
+
+  const bgRemovalOverlay = isRemovingBackground ? (
+    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center pointer-events-none select-none overflow-hidden animate-[wbBgRemovalPulse_2s_ease-in-out_infinite]">
+      <style>{`
+        @keyframes wbBgRemovalPulse {
+          0%, 100% { background-color: rgba(59, 130, 246, 0.28); box-shadow: 0 0 24px rgba(59, 130, 246, 0.6), inset 0 0 16px rgba(59, 130, 246, 0.4); }
+          33% { background-color: rgba(168, 85, 247, 0.38); box-shadow: 0 0 32px rgba(168, 85, 247, 0.7), inset 0 0 22px rgba(168, 85, 247, 0.45); }
+          66% { background-color: rgba(236, 72, 153, 0.32); box-shadow: 0 0 28px rgba(236, 72, 153, 0.65), inset 0 0 18px rgba(236, 72, 153, 0.4); }
+        }
+        @keyframes wbBgRemovalScan {
+          0% { top: 0%; opacity: 0.2; }
+          50% { opacity: 1; }
+          100% { top: 100%; opacity: 0.2; }
+        }
+      `}</style>
+      <div className="absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_12px_#22d3ee] animate-[wbBgRemovalScan_1.8s_ease-in-out_infinite]" />
+      <div className="relative z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-neutral-900/85 backdrop-blur-md text-white text-[11px] font-medium shadow-2xl border border-white/20">
+        <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-cyan-400 rounded-full animate-spin" />
+        <span>Removing background…</span>
+      </div>
+    </div>
+  ) : null;
 
   if (!src || failed) {
     return (
@@ -314,6 +346,7 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: fit === "fill" ? "fill" : fit, ...tint }}
         />
         {ring}
+        {bgRemovalOverlay}
       </div>
     );
   }
@@ -342,6 +375,7 @@ function WhiteboardImageBody({ node, src, cropping }: { node: WhiteboardNode; sr
         />
       </div>
       {ring}
+      {bgRemovalOverlay}
     </div>
   );
 }
@@ -785,6 +819,7 @@ interface WhiteboardCanvasProps {
   // WhiteboardStylePanel.tsx for the incident that established this.
   previewNodes?: WhiteboardNode[] | null;
   previewEdges?: WhiteboardEdge[] | null;
+  removingBackgroundNodeId?: string | null;
 }
 
 function clampZoom(z: number): number {
@@ -913,6 +948,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   setCroppingNodeId,
   previewNodes,
   previewEdges,
+  removingBackgroundNodeId,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
@@ -2463,7 +2499,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     />
                   </div>
                 ) : node.shapeType === "image" ? (
-                  <WhiteboardImageBody node={node} src={imageSrcFor?.(node) ?? null} cropping={croppingNodeId === node.id} />
+                  <WhiteboardImageBody
+                    node={node}
+                    src={imageSrcFor?.(node) ?? null}
+                    cropping={croppingNodeId === node.id}
+                    isRemovingBackground={removingBackgroundNodeId === node.id}
+                  />
                 ) : node.shapeType === "table" ? (
                   <div style={{ pointerEvents: selected ? "auto" : "none", width: "100%", height: "100%" }}>
                     <WhiteboardTable

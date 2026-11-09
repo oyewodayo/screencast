@@ -70,6 +70,7 @@ import PdfFolderGallery from "../components/PdfFolderGallery";
 import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import { BoardEditorHandle } from "../components/board/BoardEditor";
+import { createEmptyBoardDocument, createDefaultBoardImage } from "../utils/boardTypes";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { ItemLinksProvider } from "../contexts/ItemLinksContext";
 import LinksControl from "../components/links/LinksControl";
@@ -3498,6 +3499,88 @@ const setScreen = () => {
 		await loadFileForPlayback(newPath, newFileName);
 	};
 
+	const handleOpenImageWithBoard = async (file: { path: string; name: string; sourcePath: string }) => {
+		try {
+			// Find a non-colliding name for the new board
+			let existingBoards: { id: string; name: string }[] = [];
+			try {
+				existingBoards = await invoke<{ id: string; name: string }[]>("list_boards");
+			} catch {}
+			const baseName = file.name.replace(/\.[^/.]+$/, "");
+			let boardName = `Board (${baseName})`;
+			let counter = 1;
+			while (existingBoards.some((b) => b.name.toLowerCase() === boardName.toLowerCase())) {
+				counter++;
+				boardName = `Board (${baseName} ${counter})`;
+			}
+
+			// Generate a fresh unique board ID, retrying with a new UUID if an id collision ever occurs
+			let id = crypto.randomUUID();
+			let doc = createEmptyBoardDocument(id, boardName);
+			for (let attempt = 0; attempt < 5; attempt++) {
+				try {
+					await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
+					break;
+				} catch (err) {
+					if (attempt === 4) throw err;
+					id = crypto.randomUUID();
+					doc = createEmptyBoardDocument(id, boardName);
+				}
+			}
+
+			let assetFileName: string;
+			let naturalWidth = 0;
+			let naturalHeight = 0;
+
+			if (imageEditStore.doc?.baseImageOverride) {
+				const dataUrl = imageEditStore.doc.baseImageOverride;
+				const comma = dataUrl.indexOf(",");
+				const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+				const bin = atob(b64);
+				const bytes = new Uint8Array(bin.length);
+				for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+				assetFileName = await invoke<string>("save_board_image_bytes", {
+					boardId: id,
+					assetId: crypto.randomUUID(),
+					bytes: Array.from(bytes),
+					ext: "png",
+				});
+				naturalWidth = imageEditStore.doc.baseWidth;
+				naturalHeight = imageEditStore.doc.baseHeight;
+			} else {
+				assetFileName = await invoke<string>("import_board_image", {
+					boardId: id,
+					sourcePath: file.sourcePath,
+					assetId: crypto.randomUUID(),
+				});
+				const size = await new Promise<{ width: number; height: number }>((resolve) => {
+					const img = new Image();
+					img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+					img.onerror = () => resolve({ width: 800, height: 600 });
+					img.src = convertFileSrc(file.path);
+				});
+				naturalWidth = size.width;
+				naturalHeight = size.height;
+			}
+
+			const boardImg = createDefaultBoardImage(crypto.randomUUID(), assetFileName, naturalWidth, naturalHeight, 0, 0);
+			if (imageEditStore.doc?.baseImageOverride) {
+				boardImg.backgroundColor = "transparent";
+			}
+			boardImg.x = Math.round((doc.canvasWidth - boardImg.width) / 2);
+			boardImg.y = Math.round((doc.canvasHeight - boardImg.height) / 2);
+			doc.images = [boardImg];
+
+			// Persist the board document with the placed image
+			await invoke("save_board", { id, json: JSON.stringify(doc) });
+			setSelectedFile(null);
+			setBoardScreen({ mode: "editor", boardId: id });
+		} catch (err) {
+			console.error("Failed to open image with board:", err);
+			setError(err instanceof Error ? err.message : String(err));
+		}
+	};
+
 	// Small icon shown next to a file name in the home-screen "From your library" preview list, the
 	// sidebar file list, and the "Now open" banner.
 	const categoryIcon = (category: FileCategory | null): React.ReactNode =>
@@ -5268,6 +5351,8 @@ const setScreen = () => {
                 store={imageEditStore}
                 isToolsPanelOpen={dockerMode === "file-tools"}
                 onToolsPanelOpenChange={(open) => setDockerMode(open ? "file-tools" : "record")}
+                onBack={() => setSelectedFile(null)}
+                onOpenWithBoard={() => handleOpenImageWithBoard(selectedFile)}
               />
             ) : getFileCategory(selectedFile.name) === "document" ? (
               // .docx/.md/.txt (e.g. Docs' own Export menu output) have no in-app renderer, unlike

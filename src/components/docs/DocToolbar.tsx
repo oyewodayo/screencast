@@ -93,11 +93,13 @@ const ALIGNMENTS = [
 
 const VOICE_COMMANDS: [string, string][] = [
   ["“new line” / “new paragraph”", "Line or paragraph break"],
-  ["“comma”, “period”, “question mark”", "Punctuation"],
-  ["“open quote” … “close quote”", "Quotation marks"],
-  ["“scratch that”", "Delete the last phrase"],
-  ["“bullet list” / “numbered list”", "Start a list"],
-  ["“heading one” … “normal text”", "Paragraph style"],
+  ["“bold that” / “highlight that”", "Format last spoken phrase"],
+  ["“insert 3 by 2 table”", "Create a table by voice"],
+  ["“next cell” / “next row”", "Navigate or add table rows"],
+  ["“checklist” / “check that”", "Interactive to-do lists"],
+  ["“heading 1 …” / “bullet list”", "Instant block styles"],
+  ["“name at gmail dot com”", "Smart email & symbol formatting"],
+  ["“scratch that” / “delete last word”", "Instant voice correction"],
   ["“stop dictation”", "Stop listening"],
 ];
 
@@ -490,6 +492,12 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
         : "Auto-detect"
       : DICTATION_LANGUAGES.find((l) => l.code === language)?.label ?? language;
 
+  const statusText = dictation.speaking
+    ? "Listening"
+    : pending > 0
+      ? "Writing…"
+      : "Listening";
+
   return (
     <div
       className={`flex items-center shrink-0 rounded-full transition-colors ${
@@ -513,7 +521,7 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
         {listening ? (
           <>
             <DictationLevelMeter levelRef={dictation.levelRef} />
-            <span className="text-xs font-medium">{dictation.speaking ? "Listening" : pending > 0 ? "Writing…" : "Listening"}</span>
+            <span className="text-xs font-medium">{statusText}</span>
             <MdStop size={16} />
           </>
         ) : busy ? (
@@ -533,10 +541,10 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
         triggerClassName={`h-7 w-5 inline-flex items-center justify-center rounded-full text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.06] dark:hover:bg-white/10 ${
           menu.open ? "bg-black/[0.06] dark:bg-white/10" : ""
         }`}
-        panelClassName="w-80 py-2"
+        panelClassName="w-72 py-2 max-h-[82vh] overflow-y-auto"
       >
         <div className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Language · {langLabel}</div>
-        <div className="max-h-52 overflow-y-auto">
+        <div className="max-h-48 overflow-y-auto">
           {DICTATION_LANGUAGES.map((l) => (
             <button
               key={l.code}
@@ -563,7 +571,7 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
           ))}
         </dl>
         <p className="px-3 pt-2 text-[11px] leading-snug text-neutral-400">
-          Text appears after each pause. Click anywhere in the document to move where it goes. Runs fully on this computer.
+          Words stream in real time as you speak. Say commands inline without pausing. Runs 100% offline on this computer.
         </p>
       </Dropdown>
     </div>

@@ -97,9 +97,16 @@ function indentFor(node: JSONContent, base?: { left: number }) {
   };
 }
 
+type WordBorderSpec = {
+  style: (typeof BorderStyle)[keyof typeof BorderStyle];
+  size: number;
+  color: string;
+  space?: number;
+};
+
 // A CSS border ("1.5pt solid #1f2937", as docBlockFormat.ts / docTableCellShading.ts store them)
 // as a Word border. "none" (or nothing) = an explicit no-border, so Word's own defaults don't creep in.
-function wordBorder(css: unknown): { style: (typeof BorderStyle)[keyof typeof BorderStyle]; size: number; color: string; space?: number } | undefined {
+function wordBorder(css: unknown): WordBorderSpec | undefined {
   if (typeof css !== "string" || !css.trim()) return undefined;
   if (css.trim() === "none") return { style: BorderStyle.NONE, size: 0, color: "auto" };
   const m = css.match(/([\d.]+)(pt|px)\s+(solid|dashed|dotted|double)\s+(#[0-9a-fA-F]{6})/);
@@ -108,6 +115,29 @@ function wordBorder(css: unknown): { style: (typeof BorderStyle)[keyof typeof Bo
   const style = m[3] === "dashed" ? BorderStyle.DASHED : m[3] === "dotted" ? BorderStyle.DOTTED : m[3] === "double" ? BorderStyle.DOUBLE : BorderStyle.SINGLE;
   // Word measures borders in eighths of a point.
   return { style, size: Math.max(2, Math.round(pt * 8)), color: m[4].slice(1).toUpperCase() };
+}
+
+const TABLE_BORDER_NONE: WordBorderSpec = { style: BorderStyle.NONE, size: 0, color: "auto" };
+const TABLE_BORDER_OUTER: WordBorderSpec = { style: BorderStyle.SINGLE, size: 6, color: "334155" };
+const TABLE_BORDER_INNER: WordBorderSpec = { style: BorderStyle.SINGLE, size: 4, color: "64748B" };
+const TABLE_BORDER_HEADER_BOTTOM: WordBorderSpec = { style: BorderStyle.SINGLE, size: 8, color: "334155" };
+const TABLE_BORDER_BOOKTABS_HEAVY: WordBorderSpec = { style: BorderStyle.SINGLE, size: 12, color: "1E293B" };
+const TABLE_BORDER_DOUBLED_OUTER: WordBorderSpec = { style: BorderStyle.DOUBLE, size: 6, color: "1E293B" };
+
+// Replaces missing ("none") inner borders or washed-out near-white greys (#E5E5E5) on bordered
+// grid cells with a crisp, clearly visible slate grid line for Word and Google Docs.
+function upgradeGridCellBorder(b: WordBorderSpec | undefined, fallback: WordBorderSpec): WordBorderSpec {
+  if (!b || b.style === BorderStyle.NONE) return fallback;
+  if (/^[0-9A-F]{6}$/i.test(b.color)) {
+    const n = parseInt(b.color, 16);
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const bl = n & 255;
+    if (r >= 0xd0 && g >= 0xd0 && bl >= 0xd0 && Math.max(r, g, bl) - Math.min(r, g, bl) <= 20) {
+      return { ...b, size: Math.max(4, b.size), color: fallback.color };
+    }
+  }
+  return { ...b, size: Math.max(4, b.size) };
 }
 
 // Paragraph spacing, line spacing, borders and shading (docBlockFormat.ts, docLineSpacingExtension.ts)
@@ -327,11 +357,6 @@ async function renderInline(content: JSONContent[] | undefined, ctx: InlineConte
   if (!content) return [];
   const { commentIdFor, structure } = ctx;
   const runs: ParagraphChild[] = [];
-  // A comment mark wraps a *range* of text, which can span several runs (e.g. commented text that's
-  // also partly bold) - tracked here as "the comment range currently open", closed either when the
-  // next node's commentId differs or at the end of this content array. Only handles ranges within a
-  // single call to renderInline (i.e. within one paragraph/list-item/etc's own content) - a comment
-  // spanning across separate top-level blocks is a rarer case this doesn't attempt to reconstruct.
   let activeCommentId: string | null = null;
   const closeComment = () => {
     if (!activeCommentId) return;
@@ -377,7 +402,6 @@ async function renderInline(content: JSONContent[] | undefined, ctx: InlineConte
       const targetId = String(node.attrs?.targetId ?? "");
       const target = structure?.targets.get(targetId);
       const run = new TextRun({ text: target ? crossRefText(target, node.attrs?.form) : "??", ...runOptionsFromMarks(node.marks, forceBold) });
-      // A real internal link: Ctrl+click in Word jumps to the figure, table or equation.
       runs.push(target ? new InternalHyperlink({ anchor: bookmarkName(targetId), children: [run] }) : run);
     } else if (node.type === "mathInline") {
       const latex = (node.attrs?.latex as string) ?? "";
@@ -390,13 +414,6 @@ async function renderInline(content: JSONContent[] | undefined, ctx: InlineConte
   return runs;
 }
 
-// Tiptap's Heading schema allows levels 1-6 by default (docSchemaExtensions.ts doesn't restrict
-// it) even though DocsEditor.tsx's toolbar only exposes buttons for H1-H3 - a .docx imported via
-// docxImport.ts can still contain deeper heading levels straight from Word's own Heading 4-6
-// styles. Leaving levels 4-6 out of this map meant `heading` resolved to undefined and the whole
-// paragraph silently lost all styling on export (confirmed empirically: exported XML for an H4
-// paragraph came back as bare <w:p><w:r><w:t>...</w:t></w:r></w:p>, no pStyle, no formatting at
-// all) - so all 6 levels the schema actually allows are mapped here.
 const HEADING_BY_LEVEL: Record<number, (typeof HeadingLevel)[keyof typeof HeadingLevel]> = {
   1: HeadingLevel.HEADING_1,
   2: HeadingLevel.HEADING_2,
@@ -406,11 +423,6 @@ const HEADING_BY_LEVEL: Record<number, (typeof HeadingLevel)[keyof typeof Headin
   6: HeadingLevel.HEADING_6,
 };
 
-// Ordered lists in docx need a numbering "reference" pre-registered on the Document (inline
-// per-paragraph numbering isn't supported) - this walker accumulates one { reference, levels[] }
-// entry per distinct *top-level* orderedList encountered, sharing the same reference across a
-// list's own nested sub-lists (level incremented) so numbering doesn't restart mid-list, while
-// separate top-level lists each get a fresh, independent reference/counter.
 interface NumberingLevel {
   level: number;
   format: (typeof LevelFormat)[keyof typeof LevelFormat];
@@ -419,18 +431,26 @@ interface NumberingLevel {
   start: number;
 }
 
+interface TableCellContext {
+  rules: string | null;
+  rowIdx: number;
+  totalRows: number;
+  colIdx: number;
+  numCols: number;
+  colWidthsTwips: number[];
+  totalWidthTwips: number;
+  isHeaderRow: boolean;
+  firstRowIsHeader: boolean;
+}
+
 class DocxBuilder {
   private numberingConfigs: { reference: string; levels: NumberingLevel[] }[] = [];
   private nextListId = 0;
-  // Populated by build() before any rendering starts - the DocComment records available to look up
-  // each referenced commentId's actual text/date when the final Comments list is assembled.
   private comments: DocComment[] = [];
   private commentNumericIds = new Map<string, number>();
   private nextCommentNumericId = 0;
-  // Display equations numbered so far - the same document-order count docStructure.ts assigns.
   private equationNumber = 0;
   private captionCounts = { figure: 0, table: 0 };
-  // Every heading gets a hidden _Toc bookmark (in document order) for the table of contents' links.
   private headingIndex = 0;
   private structure: DocStructure | null = null;
   private headingPages: number[] = [];
@@ -438,12 +458,8 @@ class DocxBuilder {
   private get inline(): InlineContext {
     return { commentIdFor: this.commentIdFor, structure: this.structure };
   }
-  // Width between the margins in twips, set by build() before rendering - where a numbered
-  // equation's centre and right tab stops go.
   private textWidthTwips = 0;
 
-  // An arrow class field (auto-bound), not a plain method, so it can be passed directly as
-  // renderInline's commentIdFor callback without a separate .bind(this) at every call site.
   private commentIdFor = (uuid: string): number => {
     let id = this.commentNumericIds.get(uuid);
     if (id === undefined) {
@@ -492,11 +508,10 @@ class DocxBuilder {
     return out;
   }
 
-  private async renderOrderedList(node: JSONContent, level: number, reference?: string): Promise<Paragraph[]> {
-    const ref = reference ?? `ordered-${this.nextListId++}`;
+  private async renderOrderedList(node: JSONContent, level: number, existingRef?: string): Promise<Paragraph[]> {
+    const ref = existingRef ?? `ordered-list-${this.nextListId++}`;
     const start = (node.attrs?.start as number) ?? 1;
     this.registerNumberingLevel(ref, level, start);
-
     const out: Paragraph[] = [];
     for (const item of node.content ?? []) {
       for (const child of item.content ?? []) {
@@ -511,8 +526,6 @@ class DocxBuilder {
         } else if (child.type === "bulletList") {
           out.push(...(await this.renderBulletList(child, level + 1)));
         } else if (child.type === "orderedList") {
-          // Nested ordered list within the same top-level list - reuse the reference so
-          // numbering continues as one logical list, just at a deeper level.
           out.push(...(await this.renderOrderedList(child, level + 1, ref)));
         }
       }
@@ -520,61 +533,297 @@ class DocxBuilder {
     return out;
   }
 
-  private async renderTableCell(cell: JSONContent): Promise<TableCell> {
-    const isHeader = cell.type === "tableHeader";
+  private computeTableColumnWidthsTwips(rows: JSONContent[], totalWidthTwips: number): { numCols: number; colWidthsTwips: number[] } {
+    let numCols = 1;
+    for (const row of rows) {
+      let colsInRow = 0;
+      for (const cell of row.content ?? []) {
+        colsInRow += Math.max(1, Number(cell.attrs?.colspan) || 1);
+      }
+      if (colsInRow > numCols) numCols = colsInRow;
+    }
+
+    const colPx: (number | null)[] = new Array(numCols).fill(null);
+    for (const row of rows) {
+      let colIdx = 0;
+      for (const cell of row.content ?? []) {
+        const span = Math.max(1, Number(cell.attrs?.colspan) || 1);
+        const cw = cell.attrs?.colwidth;
+        if (Array.isArray(cw)) {
+          for (let i = 0; i < span && colIdx + i < numCols; i++) {
+            const w = Number(cw[i]);
+            if (w > 0 && colPx[colIdx + i] === null) colPx[colIdx + i] = w;
+          }
+        } else if (typeof cw === "number" && cw > 0 && span === 1 && colIdx < numCols && colPx[colIdx] === null) {
+          colPx[colIdx] = cw;
+        }
+        colIdx += span;
+      }
+    }
+
+    const minColTwips = Math.min(720, Math.floor(totalWidthTwips / numCols));
+    const knownIndices = colPx.map((w, i) => (w !== null && w > 0 ? i : -1)).filter((i) => i >= 0);
+
+    if (knownIndices.length === numCols) {
+      const sumPx = (colPx as number[]).reduce((a, b) => a + b, 0);
+      const rawTwips = (colPx as number[]).map((px) => Math.max(minColTwips, Math.round((px / sumPx) * totalWidthTwips)));
+      const diff = totalWidthTwips - rawTwips.reduce((a, b) => a + b, 0);
+      rawTwips[0] = Math.max(minColTwips, rawTwips[0] + diff);
+      return { numCols, colWidthsTwips: rawTwips };
+    }
+
+    if (knownIndices.length > 0) {
+      // Convert known pixel widths (1px = 15 twips at 96 DPI), leaving space for unknown columns.
+      const unknownCount = numCols - knownIndices.length;
+      const maxForKnown = totalWidthTwips - unknownCount * Math.max(minColTwips, Math.round(totalWidthTwips / (numCols * 2)));
+      let knownTwipsSum = knownIndices.reduce((acc, idx) => acc + Math.round((colPx[idx] as number) * 15), 0);
+      const scale = knownTwipsSum > maxForKnown && knownTwipsSum > 0 ? maxForKnown / knownTwipsSum : 1;
+      knownTwipsSum = 0;
+      const out = new Array<number>(numCols).fill(0);
+      for (const idx of knownIndices) {
+        out[idx] = Math.max(minColTwips, Math.round((colPx[idx] as number) * 15 * scale));
+        knownTwipsSum += out[idx];
+      }
+      const remaining = Math.max(unknownCount * minColTwips, totalWidthTwips - knownTwipsSum);
+      const eachUnknown = Math.floor(remaining / unknownCount);
+      for (let i = 0; i < numCols; i++) {
+        if (out[i] === 0) out[i] = eachUnknown;
+      }
+      const diff = totalWidthTwips - out.reduce((a, b) => a + b, 0);
+      out[0] = Math.max(minColTwips, out[0] + diff);
+      return { numCols, colWidthsTwips: out };
+    }
+
+    const base = Math.floor(totalWidthTwips / numCols);
+    const colWidthsTwips = new Array<number>(numCols).fill(base);
+    colWidthsTwips[0] += totalWidthTwips - base * numCols;
+    return { numCols, colWidthsTwips };
+  }
+
+  private resolveCellBorders(cell: JSONContent, ctx: TableCellContext): ITableCellBorders {
+    const { rules, rowIdx, totalRows, colIdx, numCols, isHeaderRow, firstRowIsHeader } = ctx;
+    const colspan = Math.max(1, Number(cell.attrs?.colspan) || 1);
+    const rowspan = Math.max(1, Number(cell.attrs?.rowspan) || 1);
+    const isLastRow = rowIdx + rowspan >= totalRows;
+    const isLastCol = colIdx + colspan >= numCols;
+    const edges = typeof cell.attrs?.borders === "string" ? (cell.attrs.borders as string).split("|") : null;
+
+    if (rules === "none") {
+      if (edges && edges.length === 4) {
+        return {
+          top: wordBorder(edges[0]) ?? TABLE_BORDER_NONE,
+          right: wordBorder(edges[1]) ?? TABLE_BORDER_NONE,
+          bottom: wordBorder(edges[2]) ?? TABLE_BORDER_NONE,
+          left: wordBorder(edges[3]) ?? TABLE_BORDER_NONE,
+        };
+      }
+      return {
+        top: TABLE_BORDER_NONE,
+        right: TABLE_BORDER_NONE,
+        bottom: TABLE_BORDER_NONE,
+        left: TABLE_BORDER_NONE,
+      };
+    }
+
+    if (rules === "booktabs") {
+      return {
+        top:
+          rowIdx === 0
+            ? TABLE_BORDER_BOOKTABS_HEAVY
+            : rowIdx === 1 && firstRowIsHeader
+              ? TABLE_BORDER_INNER
+              : TABLE_BORDER_NONE,
+        bottom: isLastRow ? TABLE_BORDER_BOOKTABS_HEAVY : isHeaderRow ? TABLE_BORDER_INNER : TABLE_BORDER_NONE,
+        left: TABLE_BORDER_NONE,
+        right: TABLE_BORDER_NONE,
+      };
+    }
+
+    if (rules === "doubled") {
+      return {
+        top: rowIdx === 0 ? TABLE_BORDER_DOUBLED_OUTER : TABLE_BORDER_INNER,
+        bottom: isLastRow ? TABLE_BORDER_DOUBLED_OUTER : isHeaderRow ? TABLE_BORDER_HEADER_BOTTOM : TABLE_BORDER_INNER,
+        left: TABLE_BORDER_NONE,
+        right: isLastCol ? TABLE_BORDER_NONE : TABLE_BORDER_INNER,
+      };
+    }
+
+    // Standard grid table (!rules): every outer and inner edge gets a crisp, clearly visible border
+    // so both Microsoft Word and Google Docs render the table cleanly without missing column lines.
+    const defTop = rowIdx === 0 ? TABLE_BORDER_OUTER : TABLE_BORDER_INNER;
+    const defBottom = isLastRow ? TABLE_BORDER_OUTER : isHeaderRow ? TABLE_BORDER_HEADER_BOTTOM : TABLE_BORDER_INNER;
+    const defLeft = colIdx === 0 ? TABLE_BORDER_OUTER : TABLE_BORDER_INNER;
+    const defRight = isLastCol ? TABLE_BORDER_OUTER : TABLE_BORDER_INNER;
+
+    if (edges && edges.length === 4) {
+      const parsed = edges.map((e) => wordBorder(e));
+      const visibleCount = parsed.filter((b) => b && b.style !== BorderStyle.NONE).length;
+      if (visibleCount === 0) {
+        return {
+          top: TABLE_BORDER_NONE,
+          right: TABLE_BORDER_NONE,
+          bottom: TABLE_BORDER_NONE,
+          left: TABLE_BORDER_NONE,
+        };
+      }
+      if (visibleCount === 1) {
+        return {
+          top: parsed[0] ?? TABLE_BORDER_NONE,
+          right: parsed[1] ?? TABLE_BORDER_NONE,
+          bottom: parsed[2] ?? TABLE_BORDER_NONE,
+          left: parsed[3] ?? TABLE_BORDER_NONE,
+        };
+      }
+      return {
+        top: upgradeGridCellBorder(parsed[0], defTop),
+        right: upgradeGridCellBorder(parsed[1], defRight),
+        bottom: upgradeGridCellBorder(parsed[2], defBottom),
+        left: upgradeGridCellBorder(parsed[3], defLeft),
+      };
+    }
+
+    return {
+      top: defTop,
+      right: defRight,
+      bottom: defBottom,
+      left: defLeft,
+    };
+  }
+
+  private async renderTableCell(cell: JSONContent, ctx: TableCellContext): Promise<TableCell> {
+    const isHeader = cell.type === "tableHeader" || ctx.isHeaderRow;
     const children: (Paragraph | Table)[] = [];
     for (const block of cell.content ?? []) {
-      // docx has no distinct header-cell type - force bold on header cells' text runs, mirroring
-      // docMarkdown.ts's own firstRowIsHeader handling for the same schema-level gap.
       const rendered = await this.renderBlock(block, { forceBold: isHeader });
       children.push(...rendered);
     }
     if (children.length === 0) children.push(new Paragraph({}));
+
+    const colspan = Math.max(1, Number(cell.attrs?.colspan) || 1);
+    const rowspan = Math.max(1, Number(cell.attrs?.rowspan) || 1);
+    const cellWidthTwips =
+      ctx.colWidthsTwips.slice(ctx.colIdx, ctx.colIdx + colspan).reduce((a, b) => a + b, 0) ||
+      Math.round((ctx.totalWidthTwips * colspan) / ctx.numCols);
+
     const background = cell.attrs?.background as string | null | undefined;
-    const edges = typeof cell.attrs?.borders === "string" ? (cell.attrs.borders as string).split("|") : null;
-    const borders =
-      edges && edges.length === 4
-        ? { top: wordBorder(edges[0]), right: wordBorder(edges[1]), bottom: wordBorder(edges[2]), left: wordBorder(edges[3]) }
+    // Standard grid tables get a subtle, professional header row fill if none was explicitly set.
+    const effectiveFill = background
+      ? background.slice(1).toUpperCase()
+      : isHeader && !ctx.rules
+        ? "F8FAFC"
         : undefined;
+
+    const borders = this.resolveCellBorders(cell, ctx);
     const va = cell.attrs?.verticalAlign as string | null | undefined;
+    const verticalAlign =
+      va === "bottom"
+        ? VerticalAlign.BOTTOM
+        : va === "top"
+          ? VerticalAlign.TOP
+          : va === "middle"
+            ? VerticalAlign.CENTER
+            : ctx.rules === "none"
+              ? VerticalAlign.TOP
+              : VerticalAlign.CENTER;
+
     return new TableCell({
       children,
-      ...(borders ? { borders: borders as ITableCellBorders } : {}),
-      ...(va ? { verticalAlign: va === "middle" ? VerticalAlign.CENTER : va === "bottom" ? VerticalAlign.BOTTOM : VerticalAlign.TOP } : {}),
-      width: { size: 100 / (cell.attrs?.colspan ?? 1), type: WidthType.PERCENTAGE },
-      columnSpan: (cell.attrs?.colspan as number | undefined) ?? undefined,
-      shading: background ? { fill: background.slice(1).toUpperCase(), type: ShadingType.CLEAR, color: "auto" } : undefined,
-      margins: background ? { top: 100, bottom: 100, left: 140, right: 140 } : undefined,
+      borders,
+      verticalAlign,
+      width: { size: cellWidthTwips, type: WidthType.DXA },
+      columnSpan: colspan > 1 ? colspan : undefined,
+      rowSpan: rowspan > 1 ? rowspan : undefined,
+      shading: effectiveFill ? { fill: effectiveFill, type: ShadingType.CLEAR, color: "auto" } : undefined,
+      margins: { top: 120, bottom: 120, left: 160, right: 160 },
     });
   }
 
   private async renderTable(node: JSONContent): Promise<Table | null> {
     const rows = node.content ?? [];
     if (rows.length === 0) return null;
+
+    const rules = ((node.attrs?.rules as string | null | undefined) ?? null);
+    const totalWidthTwips = Math.max(2880, this.textWidthTwips || 9360);
+    const { numCols, colWidthsTwips } = this.computeTableColumnWidthsTwips(rows, totalWidthTwips);
+    const firstRowCells = rows[0]?.content ?? [];
+    const firstRowIsHeader = firstRowCells.length > 0 && firstRowCells.every((c) => c.type === "tableHeader");
+
     const tableRows: TableRow[] = [];
-    for (const row of rows) {
+    for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+      const row = rows[rowIdx];
+      const rowCells = row.content ?? [];
+      const isHeaderRow = rowIdx === 0 && firstRowIsHeader;
       const cells: TableCell[] = [];
-      for (const cell of row.content ?? []) cells.push(await this.renderTableCell(cell));
-      tableRows.push(new TableRow({ children: cells }));
+      let colIdx = 0;
+      for (const cell of rowCells) {
+        const span = Math.max(1, Number(cell.attrs?.colspan) || 1);
+        cells.push(
+          await this.renderTableCell(cell, {
+            rules,
+            rowIdx,
+            totalRows: rows.length,
+            colIdx,
+            numCols,
+            colWidthsTwips,
+            totalWidthTwips,
+            isHeaderRow,
+            firstRowIsHeader,
+          })
+        );
+        colIdx += span;
+      }
+      tableRows.push(
+        new TableRow({
+          children: cells,
+          tableHeader: isHeaderRow || undefined,
+          cantSplit: true,
+        })
+      );
     }
+
+    const tableBorders =
+      rules === "none"
+        ? {
+            top: TABLE_BORDER_NONE,
+            bottom: TABLE_BORDER_NONE,
+            left: TABLE_BORDER_NONE,
+            right: TABLE_BORDER_NONE,
+            insideHorizontal: TABLE_BORDER_NONE,
+            insideVertical: TABLE_BORDER_NONE,
+          }
+        : rules === "booktabs"
+          ? {
+              top: TABLE_BORDER_BOOKTABS_HEAVY,
+              bottom: TABLE_BORDER_BOOKTABS_HEAVY,
+              left: TABLE_BORDER_NONE,
+              right: TABLE_BORDER_NONE,
+              insideHorizontal: TABLE_BORDER_INNER,
+              insideVertical: TABLE_BORDER_NONE,
+            }
+          : rules === "doubled"
+            ? {
+                top: TABLE_BORDER_DOUBLED_OUTER,
+                bottom: TABLE_BORDER_DOUBLED_OUTER,
+                left: TABLE_BORDER_NONE,
+                right: TABLE_BORDER_NONE,
+                insideHorizontal: TABLE_BORDER_INNER,
+                insideVertical: TABLE_BORDER_INNER,
+              }
+            : {
+                top: TABLE_BORDER_OUTER,
+                bottom: TABLE_BORDER_OUTER,
+                left: TABLE_BORDER_OUTER,
+                right: TABLE_BORDER_OUTER,
+                insideHorizontal: TABLE_BORDER_INNER,
+                insideVertical: TABLE_BORDER_INNER,
+              };
+
     return new Table({
       rows: tableRows,
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      // Matches the live editor's own table style (Tailwind Typography's default: no outer/vertical
-      // borders, only a thin line between rows - see @tailwindcss/typography's styles.js, `thead`/
-      // `tbody tr` get border-bottom only) - docx's own Table default is a full black grid, which
-      // doesn't reflect what the table actually looks like in Docs, so it's overridden explicitly
-      // rather than left at that default.
-      borders: {
-        top: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        bottom: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        left: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        right: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        insideVertical: { style: BorderStyle.NONE, size: 0, color: "auto" },
-        // A layout table (rules "none" - résumé sidebars, callout boxes) has no lines at all.
-        insideHorizontal:
-          node.attrs?.rules === "none" ? { style: BorderStyle.NONE, size: 0, color: "auto" } : { style: BorderStyle.SINGLE, size: 4, color: "D1D5DB" },
-      },
+      width: { size: totalWidthTwips, type: WidthType.DXA },
+      columnWidths: colWidthsTwips,
+      margins: { top: 120, bottom: 120, left: 160, right: 160 },
+      borders: tableBorders,
     });
   }
 
@@ -606,11 +855,6 @@ class DocxBuilder {
     return out;
   }
 
-  // extraParagraphProps carries context a container passes down into any Paragraph it produces -
-  // forceBold for table-header cells, indent/border for blockquote (docx Paragraphs are opaque
-  // once constructed, so there's no way to apply this after the fact; it has to be baked in at
-  // construction time instead). Only paragraph/heading/codeBlock lines actually consume it -
-  // nested lists/tables inside a blockquote keep their own styling, a known approximation.
   private async renderBlock(
     node: JSONContent,
     extraParagraphProps: { forceBold?: boolean; indent?: { left: number }; border?: IBordersOptions } = {}
@@ -648,8 +892,6 @@ class DocxBuilder {
       case "taskList":
         return this.renderTaskList(node, 0);
       case "blockquote": {
-        // docx has no first-class blockquote - approximated with an indent + left border, passed
-        // down into whatever paragraphs its contained blocks produce.
         const quoteProps = {
           indent: { left: 720 },
           border: { left: { style: BorderStyle.SINGLE, size: 12, color: "CCCCCC", space: 8 } },
@@ -660,7 +902,7 @@ class DocxBuilder {
       }
       case "codeBlock": {
         const language = (node.attrs?.language as string) ?? "";
-        void language; // docx has no syntax-highlighting concept - monospace + shading only.
+        void language;
         const text = (node.content ?? []).map((c) => c.text ?? "").join("");
         return text.split("\n").map(
           (line) =>
@@ -680,8 +922,6 @@ class DocxBuilder {
         const table = await this.renderTable(node);
         return table ? [table] : [];
       }
-      // A numbered equation is centred with its number flush right via a centre and a right tab
-      // stop, the usual Word layout; an unnumbered one is a display-math paragraph of its own.
       case "mathBlock": {
         const latex = ((node.attrs?.latex as string) ?? "").trim();
         if (!latex) return [];
@@ -701,7 +941,6 @@ class DocxBuilder {
               new TextRun({ children: [new Tab()] }),
               math,
               new TextRun({ children: [new Tab()] }),
-              // Cross-references to the equation link to its number.
               ...(node.attrs?.id ? this.bookmarks.wrap(bookmarkName(String(node.attrs.id)), [new TextRun(`(${number})`)]) : [new TextRun(`(${number})`)]),
             ],
             indent,
@@ -709,9 +948,6 @@ class DocxBuilder {
           }),
         ];
       }
-      // "Figure 2.  Caption text" - the label is bookmarked so cross-references link to it. Figure
-      // captions are centred under the image, table captions left-aligned above the table (and
-      // kept on the table's page).
       case "caption": {
         const kind = node.attrs?.kind === "table" ? "table" : "figure";
         const numbering = this.structure?.numbering ?? DEFAULT_NUMBERING;
@@ -730,8 +966,6 @@ class DocxBuilder {
           }),
         ];
       }
-      // The reference list, formatted exactly as in Docs: a hanging label column for numbered
-      // styles, a 0.5in hanging indent for APA.
       case "bibliography": {
         const s = this.structure;
         if (!s || s.bibliography.length === 0) return [];
@@ -747,8 +981,6 @@ class DocxBuilder {
             })
         );
       }
-      // A real Word table-of-contents field, pre-filled with the entries (and the page numbers Docs
-      // shows) so it reads correctly on open; F9 in Word refreshes it against Word's own layout.
       case "tableOfContents": {
         const s = this.structure;
         const maxLevel = Number(node.attrs?.maxLevel ?? 3);
@@ -758,13 +990,9 @@ class DocxBuilder {
           .map(({ h, i }) => ({ title: h.text, level: h.level, page: this.headingPages[i], href: `_Toc_h${i}` }));
         return [
           new Paragraph({ children: [new TextRun({ text: "Contents", bold: true, size: 28 })], spacing: { after: 160 } }),
-          // beginDirty: false - the cached entries are current, so Word opens without asking to
-          // update fields.
           new TableOfContents("Contents", { hyperlink: true, headingStyleRange: `1-${maxLevel}`, cachedEntries: entries, beginDirty: false }) as unknown as Paragraph,
         ];
       }
-      // docx's own PageBreak is a Run (extends Run - see its own import), the standard idiom for
-      // forcing one is a Paragraph containing nothing but it.
       case "pageBreak":
         return [new Paragraph({ children: [new PageBreak()] })];
       default:
@@ -782,10 +1010,6 @@ class DocxBuilder {
     this.comments = options.comments ?? [];
     this.structure = options.structure ?? null;
     this.headingPages = options.headingPages ?? [];
-    // Matches the live editor/print output exactly - same page dimensions (docPageGeometry.ts) and
-    // the doc's own margins, not docx's unrelated defaults.
-    // `dims` is the page as laid out (swapped for landscape) - the text width comes from it; Word
-    // itself wants the portrait size plus an orientation flag, and swaps them (docx's PageSize).
     const page = pageFormat(options.pageSize, options.orientation);
     const dims = pageDimensionsIn(page);
     const paper = PAGE_DIMENSIONS_IN[page.size];
@@ -794,14 +1018,6 @@ class DocxBuilder {
     this.textWidthTwips = Math.round((dims.width - m.left - m.right) * TWIPS_PER_IN);
     const children = await this.renderBlocks(json.content ?? []);
 
-    // Only comments whose mark actually appears somewhere in the rendered content end up here -
-    // commentNumericIds is populated exclusively by renderInline's commentIdFor calls during the
-    // renderBlocks() pass just above, so a resolved-but-still-anchored comment still exports (this
-    // format has no "resolved" concept to preserve), while a comment whose mark was already
-    // removed from the doc doesn't produce a dangling, unreferenced Comment entry.
-    // Document's own `comments` option wants plain ICommentOptions data, not Comment class
-    // instances (those are what docx builds internally *from* this data) - confirmed by the type
-    // error passing `new Comment(...)` here originally produced.
     const commentChildren: ICommentOptions[] = [...this.commentNumericIds.entries()].map(([uuid, id]) => {
       const comment = this.comments.find((c) => c.mark_id === uuid);
       return {
@@ -817,11 +1033,6 @@ class DocxBuilder {
     const height = `${paper.height}in` as PositiveUniversalMeasure;
     const inch = (v: number) => `${v}in` as PositiveUniversalMeasure;
 
-    // Page furniture. Each header/footer part is one paragraph: left text, a centre tab stop, a
-    // right tab stop - the three slots. The watermark rides in the header paragraph as a page-sized
-    // picture anchored to the page centre behind the text, which is how Word itself places one.
-    // "Different first page" (titlePage) is on when either the chrome or the watermark leaves page
-    // 1 out; the first-page parts then carry whichever of the two still belongs there.
     const chrome = options.pageChrome ?? null;
     const wm = options.watermark?.png ? options.watermark : null;
     const chromeHas = (band: ChromeBand) => !!chrome && bandHasContent(chrome, band);
@@ -841,7 +1052,6 @@ class DocxBuilder {
       });
     const bandParagraph = (band: ChromeBand, withText: boolean, withWatermark: boolean, letterheadPng: Uint8Array | null = null) => {
       const children: (TextRun | ImageRun)[] = [];
-      // The letterhead sheet rides in the header behind everything, as Word letterheads are built.
       if (letterheadPng && lh) children.push(sheetRun(letterheadPng, lh.widthPx, lh.heightPx));
       if (withText && chrome) {
         const style = { size: chrome.fontSize * 2, color: "5F6368" };
@@ -882,8 +1092,6 @@ class DocxBuilder {
     const textOnFirst = !chrome?.differentFirstPage;
     const markOnFirst = !wm?.skipFirstPage;
     const lhRest = lh ? (lh.rest === "same" ? lh.first : lh.rest) : null;
-    // Page 1's deeper top margin: an exact-height spacer in its header carries the header down to
-    // where the text starts - Word starts the body below the header when the header runs deeper.
     const HEADER_DIST_IN = 0.5;
     const spacerTwips = lh?.firstTopIn ? Math.round((lh.firstTopIn - HEADER_DIST_IN) * 1440) : 0;
     const lhNeedsFirst = !!lh && (lh.rest !== "same" || spacerTwips > 0);
@@ -906,8 +1114,6 @@ class DocxBuilder {
       title,
       numbering: { config: this.numberingConfigs },
       comments: commentChildren.length > 0 ? { children: commentChildren } : undefined,
-      // Page colour - Word shows it because docx also writes w:displayBackgroundShape. Text left at
-      // Word's "automatic" colour turns white on a dark page by itself, as it does on screen here.
       background: pageColor ? { color: pageColor.slice(1).toUpperCase() } : undefined,
       sections: [
         {
@@ -919,18 +1125,12 @@ class DocxBuilder {
             },
             titlePage: titlePage || undefined,
           },
-          // Word's own header/footer parts, with live PAGE/NUMPAGES fields - Word numbers the pages
-          // itself, in the chosen numerals from the chosen start (pageNumbers above). A different
-          // first page is Word's "Different First Page" (titlePage) with empty first-page parts.
           headers: parts(Header, "header"),
           footers: parts(Footer, "footer"),
           children,
         },
       ],
     });
-    // Packer.toBuffer() hardcodes JSZip's "nodebuffer" output type internally, which requires
-    // Node's global Buffer and throws ("nodebuffer is not supported by this platform") in a
-    // webview - toBlob() uses JSZip's "blob" type instead, which browsers/webviews do support.
     const blob = await Packer.toBlob(doc);
     return new Uint8Array(await blob.arrayBuffer());
   }
@@ -938,19 +1138,13 @@ class DocxBuilder {
 
 export interface DocxExportOptions {
   comments?: DocComment[];
-  // Numbers, citations and the reference list (docStructure.ts's computeStructureFromJson).
   structure?: DocStructure | null;
-  // Page of each heading in document order, as Docs paginates it - the table of contents' numbers.
   headingPages?: number[];
   pageSize?: DocPageSize | null;
   orientation?: DocOrientation | null;
   pageColor?: string | null;
-  // Header, footer and page numbers (docPageChrome.ts).
   pageChrome?: DocPageChrome | null;
-  // The watermark (docWatermark.ts), already drawn as a PNG of the whole sheet (CSS px size).
   watermark?: { png: Uint8Array | null; widthPx: number; heightPx: number; skipFirstPage: boolean } | null;
-  // The letterhead (docLetterhead.ts): page 1's sheet and the later pages' ("same" = page 1's, null
-  // = plain paper) as page-sized PNGs, and page 1's own top margin when it's deeper.
   letterhead?: { first: Uint8Array | null; rest: Uint8Array | "same" | null; widthPx: number; heightPx: number; firstTopIn: number | null } | null;
   margins?: DocMargins | null;
 }
