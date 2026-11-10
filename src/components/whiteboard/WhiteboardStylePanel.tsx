@@ -1110,6 +1110,7 @@ function ImageFields({
   cropping,
   onToggleCrop,
   previewField,
+  onPreviewNodes,
 }: {
   node: WhiteboardNode;
   updateNodes: (patch: Partial<WhiteboardNode>) => void;
@@ -1119,6 +1120,7 @@ function ImageFields({
   cropping: boolean;
   onToggleCrop?: () => void;
   previewField: (key: keyof WhiteboardNode) => (n: number | null) => void;
+  onPreviewNodes?: (patch: Partial<WhiteboardNode> | null) => void;
 }) {
   const crop = resolveImageCrop(node);
   const natural = naturalImageSize(node);
@@ -1146,8 +1148,18 @@ function ImageFields({
       </Field>
       <Field label="Shape">
         <select
-          value={node.imageMask ?? "rect"}
-          onChange={(e) => updateNodes({ imageMask: e.target.value as NonNullable<WhiteboardNode["imageMask"]> })}
+          value={node.imageMask ?? (node.cornerRadius && node.cornerRadius > 0 ? "rounded" : "rect")}
+          onChange={(e) => {
+            const next = e.target.value as NonNullable<WhiteboardNode["imageMask"]>;
+            if (next === "rounded") {
+              const r = node.cornerRadius && node.cornerRadius > 0 ? node.cornerRadius : 16;
+              updateNodes({ imageMask: "rounded", cornerRadius: r });
+            } else if (next === "rect") {
+              updateNodes({ imageMask: "rect", cornerRadius: 0, cornerRadii: undefined });
+            } else {
+              updateNodes({ imageMask: "ellipse" });
+            }
+          }}
           className={FIELD_INPUT_CLASS}
           title="The silhouette the photo is cut to - the Stroke controls above then draw a ring following that same edge"
         >
@@ -1156,6 +1168,57 @@ function ImageFields({
           <option value="ellipse">Circle / ellipse</option>
         </select>
       </Field>
+      {node.imageMask !== "ellipse" && (() => {
+        const maxRadius = Math.max(1, Math.round(Math.min(node.width, node.height) / 2));
+        const corners = detectShapeCorners(node);
+        const buildCornerRadii = (cornerIndex: number, nextRadius: number): (number | null)[] => {
+          const len = Math.max(corners.length, cornerIndex + 1);
+          return Array.from({ length: len }, (_, i) => (i === cornerIndex ? nextRadius : (node.cornerRadii?.[i] ?? null)));
+        };
+        return (
+          <>
+            <SliderField
+              label="Corner radius"
+              resetKey={`cr-${node.id}`}
+              value={node.cornerRadius ?? 0}
+              min={0}
+              max={maxRadius}
+              step={1}
+              onCommit={(n) => updateNodes({ cornerRadius: n, cornerRadii: undefined, imageMask: n > 0 ? "rounded" : node.imageMask })}
+              onPreview={(n) => {
+                previewField("cornerRadius")(n);
+                if (n !== null && n > 0 && node.imageMask !== "rounded") {
+                  onPreviewNodes?.({ cornerRadius: n, cornerRadii: undefined, imageMask: "rounded" });
+                }
+              }}
+            />
+            {corners.map((corner) => {
+              const val = node.cornerRadii?.[corner.index] ?? node.cornerRadius ?? 0;
+              return (
+                <SliderField
+                  key={`img-cr-${corner.index}-${corner.label}`}
+                  label={corner.label}
+                  resetKey={`cr-${node.id}-${corner.index}-${node.cornerRadius ?? 0}`}
+                  value={val}
+                  min={0}
+                  max={maxRadius}
+                  step={1}
+                  onCommit={(n) => {
+                    const nextRadii = buildCornerRadii(corner.index, n);
+                    const hasR = nextRadii.some((r) => r !== null && r > 0);
+                    updateNodes({ cornerRadii: nextRadii, imageMask: hasR ? "rounded" : node.imageMask });
+                  }}
+                  onPreview={(n) => {
+                    const nextRadii = buildCornerRadii(corner.index, n ?? 0);
+                    const hasR = nextRadii.some((r) => r !== null && r > 0);
+                    onPreviewNodes?.(n === null ? null : { cornerRadii: nextRadii, imageMask: hasR ? "rounded" : node.imageMask });
+                  }}
+                />
+              );
+            })}
+          </>
+        );
+      })()}
       <SliderField
         label="Opacity"
         resetKey={`op-${node.id}`}
@@ -2795,6 +2858,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
             cropping={croppingNodeId === selectedNodes[0].id}
             onToggleCrop={onToggleCrop ? () => onToggleCrop(selectedNodes[0]) : undefined}
             previewField={previewField}
+            onPreviewNodes={onPreviewNodes}
           />
         </Section>
       )}
@@ -3025,7 +3089,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
           {/* Every straight-edged outline rounds (see whiteboardHandlers.ts's supportsCornerRadius);
               an image only when its mask is "rounded" - showing the slider anywhere else would be a
               control with no visible effect. */}
-          {selectedNodes.every(supportsCornerRadius) && (() => {
+          {!(selectedNodes.length === 1 && selectedNodes[0].shapeType === "image") && selectedNodes.every(supportsCornerRadius) && (() => {
             const maxRadius = Math.max(1, Math.round(Math.min(selectedNodes[0].width, selectedNodes[0].height) / 2));
             const corners = detectShapeCorners(selectedNodes[0]);
             const buildCornerRadii = (node: WhiteboardNode, cornerIndex: number, nextRadius: number): (number | null)[] => {

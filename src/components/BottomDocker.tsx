@@ -16,6 +16,8 @@ import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings, updateSettings } from "../utils/appSettings";
 import { startSnip } from "../services/snip";
+import type { HomeItem } from "../utils/homeLibraryItems";
+import type { FileEntry } from "../utils/libraryEntries";
 
 // Dispatched (on window) to bring the dock back up when it was minimized.
 export const SHOW_DOCKER_EVENT = "briefcast:show-docker";
@@ -239,6 +241,11 @@ interface Props {
   // Whether the last row (date/time, CPU RAM, OS, feedback link) is shown - see appSettings.ts's
   // showDockerStatusBar doc comment.
   showDockerStatusBar: boolean;
+  historyItems?: HomeItem[];
+  onOpenHistoryItem?: (item: HomeItem) => void;
+  libraryFilesByPath?: Map<string, FileEntry>;
+  arrivals?: Record<string, { from: string; at: number; count: number }>;
+  libraryPreviewDurations?: Map<string, number>;
 }
 
 type ConnectedDevice = string[];
@@ -362,7 +369,12 @@ const BottomDocker = ({
   onOpenPhoneCamera,
   isPhoneCameraConnected,
   showRecordingPanelButtons,
-  showDockerStatusBar
+  showDockerStatusBar,
+  historyItems,
+  onOpenHistoryItem,
+  libraryFilesByPath,
+  arrivals,
+  libraryPreviewDurations,
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -702,6 +714,11 @@ const BottomDocker = ({
             onStartRecordingClick={() => openModalScreen()}
             onScreenshotClick={handleScreenshotClick}
             showRecordingPanelButtons={showRecordingPanelButtons}
+            historyItems={historyItems}
+            onOpenHistoryItem={onOpenHistoryItem}
+            libraryFilesByPath={libraryFilesByPath}
+            arrivals={arrivals}
+            libraryPreviewDurations={libraryPreviewDurations}
         />
 
       {/* Hidden rather than unmounted when minimized, so the video editor's open tool panel

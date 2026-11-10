@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react'
 import { PhonesDockButton } from './PhonesHub';
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
 import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
+import RecentHistoryDropup from './RecentHistoryDropup';
+import type { HomeItem } from '../utils/homeLibraryItems';
+import type { FileEntry } from '../utils/libraryEntries';
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -82,10 +85,17 @@ interface Props {
     canSwitchView?: boolean;
     viewMode?: 'screen' | 'camera';
     onSwitchView?: (mode: 'screen' | 'camera') => void;
+    // Recent history dropup for switching to recently touched items when not on home screen
+    historyItems?: HomeItem[];
+    onOpenHistoryItem?: (item: HomeItem) => void;
+    libraryFilesByPath?: Map<string, FileEntry>;
+    arrivals?: Record<string, { from: string; at: number; count: number }>;
+    libraryPreviewDurations?: Map<string, number>;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
+        historyItems,onOpenHistoryItem,libraryFilesByPath,arrivals,libraryPreviewDurations
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -236,6 +246,16 @@ const ActiveRecordingState = (
                         window - see appSettings.ts's showRecordingPanelButtons doc comment. */}
                     {showRecordingPanelButtons && (
                     <div className="px-2 flex items-center gap-0.5">
+                        {!isHome && (
+                            <RecentHistoryDropup
+                                items={historyItems ?? []}
+                                onOpenItem={onOpenHistoryItem ?? (() => {})}
+                                libraryFilesByPath={libraryFilesByPath}
+                                arrivals={arrivals}
+                                libraryPreviewDurations={libraryPreviewDurations}
+                                disabled={isRecording}
+                            />
+                        )}
                         <button
                             type="button"
                             title="Take a screenshot"

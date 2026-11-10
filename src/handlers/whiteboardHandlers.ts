@@ -3299,11 +3299,11 @@ function roundOutlineCorners(
 }
 
 // Whether the style panel's Corner radius control does anything for this node - rectangles and
-// equation cards (their own rounded "rect" body), "rounded"-mask images, and every plain polygon
+// equation cards (their own rounded "rect" body), images (unless masked as an ellipse), and every plain polygon
 // outline roundOutlineCorners accepts.
 export function supportsCornerRadius(node: WhiteboardNode): boolean {
   if (node.shapeType === "rectangle" || node.shapeType === "equation") return true;
-  if (node.shapeType === "image") return (node.imageMask ?? "rect") === "rounded";
+  if (node.shapeType === "image") return (node.imageMask ?? "rect") !== "ellipse";
   if (node.shapeType === "table") return false;
   const outline = baseShapeOutline(node.shapeType, node.width, node.height, outlineOptionsFor(node));
   return outline.kind === "polygon" && !outline.innerLines && !outline.innerCircle;
@@ -3524,7 +3524,9 @@ function imageMaskPath(node: WhiteboardNode): Path2D {
     path.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
     return path;
   }
-  if (mask === "rounded") {
+  const [tl, tr, br, bl] = resolveBoxCornerRadii(node);
+  const hasRadius = tl > 0 || tr > 0 || br > 0 || bl > 0;
+  if (mask === "rounded" || hasRadius) {
     return roundedRectPath2D(w, h, node.cornerRadius ?? 0, node.cornerRadii);
   }
   path.rect(0, 0, w, h);

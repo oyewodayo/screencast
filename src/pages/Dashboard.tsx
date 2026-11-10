@@ -180,6 +180,9 @@ import {
   recordFileOpened,
   repathFile,
   forgetFile,
+  getExternalFiles,
+  recordExternalFile,
+  type ExternalFileMetadata,
 } from "../utils/homeScreenFiles";
 import { getArrivals, getOpenedAt, recordFileArrived, recordItemOpened } from "../utils/homeScreenFiles";
 import { onUsbImported } from "../services/usbPhone";
@@ -448,6 +451,7 @@ const Dashboard = () => {
   // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
   const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
   const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
+  const [externalFiles, setExternalFiles] = useState<Record<string, ExternalFileMetadata>>(() => getExternalFiles());
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
@@ -3410,6 +3414,7 @@ const setScreen = () => {
 		setBoardScreen(null);
 		setDocsScreen(null);
 		setWhiteboardScreen(null);
+		setMindmapScreen(null);
 		// Opening another video while the Video Editor is open stays in the editor (jumping from
 		// clip to clip is ordinary editing); opening anything it can't edit - an image, a PDF -
 		// leaves it, since the tool has nothing to do with what's now on screen.
@@ -3430,7 +3435,27 @@ const setScreen = () => {
 			setDockerMode(wasOpen ? "file-tools" : "record");
 			if (wasOpen) window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
 		}
-		setRecentPaths(recordFileOpened(filePath));
+		setRecentPaths(recordFileOpened(filePath, { name: fileName }));
+		setExternalFiles((prev) => {
+			const existing = prev[filePath];
+			return {
+				...prev,
+				[filePath]: { path: filePath, name: fileName, size: existing?.size, modified: existing?.modified },
+			};
+		});
+		void invoke<{ sizeBytes: number; modifiedMs?: number }>("get_file_info", { path: filePath })
+			.then((info) => {
+				if (info && typeof info.sizeBytes === "number") {
+					const updated = recordExternalFile({
+						path: filePath,
+						name: fileName,
+						size: info.sizeBytes,
+						modified: info.modifiedMs ?? undefined,
+					});
+					setExternalFiles(updated);
+				}
+			})
+			.catch(() => {});
 		// Remembered per category so clicking the sidebar's Video/Audio/Image/Pdf/Documents tab can
 		// bring this file back later (see restoreLastOpenedForCategory below), rather than leaving
 		// whatever unrelated file happens to be on screen when the tab changes.
@@ -3627,7 +3652,20 @@ const setScreen = () => {
 	const libraryClipVideoFiles = useMemo(() => libraryVideoFiles.filter((file) => !isVideoProjectPath(file.path)), [libraryVideoFiles]);
 	// The home screen's items - rebuilt only when the library, pins, history or indexes change,
 	// not on every render of the page (playback ticks re-render it several times a second).
-	const libraryFilesByPath = useMemo(() => new Map(allLibraryFiles.map((file) => [file.path, file])), [allLibraryFiles]);
+	const libraryFilesByPath = useMemo(() => {
+		const map = new Map<string, FileEntry>(allLibraryFiles.map((file) => [file.path, file]));
+		for (const [path, ext] of Object.entries(externalFiles)) {
+			if (!map.has(path)) {
+				map.set(path, {
+					path: ext.path,
+					name: ext.name,
+					size: ext.size ?? 0,
+					modified: ext.modified,
+				});
+			}
+		}
+		return map;
+	}, [allLibraryFiles, externalFiles]);
 	const homeItems = useMemo(
 		() =>
 			buildHomeItems({
@@ -3638,8 +3676,25 @@ const setScreen = () => {
 				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
 				whiteboards: whiteboardIndex,
 				mindmaps: mindmapIndex,
+				externalFiles,
 			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex]
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles]
+	);
+	// Extended history list for the quick-switcher dropup in the dock when navigating outside home
+	const historyItems = useMemo(
+		() =>
+			buildHomeItems({
+				files: allLibraryFiles,
+				pinnedPaths,
+				recentPaths,
+				openedAt,
+				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
+				whiteboards: whiteboardIndex,
+				mindmaps: mindmapIndex,
+				externalFiles,
+				limit: 30,
+			}),
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles]
 	);
 	const homeFiles = useMemo(
 		() => homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : [])),
@@ -3648,7 +3703,11 @@ const setScreen = () => {
 	const openHomeItem = (item: HomeItem) => {
 		if (item.kind === "file") {
 			const file = libraryFilesByPath.get(item.id);
-			if (file) handleFileClick(file);
+			if (file) {
+				handleFileClick(file);
+			} else {
+				void loadFileForPlayback(item.id, item.name);
+			}
 		} else if (item.kind === "doc") {
 			handleOpenDocs();
 			setDocsScreen({ mode: "editor", docId: item.id });
@@ -4701,6 +4760,7 @@ const setScreen = () => {
 		setBoardScreen(null);
 		setDocsScreen(null);
 		setWhiteboardScreen(null);
+		setMindmapScreen(null);
 		// The main board is about to show this folder's gallery, so no tool screen can still be
 		// the thing on it.
 		setVideoEditorScreen(null);
@@ -5959,7 +6019,7 @@ const setScreen = () => {
                               </>
                             ) : (
                               <>
-                                <span>{kind!.label}</span>
+                                <span>{kind ? kind.label : (getFileCategory(item.name) ?? "File")}</span>
                                 {item.time > 0 && (
                                   <>
                                     <span aria-hidden>·</span>
@@ -6117,6 +6177,11 @@ const setScreen = () => {
         handleOpenSettings={handleOpenSettings}
         handleOpenExternalFile={handleOpenExternalFile}
         showFileList={showFileList}
+        historyItems={historyItems}
+        onOpenHistoryItem={openHomeItem}
+        libraryFilesByPath={libraryFilesByPath}
+        arrivals={arrivals}
+        libraryPreviewDurations={libraryPreviewDurations}
       />
       )}
 

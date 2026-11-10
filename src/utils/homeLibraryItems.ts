@@ -48,10 +48,32 @@ export function buildHomeItems(input: {
   docs: HomeCreationLike[];
   whiteboards: HomeCreationLike[];
   mindmaps: HomeCreationLike[];
+  externalFiles?: Record<string, HomeFileLike> | HomeFileLike[];
   limit?: number;
 }): HomeItem[] {
   const { files, pinnedPaths, recentPaths, openedAt, limit = HOME_LIST_SIZE } = input;
-  const byPath = new Map(files.map((f) => [f.path, f]));
+  const byPath = new Map<string, HomeFileLike>(files.map((f) => [f.path, f]));
+
+  if (input.externalFiles) {
+    const extList = Array.isArray(input.externalFiles)
+      ? input.externalFiles
+      : Object.values(input.externalFiles);
+    for (const f of extList) {
+      if (!byPath.has(f.path)) {
+        byPath.set(f.path, f);
+      }
+    }
+  }
+
+  const resolveFile = (p: string): HomeFileLike => {
+    const existing = byPath.get(p);
+    if (existing) return existing;
+    const name = p.split(/[\\/]/).pop() || p;
+    const fallback: HomeFileLike = { path: p, name };
+    byPath.set(p, fallback);
+    return fallback;
+  };
+
   const fileItem = (f: HomeFileLike, pinned: boolean): HomeItem => ({
     key: f.path,
     kind: "file",
@@ -62,14 +84,12 @@ export function buildHomeItems(input: {
   });
 
   const pinned = pinnedPaths
-    .map((p) => byPath.get(p))
-    .filter((f): f is HomeFileLike => !!f)
+    .map(resolveFile)
     .map((f) => fileItem(f, true));
 
-  // Files compete on recency only once opened here (or, before any open history exists, the whole
-  // library by modified time) - otherwise every untouched recording would crowd out the
-  // documents someone is actually working on.
-  const recentFiles = recentPaths.map((p) => byPath.get(p)).filter((f): f is HomeFileLike => !!f);
+  // Files compete on recency once opened here, including external files.
+  // Before any open history exists, falls back to the whole library by modified time.
+  const recentFiles = recentPaths.map(resolveFile);
   const fileCandidates = (recentFiles.length > 0 ? recentFiles : files).filter((f) => !pinnedPaths.includes(f.path)).map((f) => fileItem(f, false));
 
   const creation = (kind: Exclude<HomeItemKind, "file">) => (c: HomeCreationLike): HomeItem => {

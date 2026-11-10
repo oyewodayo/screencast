@@ -228,10 +228,11 @@ function WhiteboardImageBody({
 
   const mask = node.imageMask ?? "rect";
   const [tl, tr, br, bl] = resolveBoxCornerRadii(node);
+  const hasRadius = tl > 0 || tr > 0 || br > 0 || bl > 0;
   const borderRadius =
     mask === "ellipse"
       ? "50%"
-      : mask === "rounded"
+      : mask === "rounded" || hasRadius
       ? tl === tr && tr === br && br === bl
         ? `${tl}px`
         : `${tl}px ${tr}px ${br}px ${bl}px`
@@ -399,16 +400,16 @@ const FREEHAND_MIN_POINT_DISTANCE = 3;
 // - same "don't bloat with near-duplicate points" reasoning as FREEHAND_MIN_POINT_DISTANCE, just for
 // an ephemeral trail instead of a saved stroke.
 const LASER_MIN_POINT_DISTANCE = 2;
-// Minimum on-screen movement (CSS px, pre-zoom-correction) between two applied move/resize/rotate
-// updates on a node - unlike freehand/laser above, this isn't about bloating a saved point list
-// (only the final position is ever saved); it's that every update here calls setLiveNodes with a
-// brand-new `nodes` array, which forces a full re-render of every node and edge in the document
-// (nodesById rebuilds any time `nodes` changes identity). Left ungated, that used to fire on every
-// native pointermove tick - fine on its own, but the added GDI/DWM contention from an active
-// gdigrab screen recording (see win.rs's own doc comment on why it BitBlts the whole desktop) was
-// enough on top of it to stall the window's message pump entirely. A couple of pixels of gating is
-// imperceptible to drag but caps the re-render rate to something sane.
-const NODE_DRAG_MIN_POINT_DISTANCE = 2;
+// Minimum on-screen movement gate (set to 0 for instant, 1:1 responsive drag without dead zones).
+const NODE_DRAG_MIN_POINT_DISTANCE = 0;
+
+interface AlignmentGuide {
+  id: string;
+  type: "x" | "y";
+  pos: number;
+  from: number;
+  to: number;
+}
 // How long (ms) a laser trail point stays visible before it's fully faded/pruned - the "comet tail"
 // length. Short enough that the trail reads as "where the pointer just was," not a lingering mark.
 const LASER_FADE_MS = 550;
@@ -953,14 +954,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   const containerRef = useRef<HTMLDivElement>(null);
   const interactionRef = useRef<Interaction | null>(null);
   const [liveNodes, setLiveNodes] = useState<WhiteboardNode[] | null>(null);
-  // Mirrors liveNodes out to the parent on every change - see onLiveNodesChange's own doc comment.
-  // A plain effect rather than calling onLiveNodesChange directly alongside every setLiveNodes call
-  // site (move/resize/rotate/ampLead each have their own, plus the commit points that reset to
-  // null) - one place stays correct automatically instead of every call site needing to remember to
-  // also notify the parent.
+  // Mirrors liveNodes out to the parent throttled during drag to prevent style panel DOM layout thrashing
   useEffect(() => {
-    onLiveNodesChange?.(liveNodes);
+    if (!liveNodes) {
+      onLiveNodesChange?.(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      onLiveNodesChange?.(liveNodes);
+    }, 60);
+    return () => clearTimeout(timer);
   }, [liveNodes, onLiveNodesChange]);
+  const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
   const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [connectorPreview, setConnectorPreview] = useState<{ from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }; to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null } } | null>(null);
   // Live-updated bow for connectorPreview's own curve, computed from the gesture's pathPoints so
@@ -991,7 +996,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // pointermove tick.
   const [liveEdges, setLiveEdges] = useState<WhiteboardEdge[] | null>(null);
   useEffect(() => {
-    onLiveEdgesChange?.(liveEdges);
+    if (!liveEdges) {
+      onLiveEdgesChange?.(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      onLiveEdgesChange?.(liveEdges);
+    }, 60);
+    return () => clearTimeout(timer);
   }, [liveEdges, onLiveEdgesChange]);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [connectorHoverNodeId, setConnectorHoverNodeId] = useState<string | null>(null);
@@ -1173,6 +1185,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setMarqueeRect(null);
         setFreehandPreview(null);
         setLiveNodes(null);
+        setLiveEdges(null);
+        setAlignmentGuides([]);
         setCroppingNodeId(null);
         onSelectionChange(new Set(), new Set());
       }
@@ -1653,23 +1667,151 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "move") {
-        // See NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gate exists.
-        const last = lastDragClientRef.current;
-        if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) < NODE_DRAG_MIN_POINT_DISTANCE) return;
-        lastDragClientRef.current = { x: e.clientX, y: e.clientY };
         let dx = (e.clientX - interaction.startClientX) / zoom;
         let dy = (e.clientY - interaction.startClientY) / zoom;
-        if (snapEnabled) {
-          // Snap against the ANCHOR node's own resulting position, then apply that same dx/dy to
-          // every other selected node - keeps the whole group's relative layout intact (one shared
-          // delta) while still landing the node the user actually grabbed on the lattice, rather
-          // than independently snapping each node (which would pull a multi-selection apart).
-          const anchor = interaction.startNodes.find((n) => n.id === interaction.anchorId) ?? interaction.startNodes[0];
-          if (anchor) {
-            dx = snapCoord(anchor.x + dx) - anchor.x;
-            dy = snapCoord(anchor.y + dy) - anchor.y;
+
+        // Shift key: lock drag strictly to horizontal or vertical axis for precision alignment
+        if (e.shiftKey) {
+          if (Math.abs(dx) > Math.abs(dy)) {
+            dy = 0;
+          } else {
+            dx = 0;
           }
         }
+
+        const newGuides: AlignmentGuide[] = [];
+
+        if (snapEnabled) {
+          const anchor = interaction.startNodes.find((n) => n.id === interaction.anchorId) ?? interaction.startNodes[0];
+          if (anchor) {
+            const SNAP_THRESHOLD = Math.max(5, 6 / zoom);
+            const anchorTargetX = anchor.x + dx;
+            const anchorTargetY = anchor.y + dy;
+            const anchorW = anchor.width;
+            const anchorH = anchor.height;
+            const anchorCenterX = anchorTargetX + anchorW / 2;
+            const anchorCenterY = anchorTargetY + anchorH / 2;
+            const anchorRight = anchorTargetX + anchorW;
+            const anchorBottom = anchorTargetY + anchorH;
+
+            const otherNodes = page.nodes.filter((n) => !interaction.startNodes.some((sn) => sn.id === n.id));
+
+            // Smart alignment with other shapes (left, center, right)
+            let bestDiffX: number | null = null;
+            let bestGuideX: AlignmentGuide | null = null;
+
+            for (const other of otherNodes) {
+              const otherLeft = other.x;
+              const otherCenterX = other.x + other.width / 2;
+              const otherRight = other.x + other.width;
+              const otherTop = other.y;
+              const otherBottom = other.y + other.height;
+
+              const pairsX = [
+                { anchorEdge: anchorTargetX, otherEdge: otherLeft },
+                { anchorEdge: anchorTargetX, otherEdge: otherRight },
+                { anchorEdge: anchorCenterX, otherEdge: otherCenterX },
+                { anchorEdge: anchorRight, otherEdge: otherLeft },
+                { anchorEdge: anchorRight, otherEdge: otherRight },
+              ];
+
+              for (const { anchorEdge, otherEdge } of pairsX) {
+                const diff = otherEdge - anchorEdge;
+                if (Math.abs(diff) <= SNAP_THRESHOLD) {
+                  if (bestDiffX === null || Math.abs(diff) < Math.abs(bestDiffX)) {
+                    bestDiffX = diff;
+                    const fromY = Math.min(anchorTargetY, otherTop) - 20;
+                    const toY = Math.max(anchorBottom, otherBottom) + 20;
+                    bestGuideX = {
+                      id: `x-${other.id}-${otherEdge}`,
+                      type: "x",
+                      pos: otherEdge,
+                      from: fromY,
+                      to: toY,
+                    };
+                  }
+                }
+              }
+            }
+
+            if (bestDiffX !== null && bestGuideX) {
+              dx += bestDiffX;
+              newGuides.push(bestGuideX);
+            } else {
+              // Magnetic Grid snap on X
+              const nearestGridX = snapCoord(anchorTargetX);
+              if (Math.abs(anchorTargetX - nearestGridX) <= SNAP_THRESHOLD) {
+                dx = nearestGridX - anchor.x;
+                newGuides.push({
+                  id: `grid-x-${nearestGridX}`,
+                  type: "x",
+                  pos: nearestGridX,
+                  from: anchorTargetY - 20,
+                  to: anchorBottom + 20,
+                });
+              }
+            }
+
+            // Smart alignment with other shapes (top, center, bottom)
+            let bestDiffY: number | null = null;
+            let bestGuideY: AlignmentGuide | null = null;
+
+            for (const other of otherNodes) {
+              const otherTop = other.y;
+              const otherCenterY = other.y + other.height / 2;
+              const otherBottom = other.y + other.height;
+              const otherLeft = other.x;
+              const otherRight = other.x + other.width;
+
+              const pairsY = [
+                { anchorEdge: anchorTargetY, otherEdge: otherTop },
+                { anchorEdge: anchorTargetY, otherEdge: otherBottom },
+                { anchorEdge: anchorCenterY, otherEdge: otherCenterY },
+                { anchorEdge: anchorBottom, otherEdge: otherTop },
+                { anchorEdge: anchorBottom, otherEdge: otherBottom },
+              ];
+
+              for (const { anchorEdge, otherEdge } of pairsY) {
+                const diff = otherEdge - anchorEdge;
+                if (Math.abs(diff) <= SNAP_THRESHOLD) {
+                  if (bestDiffY === null || Math.abs(diff) < Math.abs(bestDiffY)) {
+                    bestDiffY = diff;
+                    const fromX = Math.min(anchorTargetX, otherLeft) - 20;
+                    const toX = Math.max(anchorRight, otherRight) + 20;
+                    bestGuideY = {
+                      id: `y-${other.id}-${otherEdge}`,
+                      type: "y",
+                      pos: otherEdge,
+                      from: fromX,
+                      to: toX,
+                    };
+                  }
+                }
+              }
+            }
+
+            if (bestDiffY !== null && bestGuideY) {
+              dy += bestDiffY;
+              newGuides.push(bestGuideY);
+            } else {
+              // Magnetic Grid snap on Y
+              const nearestGridY = snapCoord(anchorTargetY);
+              if (Math.abs(anchorTargetY - nearestGridY) <= SNAP_THRESHOLD) {
+                dy = nearestGridY - anchor.y;
+                newGuides.push({
+                  id: `grid-y-${nearestGridY}`,
+                  type: "y",
+                  pos: nearestGridY,
+                  from: anchorTargetX - 20,
+                  to: anchorRight + 20,
+                });
+              }
+            }
+          }
+        }
+
+        setAlignmentGuides(newGuides);
+
         const movedById = new Map(interaction.startNodes.map((n) => [n.id, { ...n, x: n.x + dx, y: n.y + dy }]));
         setLiveNodes(page.nodes.map((n) => movedById.get(n.id) ?? n));
         if (interaction.startEdges.length > 0) {
@@ -1680,37 +1822,47 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       }
 
       if (interaction.mode === "resize") {
-        // See NODE_DRAG_MIN_POINT_DISTANCE's own doc comment for why this gate exists.
-        const last = lastDragClientRef.current;
-        if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) < NODE_DRAG_MIN_POINT_DISTANCE) return;
-        lastDragClientRef.current = { x: e.clientX, y: e.clientY };
         const dx = (e.clientX - interaction.startClientX) / zoom;
         const dy = (e.clientY - interaction.startClientY) / zoom;
         const start = interaction.startNode;
-        // Project the screen-space drag delta into the box's OWN (possibly rotated AND/OR flipped)
-        // axes first - dragging a rotated/flipped corner should feel like stretching along ITS
-        // edges, not the screen's (see worldToLocalVector's own doc comment).
         const local = worldToLocalVector({ x: dx, y: dy }, start);
         let width = interaction.corner.includes("w") ? Math.max(20, start.width - local.x) : Math.max(20, start.width + local.x);
         let height = interaction.corner.includes("n") ? Math.max(20, start.height - local.y) : Math.max(20, start.height + local.y);
+
+        // Aspect ratio lock when Shift is held
+        if (e.shiftKey && start.width > 0 && start.height > 0) {
+          const aspect = start.width / start.height;
+          if (width / height > aspect) {
+            height = width / aspect;
+          } else {
+            width = height * aspect;
+          }
+        }
+
         if (snapEnabled) {
-          // Snap the MOVING corner's own world/doc-space point to the lattice, then re-derive
-          // width/height from it and the fixed anchorWorld corner - works regardless of rotation/
-          // flip (unlike snapping width/height directly, which would only land the corner on-grid
-          // for an unrotated box) because the diagonal vector from the fixed corner to the moving
-          // one, in this box's own local axes, is exactly (±width, ±height) - see
-          // cornerLocalOffset's own doc comment for that same ± convention.
+          const SNAP_THRESHOLD = Math.max(5, 6 / zoom);
           const diagonalLocal = { x: interaction.corner.includes("w") ? -width : width, y: interaction.corner.includes("n") ? -height : height };
           const diagonalWorld = localToWorldVector(diagonalLocal, start);
           const movingWorld = { x: interaction.anchorWorld.x + diagonalWorld.x, y: interaction.anchorWorld.y + diagonalWorld.y };
-          const snappedWorld = snapPoint(movingWorld);
-          const snappedLocal = worldToLocalVector({ x: snappedWorld.x - interaction.anchorWorld.x, y: snappedWorld.y - interaction.anchorWorld.y }, start);
-          width = Math.max(20, Math.abs(snappedLocal.x));
-          height = Math.max(20, Math.abs(snappedLocal.y));
+
+          let targetX = movingWorld.x;
+          let targetY = movingWorld.y;
+
+          const nearestX = snapCoord(movingWorld.x);
+          if (Math.abs(movingWorld.x - nearestX) <= SNAP_THRESHOLD) {
+            targetX = nearestX;
+          }
+          const nearestY = snapCoord(movingWorld.y);
+          if (Math.abs(movingWorld.y - nearestY) <= SNAP_THRESHOLD) {
+            targetY = nearestY;
+          }
+
+          if (targetX !== movingWorld.x || targetY !== movingWorld.y) {
+            const snappedLocal = worldToLocalVector({ x: targetX - interaction.anchorWorld.x, y: targetY - interaction.anchorWorld.y }, start);
+            width = Math.max(20, Math.abs(snappedLocal.x));
+            height = Math.max(20, Math.abs(snappedLocal.y));
+          }
         }
-        // Solve new x/y so the OPPOSITE corner lands exactly back on anchorWorld (fixed at drag
-        // start) - see cornerWorldPoint's own doc comment for why this can't just reuse the old
-        // x/y-in-local-space approach once rotation/flip is involved.
         const anchorOffset = cornerLocalOffset(width, height, oppositeCorner(interaction.corner));
         const worldAnchorOffset = localToWorldVector(anchorOffset, start);
         const x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
@@ -2019,6 +2171,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     (e: React.PointerEvent) => {
       const interaction = interactionRef.current;
       interactionRef.current = null;
+      setAlignmentGuides([]);
       if (!interaction) return;
       const snapEnabled = isSnapEnabled(snapToGrid, e);
 
@@ -3318,6 +3471,35 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             className="absolute border border-blue-500 bg-blue-500/10 pointer-events-none"
             style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.width, height: marqueeRect.height, zIndex: nodes.length + edges.length + 20 }}
           />
+        )}
+
+        {/* Dynamic smart alignment & magnetic snap guides */}
+        {alignmentGuides.length > 0 && (
+          <svg
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              overflow: "visible",
+              pointerEvents: "none",
+              zIndex: nodes.length + edges.length + 25,
+            }}
+            width={1}
+            height={1}
+          >
+            {alignmentGuides.map((guide) => (
+              <line
+                key={guide.id}
+                x1={guide.type === "x" ? guide.pos : guide.from}
+                y1={guide.type === "x" ? guide.from : guide.pos}
+                x2={guide.type === "x" ? guide.pos : guide.to}
+                y2={guide.type === "x" ? guide.to : guide.pos}
+                stroke="#0284c7"
+                strokeWidth={1.5 / zoom}
+                strokeDasharray={`${4 / zoom},${3 / zoom}`}
+              />
+            ))}
+          </svg>
         )}
 
         {/* Laser pointer - rendered last so it always sits above every shape/edge/UI-chrome layer
