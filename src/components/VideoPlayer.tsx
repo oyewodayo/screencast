@@ -48,6 +48,7 @@ import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePane
 import { useToolPanelHost } from './docker/ToolPanelHost';
 import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
+import BrandLoader from './common/BrandLoader';
 import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
 import rnnoiseSimdWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url';
 
@@ -3252,9 +3253,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 					)}
 					{isRecovering && (
-						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
-							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
-							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
+						<div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none bg-black/60 backdrop-blur-sm">
+							<BrandLoader
+								variant="contained"
+								size="md"
+								message="Preparing video"
+								progress={recoveryProgress > 0 ? recoveryProgress : undefined}
+							/>
 						</div>
 					)}
 					{activeClipEffects?.colorFilter?.preset === 'vignette' && frameRect && (

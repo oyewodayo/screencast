@@ -58,6 +58,7 @@ import { captionLabel, crossRefText, computeStructureFromJson, createDocStructur
 import { citationSpaceBefore, formatCitation, styleInfo, segmentsToText } from "../../utils/docCitationStyles";
 import { CITATION_EDIT_EVENT, CROSSREF_EDIT_EVENT, OPEN_PICKER_EVENT, type InlineEditDetail, type OpenPickerDetail } from "../../utils/docStructureNodes";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import BrandLoader from "../common/BrandLoader";
 import DocReferencesSidebar from "./DocReferencesSidebar";
 import DocOutlinePanel from "./DocOutlinePanel";
 import DocCitePicker, { type CitePickerMode } from "./DocCitePicker";
@@ -472,28 +473,33 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     onOpenChange: (next: boolean) => setHeaderMenu((cur) => (next ? id : cur === id ? null : cur)),
   });
 
+  const extensions = useMemo(
+    () => [
+      // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
+      // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
+      // headless schema builder so the live editor and the importer can never drift apart.
+      ...getDocContentExtensions(docId),
+      // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
+      // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
+      // eventually receive remote updates too.
+      ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
+      createDocImagePasteExtension(docId),
+      createSlashCommandExtension(docId),
+      // Numbers figures, tables, equations and citations; formats the reference list.
+      createDocStructureExtension(bib.store),
+      DocFindReplace,
+      DocAutoPaginate,
+      DocDictation,
+      DocPaint,
+      DocShortcuts,
+      Placeholder.configure({ placeholder: "Start writing, type “/” for blocks, or press Ctrl+Shift+S to dictate…" }),
+    ],
+    [docId, store.ydoc, bib.store]
+  );
+
   const editor = useEditor(
     {
-      extensions: [
-        // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
-        // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
-        // headless schema builder so the live editor and the importer can never drift apart.
-        ...getDocContentExtensions(docId),
-        // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
-        // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
-        // eventually receive remote updates too.
-        ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
-        createDocImagePasteExtension(docId),
-        createSlashCommandExtension(docId),
-        // Numbers figures, tables, equations and citations; formats the reference list.
-        createDocStructureExtension(bib.store),
-        DocFindReplace,
-        DocAutoPaginate,
-        DocDictation,
-        DocPaint,
-        DocShortcuts,
-        Placeholder.configure({ placeholder: "Start writing, type “/” for blocks, or press Ctrl+Shift+S to dictate…" }),
-      ],
+      extensions,
       editable: !store.loading,
       // Focuses the content area as soon as the doc is ready, so opening a doc (new or existing)
       // lets you start typing immediately instead of requiring a click into the editor first.
@@ -520,7 +526,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         store.setTitle(firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine);
       },
     },
-    [store.ydoc]
+    [extensions]
   );
 
   const dictation = useDocDictation(editor && !store.loading ? editor : null, store.title);
@@ -613,6 +619,27 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     ro.observe(el);
     return () => ro.disconnect();
   }, [store.loading]);
+
+  // Graceful dissolve/fade-out when document finishes loading
+  const isDocumentReady = !store.loading && Boolean(editor);
+  const [showDocLoader, setShowDocLoader] = useState(!isDocumentReady);
+  const [isLoaderFading, setIsLoaderFading] = useState(false);
+
+  useEffect(() => {
+    if (isDocumentReady) {
+      if (showDocLoader && !isLoaderFading) {
+        setIsLoaderFading(true);
+        const timer = setTimeout(() => {
+          setShowDocLoader(false);
+          setIsLoaderFading(false);
+        }, 320);
+        return () => clearTimeout(timer);
+      }
+    } else {
+      setShowDocLoader(true);
+      setIsLoaderFading(false);
+    }
+  }, [isDocumentReady, showDocLoader, isLoaderFading]);
 
   // Meta-only transaction, not an editor recreation - changing page size or margins shouldn't
   // disturb cursor position or the Collaboration binding; docAutoPaginate.ts's plugin `update()`
@@ -1286,71 +1313,83 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
               </div>
             </div>
           )}
-          {store.loading || !editor ? (
-            <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
-          ) : store.loadError ? (
+          {store.loadError ? (
             <div className="flex items-center justify-center h-full text-red-500 dark:text-red-400 text-sm">{store.loadError}</div>
           ) : (
-            // The "page": a bounded card on the backdrop, square-cornered like a printed page (and
-            // like docAutoPaginate.ts's flat page-gap dividers). Width and padding - the exact real
-            // 1in print margin, which docAutoPaginate.ts measures against - come from the
-            // `.doc-page-card` rule injected above.
-            // Print frame: see the <style> comment above and docPageLayout.css. On screen the table
-            // collapses to plain blocks.
-            <table className="doc-print-frame">
-              <thead aria-hidden>
-                <tr>
-                  <td>
-                    <div className="doc-print-spacer" style={{ height: `${margins.top}in` }} />
-                  </td>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>
-                    {/* Paper colour: --doc-paper (docLayout.css) is the page's one fill - the card,
-                        two-column sheets, page-break gaps and leader backgrounds all read it - and
-                        data-page-color swaps it for the document's colour. */}
-                    <div
-                      ref={pageRef}
-                      lang="en"
-                      style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
-                      data-page-color={pageColor ?? undefined}
-                      data-page-dark={pageDark ? "" : undefined}
-                      className={`doc-page-card ${cardClass} relative mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
-                    >
-                      {/* Two columns: one drawn sheet per page behind the multicol rows. */}
-                      {twoColumns &&
-                        Array.from({ length: pageCount }, (_, k) => (
-                          <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(page) + PAGE_GAP_PX), height: pageHeightPx(page) }} />
-                        ))}
-                      {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
-                          flips the editor's text, heading and link colours. */}
-                      <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
-                      {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
-                      <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
-                      <DocPageChromeOverlay
-                        chrome={pageChrome}
-                        pageCount={pageCount}
-                        page={page}
-                        margins={margins}
-                        title={store.title}
-                        date={todayLabel()}
-                        dark={pageDark}
-                        onEdit={(band) => setChromeEditor({ focus: band })}
-                      />
-                    </div>
-                  </td>
-                </tr>
-              </tbody>
-              <tfoot aria-hidden>
-                <tr>
-                  <td>
-                    <div className="doc-print-spacer" style={{ height: `${margins.bottom}in` }} />
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
+            <>
+              {editor && (
+                <table className="doc-print-frame">
+                  <thead aria-hidden>
+                    <tr>
+                      <td>
+                        <div className="doc-print-spacer" style={{ height: `${margins.top}in` }} />
+                      </td>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        {/* Paper colour: --doc-paper (docLayout.css) is the page's one fill - the card,
+                            two-column sheets, page-break gaps and leader backgrounds all read it - and
+                            data-page-color swaps it for the document's colour. */}
+                        <div
+                          ref={pageRef}
+                          lang="en"
+                          style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
+                          data-page-color={pageColor ?? undefined}
+                          data-page-dark={pageDark ? "" : undefined}
+                          className={`doc-page-card ${cardClass} relative mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
+                        >
+                          {/* Two columns: one drawn sheet per page behind the multicol rows. */}
+                          {twoColumns &&
+                            Array.from({ length: pageCount }, (_, k) => (
+                              <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(page) + PAGE_GAP_PX), height: pageHeightPx(page) }} />
+                            ))}
+                          {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
+                              flips the editor's text, heading and link colours. */}
+                          <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                          {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
+                          <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
+                          <DocPageChromeOverlay
+                            chrome={pageChrome}
+                            pageCount={pageCount}
+                            page={page}
+                            margins={margins}
+                            title={store.title}
+                            date={todayLabel()}
+                            dark={pageDark}
+                            onEdit={(band) => setChromeEditor({ focus: band })}
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                  <tfoot aria-hidden>
+                    <tr>
+                      <td>
+                        <div className="doc-print-spacer" style={{ height: `${margins.bottom}in` }} />
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              )}
+
+              {/* Infinite animated beam loader with graceful dissolve on finish */}
+              {showDocLoader && (
+                <div
+                  className={`absolute inset-0 z-30 flex items-center justify-center bg-[#f8f9fa] dark:bg-[#111214] transition-all duration-300 ease-out ${
+                    isLoaderFading ? "opacity-0 scale-[1.02] pointer-events-none" : "opacity-100 scale-100"
+                  }`}
+                >
+                  <BrandLoader
+                    variant="contained"
+                    size="md"
+                    message="Loading document"
+                    isFading={isLoaderFading}
+                  />
+                </div>
+              )}
+            </>
           )}
         </div>
         {showRuler && (

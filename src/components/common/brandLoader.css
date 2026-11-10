@@ -1,0 +1,141 @@
+/* components/common/brandLoader.css */
+/* Dedicated static stylesheet for Briefcast Brand Loader to prevent React re-render resets */
+
+:root {
+  --briefcast-frame-idle: #94a3b8;
+  --briefcast-frame-active: #000000;
+  --briefcast-blue-vibrant: #2563eb;
+  --briefcast-blue-dim: #93c5fd;
+}
+
+.dark {
+  --briefcast-frame-idle: #475569;
+  --briefcast-frame-active: #ffffff;
+  --briefcast-blue-vibrant: #3b82f6;
+  --briefcast-blue-dim: #1e3a8a;
+}
+
+/* 1. Screen Frame: Animates crisply from grey to solid black (or white in dark mode) */
+@keyframes briefcast-frame-pulse {
+  0%, 20% {
+    stroke: var(--briefcast-frame-idle);
+    opacity: 0.6;
+  }
+  50%, 82% {
+    stroke: var(--briefcast-frame-active);
+    opacity: 1;
+  }
+  100% {
+    stroke: var(--briefcast-frame-idle);
+    opacity: 0.6;
+  }
+}
+
+/* 2. Beacon Point: Solid, electric blue transmitter heartbeat */
+@keyframes briefcast-beacon-pulse {
+  0%, 100% {
+    fill: var(--briefcast-blue-dim);
+    transform-origin: 10px 36px;
+    transform: scale(0.9);
+  }
+  15%, 45% {
+    fill: var(--briefcast-blue-vibrant);
+    transform-origin: 10px 36px;
+    transform: scale(1.25);
+  }
+}
+
+/* 3. Wave 1: First razor-sharp arc */
+@keyframes briefcast-wave-1-pulse {
+  0%, 100% {
+    stroke: var(--briefcast-blue-dim);
+    opacity: 0.25;
+    stroke-width: 2.2px;
+  }
+  20%, 60% {
+    stroke: var(--briefcast-blue-vibrant);
+    opacity: 1;
+    stroke-width: 2.8px;
+  }
+}
+
+/* 4. Wave 2: Middle razor-sharp arc */
+@keyframes briefcast-wave-2-pulse {
+  0%, 15%, 100% {
+    stroke: var(--briefcast-blue-dim);
+    opacity: 0.2;
+    stroke-width: 2.2px;
+  }
+  35%, 75% {
+    stroke: var(--briefcast-blue-vibrant);
+    opacity: 1;
+    stroke-width: 2.8px;
+  }
+}
+
+/* 5. Wave 3: Outer radiant transmission arc */
+@keyframes briefcast-wave-3-pulse {
+  0%, 30%, 100% {
+    stroke: var(--briefcast-blue-dim);
+    opacity: 0.15;
+    stroke-width: 2.2px;
+  }
+  50%, 85% {
+    stroke: var(--briefcast-blue-vibrant);
+    opacity: 1;
+    stroke-width: 2.8px;
+  }
+}
+
+/* 6. Animated ellipsis dot wave */
+@keyframes briefcast-dot-wave {
+  0%, 80%, 100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+/* Permanent, hardware-accelerated infinite animation classes */
+.briefcast-screen-frame {
+  stroke: var(--briefcast-frame-idle);
+  animation: briefcast-frame-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+}
+
+.briefcast-beacon {
+  fill: var(--briefcast-blue-vibrant);
+  animation: briefcast-beacon-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+}
+
+.briefcast-wave-1 {
+  stroke: var(--briefcast-blue-vibrant);
+  animation: briefcast-wave-1-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+}
+
+.briefcast-wave-2 {
+  stroke: var(--briefcast-blue-vibrant);
+  animation: briefcast-wave-2-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+}
+
+.briefcast-wave-3 {
+  stroke: var(--briefcast-blue-vibrant);
+  animation: briefcast-wave-3-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+}
+
+.animate-briefcast-dot-1 {
+  display: inline-block;
+  animation: briefcast-dot-wave 1.4s ease-in-out infinite 0s !important;
+}
+
+.animate-briefcast-dot-2 {
+  display: inline-block;
+  animation: briefcast-dot-wave 1.4s ease-in-out infinite 0.2s !important;
+}
+
+.animate-briefcast-dot-3 {
+  display: inline-block;
+  animation: briefcast-dot-wave 1.4s ease-in-out infinite 0.4s !important;
+}

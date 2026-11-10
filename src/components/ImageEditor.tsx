@@ -37,6 +37,7 @@ import { fileToDataUrl } from "../utils/imageObjectCache";
 import { removeImageBackground } from "../utils/backgroundRemoval";
 import ImageEditorCanvas, { ImageEditorCanvasHandle } from "./image/ImageEditorCanvas";
 import ImageEditorToolbar, { IconButton, SaveStatus, ZoomControl } from "./image/ImageEditorToolbar";
+import BrandLoader from "./common/BrandLoader";
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
@@ -1011,7 +1012,13 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
               onDeleteObject={store.deleteObject}
             />
           ) : (
-            <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading image…</span>
+            <div className="flex items-center justify-center w-full h-full min-h-[300px]">
+              <BrandLoader
+                variant="contained"
+                size="md"
+                message="Loading image"
+              />
+            </div>
           )}
         </div>
 

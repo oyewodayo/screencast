@@ -19,6 +19,7 @@ import { loadSettings } from "../utils/appSettings";
 import Toast from "./custom/Toast";
 import LinksControl from "./links/LinksControl";
 import { fileRef } from "../utils/itemLinks";
+import BrandLoader from "./common/BrandLoader";
 
 const IMAGE_MAX_DIMENSION_PX = 2048; // downscale threshold before embedding into the sidecar JSON
 const IMAGE_MAX_INITIAL_WIDTH_FRACTION = 0.5; // fraction of the page's width, at 100% zoom, an inserted image is capped to
@@ -889,7 +890,13 @@ const PdfAnnotator: React.FC<PdfAnnotatorProps> = ({ src, sourcePath, isFullscre
             range, making the top of a tall page unreachable). */}
         <div ref={scrollContainerRef} className="flex-1 min-h-0 min-w-0 overflow-auto flex [align-items:safe_center] justify-center p-8">
           {!showPages ? (
-            <div className="text-gray-500 dark:text-neutral-400 italic">Loading…</div>
+            <div className="flex items-center justify-center w-full h-full min-h-[300px]">
+              <BrandLoader
+                variant="contained"
+                size="md"
+                message="Loading PDF"
+              />
+            </div>
           ) : twoPageMode ? (
             <div ref={spreadRef} className="flex items-start gap-4">
               {renderPage(clampedPageIndex, "left")}
