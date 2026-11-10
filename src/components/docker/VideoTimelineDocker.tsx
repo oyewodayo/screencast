@@ -1585,11 +1585,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [chaptersAnchor, setChaptersAnchor] = useState<{ left: number; top: number } | null>(null);
   // Screen style (ScreenStylePanel) - the frame, the drawn pointer and shortcut keys, whole-video.
   const [screenStyleAnchor, setScreenStyleAnchor] = useState<{ left: number; top: number } | null>(null);
+  const screenStyleButtonRef = useRef<HTMLButtonElement>(null);
   const clipRecordings = useClipRecordings(editStore.clips);
   const hasEditablePointer = useMemo(() => [...clipRecordings.values()].some((r) => hasPointerPath(r)), [clipRecordings]);
   const shortcutCount = useMemo(() => buildKeyChips(editStore.clips, clipRecordings).reduce((n, c) => n + c.count, 0), [editStore.clips, clipRecordings]);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
+  const elementsButtonRef = useRef<HTMLButtonElement>(null);
   // Split screen builder (SplitScreenPanel).
   const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
   // Editing a split screen already made (its group), rather than adding one.
@@ -4911,8 +4913,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
           </ActionButton>
           <button
-            type="button"
+            ref={elementsButtonRef}
             data-elements-trigger
+            type="button"
             title="Add shapes and animated elements"
             onClick={(e) => {
               if (elementsAnchor) {
@@ -5008,8 +5011,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoBookmarkOutline size={15} />
           </button>
           <button
-            type="button"
+            ref={screenStyleButtonRef}
             data-screen-style-panel
+            type="button"
             title="Screen style - frame the video on a wallpaper with rounded corners and a shadow; smooth the pointer, show clicks and shortcut keys"
             onClick={(e) => {
               if (screenStyleAnchor) {

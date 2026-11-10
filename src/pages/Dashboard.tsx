@@ -5501,7 +5501,10 @@ const setScreen = () => {
                     onCompress={() => setCompressionFile(selectedFile)}
                     onMoveOrCopy={() => {
                       const rect = document.querySelector("[data-docker-menu-trigger]")?.getBoundingClientRect();
-                      setTransferAnchor(rect ? { left: rect.left, top: rect.top - 100 } : { left: 100, top: 100 });
+                      setTransferMenu({
+                        files: [{ name: selectedFile.name, path: selectedFile.sourcePath }],
+                        anchor: rect ? { left: rect.left, top: rect.top - 100 } : { left: 100, top: 100 },
+                      });
                     }}
                     onTransferToPhone={() => openPhoneTransfer([selectedFile])}
                     onSetThumbnail={() => videoPlayerRef.current?.openThumbnailPicker()}
