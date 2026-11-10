@@ -547,7 +547,7 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, deleteNode, ext
           lineHeight: 0,
         };
       default:
-        return { display: "inline-block", maxWidth: "100%", position: "relative" };
+        return { display: "inline-block", maxWidth: "100%", position: "relative", verticalAlign: "middle", lineHeight: "normal", margin: "0 0.15em" };
     }
   })();
 
@@ -567,8 +567,8 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, deleteNode, ext
     >
       <span
         ref={frameRef}
-        className="relative inline-block max-w-full align-bottom"
-        style={{ transform: rotation ? `rotate(${rotation}deg)` : undefined, lineHeight: 0 }}
+        className="relative inline-block max-w-full align-middle"
+        style={{ transform: rotation ? `rotate(${rotation}deg)` : undefined, lineHeight: 1 }}
       >
         <img
           ref={imgRef}
@@ -582,7 +582,7 @@ const DocImageView: React.FC<NodeViewProps> = ({ node, selected, deleteNode, ext
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
-          style={{ width, height, ...look }}
+          style={{ width, height, verticalAlign: "middle", ...look }}
           className={`my-0 max-w-full block select-none ${inkIn ? "doc-signature-ink-in" : ""} ${free ? (selected ? "cursor-move" : "cursor-pointer") : selected ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"} ${
             selected ? "doc-image-selected" : ""
           }`}

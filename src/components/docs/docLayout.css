@@ -195,42 +195,45 @@
   margin-right: auto;
 }
 
-.ProseMirror .tableWrapper[data-rules] table {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) table,
+.ProseMirror table[data-rules] {
   border-collapse: collapse;
   /* Typography's 2em above and below every table: the wrapper's own spacing applies instead. */
   margin-top: 0 !important;
   margin-bottom: 0 !important;
 }
-.ProseMirror .tableWrapper[data-rules] :is(th, td) {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) :is(th, td) {
   border: 0 !important;
   background: transparent !important;
   padding: 0.12em 0.6em !important;
   font-weight: inherit;
 }
-.ProseMirror .tableWrapper[data-rules] :is(th, td) > p {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) :is(th, td) > p {
   text-indent: 0 !important;
 }
 /* Rule under the header rows: on the first body row after a run of header cells. */
-.ProseMirror .tableWrapper[data-rules] tr:has(> th) + tr:not(:has(> th)) > td {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) tr:has(> th) + tr:not(:has(> th)) > td {
   border-top: 0.5pt solid currentColor !important;
 }
-.ProseMirror .tableWrapper[data-rules="booktabs"] table {
+.ProseMirror :is(.tableWrapper[data-rules="booktabs"], table[data-rules="booktabs"], .tableWrapper:has(table[data-rules="booktabs"])) table,
+.ProseMirror table[data-rules="booktabs"] {
   border-top: 0.8pt solid currentColor;
   border-bottom: 0.8pt solid currentColor;
 }
-.ProseMirror .tableWrapper[data-rules="doubled"] table {
+.ProseMirror :is(.tableWrapper[data-rules="doubled"], table[data-rules="doubled"], .tableWrapper:has(table[data-rules="doubled"])) table,
+.ProseMirror table[data-rules="doubled"] {
   border-top: 2.2pt double currentColor;
   border-bottom: 2.2pt double currentColor;
 }
 /* The double rule of an APS table, with a single rule under the header. */
-.ProseMirror .tableWrapper[data-rules="doubled"] tr:first-child > :is(th, td) {
+.ProseMirror :is(.tableWrapper[data-rules="doubled"], table[data-rules="doubled"], .tableWrapper:has(table[data-rules="doubled"])) tr:first-child > :is(th, td) {
   padding-top: 0.3em !important;
 }
-.ProseMirror .tableWrapper[data-rules="doubled"] tr:last-child > :is(th, td) {
+.ProseMirror :is(.tableWrapper[data-rules="doubled"], table[data-rules="doubled"], .tableWrapper:has(table[data-rules="doubled"])) tr:last-child > :is(th, td) {
   padding-bottom: 0.3em !important;
 }
 /* Selection outline stays visible on a rule-less table. */
-.ProseMirror .tableWrapper[data-rules] .selectedCell::after {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) .selectedCell::after {
   background: rgba(96, 165, 250, 0.2);
 }
 
@@ -238,21 +241,41 @@
 /* No rules at all - a table used to place things side by side (a résumé's sidebar, a letterhead,
    a two-column signature block). Roomier padding than a typeset table, since shaded layout cells
    read as panels. While editing, faint dashed guides show where the cells are; they never print. */
-.ProseMirror .tableWrapper[data-rules="none"] :is(th, td) {
+.ProseMirror :is(.tableWrapper[data-rules="none"], table[data-rules="none"], .tableWrapper:has(table[data-rules="none"])) :is(th, td) {
+  border: 0 !important;
+  background: transparent !important;
   padding: 0.45em 0.75em !important;
   vertical-align: top;
 }
-.ProseMirror .tableWrapper[data-rules="none"] tr:has(> th) + tr:not(:has(> th)) > td {
+.ProseMirror :is(.tableWrapper[data-rules="none"], table[data-rules="none"], .tableWrapper:has(table[data-rules="none"])) tr:has(> th) + tr:not(:has(> th)) > td {
   border-top: 0 !important;
 }
-.ProseMirror[contenteditable="true"] .tableWrapper[data-rules="none"] :is(th, td) {
+.ProseMirror[contenteditable="true"] :is(.tableWrapper[data-rules="none"], table[data-rules="none"], .tableWrapper:has(table[data-rules="none"])) :is(th, td) {
   outline: 1px dashed rgba(148, 163, 184, 0.45);
   outline-offset: -1px;
 }
 @media print {
-  .ProseMirror .tableWrapper[data-rules="none"] :is(th, td) {
+  .ProseMirror :is(.tableWrapper[data-rules="none"], table[data-rules="none"], .tableWrapper:has(table[data-rules="none"])) :is(th, td) {
     outline: 0 !important;
   }
+}
+
+/* ---------- Right-aligned tabs / dates / labels ---------- */
+.ProseMirror :is(p, h1, h2, h3, h4, h5, h6, li):has(> [data-tab-align="right"]),
+.ProseMirror :is(p, h1, h2, h3, h4, h5, h6, li):has(> span[style*="float: right"]),
+.ProseMirror :is(p, h1, h2, h3, h4, h5, h6, li):has(> span[style*="float:right"]) {
+  display: flex !important;
+  justify-content: space-between !important;
+  align-items: baseline !important;
+  flex-wrap: wrap !important;
+}
+
+.ProseMirror [data-tab-align="right"],
+.ProseMirror span[style*="float: right"],
+.ProseMirror span[style*="float:right"] {
+  margin-left: auto !important;
+  text-align: right !important;
+  white-space: nowrap !important;
 }
 
 /* A heading or list at the top of a cell sits at the cell's top edge, not a heading's page-level
@@ -264,7 +287,7 @@
 /* ---------- Cell shading (docTableCellShading.ts) ---------- */
 /* Beats both the grid's header tint and the rule styles' forced-transparent cells. */
 .ProseMirror :is(th, td)[data-background],
-.ProseMirror .tableWrapper[data-rules] :is(th, td)[data-background] {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) :is(th, td)[data-background] {
   background-color: var(--cell-bg) !important;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
@@ -401,7 +424,7 @@
 }
 
 /* Typography's own row rules (tbody tr border-bottom) on a ruled table. */
-.ProseMirror .tableWrapper[data-rules] :is(thead, tbody, tr) {
+.ProseMirror :is(.tableWrapper[data-rules], table[data-rules], .tableWrapper:has(table[data-rules])) :is(thead, tbody, tr) {
   border: 0 !important;
 }
 

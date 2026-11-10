@@ -908,8 +908,16 @@ function parseTableMeta(tbl: Element, theme: ThemeData, styleBorders: (styleId: 
     cells.push(rowMeta);
   });
 
+  const allCellsBorderless =
+    cells.length > 0 &&
+    cells.every((row) =>
+      row.every((c) => !c.borders || Object.values(c.borders).every((b) => !b || b === "none"))
+    );
+
   let rules: "none" | "booktabs" | null = null;
-  if (anyBorderSpecified) {
+  if (allCellsBorderless) {
+    rules = "none";
+  } else if (anyBorderSpecified) {
     if (!topOrBottomVisible && !insideVOrSideVisible) rules = "none";
     else if (topOrBottomVisible && !insideVOrSideVisible) rules = "booktabs";
   }

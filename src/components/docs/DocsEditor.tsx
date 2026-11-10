@@ -401,7 +401,7 @@ function readRulerVisible(): boolean {
 }
 
 const headerIconClass = (active = false) =>
-  `relative h-9 w-9 shrink-0 inline-flex items-center justify-center rounded-full transition-colors ${
+  `relative h-8 w-8 shrink-0 inline-flex items-center justify-center rounded-full transition-colors ${
     active
       ? "bg-[#d3e3fd] text-[#041e49] dark:bg-blue-500/30 dark:text-blue-50"
       : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.06] dark:hover:bg-white/10"
@@ -501,6 +501,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     {
       extensions,
       editable: !store.loading,
+      editorProps: {
+        attributes: {
+          spellcheck: "false",
+          autocorrect: "off",
+          autocapitalize: "off",
+        },
+      },
       // Focuses the content area as soon as the doc is ready, so opening a doc (new or existing)
       // lets you start typing immediately instead of requiring a click into the editor first.
       autofocus: "start",
@@ -1060,11 +1067,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         }
       `}</style>
 
-      <header className="shrink-0 flex items-center gap-2 pl-2 pr-3 pt-2 print:hidden">
+      <header className="shrink-0 flex items-center gap-1.5 pl-2 pr-3 pt-1.5 pb-0.5 print:hidden">
         <button type="button" onClick={handleBack} data-tip="Back to docs" aria-label="Back to docs" className={headerIconClass()}>
-          <IoArrowBack size={19} />
+          <IoArrowBack size={17} />
         </button>
-        <MdDescription size={30} className="shrink-0 text-[#4285f4]" aria-hidden />
+        <MdDescription size={26} className="shrink-0 text-[#4285f4]" aria-hidden />
 
         <div className="min-w-0 flex-1 flex flex-col">
           <input
@@ -1080,16 +1087,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
             aria-label="Document title"
             spellCheck={false}
             style={{ fieldSizing: "content" } as React.CSSProperties}
-            className="min-w-[8rem] max-w-full px-1.5 -ml-1.5 h-7 rounded text-[17px] leading-7 bg-transparent border border-transparent hover:border-neutral-300 dark:hover:border-neutral-700 focus:border-blue-500 outline-none text-neutral-900 dark:text-neutral-100 truncate"
+            className="min-w-[8rem] max-w-full px-1.5 -ml-1.5 h-6.5 rounded text-[15px] leading-6 bg-transparent border border-transparent hover:border-neutral-300 dark:hover:border-neutral-700 focus:border-blue-500 outline-none text-neutral-900 dark:text-neutral-100 truncate"
           />
-          <div className="flex items-center gap-2 h-5 text-xs text-neutral-500 dark:text-neutral-400 min-w-0">
+          <div className="flex items-center gap-2 h-4 text-[11px] text-neutral-500 dark:text-neutral-400 min-w-0">
             {store.saveError ? (
               <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400" data-tip={String(store.saveError)}>
-                <IoWarningOutline size={14} /> Couldn’t save
+                <IoWarningOutline size={13} /> Couldn’t save
               </span>
             ) : (
               <span className="inline-flex items-center gap-1 shrink-0">
-                <IoCloudDoneOutline size={14} /> {store.isSaving ? "Saving…" : "Saved"}
+                <IoCloudDoneOutline size={13} /> {store.isSaving ? "Saving…" : "Saved"}
               </span>
             )}
             {editor && !store.loading && (
@@ -1125,10 +1132,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         </div>
 
         <button type="button" data-tip={showOutline ? "Hide outline" : "Show outline"} aria-label="Document outline" aria-pressed={showOutline} onClick={toggleOutline} className={headerIconClass(showOutline)}>
-          <TbListTree size={19} strokeWidth={1.75} />
+          <TbListTree size={16} strokeWidth={1.75} />
         </button>
         <button type="button" data-tip="Find and replace" data-tip-kbd="Ctrl+F" aria-label="Find and replace" onClick={() => setShowFindReplace((v) => !v)} className={headerIconClass(showFindReplace)}>
-          <IoSearch size={18} />
+          <IoSearch size={16} />
         </button>
         <button
           type="button"
@@ -1140,13 +1147,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           }}
           className={headerIconClass(showVersionHistory)}
         >
-          <IoTimeOutline size={20} />
+          <IoTimeOutline size={17} />
         </button>
         <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={toggleStyle} className={headerIconClass(showStyle)}>
-          <TbTypography size={20} strokeWidth={1.75} />
+          <TbTypography size={17} strokeWidth={1.75} />
         </button>
         <button type="button" data-tip="References" aria-label="References" aria-pressed={showReferences} onClick={toggleReferences} className={headerIconClass(showReferences)}>
-          <TbBooks size={20} strokeWidth={1.75} />
+          <TbBooks size={17} strokeWidth={1.75} />
           {bib.entries.length > 0 && (
             <span className="absolute top-1 right-0.5 min-w-4 h-4 px-1 rounded-full bg-neutral-600 dark:bg-neutral-500 text-white text-[10px] leading-4 font-semibold text-center tabular-nums">
               {bib.entries.length}
@@ -1154,10 +1161,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           )}
         </button>
         <button type="button" data-tip="Guide: writing a two-column paper" aria-label="Help: writing a two-column paper" aria-pressed={showHelp} onClick={toggleHelp} className={headerIconClass(showHelp)}>
-          <IoHelpCircleOutline size={21} />
+          <IoHelpCircleOutline size={18} />
         </button>
         <button type="button" data-tip="Comments" aria-label="Comments" onClick={toggleComments} className={headerIconClass(showComments)}>
-          <IoChatbubbleOutline size={19} />
+          <IoChatbubbleOutline size={16} />
           {openComments > 0 && (
             <span className="absolute top-1 right-1 min-w-4 h-4 px-1 rounded-full bg-blue-600 text-white text-[10px] leading-4 font-semibold text-center">
               {openComments}
@@ -1172,7 +1179,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           aria-label="Letterhead"
           className={headerIconClass(!!letterhead)}
         >
-          <TbFileCertificate size={19} strokeWidth={1.75} />
+          <TbFileCertificate size={16} strokeWidth={1.75} />
         </button>
         <Dropdown
           {...menuProps("pageSetup")}
@@ -1180,7 +1187,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           align="right"
           keepSelection={false}
           bare
-          trigger={<IoOptionsOutline size={19} />}
+          trigger={<IoOptionsOutline size={16} />}
           triggerClassName={headerIconClass(headerMenu === "pageSetup")}
         >
           <DocPageSetupPopover
@@ -1208,12 +1215,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           align="right"
           trigger={
             <>
-              <MdFileDownload size={18} />
+              <MdFileDownload size={15} />
               <span>Export</span>
-              <MdArrowDropDown size={18} className="-mr-1.5" />
+              <MdArrowDropDown size={15} className="-mr-1" />
             </>
           }
-          triggerClassName="ml-1 h-9 pl-3.5 pr-3 inline-flex items-center gap-1.5 rounded-full text-sm font-medium bg-[#c2e7ff] hover:bg-[#b0dcf7] text-[#001d35] dark:bg-blue-500/25 dark:hover:bg-blue-500/35 dark:text-blue-50 transition-colors"
+          triggerClassName="ml-1 h-8 pl-3 pr-2.5 inline-flex items-center gap-1 rounded-full text-xs font-medium bg-[#c2e7ff] hover:bg-[#b0dcf7] text-[#001d35] dark:bg-blue-500/25 dark:hover:bg-blue-500/35 dark:text-blue-50 transition-colors"
           panelClassName="w-64 py-1.5"
         >
           <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Send</div>
@@ -1347,7 +1354,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
                             ))}
                           {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
                               flips the editor's text, heading and link colours. */}
-                          <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                          <EditorContent editor={editor} spellCheck={false} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
                           {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
                           <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
                           <DocPageChromeOverlay

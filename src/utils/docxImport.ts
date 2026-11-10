@@ -116,8 +116,8 @@ export function prepareConvertedDom(
     }
 
     // A table that sets its own cell borders draws exactly those; otherwise its rule style.
-    const hasOwnBorders = meta.cells.some((row) => row.some((c) => c.borders));
-    if (meta.rules && !hasOwnBorders) {
+    const hasVisibleCellBorders = meta.cells.some((row) => row.some((c) => c.borders && Object.values(c.borders).some((v) => v && v !== "none")));
+    if (meta.rules && (!hasVisibleCellBorders || meta.rules === "none")) {
       table.setAttribute("data-rules", meta.rules);
     }
     const rows = Array.from(table.querySelectorAll("tr"));
@@ -167,7 +167,50 @@ export function prepareConvertedDom(
     el.remove();
   });
 
-  // 5. Preserve multi-space runs (xml:space="preserve", e.g. "   |   " or aligned columns) and
+  // 5. Detect paragraphs using wide space runs (>= 6 spaces or \t) to push dates/labels to the right margin,
+  // and convert them to right-aligned elements with flex alignment.
+  body.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li").forEach((block) => {
+    const childNodes = Array.from(block.childNodes);
+    for (let i = 0; i < childNodes.length; i++) {
+      const node = childNodes[i];
+      if (node.nodeType === 3 /* Node.TEXT_NODE */) {
+        const val = node.nodeValue || "";
+        const match = val.match(/^(.*?)(\t|[ ]{6,})(.*)$/);
+        if (match) {
+          const leftPart = match[1];
+          const rightPart = match[3];
+          if (rightPart.trim().length > 0) {
+            node.nodeValue = leftPart.trimEnd();
+            const span = body.ownerDocument.createElement("span");
+            span.setAttribute("data-tab-align", "right");
+            span.setAttribute("style", "float: right");
+            span.textContent = rightPart.trim();
+            if (node.nextSibling) block.insertBefore(span, node.nextSibling);
+            else block.appendChild(span);
+            break;
+          } else {
+            const remaining = childNodes.slice(i + 1).filter((n) => {
+              if (n.nodeType === 1 && (n as Element).tagName === "BR") return false;
+              if (n.nodeType === 3 && !(n.nodeValue || "").trim()) return false;
+              return true;
+            });
+            if (remaining.length > 0) {
+              node.nodeValue = leftPart.trimEnd();
+              const span = body.ownerDocument.createElement("span");
+              span.setAttribute("data-tab-align", "right");
+              span.setAttribute("style", "float: right");
+              remaining.forEach((r) => span.appendChild(r));
+              if (node.nextSibling) block.insertBefore(span, node.nextSibling);
+              else block.appendChild(span);
+              break;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // 6. Preserve multi-space runs (xml:space="preserve", e.g. "   |   " or aligned columns) and
   // tabs (\t) so ProseMirrorDOMParser's HTML whitespace collapsing doesn't squash them.
   const walker = body.ownerDocument.createTreeWalker(body, NodeFilter.SHOW_TEXT);
   let textNode = walker.nextNode() as Text | null;

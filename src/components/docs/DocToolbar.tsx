@@ -106,7 +106,7 @@ const VOICE_COMMANDS: [string, string][] = [
 // Primitives
 
 const buttonBase =
-  "h-7 min-w-7 px-1 inline-flex items-center justify-center gap-0.5 rounded text-neutral-700 dark:text-neutral-200 transition-colors select-none";
+  "h-6 min-w-6 px-1 inline-flex items-center justify-center gap-0.5 rounded text-neutral-700 dark:text-neutral-200 transition-colors select-none";
 
 export function toolClass(active = false, disabled = false): string {
   if (disabled) return `${buttonBase} opacity-35 cursor-default`;
@@ -122,7 +122,7 @@ export const menuItemClass =
   "w-full flex items-center gap-3 px-3 py-1.5 text-sm text-left text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700/70 disabled:opacity-40 disabled:hover:bg-transparent";
 
 const Divider: React.FC<{ className?: string }> = ({ className = "" }) => (
-  <div className={`w-px h-5 bg-neutral-300 dark:bg-neutral-600 mx-1 shrink-0 ${className}`} />
+  <div className={`w-px h-3.5 bg-neutral-300 dark:bg-neutral-600 mx-0.5 shrink-0 ${className}`} />
 );
 
 interface ToolButtonProps {
@@ -361,22 +361,22 @@ function renderedFontAtCursor(editor: Editor): string | null {
 // Controls
 
 const TextColorIcon: React.FC<{ color?: string | null }> = ({ color }) => (
-  <span className="flex flex-col items-center justify-center w-5 h-5 leading-none select-none">
-    <span className="text-[14px] font-bold font-sans tracking-tight leading-none text-neutral-800 dark:text-neutral-100">
+  <span className="flex flex-col items-center justify-center w-4 h-4 leading-none select-none">
+    <span className="text-[12px] font-bold font-sans tracking-tight leading-none text-neutral-800 dark:text-neutral-100">
       A
     </span>
     <span
-      className="block w-4 h-[3px] mt-[2px] rounded-full transition-colors"
+      className="block w-3.5 h-[2px] mt-[1.5px] rounded-full transition-colors"
       style={{ backgroundColor: color ?? "currentColor" }}
     />
   </span>
 );
 
 const HighlightColorIcon: React.FC<{ color?: string | null }> = ({ color }) => (
-  <span className="flex flex-col items-center justify-center w-5 h-5 leading-none select-none">
-    <LuHighlighter size={15} className="text-neutral-700 dark:text-neutral-200" />
+  <span className="flex flex-col items-center justify-center w-4 h-4 leading-none select-none">
+    <LuHighlighter size={13} className="text-neutral-700 dark:text-neutral-200" />
     <span
-      className="block w-4 h-[3px] mt-[2px] rounded-full transition-colors"
+      className="block w-3.5 h-[2px] mt-[1.5px] rounded-full transition-colors"
       style={{
         backgroundColor: color ?? "transparent",
         boxShadow: color ? undefined : "inset 0 0 0 1px currentColor",
@@ -408,7 +408,7 @@ const FontSizeControl: React.FC<{ editor: Editor }> = ({ editor }) => {
   return (
     <div className="flex items-center shrink-0">
       <ToolButton label="Decrease font size" onClick={() => step(-1)}>
-        <MdRemove size={16} />
+        <MdRemove size={13} />
       </ToolButton>
       <input
         value={display}
@@ -430,10 +430,10 @@ const FontSizeControl: React.FC<{ editor: Editor }> = ({ editor }) => {
             editor.commands.focus();
           }
         }}
-        className="w-9 h-6 text-center text-sm rounded border border-neutral-400/70 dark:border-neutral-500 bg-transparent text-neutral-800 dark:text-neutral-100 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+        className="w-7 h-5 text-center text-xs rounded border border-neutral-400/70 dark:border-neutral-500 bg-transparent text-neutral-800 dark:text-neutral-100 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
       />
       <ToolButton label="Increase font size" onClick={() => step(1)}>
-        <MdAdd size={16} />
+        <MdAdd size={13} />
       </ToolButton>
     </div>
   );
@@ -536,33 +536,33 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
         {...tipProps(listening ? "Stop voice typing" : "Voice typing", "Ctrl+Shift+S")}
         aria-label={listening ? "Stop voice typing" : "Voice typing"}
         aria-pressed={listening}
-        className={`h-7 inline-flex items-center gap-1.5 rounded-full transition-colors ${
+        className={`h-6 inline-flex items-center gap-1 rounded-full transition-colors ${
           listening
-            ? "pl-2 pr-2.5 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-500/20"
+            ? "pl-2 pr-2 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-500/20"
             : `px-1.5 ${busy ? "text-blue-600 dark:text-blue-300" : "text-neutral-700 dark:text-neutral-200 hover:bg-black/[0.06] dark:hover:bg-white/10"}`
         }`}
       >
         {listening ? (
           <>
             <DictationLevelMeter levelRef={dictation.levelRef} />
-            <span className="text-xs font-medium">{statusText}</span>
-            <MdStop size={16} />
+            <span className="text-[11px] font-medium">{statusText}</span>
+            <MdStop size={14} />
           </>
         ) : busy ? (
           <>
-            <span className="w-3.5 h-3.5 rounded-full border-2 border-current border-t-transparent animate-spin" />
-            <span className="text-xs font-medium">{phase === "starting" ? "Starting…" : `Finishing${pending > 1 ? ` (${pending})` : ""}…`}</span>
+            <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" />
+            <span className="text-[11px] font-medium">{phase === "starting" ? "Starting…" : `Finishing${pending > 1 ? ` (${pending})` : ""}…`}</span>
           </>
         ) : (
-          <MdMic size={18} />
+          <MdMic size={15} />
         )}
       </button>
       <Dropdown
         {...menu}
         label="Voice typing options"
         align="right"
-        trigger={<MdArrowDropDown size={18} />}
-        triggerClassName={`h-7 w-5 inline-flex items-center justify-center rounded-full text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.06] dark:hover:bg-white/10 ${
+        trigger={<MdArrowDropDown size={15} />}
+        triggerClassName={`h-6 w-4.5 inline-flex items-center justify-center rounded-full text-neutral-500 dark:text-neutral-400 hover:bg-black/[0.06] dark:hover:bg-white/10 ${
           menu.open ? "bg-black/[0.06] dark:bg-white/10" : ""
         }`}
         panelClassName="w-72 py-2 max-h-[82vh] overflow-y-auto"
@@ -845,17 +845,17 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   );
 
   return (
-    <div className="@container relative shrink-0 px-3 pt-1.5 pb-2 print:hidden">
+    <div className="@container relative shrink-0 px-2.5 pt-1 pb-1.5 print:hidden">
       <div
         role="toolbar"
         aria-label="Formatting"
-        className="flex items-center gap-0.5 h-10 px-2 rounded-full bg-[#edf2fa] dark:bg-neutral-800/80 ring-1 ring-black/[0.03] dark:ring-white/5"
+        className="flex items-center gap-0.5 h-8 px-1.5 rounded-full bg-[#edf2fa] dark:bg-neutral-800/80 ring-1 ring-black/[0.03] dark:ring-white/5"
       >
         <ToolButton label="Undo" shortcut="Ctrl+Z" disabled={!canUndo} onClick={() => editor.chain().focus().undo().run()}>
-          <MdUndo size={18} />
+          <MdUndo size={15} />
         </ToolButton>
         <ToolButton label="Redo" shortcut="Ctrl+Y" disabled={!canRedo} onClick={() => editor.chain().focus().redo().run()}>
-          <MdRedo size={18} />
+          <MdRedo size={15} />
         </ToolButton>
 
         <Divider />
@@ -865,11 +865,11 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           label="Styles"
           trigger={
             <>
-              <span className="w-[5.5rem] text-left text-sm truncate">{PARAGRAPH_STYLES.find((s) => s.value === paragraphStyle)?.label}</span>
-              <MdArrowDropDown size={18} />
+              <span className="w-[4.6rem] text-left text-xs truncate">{PARAGRAPH_STYLES.find((s) => s.value === paragraphStyle)?.label}</span>
+              <MdArrowDropDown size={15} />
             </>
           }
-          triggerClassName={`${toolClass(false)} pl-2 pr-0.5 hidden @2xl:inline-flex`}
+          triggerClassName={`${toolClass(false)} pl-1.5 pr-0.5 hidden @2xl:inline-flex`}
           className="hidden @2xl:block"
           panelClassName="w-60 py-1.5"
         >
@@ -897,13 +897,13 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           label="Font"
           trigger={
             <>
-              <span className="w-28 text-left text-sm truncate" style={{ fontFamily: fontValue ?? (shownFamily ? `"${shownFamily}"` : undefined) }}>
+              <span className="w-22 text-left text-xs truncate" style={{ fontFamily: fontValue ?? (shownFamily ? `"${shownFamily}"` : undefined) }}>
                 {shownLabel ?? "Default"}
               </span>
-              <MdArrowDropDown size={18} />
+              <MdArrowDropDown size={15} />
             </>
           }
-          triggerClassName={`${toolClass(false)} pl-2 pr-0.5`}
+          triggerClassName={`${toolClass(false)} pl-1.5 pr-0.5`}
           className="hidden @3xl:block"
           panelClassName=""
         >
@@ -941,7 +941,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           active={boldActive}
           onClick={() => (rendered ? editor.chain().focus().toggleRenderedBold(rendered.bold, rendered.styleBold).run() : editor.chain().focus().toggleBold().run())}
         >
-          <MdFormatBold size={19} />
+          <MdFormatBold size={15} />
         </ToolButton>
         <ToolButton
           label="Italic"
@@ -949,10 +949,10 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           active={italicActive}
           onClick={() => (rendered ? editor.chain().focus().toggleRenderedItalic(rendered.italic, rendered.styleItalic).run() : editor.chain().focus().toggleItalic().run())}
         >
-          <MdFormatItalic size={19} />
+          <MdFormatItalic size={15} />
         </ToolButton>
         <ToolButton label="Underline" shortcut="Ctrl+U" active={underlineActive} onClick={toggleUnderline}>
-          <MdFormatUnderlined size={19} />
+          <MdFormatUnderlined size={15} />
         </ToolButton>
 
         <Dropdown
@@ -994,7 +994,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           open={linkOpen}
           onOpenChange={onLinkOpenChange}
           label={onLink ? "Edit link (Ctrl+K)" : "Insert link (Ctrl+K)"}
-          trigger={<MdLink size={19} />}
+          trigger={<MdLink size={15} />}
           triggerClassName={toolClass(linkOpen || onLink)}
           panelClassName="w-80 p-3"
           keepSelection
@@ -1047,7 +1047,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           open={comment.open}
           onOpenChange={(next) => (!next || hasSelection) && comment.onOpenChange(next)}
           label={hasSelection ? "Add comment" : "Select text to comment"}
-          trigger={<MdAddComment size={18} />}
+          trigger={<MdAddComment size={15} />}
           triggerClassName={toolClass(comment.open, !hasSelection && !comment.open)}
           panelClassName="w-72 p-2.5"
           keepSelection
@@ -1081,12 +1081,12 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
 
         <div className="hidden @4xl:flex items-center gap-0.5">
           <ToolButton label="Insert image" onClick={onInsertImage}>
-            <MdImage size={19} />
+            <MdImage size={15} />
           </ToolButton>
           <ToolButton label="Sign - draw, type or upload a signature" onClick={onSign}>
-            <TbSignature size={19} strokeWidth={1.75} />
+            <TbSignature size={15} strokeWidth={1.75} />
           </ToolButton>
-          <Dropdown {...bind("table")} label="Insert table" trigger={<TbTable size={19} strokeWidth={1.75} />}>
+          <Dropdown {...bind("table")} label="Insert table" trigger={<TbTable size={15} strokeWidth={1.75} />}>
             <TableGridPicker
               onPick={(rows, cols) => {
                 editor.chain().focus().insertTable({ rows, cols, withHeaderRow: rows > 1 }).run();
@@ -1094,7 +1094,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
               }}
             />
           </Dropdown>
-          <Dropdown {...bind("equation")} label="Insert equation" trigger={<TbMathFunction size={19} strokeWidth={1.75} />} panelClassName="w-60 py-1.5">
+          <Dropdown {...bind("equation")} label="Insert equation" trigger={<TbMathFunction size={15} strokeWidth={1.75} />} panelClassName="w-60 py-1.5">
             {equationItems}
           </Dropdown>
           <button
@@ -1105,7 +1105,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
             onClick={(e) => onOpenPicker("cite", e.currentTarget.getBoundingClientRect())}
             className={toolClass(false)}
           >
-            <TbQuote size={19} strokeWidth={1.75} />
+            <TbQuote size={15} strokeWidth={1.75} />
           </button>
           <button
             type="button"
@@ -1115,7 +1115,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
             onClick={(e) => onOpenPicker("xref", e.currentTarget.getBoundingClientRect())}
             className={toolClass(false)}
           >
-            <TbCornerDownRight size={19} strokeWidth={1.75} />
+            <TbCornerDownRight size={15} strokeWidth={1.75} />
           </button>
           {twoColumns && (
             <button
@@ -1127,13 +1127,13 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
               onClick={() => editor.chain().focus().toggleSpanColumns().run()}
               className={toolClass(spansColumns)}
             >
-              <TbArrowAutofitWidth size={19} strokeWidth={1.75} />
+              <TbArrowAutofitWidth size={15} strokeWidth={1.75} />
             </button>
           )}
         </div>
 
         {inTable && (
-          <Dropdown {...bind("tableOps")} label="Table options" trigger={<TbTableOptions size={19} strokeWidth={1.75} />} panelClassName="w-52 py-1.5">
+          <Dropdown {...bind("tableOps")} label="Table options" trigger={<TbTableOptions size={15} strokeWidth={1.75} />} panelClassName="w-52 py-1.5">
             {(
               [
                 ["Insert row above", () => editor.chain().focus().addRowBefore().run(), editor.can().addRowBefore()],
@@ -1270,40 +1270,40 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
         <Divider className="hidden @4xl:block" />
 
         <div className="hidden @5xl:flex items-center gap-0.5">
-          <Dropdown {...bind("align")} label="Align" trigger={<activeAlign.icon size={18} />} panelClassName="w-60 py-1.5">
+          <Dropdown {...bind("align")} label="Align" trigger={<activeAlign.icon size={15} />} panelClassName="w-60 py-1.5">
             {alignItems}
           </Dropdown>
-          <Dropdown {...bind("spacing")} label="Line spacing" trigger={<MdFormatLineSpacing size={18} />} panelClassName="w-44 py-1.5">
+          <Dropdown {...bind("spacing")} label="Line spacing" trigger={<MdFormatLineSpacing size={15} />} panelClassName="w-44 py-1.5">
             {lineSpacingItems}
           </Dropdown>
         </div>
 
         <div className="hidden @3xl:flex items-center gap-0.5">
           <ToolButton label="Bulleted list" shortcut="Ctrl+Shift+8" active={editor.isActive("bulletList")} onClick={() => editor.chain().focus().toggleBulletList().run()}>
-            <MdFormatListBulleted size={19} />
+            <MdFormatListBulleted size={15} />
           </ToolButton>
           <ToolButton label="Numbered list" shortcut="Ctrl+Shift+7" active={editor.isActive("orderedList")} onClick={() => editor.chain().focus().toggleOrderedList().run()}>
-            <MdFormatListNumbered size={19} />
+            <MdFormatListNumbered size={15} />
           </ToolButton>
           <ToolButton label="Checklist" shortcut="Ctrl+Shift+9" active={editor.isActive("taskList")} onClick={() => editor.chain().focus().toggleTaskList().run()}>
-            <MdChecklist size={19} />
+            <MdChecklist size={15} />
           </ToolButton>
         </div>
 
         <div className="hidden @6xl:flex items-center gap-0.5">
           <ToolButton label="Decrease indent" shortcut="Ctrl+[" onClick={() => editor.chain().focus().outdent().run()}>
-            <MdFormatIndentDecrease size={18} />
+            <MdFormatIndentDecrease size={15} />
           </ToolButton>
           <ToolButton label="Increase indent" shortcut="Ctrl+]" onClick={() => editor.chain().focus().indent().run()}>
-            <MdFormatIndentIncrease size={18} />
+            <MdFormatIndentIncrease size={15} />
           </ToolButton>
           <Divider />
           <ToolButton label="Clear formatting" shortcut="Ctrl+\" onClick={() => editor.chain().focus().unsetAllMarks().clearNodes().run()}>
-            <MdFormatClear size={18} />
+            <MdFormatClear size={15} />
           </ToolButton>
         </div>
 
-        <Dropdown {...bind("more")} label="More" align="right" trigger={<MdMoreVert size={18} />} panelClassName="w-64 pb-1.5 max-h-[70vh] overflow-y-auto">
+        <Dropdown {...bind("more")} label="More" align="right" trigger={<MdMoreVert size={15} />} panelClassName="w-64 pb-1.5 max-h-[70vh] overflow-y-auto">
           <MenuSection title="Text">
             {menuAction("Strikethrough", MdStrikethroughS, () => editor.chain().focus().toggleStrike().run(), { active: strikeActive, keys: "Alt+Shift+5" })}
             {menuAction("Inline code", MdCode, () => editor.chain().focus().toggleCode().run(), { active: editor.isActive("code"), keys: "Ctrl+E" })}
