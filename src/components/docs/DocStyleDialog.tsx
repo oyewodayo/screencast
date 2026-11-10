@@ -79,51 +79,53 @@ const DocStyleDialog: React.FC<DocStyleDialogProps> = ({ ydoc, layout, bib, cita
   const captionId = captionStyleId(numbering);
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end print:hidden" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div
-        role="dialog"
-        aria-modal="false"
-        aria-labelledby="doc-style-title"
-        className="h-full w-[360px] max-w-full overflow-y-auto bg-white dark:bg-neutral-900 border-l border-neutral-200 dark:border-neutral-800 shadow-[-8px_0_24px_rgba(0,0,0,0.08)]"
-      >
-        <div className="sticky top-0 z-10 flex items-center gap-2 px-4 py-3 bg-white/95 dark:bg-neutral-900/95 backdrop-blur border-b border-neutral-200 dark:border-neutral-800">
-          <h2 id="doc-style-title" className="flex-1 text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-            Document style
-          </h2>
-          <button type="button" onClick={onClose} aria-label="Close" className="p-1.5 -m-1 rounded-full text-neutral-500 hover:bg-black/[0.06] dark:hover:bg-white/10">
-            <IoClose size={18} />
-          </button>
-        </div>
+    <aside
+      aria-labelledby="doc-style-title"
+      className="w-[22rem] shrink-0 h-full border-l border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 flex flex-col print:hidden"
+    >
+      <div className="shrink-0 flex items-center justify-between gap-2 px-3 py-2.5 border-b border-neutral-200 dark:border-neutral-800">
+        <h2 id="doc-style-title" className="text-sm font-medium text-neutral-800 dark:text-neutral-100">
+          Document style
+        </h2>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="p-1.5 rounded-md text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-800 dark:hover:text-neutral-100"
+        >
+          <IoClose size={18} />
+        </button>
+      </div>
 
-        <div className="p-4 space-y-5">
-          <section>
-            <h3 className={label}>Start from</h3>
-            <div className="space-y-1.5">
-              {PAPER_STYLES.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => applyPreset(p)}
-                  aria-pressed={activePreset === p.id}
-                  className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
-                    activePreset === p.id
-                      ? "border-blue-500 bg-blue-50/70 dark:bg-blue-500/10"
-                      : "border-neutral-200 dark:border-neutral-700 hover:bg-neutral-50 dark:hover:bg-neutral-800/60"
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <span className="inline-flex gap-[2px]" aria-hidden>
-                      {Array.from({ length: p.columns }, (_, k) => (
-                        <span key={k} className={`block h-4 ${p.columns === 1 ? "w-4" : "w-[7px]"} rounded-[1px] border border-current opacity-60`} />
-                      ))}
-                    </span>
-                    <span className="text-sm font-medium text-neutral-900 dark:text-neutral-100">{p.name}</span>
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 pt-4 pb-28 space-y-5 [scrollbar-width:thin]">
+        <section>
+          <h3 className={label}>Start from</h3>
+          <div className="space-y-1.5">
+            {PAPER_STYLES.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => applyPreset(p)}
+                aria-pressed={activePreset === p.id}
+                className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
+                  activePreset === p.id
+                    ? "border-blue-500 bg-blue-50/70 dark:bg-blue-500/10"
+                    : "border-neutral-200 dark:border-neutral-700 hover:bg-neutral-50 dark:hover:bg-neutral-800/60"
+                }`}
+              >
+                <span className="flex items-center gap-2">
+                  <span className="inline-flex gap-[2px]" aria-hidden>
+                    {Array.from({ length: p.columns }, (_, k) => (
+                      <span key={k} className={`block h-4 ${p.columns === 1 ? "w-4" : "w-[7px]"} rounded-[1px] border border-current opacity-60`} />
+                    ))}
                   </span>
-                  <span className="mt-0.5 block text-xs leading-snug text-neutral-500 dark:text-neutral-400">{p.description}</span>
-                </button>
-              ))}
-            </div>
-          </section>
+                  <span className="text-sm font-medium text-neutral-900 dark:text-neutral-100">{p.name}</span>
+                </span>
+                <span className="mt-0.5 block text-xs leading-snug text-neutral-500 dark:text-neutral-400">{p.description}</span>
+              </button>
+            ))}
+          </div>
+        </section>
 
           <section className="space-y-3">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Body text</h3>
@@ -277,9 +279,9 @@ const DocStyleDialog: React.FC<DocStyleDialogProps> = ({ ydoc, layout, bib, cita
               </select>
             </div>
           </section>
+          <div className="h-16 shrink-0" aria-hidden />
         </div>
-      </div>
-    </div>
+    </aside>
   );
 };
 

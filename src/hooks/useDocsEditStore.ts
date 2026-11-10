@@ -254,20 +254,34 @@ export default function useDocsEditStore(docId: string | undefined): UseDocsEdit
       setYdoc(doc);
       refreshComments(id);
 
-      // On-open snapshot - docs.rs's write_version dedups against the latest existing version, so
-      // this is a no-op on disk (and in the returned list) if nothing changed since the last one.
+      // On-open snapshot and reindex are deferred to idle time so they never block initial
+      // document render or freeze the main thread on large documents.
       dirtySinceVersionRef.current = false;
-      invoke("create_doc_version", { id, bytes: result.bytes })
-        .then(() => refreshVersions(id))
-        .catch((err) => console.error("Failed to snapshot document version on open:", err));
+      const deferTask = (fn: () => void) => {
+        if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+          window.requestIdleCallback(fn, { timeout: 3000 });
+        } else {
+          setTimeout(fn, 1200);
+        }
+      };
 
-      // On-open reindex - the other half of keeping docs_search.rs's FTS5 index current (the
-      // autosave path in flushSave is the other), and also what backfills a doc that predates the
-      // index or was just restored from trash (DocsHome.tsx's own lazy backfill pass would
-      // otherwise be the only thing to pick it up).
-      invoke("index_doc_content", { id, title: result.title, body: extractPlainText(doc.getXmlFragment("default")) }).catch((err) =>
-        console.error("Failed to update search index on open:", err)
-      );
+      deferTask(() => {
+        if (loadGenerationRef.current !== generation) return;
+        // Snapshot version in background
+        invoke("create_doc_version", { id, bytes: result.bytes })
+          .then(() => refreshVersions(id))
+          .catch((err) => console.error("Failed to snapshot document version on open:", err));
+
+        // Reindex in background
+        try {
+          const body = extractPlainText(doc.getXmlFragment("default"));
+          invoke("index_doc_content", { id, title: result.title, body }).catch((err) =>
+            console.error("Failed to update search index on open:", err)
+          );
+        } catch (err) {
+          console.error("Failed to extract plain text for index:", err);
+        }
+      });
     } catch (err) {
       console.error("Failed to load document:", err);
       if (loadGenerationRef.current === generation) setLoadError(err instanceof Error ? err.message : String(err));

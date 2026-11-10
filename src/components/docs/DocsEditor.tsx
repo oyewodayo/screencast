@@ -441,21 +441,30 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
       return !v;
     });
   }, []);
-  // Comments and References share the right-hand slot.
+  // Comments, References, Help, and Document Style share the right-hand slot.
   const toggleComments = useCallback(() => {
     setShowReferences(false);
     setShowHelp(false);
+    setShowStyle(false);
     setShowComments((v) => !v);
   }, []);
   const toggleReferences = useCallback(() => {
     setShowComments(false);
     setShowHelp(false);
+    setShowStyle(false);
     setShowReferences((v) => !v);
   }, []);
   const toggleHelp = useCallback(() => {
     setShowComments(false);
     setShowReferences(false);
+    setShowStyle(false);
     setShowHelp((v) => !v);
+  }, []);
+  const toggleStyle = useCallback(() => {
+    setShowComments(false);
+    setShowReferences(false);
+    setShowHelp(false);
+    setShowStyle((v) => !v);
   }, []);
 
   const menuProps = (id: "export" | "pageSetup") => ({
@@ -610,9 +619,9 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
   // recomputes on it (a top/bottom margin change doesn't resize view.dom, so its ResizeObserver
   // wouldn't notice on its own).
   useEffect(() => {
-    if (!editor) return;
+    if (!editor || store.loading) return;
     editor.commands.setPaginationLayout(page, paginationMargins, layout.columns);
-  }, [editor, page, paginationMargins, layout.columns]);
+  }, [editor, page, paginationMargins, layout.columns, store.loading]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -1106,7 +1115,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         >
           <IoTimeOutline size={20} />
         </button>
-        <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={() => setShowStyle(true)} className={headerIconClass(showStyle)}>
+        <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={toggleStyle} className={headerIconClass(showStyle)}>
           <TbTypography size={20} strokeWidth={1.75} />
         </button>
         <button type="button" data-tip="References" aria-label="References" aria-pressed={showReferences} onClick={toggleReferences} className={headerIconClass(showReferences)}>
@@ -1256,7 +1265,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col print:block">
         <div
           ref={scrollerRef}
-          className={`flex-1 min-h-0 overflow-y-auto px-4 sm:px-8 pb-10 ${showRuler ? "" : "pt-6"} bg-[var(--doc-canvas)] print:h-auto print:overflow-visible print:block print:p-0 print:bg-white`}
+          className={`flex-1 min-h-0 overflow-y-auto [scrollbar-width:thin] px-4 sm:px-8 pb-10 ${showRuler ? "" : "pt-6"} bg-[var(--doc-canvas)] print:h-auto print:overflow-visible print:block print:p-0 print:bg-white`}
         >
           {showRuler && editor && (
             // Sticky inside the scroller and exactly as wide as the page card, so ruler positions
@@ -1375,12 +1384,26 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           <DocHelpPanel
             isJournal={layout.columns === 2 && !!layout.body}
             onApplyJournal={() => applyPaperStyle("journal")}
-            onOpenStyle={() => setShowStyle(true)}
+            onOpenStyle={() => {
+              setShowHelp(false);
+              setShowStyle(true);
+            }}
             onClose={() => setShowHelp(false)}
           />
         )}
         {editor && showReferences && bib.store && (
           <DocReferencesSidebar editor={editor} store={bib.store} entries={bib.entries} style={bib.style} onClose={() => setShowReferences(false)} />
+        )}
+        {showStyle && store.ydoc && bib.store && (
+          <DocStyleDialog
+            ydoc={store.ydoc}
+            layout={layout}
+            bib={bib.store}
+            citationStyle={bib.style}
+            docFonts={docFonts}
+            onMargins={(m) => void store.setPageSetup({ margins: m })}
+            onClose={() => setShowStyle(false)}
+          />
         )}
       </div>
 
@@ -1392,18 +1415,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
             <DocCrossRefPicker editor={editor} mode={picker.mode} onClose={closePicker} />
           )}
         </FloatingPanel>
-      )}
-
-      {showStyle && store.ydoc && bib.store && (
-        <DocStyleDialog
-          ydoc={store.ydoc}
-          layout={layout}
-          bib={bib.store}
-          citationStyle={bib.style}
-          docFonts={docFonts}
-          onMargins={(m) => void store.setPageSetup({ margins: m })}
-          onClose={() => setShowStyle(false)}
-        />
       )}
 
       {signing === "studio" && <DocSignatureStudio onPlace={(sig) => void handleSignaturePlace(sig)} onClose={() => setSigning(null)} />}

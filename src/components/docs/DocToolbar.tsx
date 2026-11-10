@@ -27,7 +27,6 @@ import {
   MdFormatAlignRight,
   MdFormatBold,
   MdFormatClear,
-  MdFormatColorText,
   MdFormatIndentDecrease,
   MdFormatIndentIncrease,
   MdFormatItalic,
@@ -55,7 +54,7 @@ import {
   MdUndo,
   MdBrandingWatermark,
 } from "react-icons/md";
-import { BiHighlight } from "react-icons/bi";
+import { LuHighlighter } from "react-icons/lu";
 import { TbArrowAutofitWidth, TbBooks, TbCheck, TbCornerDownRight, TbFileCertificate, TbLayoutNavbar, TbListDetails, TbMath, TbMathFunction, TbNumbers, TbPhoto, TbQuote, TbSignature, TbTable, TbTableOptions } from "react-icons/tb";
 import { topBlockAt, type TableRules } from "../../utils/docBlockFormat";
 import { CELL_SHADES } from "../../utils/docTableCellShading";
@@ -360,6 +359,31 @@ function renderedFontAtCursor(editor: Editor): string | null {
 
 // ---------------------------------------------------------------------------------------------
 // Controls
+
+const TextColorIcon: React.FC<{ color?: string | null }> = ({ color }) => (
+  <span className="flex flex-col items-center justify-center w-5 h-5 leading-none select-none">
+    <span className="text-[14px] font-bold font-sans tracking-tight leading-none text-neutral-800 dark:text-neutral-100">
+      A
+    </span>
+    <span
+      className="block w-4 h-[3px] mt-[2px] rounded-full transition-colors"
+      style={{ backgroundColor: color ?? "currentColor" }}
+    />
+  </span>
+);
+
+const HighlightColorIcon: React.FC<{ color?: string | null }> = ({ color }) => (
+  <span className="flex flex-col items-center justify-center w-5 h-5 leading-none select-none">
+    <LuHighlighter size={15} className="text-neutral-700 dark:text-neutral-200" />
+    <span
+      className="block w-4 h-[3px] mt-[2px] rounded-full transition-colors"
+      style={{
+        backgroundColor: color ?? "transparent",
+        boxShadow: color ? undefined : "inset 0 0 0 1px currentColor",
+      }}
+    />
+  </span>
+);
 
 const FontSizeControl: React.FC<{ editor: Editor }> = ({ editor }) => {
   const size = currentFontSizePt(editor);
@@ -935,12 +959,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           {...colorMenu("color", "textColor")}
           label={paint?.kind === "color" ? "Stop text colour highlighter (Esc)" : "Text color"}
           triggerClassName={paintTrigger("color", bind("textColor").open)}
-          trigger={
-            <span className="flex flex-col items-center leading-none">
-              <MdFormatColorText size={17} />
-              <span className="block w-4 h-[3px] -mt-px rounded-sm" style={{ backgroundColor: textColor ?? "currentColor" }} />
-            </span>
-          }
+          trigger={<TextColorIcon color={textColor} />}
           className="hidden @xl:block"
         >
           <DocColorPicker
@@ -956,15 +975,7 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
           {...colorMenu("highlight", "highlight")}
           label={paint?.kind === "highlight" ? "Stop highlighter (Esc)" : "Highlight color"}
           triggerClassName={paintTrigger("highlight", bind("highlight").open)}
-          trigger={
-            <span className="flex flex-col items-center leading-none">
-              <BiHighlight size={16} />
-              <span
-                className="block w-4 h-[3px] mt-px rounded-sm"
-                style={{ backgroundColor: highlightColor ?? "transparent", boxShadow: highlightColor ? undefined : "inset 0 0 0 1px currentColor" }}
-              />
-            </span>
-          }
+          trigger={<HighlightColorIcon color={highlightColor} />}
           className="hidden @xl:block"
         >
           <DocColorPicker

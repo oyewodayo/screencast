@@ -266,8 +266,10 @@ export function analysePage(pageNo: number, width: number, height: number, glyph
     if (row) row.push(sg);
     else pageRows.push([sg]);
   }
+  const LEADER_PATTERN = /[.·⋅∙‧…]\s*[.·⋅∙‧…]\s*[.·⋅∙‧…]/;
   const cellsOf = (row: Segment[]) => row.filter((sg) => !isBodyText(sg) && !CAPTION_START.test(segmentText(sg).trim())).sort((a, b) => a.x0 - b.x0);
   const isGridRow = (row: Segment[]) => {
+    if (row.some((sg) => LEADER_PATTERN.test(segmentText(sg)))) return false;
     const cells = cellsOf(row);
     if (cells.length < 2) return false;
     if (cells.length === 2 && EQ_NUMBER.test(segmentText(cells[1]).trim())) return false;
@@ -302,6 +304,7 @@ export function analysePage(pageNo: number, width: number, height: number, glyph
     const hx1 = Math.max(...group[0].map((sg) => sg.x1));
     let k = j + 1;
     while (k < pageRows.length) {
+      if (pageRows[k].some((sg) => LEADER_PATTERN.test(segmentText(sg)))) break;
       const next = sideCells(cellsOf(pageRows[k]), side).filter((sg) => sg.x0 > hx0 - 20 && sg.x1 < hx1 + 20);
       const prevBase = group[group.length - 1][0].base;
       if (next.length === 0) {

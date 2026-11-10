@@ -487,10 +487,17 @@
   padding: 0 0 0.35em 0 !important;
   vertical-align: top;
 }
-.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child {
+/* 3-column contents lists: Label column (cell 1 of 3) */
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child:nth-last-child(3) {
   width: 1%;
   white-space: nowrap;
   padding-right: 0.9em !important;
+}
+/* 2-column contents lists: Title column with integrated label (cell 1 of 2) */
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child:nth-last-child(2) {
+  width: auto;
+  white-space: normal;
+  padding-right: 0 !important;
 }
 .ProseMirror .tableWrapper[data-rules="leaders"] td:last-child {
   width: 1%;
@@ -498,14 +505,17 @@
   vertical-align: bottom;
   padding-left: 0.5em !important;
 }
-.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2) {
+/* Title with dot leaders (cell 2 of 3, or cell 1 of 2) */
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child:nth-last-child(2),
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2):not(:last-child) {
   position: relative;
   /* Keeps the text-over-dots layering inside the cell, under the app's own bars. */
   isolation: isolate;
   overflow: hidden;
   text-align: justify;
 }
-.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2)::after {
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child:nth-last-child(2)::after,
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2):not(:last-child)::after {
   content: ". . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .";
   position: absolute;
   left: 0;
@@ -518,7 +528,8 @@
   letter-spacing: 0.18em;
   pointer-events: none;
 }
-.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2) > p {
+.ProseMirror .tableWrapper[data-rules="leaders"] td:first-child:nth-last-child(2) > p,
+.ProseMirror .tableWrapper[data-rules="leaders"] td:nth-child(2):not(:last-child) > p {
   display: inline;
   position: relative;
   z-index: 1;

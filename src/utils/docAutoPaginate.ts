@@ -113,24 +113,30 @@ function buildTailWidget(height: number): HTMLElement {
   return el;
 }
 
-// Sum of the net vertical shift of every gap widget *currently rendered* at or before `offset`,
-// read straight from the live DOM rather than tracked separately - this is what lets
-// computeDecorations undo the previous pass's own gaps before doing its break-point math, so every
-// pass reasons about the same gap-free coordinate space regardless of what's already been inserted.
-function existingGapHeightBefore(view: EditorView, offset: number): number {
+// Sum of the net vertical shift of every gap widget *currently rendered* at or before `offset`.
+// Pre-measures all gaps in one single batch at the start of the pass rather than querying the DOM
+// in a loop on every block, eliminating tens of thousands of layout thrashing reflows on large documents.
+interface MeasuredGap {
+  pos: number;
+  shift: number;
+}
+
+function measureExistingGaps(view: EditorView): MeasuredGap[] {
   const gaps = view.dom.querySelectorAll<HTMLElement>(".doc-page-gap");
-  let total = 0;
+  const list: MeasuredGap[] = [];
   gaps.forEach((el) => {
     const pos = Number(el.dataset.pos);
-    if (!Number.isNaN(pos) && pos <= offset) {
+    if (!Number.isNaN(pos)) {
       const collapsed = Number(el.dataset.collapsed);
       const offsetBeforeGap = Number.isFinite(collapsed)
         ? collapsed
         : -(parseFloat(getComputedStyle(el).marginBottom) || 0);
-      total += el.getBoundingClientRect().height - offsetBeforeGap;
+      const shift = el.getBoundingClientRect().height - offsetBeforeGap;
+      list.push({ pos, shift });
     }
   });
-  return total;
+  list.sort((a, b) => a.pos - b.pos);
+  return list;
 }
 
 interface PaginationResult {
@@ -220,6 +226,11 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
       signature: `cols:${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left}|${pageCount}|${breaks.join(",")}`,
     };
   }
+
+  if (!view.dom.isConnected || view.dom.offsetHeight === 0) {
+    return { decorations: DecorationSet.empty, pageCount: 1, signature: "disconnected" };
+  }
+
   const contentHeight = pageContentHeightPx(page, margins);
   // Page 1 is shorter by however much deeper its own top margin is.
   const firstExtra = typeof margins.firstTop === "number" ? inToPx(margins.firstTop - margins.top) : 0;
@@ -267,6 +278,12 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
     marginTopPx: number;
   } | null = null;
 
+  // Pre-measure all currently rendered gaps once at the start of this pass:
+  // single DOM query batch, no O(N*G) layout thrashing.
+  const existingGaps = measureExistingGaps(view);
+  let gapIdx = 0;
+  let alreadyShifted = 0;
+
   state.doc.forEach((node, offset) => {
     // view.nodeDOM (not raw DOM child indexing) - this extension's own previously-inserted gap
     // widgets are themselves extra top-level DOM siblings that don't correspond to any doc node,
@@ -274,10 +291,12 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
     const dom = view.nodeDOM(offset);
     if (!(dom instanceof HTMLElement)) return;
 
-    // Normalized back to "as if no gaps existed yet" - the live DOM already reflects whatever this
-    // extension inserted last pass, so the raw rect alone would double-count that on every
-    // subsequent measurement (see existingGapHeightBefore's own comment).
-    const alreadyShifted = existingGapHeightBefore(view, offset);
+    // Advance our pointer through existingGaps in O(1) amortized time
+    while (gapIdx < existingGaps.length && existingGaps[gapIdx].pos <= offset) {
+      alreadyShifted += existingGaps[gapIdx].shift;
+      gapIdx++;
+    }
+
     const rect = dom.getBoundingClientRect();
     const cs = getComputedStyle(dom);
     const marginTopPx = Math.max(0, parseFloat(cs.marginTop) || 0);
@@ -315,7 +334,7 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
       // Keep-with-next, as in Word and LaTeX: a heading never ends a page alone, a table caption
       // stays with its table, a figure with the caption under it - the pair moves together,
       // unless the first of them already starts the page.
-      if (prev && prev.top > pageTop && keepsWithNext(prev.node, node)) {
+      if (prev && prev.top > pageTop + 4 && keepsWithNext(prev.node, node)) {
         addGap(
           prev.offset,
           -1,
@@ -348,7 +367,8 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
   // Layout is part of the signature: gap widgets carry the side margins, so a margin change must
   // redraw them even when every break lands in the same place.
   const layout = `${page.size}-${page.orientation}:${margins.top},${margins.right},${margins.bottom},${margins.left},${margins.firstTop ?? ""}`;
-  return { decorations: DecorationSet.create(state.doc, decorations), signature: `${layout}|${signatureParts.join("|")}` };
+  const pageCount = pageIndex + 1;
+  return { decorations: DecorationSet.create(state.doc, decorations), pageCount, signature: `${layout}|${signatureParts.join("|")}` };
 }
 
 const DocAutoPaginate = Extension.create({
@@ -359,7 +379,7 @@ const DocAutoPaginate = Extension.create({
       setPaginationLayout:
         (page: PageFormat, margins: PageMargins, columns: 1 | 2 = 1) =>
         ({ tr, dispatch }) => {
-          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { page, margins, columns }));
+          if (dispatch) dispatch(tr.setMeta(DocAutoPaginatePluginKey, { page, margins, columns, force: true }));
           return true;
         },
     };
@@ -372,7 +392,7 @@ const DocAutoPaginate = Extension.create({
         state: {
           init: (): PaginationState => ({ page: DEFAULT_PAGE, margins: DEFAULT_MARGINS, columns: 1, decorations: DecorationSet.empty, pageCount: 1 }),
           apply(tr, prev) {
-            const meta = tr.getMeta(DocAutoPaginatePluginKey) as Partial<PaginationState> | undefined;
+            const meta = tr.getMeta(DocAutoPaginatePluginKey) as (Partial<PaginationState> & { force?: boolean }) | undefined;
             if (meta?.page) return { ...prev, page: meta.page, margins: meta.margins ?? prev.margins, columns: meta.columns ?? prev.columns };
             if (meta?.decorations)
               return {
@@ -380,10 +400,6 @@ const DocAutoPaginate = Extension.create({
                 decorations: meta.decorations,
                 pageCount: meta.pageCount ?? meta.decorations.find(undefined, undefined, (spec) => String(spec.key ?? "").startsWith("gap:")).length + 1,
               };
-            // Map existing decorations through the edit so they don't vanish/misplace for the
-            // brief window before the next debounced recompute (triggered by the ResizeObserver
-            // below, since view.dom's own height changes on essentially every edit that matters
-            // here) actually lands.
             if (tr.docChanged) return { ...prev, decorations: prev.decorations.map(tr.mapping, tr.doc) };
             return prev;
           },
@@ -396,39 +412,52 @@ const DocAutoPaginate = Extension.create({
         view(editorView) {
           let frame: number | null = null;
           let lastSignature = "";
-          const scheduleRecompute = () => {
+          let consecutivePasses = 0;
+
+          const scheduleRecompute = (resetPasses = true) => {
+            if (resetPasses) consecutivePasses = 0;
             if (frame !== null) return;
             frame = requestAnimationFrame(() => {
               frame = null;
               const st = DocAutoPaginatePluginKey.getState(editorView.state);
               const result = computeDecorations(editorView, st?.page ?? DEFAULT_PAGE, st?.margins ?? DEFAULT_MARGINS, st?.columns ?? 1);
-              if (result.signature === lastSignature) return;
+              if (result.signature === lastSignature) {
+                consecutivePasses = 0;
+                return;
+              }
               lastSignature = result.signature;
-              editorView.dispatch(editorView.state.tr.setMeta(DocAutoPaginatePluginKey, { decorations: result.decorations, pageCount: result.pageCount }));
-              // New gaps move everything after them; check once more against that layout rather
-              // than relying on the ResizeObserver, which stays silent when the total height
-              // happens not to change. Settles as soon as a pass reproduces the same signature.
-              scheduleRecompute();
+              editorView.dispatch(
+                editorView.state.tr.setMeta(DocAutoPaginatePluginKey, {
+                  decorations: result.decorations,
+                  pageCount: result.pageCount,
+                })
+              );
+              consecutivePasses++;
+              // Check settled layout once more, but cap consecutive passes at 2 to strictly prevent infinite oscillation
+              if (consecutivePasses < 2) {
+                scheduleRecompute(false);
+              }
             });
           };
 
-          // view.dom's own rendered height changes on every reflow that matters here - text
-          // wrapping, an image finishing loading, a table edit, a page-size change re-triggering
-          // layout - so this single observer covers all of those without also needing a separate
-          // per-transaction hook for content edits.
-          const observer = new ResizeObserver(scheduleRecompute);
+          const observer = new ResizeObserver(() => {
+            scheduleRecompute();
+          });
           observer.observe(editorView.dom);
+
+          // Always run initial pagination pass on mount so gaps appear as soon as the document opens
+          scheduleRecompute();
 
           return {
             update(view, prevState) {
-              // A page-size change (meta-only, no docChanged) doesn't itself resize view.dom, so
-              // the ResizeObserver above wouldn't fire for it on its own - catch that case here.
               const prev = DocAutoPaginatePluginKey.getState(prevState);
               const next = DocAutoPaginatePluginKey.getState(view.state);
-              if (prev?.page !== next?.page || prev?.margins !== next?.margins || prev?.columns !== next?.columns) scheduleRecompute();
-              // Two columns: the rows have a fixed height, so an edit that moves a page break
-              // between columns may not resize anything - re-check after every edit (one per frame).
-              else if (next?.columns === 2 && !prevState.doc.eq(view.state.doc)) scheduleRecompute();
+              const meta = view.state.tr.getMeta(DocAutoPaginatePluginKey) as { force?: boolean } | undefined;
+              if (meta?.force || prev?.page !== next?.page || prev?.margins !== next?.margins || prev?.columns !== next?.columns) {
+                scheduleRecompute();
+              } else if (!prevState.doc.eq(view.state.doc)) {
+                scheduleRecompute();
+              }
             },
             destroy() {
               observer.disconnect();
