@@ -39,4 +39,4 @@ Briefcast is a free, open-source desktop app for recording, editing and explaini
 - **[Privacy](privacy.md)**: what stays on your computer, and the optional anonymous statistics.
 - **[Troubleshooting](troubleshooting.md)**: fixes for the problems people run into most.
 
-Briefcast runs on Windows 10 and 11 (64-bit). The source code is at [github.com/oyewodayo/screencast](https://github.com/oyewodayo/screencast).
+Briefcast runs on Windows 10 and 11 (64-bit), macOS 11+ (Apple Silicon & Intel), and 64-bit Linux. The source code is at [github.com/oyewodayo/screencast](https://github.com/oyewodayo/screencast).
