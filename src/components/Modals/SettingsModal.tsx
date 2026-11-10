@@ -12,13 +12,17 @@ import { HandGraphic } from "../AnnotationPointer";
 import AnnotationPreview from "./AnnotationPreview";
 import ColorInput from "../common/ColorInput";
 
-interface SettingsModalProps {
+export type SettingsSectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
+export type SettingsInitialTarget = SettingsSectionKey | "audio" | "shortcuts";
+
+export interface SettingsModalProps {
   onClose: () => void;
   onSave: (settings: AppSettings) => void;
   // Fired after the Briefcast storage folder has actually moved (see the Storage section below) -
   // Dashboard.tsx owns the file list and whichever file is currently open, neither of which this
   // modal has access to, so it can't refresh/invalidate those itself.
   onStorageChanged: () => void;
+  initialSection?: SettingsInitialTarget;
 }
 
 const RECORD_TYPE_OPTIONS: { value: string; label: string; category: "video" | "audio" | "image" }[] = [
@@ -162,7 +166,7 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
+type SectionKey = SettingsSectionKey;
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
@@ -227,10 +231,34 @@ const BulletList: React.FC<{ items: React.ReactNode[] }> = ({ items }) => (
 // doesn't show a mismatched slash direction on Windows.
 const joinDisplayPath = (parent: string, child: string): string => `${parent}${parent.includes("\\") ? "\\" : "/"}${child}`;
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorageChanged }) => {
+const resolveInitialSection = (target?: SettingsInitialTarget): SettingsSectionKey => {
+  if (target === "audio") return "recording";
+  if (target === "shortcuts") return "help";
+  if (target && SECTION_NAV.some((s) => s.key === target)) return target as SettingsSectionKey;
+  return "appearance";
+};
+
+const SettingsModal: React.FC<SettingsModalProps> = ({
+  onClose,
+  onSave,
+  onStorageChanged,
+  initialSection = "appearance",
+}) => {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const { theme, setTheme } = useTheme();
-  const [activeSection, setActiveSection] = useState<SectionKey>("appearance");
+  const [activeSection, setActiveSection] = useState<SettingsSectionKey>(() => resolveInitialSection(initialSection));
+
+  useEffect(() => {
+    if (initialSection) {
+      setActiveSection(resolveInitialSection(initialSection));
+      if (initialSection === "audio") {
+        const timer = setTimeout(() => {
+          document.getElementById("settings-audio-device")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 150);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [initialSection]);
   // "Start Briefcast when I sign in" lives with the OS (services/autostart.rs), not in the settings
   // file, so it's read from there and written back on Save. null until read.
   const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
@@ -661,20 +689,22 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     placeholder="Recording"
                   />
                 </Field>
-                <Field label="Audio device">
-                  <select
-                    className={fieldInputClass}
-                    value={settings.defaultAudioDevice}
-                    onChange={(e) => update("defaultAudioDevice", e.target.value)}
-                  >
-                    <option value="">First detected device</option>
-                    {connectedAudioDevices?.map((device) => (
-                      <option key={device} value={device}>
-                        {device}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <div id="settings-audio-device" className="scroll-mt-6">
+                  <Field label="Audio device">
+                    <select
+                      className={fieldInputClass}
+                      value={settings.defaultAudioDevice}
+                      onChange={(e) => update("defaultAudioDevice", e.target.value)}
+                    >
+                      <option value="">First detected device</option>
+                      {connectedAudioDevices?.map((device) => (
+                        <option key={device} value={device}>
+                          {device}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
                 <Field label="Enhance audio automatically">
                   <input
                     type="checkbox"

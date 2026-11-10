@@ -3887,6 +3887,82 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       });
   };
 
+  // Listen for actions dispatched from EditorMenuBar at the top of the window
+  useEffect(() => {
+    const onEditorAction = (e: Event) => {
+      const tool = (e as CustomEvent<{ tool: string }>).detail?.tool;
+      if (!tool) return;
+      if (tool === "auto-zoom") {
+        void handleDetectAutoZoom();
+      } else if (tool === "silence") {
+        void handleDetectSilence();
+      } else if (tool === "view-switch") {
+        void handleDetectViewSwitch();
+      } else if (tool === "insert-clip") {
+        void handleInsertClipViaPicker();
+      } else if (tool === "add-scene") {
+        void addScene();
+      } else if (tool === "text-overlay") {
+        onToggleArmPlaceText?.();
+      } else if (tool === "captions") {
+        const rect = captionsButtonRef.current?.getBoundingClientRect();
+        setCaptionsAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 120, top: 120 });
+      } else if (tool === "transcript") {
+        const rect = transcriptButtonRef.current?.getBoundingClientRect();
+        setTranscriptAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 140, top: 120 });
+      } else if (tool === "screen-style") {
+        const rect = screenStyleButtonRef.current?.getBoundingClientRect();
+        setScreenStyleAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+      } else if (tool === "elements") {
+        const rect = elementsButtonRef.current?.getBoundingClientRect();
+        setElementsAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 150, top: 120 });
+      } else if (tool === "split-screen") {
+        const rect = splitButtonRef.current?.getBoundingClientRect();
+        setSplitAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 180, top: 120 });
+      } else if (tool === "effects") {
+        if (selectedClipId) {
+          const rect = effectsButtonRef.current?.getBoundingClientRect();
+          setEffectsPopoverAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+        }
+      } else if (tool === "split") {
+        handleSplit();
+      } else if (tool === "delete") {
+        handleDeleteSegment();
+      } else if (tool === "duplicate") {
+        if (selectedClipIds.length > 1) {
+          editStore.duplicateClips(selectedClipIds);
+        } else if (selectedClip) {
+          editStore.duplicateClip(selectedClip.id);
+        }
+      } else if (tool === "select-all") {
+        setSelectedClipIds(editStore.clips.map((c) => c.id));
+      } else if (tool === "flip-horizontal") {
+        if (selectedClip) {
+          updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal });
+        }
+      } else if (tool === "save") {
+        void handleSave();
+      }
+    };
+    window.addEventListener("briefcast:video-tool-trigger", onEditorAction);
+    return () => window.removeEventListener("briefcast:video-tool-trigger", onEditorAction);
+  }, [
+    handleDetectAutoZoom,
+    handleDetectSilence,
+    handleDetectViewSwitch,
+    handleInsertClipViaPicker,
+    addScene,
+    onToggleArmPlaceText,
+    handleSplit,
+    handleDeleteSegment,
+    handleSave,
+    selectedClipId,
+    selectedClipIds,
+    selectedClip,
+    editStore,
+    updateSelectedClips,
+  ]);
+
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
   // timestamp) via whichever clip is currently tracked as active (activeClipIndexRef, clamped
   // into range in case clips changed shape since it was last set). Also the "current output

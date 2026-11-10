@@ -2701,7 +2701,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded-none`}
 			ref={videoContainerRef}
 			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
 			// flyout menus in player.css so a short player scrolls them instead of clipping their top.

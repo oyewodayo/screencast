@@ -49,6 +49,7 @@ import {
 } from "../utils/sidebarFolders";
 import { FileNameText, SidebarRail, SidebarResizeHandle } from "../components/SidebarResize";
 import VideoPlayer, { EditTimeline, VideoPlayerHandle } from "../components/VideoPlayer";
+import EditorMenuBar from "../components/editor/EditorMenuBar";
 import { seekTimeline, timelineTime } from "../utils/timelineTransport";
 import { chapterAtOutputTime, outputChapters } from "../utils/videoChapters";
 import useVideoEditStore from "../hooks/useVideoEditStore";
@@ -125,7 +126,7 @@ import { buildKeyChips, keystrokeStyleOf } from "../utils/keystrokes";
 import { screenContentRect } from "../utils/screenStyle";
 import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
-import SettingsModal from "../components/Modals/SettingsModal";
+import SettingsModal, { SettingsInitialTarget } from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
 import { PhoneTransferHost } from "../components/Modals/PhoneTransferModal";
 import {
@@ -2767,7 +2768,11 @@ const setScreen = () => {
 			setError(`Failed to open video: ${error}`);
 		}
 	};
-	const handleOpenSettings = () => setShowSettings(true);
+	const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsInitialTarget>("appearance");
+	const handleOpenSettings = (initialSection: SettingsInitialTarget = "appearance") => {
+		setSettingsInitialSection(initialSection);
+		setShowSettings(true);
+	};
 	const handleCloseSettings = () => setShowSettings(false);
 	// Settings apply immediately to the current session too, not just future ones — otherwise
 	// saving a new default file extension/type wouldn't visibly do anything until next launch.
@@ -5480,7 +5485,62 @@ const setScreen = () => {
                 </button>
               </div>
             ) : (
-              <VideoPlayer
+              <div className="w-full h-full flex flex-col min-w-0 min-h-0 overflow-hidden bg-black">
+                {isEditingVideo && (
+                  <EditorMenuBar
+                    fileName={selectedFile.name}
+                    filePath={selectedFile.sourcePath}
+                    duration={totalOutputDuration > 0 ? totalOutputDuration : (playerEditTimeline?.duration ?? 0)}
+                    isEdited={editStore.canUndo}
+                    canUndo={editStore.canUndo}
+                    canRedo={editStore.canRedo}
+                    onNewProject={() => setIsNewVideoProjectOpen(true)}
+                    onOpenFile={() => void handleOpenExternalFile()}
+                    onRename={(newName) => void renameFile(selectedFile, newName)}
+                    onConvert={() => setConversionFile(selectedFile)}
+                    onCompress={() => setCompressionFile(selectedFile)}
+                    onMoveOrCopy={() => {
+                      const rect = document.querySelector("[data-docker-menu-trigger]")?.getBoundingClientRect();
+                      setTransferAnchor(rect ? { left: rect.left, top: rect.top - 100 } : { left: 100, top: 100 });
+                    }}
+                    onTransferToPhone={() => openPhoneTransfer([selectedFile])}
+                    onSetThumbnail={() => videoPlayerRef.current?.openThumbnailPicker()}
+                    onShowInFolder={() => void invoke("open_file_from_directory", { filepath: selectedFile.sourcePath })}
+                    onExport={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "save" } }))}
+                    onClose={() => {
+                      setSelectedFile(null);
+                      setDockerMode("record");
+                    }}
+                    onUndo={() => editStore.undo()}
+                    onRedo={() => editStore.redo()}
+                    onSplit={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "split" } }))}
+                    onDelete={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "delete" } }))}
+                    onDuplicate={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "duplicate" } }))}
+                    onSelectAll={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "select-all" } }))}
+                    onFlipHorizontal={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "flip-horizontal" } }))}
+                    onOpenEffects={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "effects" } }))}
+                    onInsertMedia={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "insert-clip" } }))}
+                    onAddAudio={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "insert-clip" } }))}
+                    onAddText={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "text-overlay" } }))}
+                    onAddScene={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "add-scene" } }))}
+                    onAddElements={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "elements" } }))}
+                    onAddStickers={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "elements" } }))}
+                    onAutoZoom={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "auto-zoom" } }))}
+                    onTrimSilence={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "silence" } }))}
+                    onViewSwitches={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "view-switch" } }))}
+                    onCaptions={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "captions" } }))}
+                    onTranscript={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "transcript" } }))}
+                    onScreenStyle={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "screen-style" } }))}
+                    onColorGrade={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "effects" } }))}
+                    onFindShorts={() => setTidyOpen(true)}
+                    onScreenOptions={() => handleOpenSettings("recording")}
+                    onAudioSettings={() => handleOpenSettings("audio")}
+                    onShortcuts={() => handleOpenSettings("help")}
+                    onPreferences={() => handleOpenSettings("appearance")}
+                  />
+                )}
+                <div className="flex-1 min-w-0 min-h-0 relative flex items-center justify-center bg-black">
+                  <VideoPlayer
                 ref={videoPlayerRef}
                 key={selectedFile.path}
                 src={selectedFile.path}
@@ -5811,6 +5871,8 @@ const setScreen = () => {
                 gradeLut={activeGradeLut}
                 onNoiseReductionStatusChange={setNoiseReductionStatus}
               />
+                </div>
+              </div>
             )
           ) : selectedFolder !== null && activeFileCategory === "image" ? (
             <ImageFolderGallery
@@ -6189,7 +6251,14 @@ const setScreen = () => {
       <PhonesHubHost dropHover={phoneHover} />
       <PhoneShelf dragging={shelfDragging} point={shelfAt} />
       <UsbImportHost />
-      {showSettings && <SettingsModal onClose={handleCloseSettings} onSave={handleSettingsSaved} onStorageChanged={handleStorageChanged} />}
+      {showSettings && (
+        <SettingsModal
+          initialSection={settingsInitialSection}
+          onClose={handleCloseSettings}
+          onSave={handleSettingsSaved}
+          onStorageChanged={handleStorageChanged}
+        />
+      )}
       {showPhoneCamera && (
         <PhoneCameraModal
           onClose={() => setShowPhoneCamera(false)}
