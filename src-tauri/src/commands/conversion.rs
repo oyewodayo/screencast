@@ -1110,10 +1110,140 @@ pub async fn get_blank_frame_image(app_handle: AppHandle, width: u32, height: u3
     encode_preview_proxy(ffmpeg_path, args, cache_path).await
 }
 
-// Convert a still image (screenshot) between png/jpeg/webp/bmp. No audio/video codec args
-// apply here - ffmpeg's image2 muxer picks a sane default encoder from the output extension,
-// and run_conversion's duration-based progress just never populates (there's no "Duration:"
-// line for a single frame), which is fine since these finish effectively instantly anyway.
+/// Wraps JPEG bytes in a standard single-page PDF document sized exactly to the image's dimensions.
+pub(crate) fn wrap_jpeg_in_pdf(jpeg_bytes: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    let mut offsets = Vec::new();
+
+    // 1: Catalog
+    offsets.push(out.len());
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // 2: Pages
+    offsets.push(out.len());
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // 3: Page (MediaBox: width x height points at 1px = 1pt)
+    offsets.push(out.len());
+    let page_obj = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\nendobj\n",
+        width, height
+    );
+    out.extend_from_slice(page_obj.as_bytes());
+
+    // 4: Contents stream (places /Im1 at (0, 0) scaled to width x height)
+    offsets.push(out.len());
+    let stream_content = format!("q\n{} 0 0 {} 0 0 cm\n/Im1 Do\nQ\n", width, height);
+    let content_obj = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+        stream_content.len(),
+        stream_content
+    );
+    out.extend_from_slice(content_obj.as_bytes());
+
+    // 5: Image XObject with DCTDecode (native JPEG compression)
+    offsets.push(out.len());
+    let img_header = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+        width, height, jpeg_bytes.len()
+    );
+    out.extend_from_slice(img_header.as_bytes());
+    out.extend_from_slice(jpeg_bytes);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // xref table (each entry exactly 20 bytes per ISO 32000-1)
+    let xref_offset = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+
+    // trailer
+    let trailer = format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        offsets.len() + 1,
+        xref_offset
+    );
+    out.extend_from_slice(trailer.as_bytes());
+
+    out
+}
+
+/// Converts any supported image file (PNG, JPEG, WebP, BMP, etc.) into a standalone PDF document.
+pub(crate) fn convert_image_file_to_pdf(input: &Path, output: &Path) -> Result<(), String> {
+    use image::ImageDecoder;
+
+    let parent = output.parent().unwrap_or_else(|| Path::new(""));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create destination folder: {e}"))?;
+    }
+
+    // Decode with orientation awareness so phone camera EXIF tags are respected
+    let (mut img, orientation) = match image::ImageReader::open(input)
+        .and_then(|reader| reader.with_guessed_format())
+    {
+        Ok(reader) => match reader.into_decoder() {
+            Ok(mut decoder) => {
+                let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+                match image::DynamicImage::from_decoder(decoder) {
+                    Ok(img) => (img, orientation),
+                    Err(_) => (image::open(input).map_err(|e| format!("Failed to decode image: {e}"))?, image::metadata::Orientation::NoTransforms),
+                }
+            }
+            Err(_) => (image::open(input).map_err(|e| format!("Failed to decode image: {e}"))?, image::metadata::Orientation::NoTransforms),
+        },
+        Err(_) => (image::open(input).map_err(|e| format!("Failed to open image: {e}"))?, image::metadata::Orientation::NoTransforms),
+    };
+    img.apply_orientation(orientation);
+
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return Err("Image has zero width or height".to_string());
+    }
+
+    // Composite any transparent alpha over a crisp white background
+    let rgb_image = match &img {
+        image::DynamicImage::ImageRgba8(rgba) => {
+            let mut rgb = image::RgbImage::new(w, h);
+            for (x, y, pixel) in rgba.enumerate_pixels() {
+                let [r, g, b, a] = pixel.0;
+                if a == 255 {
+                    rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+                } else if a == 0 {
+                    rgb.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                } else {
+                    let alpha = a as f32 / 255.0;
+                    let bg = 255.0 * (1.0 - alpha);
+                    let cr = (r as f32 * alpha + bg).round() as u8;
+                    let cg = (g as f32 * alpha + bg).round() as u8;
+                    let cb = (b as f32 * alpha + bg).round() as u8;
+                    rgb.put_pixel(x, y, image::Rgb([cr, cg, cb]));
+                }
+            }
+            rgb
+        }
+        _ => img.to_rgb8(),
+    };
+
+    let mut jpeg_bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 95)
+        .encode(&rgb_image, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("Failed to encode image for PDF: {e}"))?;
+
+    let pdf_bytes = wrap_jpeg_in_pdf(&jpeg_bytes, w, h);
+
+    let tmp_file_name = format!("{}.tmp", output.file_name().unwrap_or_default().to_string_lossy());
+    let tmp = output.with_file_name(tmp_file_name);
+    std::fs::write(&tmp, &pdf_bytes).map_err(|e| format!("Failed to write PDF: {e}"))?;
+    std::fs::rename(&tmp, output).map_err(|e| format!("Failed to save PDF: {e}"))?;
+
+    Ok(())
+}
+
+// Convert a still image (screenshot) between png/jpeg/webp/bmp/pdf.
 #[tauri::command]
 pub async fn convert_image(
     app_handle: AppHandle,
@@ -1130,7 +1260,97 @@ pub async fn convert_image(
         None => input.with_extension(&output_format),
     };
 
-    let codec_args: Vec<&str> = match output_format.to_lowercase().as_str() {
+    let target_format = output_format.to_lowercase();
+
+    // PDF output path
+    if target_format == "pdf" {
+        let final_output = unique_output_path(output);
+        let _ = window.emit(
+            "conversion-progress",
+            ConversionProgress {
+                input_path: input_path.clone(),
+                output_path: final_output.to_string_lossy().to_string(),
+                progress: 0.0,
+                status: ConversionStatus::Starting,
+                message: "Converting image to PDF...".to_string(),
+            },
+        );
+
+        #[cfg(windows)]
+        {
+            let input_ext = input
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            if matches!(input_ext.as_deref(), Some("heic") | Some("heif")) {
+                return convert_heic_windows(
+                    &app_handle,
+                    &window,
+                    &state,
+                    &input,
+                    final_output,
+                    "pdf",
+                    preserve_original,
+                )
+                .await;
+            }
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let input_ext = input
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            if matches!(input_ext.as_deref(), Some("heic") | Some("heif")) {
+                return convert_heic_unix(
+                    &app_handle,
+                    &window,
+                    &state,
+                    &input,
+                    final_output,
+                    "pdf",
+                    preserve_original,
+                )
+                .await;
+            }
+        }
+
+        let result = convert_image_file_to_pdf(&input, &final_output);
+        match result {
+            Ok(()) => {
+                let _ = window.emit(
+                    "conversion-progress",
+                    ConversionProgress {
+                        input_path: input_path.clone(),
+                        output_path: final_output.to_string_lossy().to_string(),
+                        progress: 100.0,
+                        status: ConversionStatus::Completed,
+                        message: "Conversion completed".to_string(),
+                    },
+                );
+                if !preserve_original {
+                    let _ = std::fs::remove_file(&input);
+                }
+                return Ok(final_output.to_string_lossy().to_string());
+            }
+            Err(err) => {
+                let _ = window.emit(
+                    "conversion-progress",
+                    ConversionProgress {
+                        input_path: input_path.clone(),
+                        output_path: String::new(),
+                        progress: 0.0,
+                        status: ConversionStatus::Failed,
+                        message: err.clone(),
+                    },
+                );
+                return Err(err);
+            }
+        }
+    }
+
+    let codec_args: Vec<&str> = match target_format.as_str() {
         "png" | "jpeg" | "jpg" | "webp" | "bmp" => vec![],
         _ => return Err(format!("Unsupported output format: {}", output_format)),
     };
@@ -1234,6 +1454,12 @@ pub(crate) async fn convert_heic_windows(
             crate::services::heic_windows::decode_to_png(input.clone(), final_output.clone())
                 .await?;
             Ok(final_output.to_string_lossy().to_string())
+        } else if format == "pdf" {
+            let temp_png = final_output.with_extension("heic_tmp.png");
+            crate::services::heic_windows::decode_to_png(input.clone(), temp_png.clone()).await?;
+            let res = convert_image_file_to_pdf(&temp_png, &final_output);
+            let _ = std::fs::remove_file(&temp_png);
+            res.map(|_| final_output.to_string_lossy().to_string())
         } else {
             let temp_png = final_output.with_extension("heic_tmp.png");
             crate::services::heic_windows::decode_to_png(input.clone(), temp_png.clone()).await?;
@@ -1277,6 +1503,17 @@ pub(crate) async fn convert_heic_windows(
                     )
                     .await?;
                     Ok(final_output.to_string_lossy().to_string())
+                } else if format == "pdf" {
+                    let temp_png = final_output.with_extension("heic_tmp.png");
+                    crate::services::heif_tool::decode_to_png(
+                        app_handle.clone(),
+                        input.clone(),
+                        temp_png.clone(),
+                    )
+                    .await?;
+                    let res = convert_image_file_to_pdf(&temp_png, &final_output);
+                    let _ = std::fs::remove_file(&temp_png);
+                    res.map(|_| final_output.to_string_lossy().to_string())
                 } else {
                     let temp_png = final_output.with_extension("heic_tmp.png");
                     crate::services::heif_tool::decode_to_png(
@@ -1376,6 +1613,12 @@ pub(crate) async fn convert_heic_unix(
         if format == "png" {
             crate::services::heic_unix::decode_to_png(input.clone(), final_output.clone()).await?;
             Ok(final_output.to_string_lossy().to_string())
+        } else if format == "pdf" {
+            let temp_png = final_output.with_extension("heic_tmp.png");
+            crate::services::heic_unix::decode_to_png(input.clone(), temp_png.clone()).await?;
+            let res = convert_image_file_to_pdf(&temp_png, &final_output);
+            let _ = std::fs::remove_file(&temp_png);
+            res.map(|_| final_output.to_string_lossy().to_string())
         } else {
             let temp_png = final_output.with_extension("heic_tmp.png");
             crate::services::heic_unix::decode_to_png(input.clone(), temp_png.clone()).await?;
@@ -12325,6 +12568,39 @@ mod tests {
         near(at(10, 10), [0.0, 200.0, 0.0], "the wallpaper");
         near(at(160, 120), [200.0, 100.0, 50.0], "the video in the hole");
         near(at(42, 32), [200.0, 100.0, 50.0], "right to the hole's edge");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_wrap_jpeg_in_pdf() {
+        let dummy_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9];
+        let pdf = wrap_jpeg_in_pdf(&dummy_jpeg, 640, 480);
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        let pdf_str = String::from_utf8_lossy(&pdf);
+        assert!(pdf_str.contains("/MediaBox [0 0 640 480]"));
+        assert!(pdf_str.contains("/Width 640 /Height 480"));
+        assert!(pdf_str.contains("/Filter /DCTDecode"));
+    }
+
+    #[test]
+    fn test_convert_image_file_to_pdf() {
+        let tmp = std::env::temp_dir().join("briefcast_test_img_to_pdf");
+        let _ = std::fs::create_dir_all(&tmp);
+        let img_path = tmp.join("test_img.png");
+        let pdf_path = tmp.join("test_img.pdf");
+
+        // Create a 100x80 test PNG image
+        let test_img = image::RgbaImage::from_pixel(100, 80, image::Rgba([120, 180, 240, 255]));
+        test_img.save(&img_path).unwrap();
+
+        let res = convert_image_file_to_pdf(&img_path, &pdf_path);
+        assert!(res.is_ok(), "Image to PDF conversion failed: {:?}", res.err());
+        assert!(pdf_path.exists());
+        let pdf_bytes = std::fs::read(&pdf_path).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-1.4"));
+        assert!(pdf_bytes.ends_with(b"%%EOF\n"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

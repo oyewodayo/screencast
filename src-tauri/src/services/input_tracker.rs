@@ -106,15 +106,15 @@ mod win {
     };
 
 #[derive(Default)]
-struct Modifiers {
-    lctrl: bool,
-    rctrl: bool,
-    lshift: bool,
-    rshift: bool,
-    lalt: bool,
-    ralt: bool,
-    lwin: bool,
-    rwin: bool,
+pub(crate) struct Modifiers {
+    pub(crate) lctrl: bool,
+    pub(crate) rctrl: bool,
+    pub(crate) lshift: bool,
+    pub(crate) rshift: bool,
+    pub(crate) lalt: bool,
+    pub(crate) ralt: bool,
+    pub(crate) lwin: bool,
+    pub(crate) rwin: bool,
 }
 
 struct Ctx {
@@ -272,7 +272,7 @@ impl Ctx {
 
 // The keys of a press worth showing, or None for typing. AltGr (right Alt) types characters on
 // many layouts - nothing typed through it is kept either.
-fn shortcut(m: &Modifiers, vk: u32) -> Option<Vec<String>> {
+pub(crate) fn shortcut(m: &Modifiers, vk: u32) -> Option<Vec<String>> {
     if m.ralt {
         return None;
     }
