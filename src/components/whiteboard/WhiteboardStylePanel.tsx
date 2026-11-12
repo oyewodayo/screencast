@@ -90,6 +90,8 @@ import {
   WhiteboardFillType,
   WhiteboardGradientStop,
   WhiteboardNode,
+  WhiteboardBlendMode,
+  WHITEBOARD_BLEND_MODES,
   DEFAULT_FILL_PATTERN_OPACITY,
   DEFAULT_FILL_PATTERN_SPACING,
   DEFAULT_GRADIENT_ANGLE,
@@ -2826,6 +2828,61 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
               title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
             />
+            <Field label="Blend">
+              <select
+                value={selectedNodes[0].blendMode ?? "normal"}
+                onChange={(e) => updateNodes({ blendMode: e.target.value === "normal" ? undefined : (e.target.value as WhiteboardBlendMode) })}
+                className={`w-full h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
+                title="How this element blends with elements behind it"
+              >
+                <optgroup label="Normal">
+                  <option value="normal">Normal</option>
+                </optgroup>
+                <optgroup label="Darken">
+                  <option value="darken">Darken</option>
+                  <option value="multiply">Multiply</option>
+                  <option value="color-burn">Color Burn</option>
+                </optgroup>
+                <optgroup label="Lighten">
+                  <option value="lighten">Lighten</option>
+                  <option value="screen">Screen</option>
+                  <option value="color-dodge">Color Dodge</option>
+                  <option value="plus-lighter">Add (Plus Lighter)</option>
+                </optgroup>
+                <optgroup label="Contrast">
+                  <option value="overlay">Overlay</option>
+                  <option value="soft-light">Soft Light</option>
+                  <option value="hard-light">Hard Light</option>
+                </optgroup>
+                <optgroup label="Inversion">
+                  <option value="difference">Difference</option>
+                  <option value="exclusion">Exclusion</option>
+                </optgroup>
+                <optgroup label="Component">
+                  <option value="hue">Hue</option>
+                  <option value="saturation">Saturation</option>
+                  <option value="color">Color</option>
+                  <option value="luminosity">Luminosity</option>
+                </optgroup>
+              </select>
+            </Field>
+            <div className="flex items-center gap-1 overflow-x-auto pb-0.5 [scrollbar-width:none]">
+              {(["normal", "multiply", "screen", "overlay", "difference"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => updateNodes({ blendMode: mode === "normal" ? undefined : mode })}
+                  className={`px-2 py-0.5 rounded text-[10px] font-medium transition cursor-pointer capitalize shrink-0 ${
+                    (selectedNodes[0].blendMode ?? "normal") === mode
+                      ? "bg-blue-600 text-white shadow-sm"
+                      : "bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-600 dark:text-neutral-400"
+                  }`}
+                  title={WHITEBOARD_BLEND_MODES.find((m) => m.value === mode)?.hint}
+                >
+                  {mode}
+                </button>
+              ))}
+            </div>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <NudgeBar onNudge={nudgeSelected} />
               <Segmented>
@@ -2906,7 +2963,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         </Section>
       )}
 
-      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
+      {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "text" && n.shapeType !== "latticeGauge") && (
         <Section title={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink" : "Stroke"} dense>
           <ColorField label="Color" value={selectedNodes[0].strokeColor} onChange={(strokeColor) => updateNodes({ strokeColor })} />
           {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a

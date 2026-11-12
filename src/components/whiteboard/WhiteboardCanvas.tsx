@@ -2566,6 +2566,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 transform:
                   [node.rotation ? `rotate(${node.rotation}deg)` : null, node.flipHorizontal ? "scaleX(-1)" : null, node.flipVertical ? "scaleY(-1)" : null].filter(Boolean).join(" ") || undefined,
                 transformOrigin: "center",
+                mixBlendMode: node.blendMode && node.blendMode !== "normal" ? (node.blendMode as React.CSSProperties["mixBlendMode"]) : undefined,
               }}
               onPointerEnter={() => setHoveredNodeId(node.id)}
               onPointerLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
@@ -2680,9 +2681,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
                   // fields are actually used.
                   <BoxShapeBody node={node} paint={paint} />
-                ) : node.shapeType === "text" ? (
-                  isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
-                ) : outline.kind === "cylinder" ? (
+                ) : node.shapeType === "text" ? null : outline.kind === "cylinder" ? (
                   <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                     {paint.defs}
                     <PaintedShape
@@ -3023,7 +3022,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   const textTransform = node.textTransform && node.textTransform !== "none" ? node.textTransform : undefined;
 
                   let textShadow: string | undefined;
-                  let webkitTextStroke: string | undefined;
                   let background: string | undefined;
                   let webkitBackgroundClip: string | undefined;
                   let webkitTextFillColor: string | undefined;
@@ -3033,11 +3031,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     if (node.shadowEnabled) {
                       const shadowRgba = hexToRgba(node.shadowColor ?? "#000000", node.shadowOpacity ?? 0.25);
                       textShadow = `${node.shadowOffsetX ?? 0}px ${node.shadowOffsetY ?? 4}px ${node.shadowBlur ?? 8}px ${shadowRgba}`;
-                    }
-
-                    if (node.strokeWidth > 0) {
-                      const strokeRgba = hexToRgba(node.strokeColor ?? "#000000", node.strokeOpacity ?? 1);
-                      webkitTextStroke = `${node.strokeWidth}px ${strokeRgba}`;
                     }
 
                     const fillType = resolveFillType(node);
@@ -3106,7 +3099,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       <span
                         style={{
                           textShadow,
-                          WebkitTextStroke: webkitTextStroke,
                           background,
                           WebkitBackgroundClip: webkitBackgroundClip,
                           backgroundClip: webkitBackgroundClip,

@@ -229,6 +229,52 @@ export type AxisPlacement = "origin" | "edge" | "box" | "none";
 export type WhiteboardFillType ="solid" | "linear" | "radial" | "image";
 export type WhiteboardFillPattern = "none" | "grid" | "dots" | "lines" | "diagonal";
 
+export type WhiteboardBlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "color-dodge"
+  | "color-burn"
+  | "hard-light"
+  | "soft-light"
+  | "difference"
+  | "exclusion"
+  | "plus-lighter"
+  | "hue"
+  | "saturation"
+  | "color"
+  | "luminosity";
+
+export interface BlendModeOption {
+  value: WhiteboardBlendMode;
+  label: string;
+  category: "Normal" | "Darken" | "Lighten" | "Contrast" | "Inversion" | "Component";
+  hint: string;
+}
+
+export const WHITEBOARD_BLEND_MODES: BlendModeOption[] = [
+  { value: "normal", label: "Normal", category: "Normal", hint: "Standard rendering, covers underlying content" },
+  { value: "darken", label: "Darken", category: "Darken", hint: "Retains the darkest pixels of both layers" },
+  { value: "multiply", label: "Multiply", category: "Darken", hint: "Multiplies colors; white disappears, great for shadows and ink" },
+  { value: "color-burn", label: "Color Burn", category: "Darken", hint: "Darkens base color to reflect blend color with increased contrast" },
+  { value: "lighten", label: "Lighten", category: "Lighten", hint: "Retains the lightest pixels of both layers" },
+  { value: "screen", label: "Screen", category: "Lighten", hint: "Multiplies inverses; black disappears, great for glows and light" },
+  { value: "color-dodge", label: "Color Dodge", category: "Lighten", hint: "Brightens base color to reflect blend color with decreased contrast" },
+  { value: "plus-lighter", label: "Add", category: "Lighten", hint: "Adds color values together for intense, vibrant illumination" },
+  { value: "overlay", label: "Overlay", category: "Contrast", hint: "Combines Multiply and Screen; preserves highlights and shadows" },
+  { value: "soft-light", label: "Soft Light", category: "Contrast", hint: "Subtle, diffused spotlight effect" },
+  { value: "hard-light", label: "Hard Light", category: "Contrast", hint: "Combines Multiply and Screen based on blend color; intense lighting" },
+  { value: "difference", label: "Difference", category: "Inversion", hint: "Subtracts darker color from lighter color; inverts overlapping regions" },
+  { value: "exclusion", label: "Exclusion", category: "Inversion", hint: "Similar to difference with lower contrast" },
+  { value: "hue", label: "Hue", category: "Component", hint: "Preserves luminance and saturation, adopts blend hue" },
+  { value: "saturation", label: "Saturation", category: "Component", hint: "Preserves luminance and hue, adopts blend saturation" },
+  { value: "color", label: "Color", category: "Component", hint: "Preserves luminance, adopts hue and saturation" },
+  { value: "luminosity", label: "Luminosity", category: "Component", hint: "Preserves hue and saturation, adopts luminance" },
+];
+
 export interface WhiteboardGradientStop {
   offset: number; // 0-1
   color: string;
@@ -690,6 +736,8 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   strokeOpacity?: number;
   // Overall node opacity (0-1). Absent - resolves to 1 (solid).
   opacity?: number;
+  // How this node blends with layers underneath it. Absent - "normal".
+  blendMode?: WhiteboardBlendMode;
   // Shadow properties - renders a drop-shadow following the shape's exact silhouette.
   shadowEnabled?: boolean;
   shadowColor?: string;

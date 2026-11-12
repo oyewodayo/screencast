@@ -4505,22 +4505,9 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
 
   ctx.fillStyle = fillStyle;
 
-  // Stroke for text nodes
-  const hasStroke = isTextNode && node.strokeWidth > 0;
-  if (hasStroke) {
-    ctx.strokeStyle = hexToRgba(node.strokeColor ?? "#000000", node.strokeOpacity ?? 1);
-    ctx.lineWidth = node.strokeWidth;
-    if (node.strokeStyle === "dashed") ctx.setLineDash([8, 6]);
-    else if (node.strokeStyle === "dotted") ctx.setLineDash([2, 4]);
-    else ctx.setLineDash([]);
-  }
-
   lines.forEach((line, i) => {
     const lineY = startY + i * lineHeight;
     ctx.fillText(line, textX, lineY);
-    if (hasStroke) {
-      ctx.strokeText(line, textX, lineY);
-    }
     if (node.textDecoration === "underline") {
       const metrics = ctx.measureText(line);
       const underlineY = lineY + node.fontSize * 0.35;
@@ -4712,9 +4699,34 @@ function paintTable(ctx: CanvasRenderingContext2D, node: WhiteboardNode): void {
   }
 }
 
+export function canvasCompositeOperation(blendMode?: string): GlobalCompositeOperation {
+  switch (blendMode) {
+    case "multiply": return "multiply";
+    case "screen": return "screen";
+    case "overlay": return "overlay";
+    case "darken": return "darken";
+    case "lighten": return "lighten";
+    case "color-dodge": return "color-dodge";
+    case "color-burn": return "color-burn";
+    case "hard-light": return "hard-light";
+    case "soft-light": return "soft-light";
+    case "difference": return "difference";
+    case "exclusion": return "exclusion";
+    case "hue": return "hue";
+    case "saturation": return "saturation";
+    case "color": return "color";
+    case "luminosity": return "luminosity";
+    case "plus-lighter": return "lighter";
+    default: return "source-over";
+  }
+}
+
 async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, imageSrcFor?: ImageSrcResolver): Promise<void> {
   ctx.save();
   ctx.translate(node.x, node.y);
+  if (node.blendMode && node.blendMode !== "normal") {
+    ctx.globalCompositeOperation = canvasCompositeOperation(node.blendMode);
+  }
   // Matches WhiteboardCanvas.tsx's own `transform: rotate(deg) scaleX(-1) scaleY(-1); transform-
   // origin: center` - rotate then flip about the box's own center (ctx.rotate called BEFORE
   // ctx.scale, so - per how Canvas2D composes transforms - the flip applies to local points first,
