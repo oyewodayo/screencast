@@ -16,6 +16,7 @@
 
 use tauri::{AppHandle, Manager, WebviewWindow};
 
+#[allow(dead_code)]
 pub const OVERLAY_LABELS: &[&str] = &[
     "recording-overlay",
     "countdown-overlay",
@@ -26,21 +27,11 @@ pub const OVERLAY_LABELS: &[&str] = &[
 
 #[cfg(target_os = "windows")]
 pub fn exclude_window_from_capture(window: &WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY};
-
-    // WDA_EXCLUDEFROMCAPTURE = 0x00000011 (WINDOW_DISPLAY_AFFINITY(17))
-    const WDA_EXCLUDEFROMCAPTURE: WINDOW_DISPLAY_AFFINITY = WINDOW_DISPLAY_AFFINITY(0x00000011);
-
-    let raw_hwnd = window.hwnd().map_err(|e| format!("Window hwnd error: {e}"))?;
-    unsafe {
-        let hwnd = HWND(raw_hwnd.0 as _);
-        if let Err(e) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
-            log::warn!("SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) for {}: {}", window.label(), e);
-            return Err(e.to_string());
-        }
-    }
-    log::debug!("Excluded window '{}' from screen capture", window.label());
+    // Note on Windows: Calling SetWindowDisplayAffinity on transparent/frameless WebView2 windows
+    // (decorations: false, transparent: true) breaks DWM DirectComposition transparency, forces
+    // standard non-client title bar decorations to appear, and makes hidden overlay windows visible.
+    // Therefore, Windows transparent overlays remain untouched to preserve frameless transparency.
+    let _ = window;
     Ok(())
 }
 
@@ -71,6 +62,7 @@ pub fn exclude_window_from_capture(_window: &WebviewWindow) -> Result<(), String
 }
 
 /// Applies capture exclusion to all pre-configured overlay windows in the application.
+#[allow(dead_code)]
 pub fn exclude_overlays_from_capture(app: &AppHandle) {
     for label in OVERLAY_LABELS {
         if let Some(win) = app.get_webview_window(label) {

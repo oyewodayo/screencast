@@ -275,7 +275,6 @@ fn setup(app: &AppHandle) {
     services::phone_transfer::autostart(app.clone());
     services::usb_phone::start(app);
     services::responsiveness::start_ui_watchdog(app);
-    services::window_affinity::exclude_overlays_from_capture(app);
     #[cfg(target_os = "windows")]
     services::webview_recovery::install(app);
     // ffmpeg version and encoders, checked once in the background; the UI asks for the result.
