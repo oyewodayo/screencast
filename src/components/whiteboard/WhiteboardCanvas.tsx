@@ -46,6 +46,11 @@ import {
   WhiteboardPage,
   WhiteboardShapeType,
   resolveNodeFill,
+  resolveFillType,
+  resolveGradientStops,
+  DEFAULT_FILL_PATTERN_SPACING,
+  DEFAULT_FILL_PATTERN_OPACITY,
+  DEFAULT_GRADIENT_ANGLE,
 } from "../../utils/whiteboardTypes";
 import {
   AMP_MINUS_Y_FRAC,
@@ -3012,25 +3017,109 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
                   </div>
                 )}
-                {!isEditing && node.text && node.shapeType !== "equation" && (
-                  <div
-                    className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
-                    style={{
-                      alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
-                      justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
-                      textAlign: node.textAlign,
-                      color: node.fontColor,
-                      fontFamily: node.fontFamily,
-                      fontSize: node.fontSize,
-                      fontWeight: node.fontWeight,
-                      fontStyle: node.fontStyle,
-                      textDecoration: node.textDecoration,
-                      pointerEvents: "none",
-                    }}
-                  >
-                    <span>{node.text}</span>
-                  </div>
-                )}
+                {!isEditing && node.text && node.shapeType !== "equation" && (() => {
+                  const isTextNode = node.shapeType === "text";
+                  const letterSpacing = node.letterSpacing ? `${node.letterSpacing}px` : undefined;
+                  const textTransform = node.textTransform && node.textTransform !== "none" ? node.textTransform : undefined;
+
+                  let textShadow: string | undefined;
+                  let webkitTextStroke: string | undefined;
+                  let background: string | undefined;
+                  let webkitBackgroundClip: string | undefined;
+                  let webkitTextFillColor: string | undefined;
+                  let color: string = node.fillColor ?? node.fontColor;
+
+                  if (isTextNode) {
+                    if (node.shadowEnabled) {
+                      const shadowRgba = hexToRgba(node.shadowColor ?? "#000000", node.shadowOpacity ?? 0.25);
+                      textShadow = `${node.shadowOffsetX ?? 0}px ${node.shadowOffsetY ?? 4}px ${node.shadowBlur ?? 8}px ${shadowRgba}`;
+                    }
+
+                    if (node.strokeWidth > 0) {
+                      const strokeRgba = hexToRgba(node.strokeColor ?? "#000000", node.strokeOpacity ?? 1);
+                      webkitTextStroke = `${node.strokeWidth}px ${strokeRgba}`;
+                    }
+
+                    const fillType = resolveFillType(node);
+                    const pattern = node.fillPattern ?? "none";
+
+                    if (pattern !== "none") {
+                      const spacing = Math.max(4, node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING);
+                      const defaultWidth = pattern === "lines" ? Math.round(spacing * 0.5) : 1;
+                      const lineWidth = Math.max(1, Math.min(spacing, node.fillPatternWidth ?? defaultWidth));
+                      const patColor = hexToRgba(
+                        node.fillPatternColor ?? node.strokeColor ?? node.fontColor ?? "#000000",
+                        node.fillPatternOpacity ?? DEFAULT_FILL_PATTERN_OPACITY
+                      );
+                      const baseFill =
+                        fillType === "solid" && node.fillColor && node.fillColor !== "transparent"
+                          ? hexToRgba(node.fillColor, node.fillOpacity ?? 1)
+                          : "transparent";
+
+                      if (pattern === "lines") {
+                        background = `repeating-linear-gradient(to bottom, ${patColor} 0px, ${patColor} ${lineWidth}px, ${baseFill} ${lineWidth}px, ${baseFill} ${spacing}px)`;
+                      } else if (pattern === "grid") {
+                        background = `repeating-linear-gradient(to right, ${patColor} 0px, ${patColor} ${lineWidth}px, transparent ${lineWidth}px, transparent ${spacing}px), repeating-linear-gradient(to bottom, ${patColor} 0px, ${patColor} ${lineWidth}px, ${baseFill} ${lineWidth}px, ${baseFill} ${spacing}px)`;
+                      } else if (pattern === "diagonal") {
+                        background = `repeating-linear-gradient(45deg, ${patColor} 0px, ${patColor} ${lineWidth}px, ${baseFill} ${lineWidth}px, ${baseFill} ${spacing}px)`;
+                      } else if (pattern === "dots") {
+                        const r = Math.max(1, spacing * 0.08);
+                        background = `radial-gradient(circle, ${patColor} ${r}px, ${baseFill} ${r}px) 0 0 / ${spacing}px ${spacing}px`;
+                      }
+                      webkitBackgroundClip = "text";
+                      webkitTextFillColor = "transparent";
+                    } else if (fillType === "linear") {
+                      const stops = resolveGradientStops(node);
+                      const stopsCss = stops.map((s) => `${s.color} ${Math.round(s.offset * 100)}%`).join(", ");
+                      background = `linear-gradient(${node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE}deg, ${stopsCss})`;
+                      webkitBackgroundClip = "text";
+                      webkitTextFillColor = "transparent";
+                    } else if (fillType === "radial") {
+                      const stops = resolveGradientStops(node);
+                      const stopsCss = stops.map((s) => `${s.color} ${Math.round(s.offset * 100)}%`).join(", ");
+                      background = `radial-gradient(circle, ${stopsCss})`;
+                      webkitBackgroundClip = "text";
+                      webkitTextFillColor = "transparent";
+                    } else {
+                      const op = node.fillOpacity ?? 1;
+                      color = op < 1 ? hexToRgba(node.fillColor ?? node.fontColor, op) : (node.fillColor ?? node.fontColor);
+                    }
+                  }
+
+                  return (
+                    <div
+                      className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
+                      style={{
+                        alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                        justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                        textAlign: node.textAlign,
+                        fontFamily: node.fontFamily,
+                        fontSize: node.fontSize,
+                        fontWeight: node.fontWeight,
+                        fontStyle: node.fontStyle,
+                        textDecoration: node.textDecoration,
+                        letterSpacing,
+                        textTransform,
+                        pointerEvents: "none",
+                      }}
+                    >
+                      <span
+                        style={{
+                          textShadow,
+                          WebkitTextStroke: webkitTextStroke,
+                          background,
+                          WebkitBackgroundClip: webkitBackgroundClip,
+                          backgroundClip: webkitBackgroundClip,
+                          WebkitTextFillColor: webkitTextFillColor,
+                          color: webkitTextFillColor ? undefined : color,
+                          display: "inline-block",
+                        }}
+                      >
+                        {node.text}
+                      </span>
+                    </div>
+                  );
+                })()}
                 {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
                   <div className="absolute inset-0 flex items-center justify-center text-neutral-400 text-xs pointer-events-none">
                     {node.shapeType === "equation" ? "Double-click to type LaTeX" : "Double-click to type"}
@@ -3057,6 +3146,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     fontWeight: node.fontWeight,
                     fontStyle: node.fontStyle,
                     textDecoration: node.textDecoration,
+                    letterSpacing: node.letterSpacing ? `${node.letterSpacing}px` : undefined,
+                    textTransform: node.textTransform && node.textTransform !== "none" ? node.textTransform : undefined,
                     cursor: "text",
                   }}
                   onPointerDown={(e) => e.stopPropagation()}

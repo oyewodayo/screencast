@@ -108,11 +108,19 @@ export function nodeFillPaint(node: WhiteboardNode, imageSrc: string | null): Fi
   let patternDef: React.ReactNode = null;
   if (pattern !== "none") {
     const spacing = Math.max(4, node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING);
+    const defaultWidth = pattern === "lines" && node.shapeType === "text" ? Math.round(spacing * 0.5) : 1;
+    const lineWidth = Math.max(1, Math.min(spacing, node.fillPatternWidth ?? defaultWidth));
     const tile = fillPatternTile(pattern, spacing);
     const color = node.fillPatternColor ?? node.strokeColor;
     patternDef = (
       <pattern id={patternId} patternUnits="userSpaceOnUse" x={0} y={0} width={spacing} height={spacing}>
-        {tile.dots ? <path d={tile.d} fill={color} /> : <path d={tile.d} fill="none" stroke={color} strokeWidth={1} />}
+        {tile.dots ? (
+          <path d={tile.d} fill={color} />
+        ) : pattern === "lines" ? (
+          <rect x={0} y={0} width={spacing} height={lineWidth} fill={color} />
+        ) : (
+          <path d={tile.d} fill="none" stroke={color} strokeWidth={lineWidth} />
+        )}
       </pattern>
     );
   }

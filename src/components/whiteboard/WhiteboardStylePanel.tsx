@@ -42,6 +42,7 @@ import {
   TbStackBack,
   TbStackFront,
   TbUnderline,
+  TbSparkles,
 } from "react-icons/tb";
 import { ColormapName, COLORMAP_NAMES, colormapPalette, DEFAULT_COLORMAP } from "../../utils/colormaps";
 import {
@@ -165,8 +166,13 @@ import ColorInput from "../common/ColorInput";
 
 const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
   { label: "Sans", value: "system-ui, sans-serif" },
+  { label: "Slab Serif (IBM / Rockwell)", value: "'Rockwell', 'Roboto Slab', 'Courier New', serif" },
+  { label: "Heavy / Impact", value: "'Impact', 'Arial Black', sans-serif" },
+  { label: "Geometric Sans", value: "'Montserrat', 'Helvetica Neue', 'Arial', sans-serif" },
+  { label: "Tech / Modern", value: "'Orbitron', 'JetBrains Mono', monospace" },
   { label: "Serif", value: "Georgia, 'Times New Roman', serif" },
   { label: "Monospace", value: "'Courier New', monospace" },
+  { label: "Display", value: "'Playfair Display', Georgia, serif" },
   { label: "Rounded", value: "'Trebuchet MS', sans-serif" },
   { label: "Casual", value: "'Comic Sans MS', cursive" },
 ];
@@ -2196,6 +2202,20 @@ function FillControls({
             onCommit={(n) => updateNodes({ fillPatternSpacing: n })}
             onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillPatternSpacing: n })}
           />
+          {(pattern === "lines" || pattern === "diagonal" || pattern === "grid") && (
+            <SliderField
+              label={pattern === "lines" ? "Stripe width" : "Line width"}
+              resetKey={`fpw-${ids}`}
+              value={node.fillPatternWidth ?? (pattern === "lines" && node.shapeType === "text" ? Math.round((node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING) * 0.5) : 1)}
+              min={1}
+              max={node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING}
+              sliderMax={Math.min(60, node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING)}
+              step={0.5}
+              onCommit={(n) => updateNodes({ fillPatternWidth: n })}
+              onPreview={(n) => onPreviewNodes?.(n === null ? null : { fillPatternWidth: n })}
+              title="Thickness of pattern lines or stripes"
+            />
+          )}
         </>
       )}
     </>
@@ -2754,8 +2774,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   // images keep the plain color well: their "fill" is bar color / cell background / letterbox matte,
   // where a gradient or a photo has no sensible meaning.
   const canPaintFill = (n: WhiteboardNode) =>
-    !["text", "freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
-  const hasFill = selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
+    !["freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
+  const hasFill = selectedNodes.some((n) => n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
   const ids = selectedNodes.map((n) => n.id).join(",");
   const allLocked =
     selectedNodes.length > 0
@@ -4015,7 +4035,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               />
             </div>
           </div>
-          <ColorField label="Color" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor })} />
+          <ColorField label="Color" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor, fillColor: fontColor })} />
           <div className="flex items-center justify-between gap-1.5">
             {selectedNodes.every((n) => n.shapeType !== "equation") && (
               <Segmented>
@@ -4059,6 +4079,67 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               ))}
             </Segmented>
           </Field>
+          {selectedNodes.every((n) => n.shapeType !== "equation") && (
+            <>
+              <SliderField
+                label="Letter spacing"
+                resetKey={`ls-${ids}`}
+                value={selectedNodes[0].letterSpacing ?? 0}
+                min={-5}
+                max={50}
+                step={0.5}
+                onCommit={(letterSpacing) => updateNodes({ letterSpacing: letterSpacing === 0 ? undefined : letterSpacing })}
+                onPreview={(letterSpacing) => onPreviewNodes?.(letterSpacing === null ? null : { letterSpacing })}
+                title="Character spacing (tracking) in pixels"
+              />
+              <Field label="Case">
+                <Segmented>
+                  {(["none", "uppercase", "lowercase", "capitalize"] as const).map((c) => (
+                    <SegmentButton
+                      key={c}
+                      active={(selectedNodes[0].textTransform ?? "none") === c}
+                      onClick={() => updateNodes({ textTransform: c === "none" ? undefined : c })}
+                      title={c === "none" ? "Original case" : c === "uppercase" ? "UPPERCASE" : c === "lowercase" ? "lowercase" : "Capitalize"}
+                    >
+                      <span className="text-[11px] font-medium">
+                        {c === "none" ? "Aa" : c === "uppercase" ? "AA" : c === "lowercase" ? "aa" : "A-a"}
+                      </span>
+                    </SegmentButton>
+                  ))}
+                </Segmented>
+              </Field>
+            </>
+          )}
+          {selectedNodes.some((n) => n.shapeType === "text") && (
+            <div className="pt-2 border-t border-black/5 dark:border-white/5 flex flex-col gap-1.5">
+              <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">Logo Preset</span>
+              <button
+                type="button"
+                onClick={() =>
+                  updateNodes({
+                    text: selectedNodes[0].text?.trim() ? selectedNodes[0].text : "IBM",
+                    fontFamily: "'Rockwell', 'Roboto Slab', 'Courier New', serif",
+                    fontWeight: "bold",
+                    textTransform: "uppercase",
+                    letterSpacing: 4,
+                    fillType: "solid",
+                    fillColor: "#000000",
+                    fontColor: "#000000",
+                    fillPattern: "lines",
+                    fillPatternSpacing: 14,
+                    fillPatternWidth: 7,
+                    fillPatternColor: "#000000",
+                    fillPatternOpacity: 1,
+                  })
+                }
+                className="w-full flex items-center justify-center gap-1.5 h-7 px-2 rounded-[6px] bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-800 dark:text-neutral-200 text-[11px] font-medium transition cursor-pointer"
+                title="Apply iconic 8-bar horizontal stripe logo style"
+              >
+                <TbSparkles size={13} className="text-amber-500" />
+                <span>IBM 8-Bar Logo Preset</span>
+              </button>
+            </div>
+          )}
         </Section>
       )}
 

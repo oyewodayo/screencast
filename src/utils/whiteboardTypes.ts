@@ -679,6 +679,9 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   fillPatternOpacity?: number;
   // Distance between pattern lines/dots in document units. Absent - DEFAULT_FILL_PATTERN_SPACING.
   fillPatternSpacing?: number;
+  // Stripe width / line thickness for "lines", "diagonal", "grid" patterns in document units.
+  // Absent - resolves to Math.round(spacing * 0.5) for "lines" on text or 1 for other patterns/shapes.
+  fillPatternWidth?: number;
   strokeColor: string;
   strokeWidth: number;
   // Border line style: "solid" (default), "dashed" (8,6), or "dotted" (round dots).
@@ -1123,6 +1126,8 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   fontWeight: "normal" | "bold";
   fontStyle: "normal" | "italic";
   textDecoration: "none" | "underline";
+  letterSpacing?: number;
+  textTransform?: "none" | "uppercase" | "lowercase" | "capitalize";
   textAlign: "left" | "center" | "right";
   verticalAlign: "top" | "middle" | "bottom";
   // "freehand" only - the stroke's points, each a fraction (0-1) of this node's own width/height

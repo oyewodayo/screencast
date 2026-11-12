@@ -4395,14 +4395,30 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
   ctx.beginPath();
   ctx.rect(0, 0, node.width, node.height);
   ctx.clip();
-  ctx.fillStyle = node.fontColor;
+
+  if (node.letterSpacing) {
+    try {
+      (ctx as any).letterSpacing = `${node.letterSpacing}px`;
+    } catch {
+      // safe fallback if unsupported
+    }
+  }
+
+  let rawText = node.text;
+  if (node.textTransform === "uppercase") rawText = rawText.toUpperCase();
+  else if (node.textTransform === "lowercase") rawText = rawText.toLowerCase();
+  else if (node.textTransform === "capitalize") {
+    rawText = rawText.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  const isTextNode = node.shapeType === "text";
   const fontStyle = node.fontStyle === "italic" ? "italic " : "";
   const fontWeight = node.fontWeight === "bold" ? "bold " : "";
   ctx.font = `${fontStyle}${fontWeight}${node.fontSize}px ${node.fontFamily || "system-ui, sans-serif"}`;
   ctx.textAlign = node.textAlign;
   ctx.textBaseline = "middle";
   const paddingX = 8;
-  const lines = wrapTextToWidth(ctx, node.text, node.width - paddingX * 2);
+  const lines = wrapTextToWidth(ctx, rawText, node.width - paddingX * 2);
   const lineHeight = node.fontSize * 1.25;
   const totalHeight = lines.length * lineHeight;
   const startY =
@@ -4412,15 +4428,105 @@ function paintNodeText(ctx: CanvasRenderingContext2D, node: WhiteboardNode): voi
       ? node.height - totalHeight + lineHeight / 2 - 4
       : node.height / 2 - totalHeight / 2 + lineHeight / 2;
   const textX = node.textAlign === "left" ? paddingX : node.textAlign === "right" ? node.width - paddingX : node.width / 2;
+
+  // Shadow for text nodes
+  if (isTextNode && node.shadowEnabled) {
+    ctx.shadowColor = hexToRgba(node.shadowColor ?? "#000000", node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY);
+    ctx.shadowBlur = node.shadowBlur ?? 8;
+    ctx.shadowOffsetX = node.shadowOffsetX ?? 0;
+    ctx.shadowOffsetY = node.shadowOffsetY ?? 4;
+  }
+
+  // Fill style
+  const fillType = resolveFillType(node);
+  const pattern = node.fillPattern ?? "none";
+  let fillStyle: string | CanvasGradient | CanvasPattern = node.fontColor;
+
+  if (isTextNode) {
+    if (pattern !== "none") {
+      const spacing = Math.max(4, node.fillPatternSpacing ?? DEFAULT_FILL_PATTERN_SPACING);
+      const defaultWidth = pattern === "lines" ? Math.round(spacing * 0.5) : 1;
+      const lineWidth = Math.max(1, Math.min(spacing, node.fillPatternWidth ?? defaultWidth));
+      const patCanvas = document.createElement("canvas");
+      patCanvas.width = spacing;
+      patCanvas.height = spacing;
+      const pctx = patCanvas.getContext("2d");
+      if (pctx) {
+        const patColor = node.fillPatternColor ?? node.strokeColor ?? node.fontColor ?? "#000000";
+        const patAlpha = Math.max(0, Math.min(1, node.fillPatternOpacity ?? DEFAULT_FILL_PATTERN_OPACITY));
+        pctx.fillStyle = hexToRgba(patColor, patAlpha);
+        pctx.strokeStyle = hexToRgba(patColor, patAlpha);
+        if (pattern === "lines") {
+          pctx.fillRect(0, 0, spacing, lineWidth);
+        } else if (pattern === "grid") {
+          pctx.lineWidth = lineWidth;
+          pctx.beginPath();
+          pctx.moveTo(0.5, 0);
+          pctx.lineTo(0.5, spacing);
+          pctx.moveTo(0, 0.5);
+          pctx.lineTo(spacing, 0.5);
+          pctx.stroke();
+        } else if (pattern === "diagonal") {
+          pctx.lineWidth = lineWidth;
+          pctx.beginPath();
+          pctx.moveTo(0, spacing);
+          pctx.lineTo(spacing, 0);
+          pctx.moveTo(-spacing / 2, spacing / 2);
+          pctx.lineTo(spacing / 2, -spacing / 2);
+          pctx.moveTo(spacing / 2, spacing * 1.5);
+          pctx.lineTo(spacing * 1.5, spacing / 2);
+          pctx.stroke();
+        } else if (pattern === "dots") {
+          const r = Math.max(0.9, spacing * 0.07);
+          pctx.beginPath();
+          pctx.arc(spacing / 2, spacing / 2, r, 0, Math.PI * 2);
+          pctx.fill();
+        }
+        const createdPat = ctx.createPattern(patCanvas, "repeat");
+        if (createdPat) fillStyle = createdPat;
+      }
+    } else if (fillType === "linear") {
+      const p = linearGradientPoints(node.width, node.height, node.fillGradientAngle ?? DEFAULT_GRADIENT_ANGLE);
+      const grad = ctx.createLinearGradient(p.x1, p.y1, p.x2, p.y2);
+      const stops = resolveGradientStops(node);
+      stops.forEach((s) => grad.addColorStop(s.offset, s.color));
+      fillStyle = grad;
+    } else if (fillType === "radial") {
+      const grad = ctx.createRadialGradient(node.width / 2, node.height / 2, 0, node.width / 2, node.height / 2, Math.max(node.width, node.height) / 2);
+      const stops = resolveGradientStops(node);
+      stops.forEach((s) => grad.addColorStop(s.offset, s.color));
+      fillStyle = grad;
+    } else {
+      const baseColor = node.fillColor ?? node.fontColor;
+      const op = node.fillOpacity ?? 1;
+      fillStyle = op < 1 ? hexToRgba(baseColor, op) : baseColor;
+    }
+  }
+
+  ctx.fillStyle = fillStyle;
+
+  // Stroke for text nodes
+  const hasStroke = isTextNode && node.strokeWidth > 0;
+  if (hasStroke) {
+    ctx.strokeStyle = hexToRgba(node.strokeColor ?? "#000000", node.strokeOpacity ?? 1);
+    ctx.lineWidth = node.strokeWidth;
+    if (node.strokeStyle === "dashed") ctx.setLineDash([8, 6]);
+    else if (node.strokeStyle === "dotted") ctx.setLineDash([2, 4]);
+    else ctx.setLineDash([]);
+  }
+
   lines.forEach((line, i) => {
     const lineY = startY + i * lineHeight;
     ctx.fillText(line, textX, lineY);
+    if (hasStroke) {
+      ctx.strokeText(line, textX, lineY);
+    }
     if (node.textDecoration === "underline") {
       const metrics = ctx.measureText(line);
       const underlineY = lineY + node.fontSize * 0.35;
       const startX = node.textAlign === "left" ? textX : node.textAlign === "right" ? textX - metrics.width : textX - metrics.width / 2;
       ctx.save();
-      ctx.strokeStyle = node.fontColor;
+      ctx.strokeStyle = typeof fillStyle === "string" ? fillStyle : node.fontColor;
       ctx.lineWidth = Math.max(1, node.fontSize / 16);
       ctx.beginPath();
       ctx.moveTo(startX, underlineY);
