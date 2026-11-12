@@ -337,5 +337,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         services::screen_blur::screen_blur_configure,
         services::screen_blur::screen_blur_toggle_window,
         services::screen_blur::screen_blur_ocr_language,
+        services::window_affinity::exclude_from_screen_capture,
+        services::macos_permissions::check_macos_permissions,
+        services::macos_permissions::open_macos_permission_settings,
     ]
 }

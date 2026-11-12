@@ -73,7 +73,7 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
           urlRef.current = url;
           setState((s) => (s.phase === "needs-engine" || s.phase === "error" ? s : { ...s, phase: "running", frameUrl: url }));
         }
-        if (tick++ % 15 === 0) {
+        if (tick++ % 30 === 0) {
           const status = await invoke<{ engine: string; fps: number } | null>("camera_effect_status");
           if (live && status) {
             if (status.engine.startsWith("error")) setState({ phase: "error", frameUrl: null, message: status.engine.slice(7) });
@@ -83,7 +83,7 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
       } catch {
         // The feed isn't up yet.
       }
-      if (live) timer = window.setTimeout(poll, 66);
+      if (live) timer = window.setTimeout(poll, 30);
     };
     void poll();
     return () => {

@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { WindowInfo, MonitorInfo, CaptureCapabilities } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
+import LiveMicMeter from "./LiveMicMeter";
 import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type CameraBackgroundPref } from "../utils/appSettings";
 import { backgroundRemovalStatus, downloadBackgroundEngine } from "../utils/backgroundRemoval";
@@ -1052,7 +1053,10 @@ const EnhancedScreenOptions = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {hasMic && (
                     <div>
-                        <SectionLabel>Microphone</SectionLabel>
+                        <div className="flex items-center justify-between mb-1">
+                            <SectionLabel>Microphone</SectionLabel>
+                            <LiveMicMeter audioDevice={audioDevice} />
+                        </div>
                         <select className={selectClass} value={audioDevice} onChange={(e) => onAudioDeviceChange(e.target.value)}>
                             {connectedAudioDevices && connectedAudioDevices.length > 0 ? (
                                 connectedAudioDevices.map((d) => (

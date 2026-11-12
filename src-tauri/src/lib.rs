@@ -107,6 +107,8 @@ pub(crate) mod services {
     // The tray icon the closed window hides to - see the module's own comment.
     pub mod tray;
     pub mod utility;
+    pub mod window_affinity;
+    pub mod macos_permissions;
     pub mod whisper_model;
     // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
     pub mod tts;
@@ -273,6 +275,7 @@ fn setup(app: &AppHandle) {
     services::phone_transfer::autostart(app.clone());
     services::usb_phone::start(app);
     services::responsiveness::start_ui_watchdog(app);
+    services::window_affinity::exclude_overlays_from_capture(app);
     #[cfg(target_os = "windows")]
     services::webview_recovery::install(app);
     // ffmpeg version and encoders, checked once in the background; the UI asks for the result.

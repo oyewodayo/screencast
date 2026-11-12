@@ -261,7 +261,7 @@ fn run_matting(s: &Shared, dir: &std::path::Path, model: &std::path::Path, w: us
     use ort::session::Session;
     use ort::value::Tensor;
     let env = ort_environment(dir)?;
-    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 4);
+    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).clamp(2, 6);
     let cpu = Session::builder(env).and_then(|b| b.with_intra_threads(threads).map_err(|e| e.into())).and_then(|mut b| b.commit_from_file(model)).map_err(|e| e.to_string())?;
     // A GPU session only where there is a path to one (DirectML on Windows) - elsewhere it would be a
     // second copy of the CPU one.
@@ -349,6 +349,8 @@ fn composite_frames(s: &Shared, w: usize, h: usize) {
     let (mut bg, mut tmp, mut out) = (vec![0u8; plane * 3], vec![0u8; plane * 3], vec![0u8; plane * 3]);
     let mut last_seq = 0u64;
     let mut last_preview = Instant::now() - Duration::from_secs(1);
+    let mut comp_frames = 0u32;
+    let mut comp_since = Instant::now();
     while !s.stop.load(Ordering::SeqCst) {
         let next = s.latest.lock().unwrap().as_ref().filter(|(seq, _)| *seq != last_seq).cloned();
         let (Some((seq, frame)), Some(alpha)) = (next, s.alpha.lock().unwrap().clone()) else {
@@ -364,10 +366,19 @@ fn composite_frames(s: &Shared, w: usize, h: usize) {
         pixel_convert::composite_over(&frame, &alpha, &bg, &mut out);
         let composed = Arc::new(out.clone());
         *s.composed.lock().unwrap() = Some(composed.clone());
-        if last_preview.elapsed() >= Duration::from_millis(66) {
+        comp_frames += 1;
+        if comp_since.elapsed() >= Duration::from_secs(1) {
+            let mut st = s.status.lock().unwrap();
+            if !st.engine.is_empty() && !st.engine.starts_with("error") {
+                st.fps = (comp_frames as f64 / comp_since.elapsed().as_secs_f64()).round().min(30.0);
+            }
+            comp_frames = 0;
+            comp_since = Instant::now();
+        }
+        if last_preview.elapsed() >= Duration::from_millis(30) {
             last_preview = Instant::now();
             let mut jpeg = Vec::new();
-            if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 82).encode(&composed, w as u32, h as u32, image::ExtendedColorType::Rgb8).is_ok() {
+            if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 78).encode(&composed, w as u32, h as u32, image::ExtendedColorType::Rgb8).is_ok() {
                 *s.preview_jpeg.lock().unwrap() = Some(jpeg);
             }
         }

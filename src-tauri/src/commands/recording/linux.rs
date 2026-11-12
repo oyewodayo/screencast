@@ -318,6 +318,46 @@ pub async fn recording_with_output_sva(
     ))?);
 
     let has_camera_overlay = !form_data.video_devices.is_empty();
+    let separate_webcam_capture = has_camera_overlay
+        && form_data.separate_webcam_capture
+        && form_data.video_devices.len() == 1;
+
+    if separate_webcam_capture {
+        let webcam_path = super::webcam_sidecar_path(output_path);
+        let camera_device = &form_data.video_devices[0];
+        let camera_args = camera_input_args(camera_device, &map_overlay_size(&form_data.overlay_size))?;
+
+        let mut args: Vec<String> = vec![
+            "-f".to_string(),
+            "x11grab".to_string(),
+            "-framerate".to_string(),
+            resolved_framerate(form_data, 30).to_string(),
+        ];
+        args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+        args.extend(camera_args);
+
+        let mic_input_index = 2;
+        args.extend(vec![
+            "-f".to_string(),
+            "pulse".to_string(),
+            "-i".to_string(),
+            form_data.audio_device.clone(),
+        ]);
+
+        // Output 1: Screen (+ mic audio)
+        args.extend(vec!["-map".to_string(), "0:v".to_string()]);
+        args.extend(vec!["-map".to_string(), format!("{mic_input_index}:a")]);
+        args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+        args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+        args.push(path_to_str(output_path)?.to_string());
+
+        // Output 2: Webcam alone, for post-recording PiP editing
+        args.extend(vec!["-map".to_string(), "1:v".to_string()]);
+        args.extend(codec_args_for_ext_hw("mp4", &ffmpeg_path));
+        args.push(path_to_str(&webcam_path)?.to_string());
+
+        return spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await;
+    }
     if has_camera_overlay {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_camera_overlay_args(app_handle, &mut args, form_data)?;

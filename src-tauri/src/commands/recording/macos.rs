@@ -407,6 +407,57 @@ pub async fn recording_with_output_sva(
         None
     };
 
+    let separate_webcam_capture = has_camera_overlay
+        && form_data.separate_webcam_capture
+        && form_data.video_devices.len() == 1;
+
+    if separate_webcam_capture {
+        let webcam_path = super::webcam_sidecar_path(output_path);
+        let camera_device = &form_data.video_devices[0];
+        let camera_index = find_index(&video_devices, camera_device)
+            .ok_or_else(|| format!("Camera '{}' not found", camera_device))?;
+
+        let mut args: Vec<String> = vec![
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-capture_cursor".to_string(),
+            "1".to_string(),
+            "-framerate".to_string(),
+            resolved_framerate(form_data, 30).to_string(),
+            "-i".to_string(),
+            av_input_spec(Some(screen_index), None),
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-framerate".to_string(),
+            resolved_framerate(form_data, 30).to_string(),
+            "-i".to_string(),
+            av_input_spec(Some(camera_index), None),
+        ];
+        if let Some(index) = audio_index {
+            args.extend(vec![
+                "-f".to_string(),
+                "avfoundation".to_string(),
+                "-i".to_string(),
+                av_input_spec(None, Some(index)),
+            ]);
+        }
+
+        // Output 1: Screen (+ mic audio if present)
+        args.extend(vec!["-map".to_string(), "0:v".to_string()]);
+        if audio_index.is_some() {
+            args.extend(vec!["-map".to_string(), "2:a".to_string()]);
+        }
+        args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
+        args.push(path_to_str(output_path)?.to_string());
+
+        // Output 2: Webcam alone, for post-recording PiP editing
+        args.extend(vec!["-map".to_string(), "1:v".to_string()]);
+        args.extend(codec_args_for_ext_hw("mp4", &ffmpeg_path));
+        args.push(path_to_str(&webcam_path)?.to_string());
+
+        return spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await;
+    }
+
     let mut args = if has_camera_overlay {
         let mut args: Vec<String> = vec![
             "-f".to_string(),
