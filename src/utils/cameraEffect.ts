@@ -61,9 +61,16 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
   useEffect(() => {
     if (!on) return;
     let live = true;
+    let inFlight = false;
     let timer = 0;
     let tick = 0;
     const poll = async () => {
+      if (!live) return;
+      if (inFlight) {
+        timer = window.setTimeout(poll, 45);
+        return;
+      }
+      inFlight = true;
       try {
         const bytes = await invoke<ArrayBuffer>("camera_effect_preview");
         if (!live) return;
@@ -73,7 +80,7 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
           urlRef.current = url;
           setState((s) => (s.phase === "needs-engine" || s.phase === "error" ? s : { ...s, phase: "running", frameUrl: url }));
         }
-        if (tick++ % 30 === 0) {
+        if (tick++ % 20 === 0) {
           const status = await invoke<{ engine: string; fps: number } | null>("camera_effect_status");
           if (live && status) {
             if (status.engine.startsWith("error")) setState({ phase: "error", frameUrl: null, message: status.engine.slice(7) });
@@ -82,8 +89,10 @@ export function useCameraEffectFeed(device: string | null, shape: string, size: 
         }
       } catch {
         // The feed isn't up yet.
+      } finally {
+        inFlight = false;
       }
-      if (live) timer = window.setTimeout(poll, 30);
+      if (live) timer = window.setTimeout(poll, 45);
     };
     void poll();
     return () => {

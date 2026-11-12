@@ -261,7 +261,7 @@ fn run_matting(s: &Shared, dir: &std::path::Path, model: &std::path::Path, w: us
     use ort::session::Session;
     use ort::value::Tensor;
     let env = ort_environment(dir)?;
-    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).clamp(2, 6);
+    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 3);
     let cpu = Session::builder(env).and_then(|b| b.with_intra_threads(threads).map_err(|e| e.into())).and_then(|mut b| b.commit_from_file(model)).map_err(|e| e.to_string())?;
     // A GPU session only where there is a path to one (DirectML on Windows) - elsewhere it would be a
     // second copy of the CPU one.
@@ -275,18 +275,18 @@ fn run_matting(s: &Shared, dir: &std::path::Path, model: &std::path::Path, w: us
         sessions.push(("gpu", g));
     }
     let plane = w * h;
-    let ratio = (224.0 / w.max(h) as f32).min(1.0);
+    let ratio = (160.0 / w.max(h) as f32).clamp(0.25, 0.45);
     let ratio_tensor = Tensor::from_array(([1usize], vec![ratio])).map_err(|e| e.to_string())?;
     let zero = || Tensor::from_array(([1usize, 1, 1, 1], vec![0f32])).map(|t| t.into_dyn());
     let mut recs: Vec<Vec<ort::value::DynValue>> = sessions.iter().map(|_| (0..4).map(|_| zero()).collect::<Result<Vec<_>, _>>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
     // Engine trial: each engine gets frames 2..10 of its turn timed; then the faster one stays.
-    const TRIAL: usize = 10;
+    const TRIAL: usize = 3;
     let mut timings: Vec<Vec<f64>> = vec![Vec::new(); sessions.len()];
     let mut chosen: Option<usize> = if sessions.len() == 1 { Some(0) } else { None };
     let mut frame_count = 0usize;
     let mut last_seq = 0u64;
     let mut chw = vec![0f32; plane * 3];
-    let (mut fps_frames, mut fps_since) = (0u32, Instant::now());
+    let mut fps_since = Instant::now();
     while !s.stop.load(Ordering::SeqCst) {
         let next = s.latest.lock().unwrap().as_ref().filter(|(seq, _)| *seq != last_seq).cloned();
         let Some((seq, frame)) = next else {
@@ -329,12 +329,9 @@ fn run_matting(s: &Shared, dir: &std::path::Path, model: &std::path::Path, w: us
                 log::info!("Live camera background: {} ({:?} s/frame by engine)", sessions[chosen.unwrap_or(0)].0, timings.iter().map(median).collect::<Vec<_>>());
             }
         }
-        fps_frames += 1;
         if fps_since.elapsed() >= Duration::from_secs(1) {
             let mut st = s.status.lock().unwrap();
-            st.fps = fps_frames as f64 / fps_since.elapsed().as_secs_f64();
             st.engine = sessions[chosen.unwrap_or(which)].0.to_string();
-            fps_frames = 0;
             fps_since = Instant::now();
         }
     }
@@ -375,7 +372,7 @@ fn composite_frames(s: &Shared, w: usize, h: usize) {
             comp_frames = 0;
             comp_since = Instant::now();
         }
-        if last_preview.elapsed() >= Duration::from_millis(30) {
+        if last_preview.elapsed() >= Duration::from_millis(40) {
             last_preview = Instant::now();
             let mut jpeg = Vec::new();
             if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 78).encode(&composed, w as u32, h as u32, image::ExtendedColorType::Rgb8).is_ok() {
