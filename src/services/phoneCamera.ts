@@ -296,6 +296,13 @@ const pickMimeType = (): string => {
 };
 
 export interface PhoneCaptureHandle {
+    pause: () => void;
+    resume: () => void;
+    /** Stops MediaRecorder and flushes the final raw chunk to disk (~50ms), without re-encoding. */
+    stopRecording: () => Promise<void>;
+    /** Converts the flushed raw file into `<stem>_webcam.mp4` on the backend. */
+    finalize: () => Promise<void>;
+    /** Convenience: stopRecording() followed by finalize(). */
     stop: () => Promise<void>;
 }
 
@@ -379,23 +386,46 @@ export const startPhoneCapture = (
         });
     };
 
-    const finished = new Promise<void>((resolve) => {
+    let finalized = false;
+    const flushed = new Promise<void>((resolve) => {
         recorder.onstop = async () => {
             try {
                 await writeChain;
-                if (chunkCount === 0) {
-                    onError?.("The phone camera stopped before anything was recorded.");
-                    return;
-                }
-                if (writeFailed) return;
-                await invoke("save_phone_camera_capture", { startOffsetMs });
-            } catch (e) {
-                onError?.(`Failed to save the phone camera recording: ${e}`);
             } finally {
                 resolve();
             }
         };
     });
+
+    const stopRecording = async () => {
+        if (recorder.state !== "inactive") {
+            if (recorder.state === "paused") {
+                try {
+                    recorder.resume();
+                } catch {
+                    /* ignore */
+                }
+            }
+            recorder.stop();
+        }
+        await flushed;
+    };
+
+    const finalize = async () => {
+        if (finalized) return;
+        finalized = true;
+        try {
+            await flushed;
+            if (chunkCount === 0) {
+                onError?.("The phone camera stopped before anything was recorded.");
+                return;
+            }
+            if (writeFailed) return;
+            await invoke("save_phone_camera_capture", { startOffsetMs });
+        } catch (e) {
+            onError?.(`Failed to save the phone camera recording: ${e}`);
+        }
+    };
 
     // One chunk a second. The interval was stretched to two to halve the cost of the base64 IPC
     // path; with raw chunks that cost is low enough that the shorter window - which bounds how much
@@ -403,9 +433,29 @@ export const startPhoneCapture = (
     recorder.start(1000);
 
     return {
+        pause: () => {
+            if (recorder.state === "recording") {
+                try {
+                    recorder.pause();
+                } catch {
+                    /* older MediaRecorder without pause */
+                }
+            }
+        },
+        resume: () => {
+            if (recorder.state === "paused") {
+                try {
+                    recorder.resume();
+                } catch {
+                    /* ignore */
+                }
+            }
+        },
+        stopRecording,
+        finalize,
         stop: async () => {
-            if (recorder.state !== "inactive") recorder.stop();
-            await finished;
+            await stopRecording();
+            await finalize();
         },
     };
 };

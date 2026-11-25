@@ -21,12 +21,13 @@
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-/// The newest complete preview frame, or None before the first one arrives.
+/// The newest complete preview frame as `(sequence_number, jpeg_bytes)`, or None before the first
+/// one arrives.
 ///
 /// Deliberately a plain `std::sync::Mutex` rather than the async one the rest of `AppState` uses:
 /// it is held only long enough to swap a `Vec`, by a blocking reader thread that has no runtime to
 /// yield to, so an async mutex would buy nothing and force the reader to be async for no reason.
-pub type PreviewFrame = Arc<Mutex<Option<Vec<u8>>>>;
+pub type PreviewFrame = Arc<Mutex<Option<(u32, Vec<u8>)>>>;
 
 // JPEG frame markers. Every frame in an MJPEG stream starts with SOI and ends with EOI, and
 // neither sequence can appear in the entropy-coded data in between without being byte-stuffed,
@@ -50,6 +51,10 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub fn pump<R: Read>(mut source: R, slot: PreviewFrame) {
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut chunk = [0u8; 64 * 1024];
+    let mut seq: u32 = 0;
+    // Byte offset where we already know no EOI exists for the currently buffered partial frame, so
+    // multi-chunk frames don't re-scan from byte 0 on every read().
+    let mut eoi_scan_from: usize = 0;
 
     loop {
         let read = match source.read(&mut chunk) {
@@ -61,34 +66,50 @@ pub fn pump<R: Read>(mut source: R, slot: PreviewFrame) {
 
         // Emit every complete frame currently in the buffer, keeping only the last one - if the
         // consumer is slower than ffmpeg, showing it the newest frame is strictly better than
-        // working through a backlog of stale ones.
-        let mut newest: Option<Vec<u8>> = None;
+        // working through a backlog of stale ones. Scan using a cursor and compact once per read.
+        let mut cursor: usize = 0;
+        let mut newest: Option<(usize, usize)> = None;
         loop {
-            let Some(start) = find(&buf, &SOI) else {
-                // No frame start in hand at all - anything buffered is leading junk.
-                buf.clear();
+            let Some(rel_start) = find(&buf[cursor..], &SOI) else {
+                // No frame start left in the buffer - discard trailing junk.
+                cursor = buf.len();
+                eoi_scan_from = 0;
                 break;
             };
-            let Some(rel_end) = find(&buf[start + 2..], &EOI) else {
-                // Frame started but hasn't finished arriving; drop what precedes it and wait.
-                if start > 0 {
-                    buf.drain(..start);
-                }
+            let start = cursor + rel_start;
+            let search_from = (start + 2).max(eoi_scan_from);
+            let Some(rel_end) = find(&buf[search_from..], &EOI) else {
+                // Frame started but hasn't finished arriving; compact to `start` and resume EOI
+                // scan at the tail on the next read (backing up 1 byte in case 0xFF sat at the
+                // chunk boundary).
+                cursor = start;
+                eoi_scan_from = buf.len().saturating_sub(1).saturating_sub(start);
                 break;
             };
-            let end = start + 2 + rel_end + 2;
-            newest = Some(buf[start..end].to_vec());
-            buf.drain(..end);
+            let end = search_from + rel_end + 2;
+            newest = Some((start, end));
+            cursor = end;
+            eoi_scan_from = 0;
+        }
+
+        if let Some((start, end)) = newest {
+            let frame = buf[start..end].to_vec();
+            seq = seq.wrapping_add(1).max(1);
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some((seq, frame));
+            }
+        }
+
+        if cursor >= buf.len() {
+            buf.clear();
+            eoi_scan_from = 0;
+        } else if cursor > 0 {
+            buf.drain(..cursor);
         }
 
         if buf.len() > MAX_FRAME_BYTES {
             buf.clear();
-        }
-
-        if let Some(frame) = newest {
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(frame);
-            }
+            eoi_scan_from = 0;
         }
     }
 
@@ -120,7 +141,7 @@ mod tests {
         let slot = PreviewFrame::default();
         let frame = jpeg(b"abc");
         pump(&frame[..], slot.clone());
-        assert_eq!(slot.lock().unwrap().as_deref(), Some(&frame[..]));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(_, b)| b.as_slice()), Some(&frame[..]));
     }
 
     #[test]
@@ -129,7 +150,7 @@ mod tests {
         let mut stream = jpeg(b"old");
         stream.extend_from_slice(&jpeg(b"new"));
         pump(&stream[..], slot.clone());
-        assert_eq!(slot.lock().unwrap().as_deref(), Some(&jpeg(b"new")[..]));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(_, b)| b.as_slice()), Some(&jpeg(b"new")[..]));
     }
 
     #[test]
@@ -138,7 +159,7 @@ mod tests {
         let mut stream = jpeg(b"whole");
         stream.extend_from_slice(&[0xFF, 0xD8, b'p', b'a', b'r', b't']); // no EOI yet
         pump(&stream[..], slot.clone());
-        assert_eq!(slot.lock().unwrap().as_deref(), Some(&jpeg(b"whole")[..]));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(_, b)| b.as_slice()), Some(&jpeg(b"whole")[..]));
     }
 
     #[test]
@@ -147,7 +168,7 @@ mod tests {
         let mut stream = vec![0x00, 0x11, 0x22];
         stream.extend_from_slice(&jpeg(b"real"));
         pump(&stream[..], slot.clone());
-        assert_eq!(slot.lock().unwrap().as_deref(), Some(&jpeg(b"real")[..]));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(_, b)| b.as_slice()), Some(&jpeg(b"real")[..]));
     }
 
     #[test]

@@ -349,8 +349,8 @@ const BottomDocker = ({
   pausedAccumulatedMs,
   handlePauseRecording,
   handleResumeRecording,
-  isMonitoring,
-  setIsMonitoring,
+  isMonitoring: _isMonitoring,
+  setIsMonitoring: _setIsMonitoring,
   windowTitles,
   isRecording,
   recordingStartTime,
@@ -401,7 +401,11 @@ const BottomDocker = ({
   const [isClickTrackingSupported, setIsClickTrackingSupported] = useState(true);
   useEffect(() => {
     invoke<string>('get_platform')
-      .then((platform) => setIsClickTrackingSupported(platform === 'windows'))
+      .then((platform) =>
+        setIsClickTrackingSupported(
+          platform === 'windows' || platform === 'macos' || platform === 'linux'
+        )
+      )
       .catch((err) => console.error('Failed to detect platform:', err));
   }, []);
   // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
@@ -457,30 +461,27 @@ const BottomDocker = ({
   const loadDevices = () => {
     const settings = loadSettings();
 
-    invoke<ConnectedDevice>("get_connected_audios")
-      .then((devices) => {
-        setConnectedAudioDevices(devices);
-        if (devices.length > 0) {
+    // Fetch cameras and microphones in a single IPC round trip instead of two separate calls.
+    invoke<[ConnectedDevice, ConnectedDevice]>("get_connected_devices")
+      .then(([cameraDevices, audioDevices]) => {
+        setConnectedAudioDevices(audioDevices);
+        if (audioDevices.length > 0) {
           // Prefer whatever's configured as the default in Settings, so long as it's actually
           // still plugged in - otherwise fall back to the first detected device like before.
           const preferred = settings.defaultAudioDevice;
-          setAudioDevice(preferred && devices.includes(preferred) ? preferred : devices[0]);
+          setAudioDevice(preferred && audioDevices.includes(preferred) ? preferred : audioDevices[0]);
         }
-      })
-      .catch(console.error);
 
-    invoke<ConnectedDevice>("get_connected_cameras")
-      .then((devices) => {
-        // The phone is appended rather than detected: it can never appear in get_connected_cameras
+        // The phone is appended rather than detected: it can never appear in get_connected_devices
         // (that enumerates DirectShow devices, and a phone isn't one - see
         // src-tauri/src/services/phone_camera.rs), so the entry has to be offered unconditionally
         // and is paired on demand from the panel behind it.
-        setConnectedCameraDevices([...devices, PHONE_CAMERA_DEVICE]);
+        setConnectedCameraDevices([...cameraDevices, PHONE_CAMERA_DEVICE]);
         // Defaults are chosen from the REAL cameras only - auto-selecting the phone on a machine
         // with no webcam would arm a source that isn't paired yet and record nothing.
-        if (devices.length > 0) {
-          const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
-          setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
+        if (cameraDevices.length > 0) {
+          const preferred = settings.defaultVideoDevices.filter((d) => cameraDevices.includes(d));
+          setVideoDevices(preferred.length > 0 ? preferred : [cameraDevices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -588,22 +589,9 @@ const BottomDocker = ({
 
   };
 
-  const openModalScreen = async ()=>{
-    try {
-      if (!isMonitoring) {
-        console.log("Is monitoring: ",isMonitoring)
-        await invoke("start_monitoring_windows")
-
-        setIsMonitoring(true)
-        console.log("Monitoring started")
-      }
-
-
-    } catch (error) {
-      console.error("Error monitoring screens: ",error)
-    }
-    setModalOpenScreen(true)
-  }
+  const openModalScreen = () => {
+    setModalOpenScreen(true);
+  };
 
   const closeModalScreen = ()=>{
     setModalOpenScreen(false)
@@ -631,6 +619,7 @@ const BottomDocker = ({
 
   return (
     <>
+    {modalOpenScreen && (
     <EnhancedScreenOptions
      recordType={recordType}
      videoDevices={videoDevices}
@@ -677,6 +666,7 @@ const BottomDocker = ({
       setOpen={setModalOpenScreen}
       onRecordTypeChange={handleRecordTypeSelected}
     />
+    )}
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
@@ -842,12 +832,14 @@ const BottomDocker = ({
           </span>
           <OsInfo />
           </div>
-          <div className="right-0"><span> <a
+          <div className="right-0">           
+            <span> <a
             href={`mailto:${FEEDBACK_EMAIL}`}
             onClick={(e) => { e.preventDefault(); void openFeedbackEmail(); }}
             title={`Email ${FEEDBACK_EMAIL}`}
             className="text-blue-600 dark:text-blue-400"
-          >Request feature / Report a bug</a></span></div>
+          > Request feature / Report a bug </a> </span></div>
+          <span> <a href="https://x.com/oyewodayo" target="_blank"> &nbsp; X </a></span>
         </div>
         )}
       </div>)}

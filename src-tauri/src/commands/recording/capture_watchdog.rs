@@ -121,16 +121,48 @@ pub(crate) fn watch(app_handle: AppHandle, video_path: PathBuf) {
                         let _ = stdin.flush();
                     }
                     let path = parts.current_video_path().to_path_buf();
+                    // Release all AppState locks BEFORE blocking on finalization (which can take
+                    // seconds), so user Stop/Pause commands are never blocked waiting on recovery.
+                    drop(assembly);
+                    drop(process);
+                    drop(paused);
                     let stalled = tauri::async_runtime::spawn_blocking(move || {
                         super::wait_for_ffmpeg_to_finalize(&mut stalled, &path);
                         stalled
                     })
                     .await;
-                    match stalled {
-                        Ok(stalled) => *process = Some(stalled),
-                        Err(_) => break,
+                    let Ok(stalled) = stalled else { break };
+                    // Re-acquire locks and confirm the recording wasn't stopped while we waited.
+                    let _paused = state.paused.lock().await;
+                    let mut process = state.ffmpeg_process.lock().await;
+                    let mut assembly = state.assembly.lock().await;
+                    let Some(parts) = assembly.as_mut().filter(|a| a.video_path == video_path) else {
+                        break;
+                    };
+                    if process.is_some() {
+                        // Something else already replaced the child.
+                        continue;
                     }
-                    retry_at = Some(Instant::now());
+                    *process = Some(stalled);
+                    failures += 1;
+                    match restart(parts, &command) {
+                        Ok(child) => {
+                            let pid = child.id();
+                            *process = Some(child);
+                            crate::services::progress_watch::watch(
+                                app_handle.clone(),
+                                command.progress_path.clone(),
+                                state.ffmpeg_process.clone(),
+                                pid,
+                            );
+                            info!("Screen capture restarted into {:?}", parts.current_video_path());
+                        }
+                        Err(e) => warn!("Couldn't restart the screen capture: {}", e),
+                    }
+                    last_frames = 0;
+                    last_progress = Instant::now();
+                    recovering = true;
+                    continue;
                 }
                 Ok(Some(status)) if retry_at.is_none() => {
                     warn!(

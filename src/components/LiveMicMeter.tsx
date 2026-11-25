@@ -8,9 +8,24 @@ interface LiveMicMeterProps {
 
 export const LiveMicMeter: React.FC<LiveMicMeterProps> = ({ audioDevice, className = "" }) => {
     const [active, setActive] = useState<boolean>(false);
+    const rootRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const textRef = useRef<HTMLSpanElement | null>(null);
     const micIconRef = useRef<HTMLSpanElement | null>(null);
+    const visibleRef = useRef<boolean>(true);
+
+    useEffect(() => {
+        const el = rootRef.current;
+        if (!el || typeof IntersectionObserver === "undefined") return;
+        const obs = new IntersectionObserver(
+            (entries) => {
+                visibleRef.current = entries.some((e) => e.isIntersecting);
+            },
+            { threshold: 0 }
+        );
+        obs.observe(el);
+        return () => obs.disconnect();
+    }, []);
 
     useEffect(() => {
         if (!audioDevice || audioDevice.trim() === "") {
@@ -64,8 +79,15 @@ export const LiveMicMeter: React.FC<LiveMicMeterProps> = ({ audioDevice, classNa
 
                 const dataArray = new Uint8Array(analyser.fftSize);
 
-                const draw = () => {
+                let lastDraw = 0;
+                const draw = (ts: number) => {
                     if (isCancelled) return;
+                    // Skip drawing when scrolled off-screen or hidden, and cap to ~30fps to save CPU.
+                    if (!visibleRef.current || document.hidden || ts - lastDraw < 32) {
+                        animId = requestAnimationFrame(draw);
+                        return;
+                    }
+                    lastDraw = ts;
                     analyser.getByteTimeDomainData(dataArray);
 
                     let sumSquares = 0;
@@ -129,18 +151,31 @@ export const LiveMicMeter: React.FC<LiveMicMeterProps> = ({ audioDevice, classNa
             }
         };
 
-        void startMeter();
+        // Defer opening the mic by 180 ms so the modal opens and paints at 60 fps first without
+        // blocking on WASAPI/enumerateDevices during the open transition.
+        const startTimer = window.setTimeout(() => {
+            if (!isCancelled) void startMeter();
+        }, 180);
 
         return () => {
             isCancelled = true;
+            window.clearTimeout(startTimer);
             if (animId) cancelAnimationFrame(animId);
-            if (stream) stream.getTracks().forEach((t) => t.stop());
-            if (audioCtx && audioCtx.state !== "closed") void audioCtx.close();
+            // Release WASAPI/MediaStream handles on the next macrotask so closing the modal paints
+            // immediately (<16 ms) instead of blocking the UI thread during React unmount.
+            const s = stream;
+            const ctx = audioCtx;
+            if (s || ctx) {
+                window.setTimeout(() => {
+                    if (s) s.getTracks().forEach((t) => t.stop());
+                    if (ctx && ctx.state !== "closed") void ctx.close();
+                }, 0);
+            }
         };
     }, [audioDevice]);
 
     return (
-        <div className={`flex items-center gap-1.5 ${className}`} title={active ? "Microphone input active" : "Microphone inactive"}>
+        <div ref={rootRef} className={`flex items-center gap-1.5 ${className}`} title={active ? "Microphone input active" : "Microphone inactive"}>
             <span ref={micIconRef} className="transition-colors duration-75">
                 {active ? <IoMicOutline className="w-3.5 h-3.5" /> : <IoMicOffOutline className="w-3.5 h-3.5 text-neutral-400" />}
             </span>

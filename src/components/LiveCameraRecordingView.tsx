@@ -50,16 +50,18 @@ const LiveCameraRecordingView = ({ videoDevices, isPaused }: LiveCameraRecording
     useEffect(() => {
         let cancelled = false;
         let timer: number | undefined;
+        let lastSeq = 0;
 
         const poll = async () => {
             try {
-                // Raw JPEG bytes rather than a data URL - see get_recording_preview_frame. An
-                // empty body means "nothing to show yet", which is normal before ffmpeg's first
-                // frame and after the recording ends.
-                const bytes = await invoke<ArrayBuffer>("get_recording_preview_frame");
+                // Raw JPEG bytes prefixed with a 4-byte LE sequence number; empty when unchanged
+                // (avoids redundant IPC copy + Blob allocation between 12fps frames).
+                const bytes = await invoke<ArrayBuffer>("get_recording_preview_frame", { afterSeq: lastSeq });
                 if (cancelled) return;
-                if (bytes && bytes.byteLength > 0) {
-                    const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+                if (bytes && bytes.byteLength > 4) {
+                    const view = new DataView(bytes);
+                    lastSeq = view.getUint32(0, true);
+                    const url = URL.createObjectURL(new Blob([bytes.slice(4)], { type: "image/jpeg" }));
                     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
                     urlRef.current = url;
                     startedRef.current = true;
@@ -70,7 +72,7 @@ const LiveCameraRecordingView = ({ videoDevices, isPaused }: LiveCameraRecording
                 // last frame on screen is better than blanking it for the moment before this
                 // component unmounts anyway.
             }
-            if (!cancelled) timer = window.setTimeout(poll, POLL_MS);
+            if (!cancelled) timer = window.setTimeout(poll, document.hidden ? 250 : POLL_MS);
         };
 
         poll();

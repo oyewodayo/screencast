@@ -80,7 +80,10 @@ pub use win::InputCapture;
 #[cfg(target_os = "macos")]
 pub use mac::InputCapture;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub use linux::InputCapture;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub use fallback::InputCapture;
 
 #[cfg(target_os = "windows")]
@@ -450,7 +453,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     WM_MBUTTONDOWN => ctx.on_click(now, info.pt, 2),
                     _ => return,
                 }
-                ctx.check_shape(now);
+                // Deliberately NOT calling check_shape() here: GetCursorInfo + GDI DrawIconEx +
+                // PNG encoding inside WH_MOUSE_LL can stall the OS pointer or trip Windows'
+                // LowLevelHooksTimeout (~300ms) and silently evict the hook. on_tick() captures
+                // cursor changes every 50ms cleanly off the hook hot path.
             }
         });
     }
@@ -599,8 +605,37 @@ mod mac {
         fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
         fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
         fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+        fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
         fn CFRelease(cf: *mut c_void);
     }
+
+    // CGEventFlags modifier bitmasks (macOS Carbon/CoreGraphics).
+    const FLAG_SHIFT: u64 = 1 << 17;
+    const FLAG_CTRL: u64 = 1 << 18;
+    const FLAG_ALT: u64 = 1 << 19;
+    const FLAG_CMD: u64 = 1 << 20;
+
+    // Carbon virtual keycodes for shortcut keys (same privacy rule as Windows: only recorded when
+    // Cmd/Ctrl/Option is held, or for standalone named action keys like Enter/Esc/Tab/F-keys).
+    const MAC_KEYCODES: &[(u16, &str, bool)] = &[
+        (0x00, "A", false), (0x0B, "B", false), (0x08, "C", false), (0x02, "D", false),
+        (0x0E, "E", false), (0x03, "F", false), (0x05, "G", false), (0x04, "H", false),
+        (0x22, "I", false), (0x26, "J", false), (0x28, "K", false), (0x25, "L", false),
+        (0x2E, "M", false), (0x2D, "N", false), (0x1F, "O", false), (0x23, "P", false),
+        (0x0C, "Q", false), (0x0F, "R", false), (0x01, "S", false), (0x11, "T", false),
+        (0x20, "U", false), (0x09, "V", false), (0x0D, "W", false), (0x07, "X", false),
+        (0x10, "Y", false), (0x06, "Z", false),
+        (0x1D, "0", false), (0x12, "1", false), (0x13, "2", false), (0x14, "3", false),
+        (0x15, "4", false), (0x17, "5", false), (0x16, "6", false), (0x1A, "7", false),
+        (0x1C, "8", false), (0x19, "9", false),
+        (0x31, "Space", false), (0x33, "Backspace", false), (0x75, "Del", false),
+        (0x24, "Enter", true), (0x4C, "Enter", true), (0x35, "Esc", true), (0x30, "Tab", true),
+        (0x7A, "F1", true), (0x78, "F2", true), (0x63, "F3", true), (0x76, "F4", true),
+        (0x60, "F5", true), (0x61, "F6", true), (0x62, "F7", true), (0x64, "F8", true),
+        (0x65, "F9", true), (0x6D, "F10", true), (0x67, "F11", true), (0x6F, "F12", true),
+        (0x7B, "Left", false), (0x7C, "Right", false), (0x7D, "Down", false), (0x7E, "Up", false),
+    ];
 
     pub struct InputCapture {
         running: Arc<AtomicBool>,
@@ -609,7 +644,7 @@ mod mac {
     }
 
     impl InputCapture {
-        pub fn start(area: Area, track_pointer: bool, _track_keys: bool) -> Result<Self, String> {
+        pub fn start(area: Area, track_pointer: bool, track_keys: bool) -> Result<Self, String> {
             let started = now_hns();
             let running = Arc::new(AtomicBool::new(true));
             let r = running.clone();
@@ -622,40 +657,80 @@ mod mac {
             let handle = std::thread::spawn(move || -> Option<InputLog> {
                 let mut moves = Vec::new();
                 let mut clicks = Vec::new();
-                let mut was_down = false;
+                let mut keys = Vec::new();
+                let mut was_down = [false; 3];
+                let mut was_key = [false; MAC_KEYCODES.len()];
                 let mut last_pos = (-9999.0f32, -9999.0f32);
                 let mut last_pushed = i64::MIN / 2;
 
                 while r.load(Ordering::Relaxed) {
                     let now = now_hns();
-                    let is_down = unsafe { CGEventSourceButtonState(0, 0) };
-                    unsafe {
-                        let event = CGEventCreate(std::ptr::null_mut());
-                        if !event.is_null() {
-                            let loc = CGEventGetLocation(event);
-                            CFRelease(event);
+                    let down = [
+                        unsafe { CGEventSourceButtonState(0, 0) },
+                        unsafe { CGEventSourceButtonState(0, 1) },
+                        unsafe { CGEventSourceButtonState(0, 2) },
+                    ];
+                    if track_pointer || down.iter().enumerate().any(|(i, &d)| d && !was_down[i]) {
+                        unsafe {
+                            let event = CGEventCreate(std::ptr::null_mut());
+                            if !event.is_null() {
+                                let loc = CGEventGetLocation(event);
+                                CFRelease(event);
 
-                            let (ox, oy, w, h) = rect;
-                            let (bw, bh) = base;
-                            let ax = ((loc.x - ox as f64) / w.max(1) as f64 * bw as f64) as f32;
-                            let ay = ((loc.y - oy as f64) / h.max(1) as f64 * bh as f64) as f32;
+                                let (ox, oy, w, h) = rect;
+                                let (bw, bh) = base;
+                                let ax = ((loc.x - ox as f64) / w.max(1) as f64 * bw as f64) as f32;
+                                let ay = ((loc.y - oy as f64) / h.max(1) as f64 * bh as f64) as f32;
 
-                            if track_pointer {
-                                let moved = (ax - last_pos.0).abs() >= 1.0 || (ay - last_pos.1).abs() >= 1.0;
-                                let keepalive = now - last_pushed >= KEEPALIVE_HNS;
-                                if moved || keepalive {
-                                    moves.push((now, ax, ay));
-                                    last_pos = (ax, ay);
-                                    last_pushed = now;
+                                if track_pointer {
+                                    let moved = (ax - last_pos.0).abs() >= 1.0 || (ay - last_pos.1).abs() >= 1.0;
+                                    let keepalive = now - last_pushed >= KEEPALIVE_HNS;
+                                    if moved || keepalive {
+                                        moves.push((now, ax, ay));
+                                        last_pos = (ax, ay);
+                                        last_pushed = now;
+                                    }
                                 }
-                            }
 
-                            if is_down && !was_down {
-                                clicks.push((now, ax, ay, 0));
+                                for (btn, (&d, &prev)) in down.iter().zip(was_down.iter()).enumerate() {
+                                    if d && !prev {
+                                        clicks.push((now, ax, ay, btn as u8));
+                                    }
+                                }
                             }
                         }
                     }
-                    was_down = is_down;
+                    was_down = down;
+
+                    if track_keys {
+                        let flags = unsafe { CGEventSourceFlagsState(0) };
+                        let has_cmd = (flags & FLAG_CMD) != 0;
+                        let has_ctrl = (flags & FLAG_CTRL) != 0;
+                        let has_alt = (flags & FLAG_ALT) != 0;
+                        let has_shift = (flags & FLAG_SHIFT) != 0;
+                        let has_mod = has_cmd || has_ctrl || has_alt;
+
+                        for (idx, &(code, label, standalone)) in MAC_KEYCODES.iter().enumerate() {
+                            let pressed = unsafe { CGEventSourceKeyState(0, code) };
+                            if pressed && !was_key[idx] && (has_mod || standalone) {
+                                let mut combo = Vec::with_capacity(4);
+                                if has_ctrl { combo.push("Ctrl".to_string()); }
+                                if has_alt { combo.push("Alt".to_string()); }
+                                if has_shift { combo.push("Shift".to_string()); }
+                                if has_cmd { combo.push("Cmd".to_string()); }
+                                combo.push(label.to_string());
+                                let is_own = OWN_HOTKEYS.iter().any(|own| {
+                                    own.len() == combo.len()
+                                        && own.iter().zip(combo.iter()).all(|(a, b)| a == b)
+                                });
+                                if !is_own {
+                                    keys.push((now, combo));
+                                }
+                            }
+                            was_key[idx] = pressed;
+                        }
+                    }
+
                     std::thread::sleep(std::time::Duration::from_millis(8));
                 }
 
@@ -666,7 +741,7 @@ mod mac {
                     clicks,
                     shapes: Vec::new(),
                     cursors: Vec::new(),
-                    keys: Vec::new(),
+                    keys,
                 })
             });
 
@@ -680,7 +755,191 @@ mod mac {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt as _, KeyButMask};
+
+    fn keysym_label(sym: u32) -> Option<(String, bool)> {
+        match sym {
+            0x61..=0x7A => Some((((sym - 0x20) as u8 as char).to_string(), false)),
+            0x41..=0x5A => Some(((sym as u8 as char).to_string(), false)),
+            0x30..=0x39 => Some(((sym as u8 as char).to_string(), false)),
+            0x0020 => Some(("Space".to_string(), false)),
+            0xFF08 => Some(("Backspace".to_string(), false)),
+            0xFFFF => Some(("Del".to_string(), false)),
+            0xFF0D | 0xFF8D => Some(("Enter".to_string(), true)),
+            0xFF1B => Some(("Esc".to_string(), true)),
+            0xFF09 => Some(("Tab".to_string(), true)),
+            0xFF51 => Some(("Left".to_string(), false)),
+            0xFF52 => Some(("Up".to_string(), false)),
+            0xFF53 => Some(("Right".to_string(), false)),
+            0xFF54 => Some(("Down".to_string(), false)),
+            0xFFBE..=0xFFC9 => Some((format!("F{}", sym - 0xFFBE + 1), true)),
+            _ => None,
+        }
+    }
+
+    pub struct InputCapture {
+        running: Arc<AtomicBool>,
+        handle: JoinHandle<Option<InputLog>>,
+        pub started_hns: i64,
+    }
+
+    impl InputCapture {
+        pub fn start(area: Area, track_pointer: bool, track_keys: bool) -> Result<Self, String> {
+            let (conn, screen_num) = x11rb::connect(None)
+                .map_err(|e| format!("Failed to connect to X11 for input tracking: {e}"))?;
+            let root = conn.setup().roots[screen_num].root;
+            let min_kc = conn.setup().min_keycode;
+            let max_kc = conn.setup().max_keycode;
+            let keymap_table: Vec<(u8, String, bool)> = if track_keys && max_kc >= min_kc {
+                conn.get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|reply| {
+                        let per = reply.keysyms_per_keycode as usize;
+                        if per == 0 {
+                            return Vec::new();
+                        }
+                        reply
+                            .keysyms
+                            .chunks(per)
+                            .enumerate()
+                            .filter_map(|(i, syms)| {
+                                let kc = min_kc.saturating_add(i as u8);
+                                let sym = *syms.first()?;
+                                let (label, standalone) = keysym_label(sym)?;
+                                Some((kc, label, standalone))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let started = now_hns();
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+
+            let (rect, base) = match area {
+                Area::Fixed { x, y, width, height } => ((x, y, width, height), (width.max(1), height.max(1))),
+                Area::Window { x, y, width, height, .. } => ((x, y, width, height), (width.max(1), height.max(1))),
+            };
+
+            let handle = std::thread::spawn(move || -> Option<InputLog> {
+                let mut moves = Vec::new();
+                let mut clicks = Vec::new();
+                let mut keys = Vec::new();
+                let mut was_down = [false; 3];
+                let mut prev_keymap = [0u8; 32];
+                let mut last_pos = (-9999.0f32, -9999.0f32);
+                let mut last_pushed = i64::MIN / 2;
+
+                while r.load(Ordering::Relaxed) {
+                    let now = now_hns();
+                    let mut mod_mask = KeyButMask::default();
+                    if let Ok(cookie) = conn.query_pointer(root) {
+                        if let Ok(reply) = cookie.reply() {
+                            mod_mask = reply.mask;
+                            let down = [
+                                reply.mask.contains(KeyButMask::BUTTON1),
+                                reply.mask.contains(KeyButMask::BUTTON3),
+                                reply.mask.contains(KeyButMask::BUTTON2),
+                            ];
+                            let (ox, oy, w, h) = rect;
+                            let (bw, bh) = base;
+                            let ax = ((reply.root_x as i32 - ox) as f64 / w.max(1) as f64 * bw as f64) as f32;
+                            let ay = ((reply.root_y as i32 - oy) as f64 / h.max(1) as f64 * bh as f64) as f32;
+
+                            if track_pointer {
+                                let moved = (ax - last_pos.0).abs() >= 1.0 || (ay - last_pos.1).abs() >= 1.0;
+                                let keepalive = now - last_pushed >= KEEPALIVE_HNS;
+                                if moved || keepalive {
+                                    moves.push((now, ax, ay));
+                                    last_pos = (ax, ay);
+                                    last_pushed = now;
+                                }
+                            }
+                            for (btn, (&d, &prev)) in down.iter().zip(was_down.iter()).enumerate() {
+                                if d && !prev {
+                                    clicks.push((now, ax, ay, btn as u8));
+                                }
+                            }
+                            was_down = down;
+                        }
+                    }
+
+                    if track_keys && !keymap_table.is_empty() {
+                        if let Ok(cookie) = conn.query_keymap() {
+                            if let Ok(reply) = cookie.reply() {
+                                let has_ctrl = mod_mask.contains(KeyButMask::CONTROL);
+                                let has_alt = mod_mask.contains(KeyButMask::MOD1);
+                                let has_super = mod_mask.contains(KeyButMask::MOD4);
+                                let has_shift = mod_mask.contains(KeyButMask::SHIFT);
+                                let has_mod = has_ctrl || has_alt || has_super;
+
+                                for (kc, label, standalone) in &keymap_table {
+                                    let byte = (*kc / 8) as usize;
+                                    let bit = 1u8 << (*kc % 8);
+                                    if byte >= 32 {
+                                        continue;
+                                    }
+                                    let pressed = (reply.keys[byte] & bit) != 0;
+                                    let was_pressed = (prev_keymap[byte] & bit) != 0;
+                                    if pressed && !was_pressed && (has_mod || *standalone) {
+                                        let mut combo = Vec::with_capacity(4);
+                                        if has_ctrl { combo.push("Ctrl".to_string()); }
+                                        if has_alt { combo.push("Alt".to_string()); }
+                                        if has_shift { combo.push("Shift".to_string()); }
+                                        if has_super { combo.push("Win".to_string()); }
+                                        combo.push(label.clone());
+                                        let is_own = OWN_HOTKEYS.iter().any(|own| {
+                                            own.len() == combo.len()
+                                                && own.iter().zip(combo.iter()).all(|(a, b)| a == b)
+                                        });
+                                        if !is_own {
+                                            keys.push((now, combo));
+                                        }
+                                    }
+                                }
+                                prev_keymap = reply.keys;
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+
+                Some(InputLog {
+                    width: base.0,
+                    height: base.1,
+                    moves,
+                    clicks,
+                    shapes: Vec::new(),
+                    cursors: Vec::new(),
+                    keys,
+                })
+            });
+
+            Ok(Self { running, handle, started_hns: started })
+        }
+
+        pub fn stop(self) -> Option<InputLog> {
+            self.running.store(false, Ordering::Relaxed);
+            self.handle.join().ok().flatten()
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod fallback {
     use super::*;
 

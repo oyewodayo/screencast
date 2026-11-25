@@ -120,6 +120,16 @@ pub(crate) fn engine_ready(dir: &Path) -> bool {
     DLLS.iter().all(|d| dll_ok(dir, d)) && is_valid_install(&dir.join(MODEL_ASSET.file_name), &MODEL_ASSET)
 }
 
+// Fast presence check (file sizes only) for status queries and startup checks: full SHA-256
+// verification runs once on download/install (ensure_engine_dlls / download_background_removal),
+// so hashing ~55 MB on every modal open or app launch only wastes disk I/O and CPU.
+pub(crate) fn engine_present(dir: &Path) -> bool {
+    engine_dlls_present(dir)
+        && std::fs::metadata(dir.join(MODEL_ASSET.file_name))
+            .map(|m| m.len() == MODEL_ASSET.size)
+            .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundRemovalStatus {
@@ -134,7 +144,7 @@ pub async fn background_removal_status(app_handle: AppHandle) -> Result<Backgrou
         return Ok(BackgroundRemovalStatus { state: "unsupported", download_mb: 0 });
     }
     let dir = engine_dir(&app_handle)?;
-    let ready = tauri::async_runtime::spawn_blocking(move || engine_ready(&dir)).await.map_err(|e| e.to_string())?;
+    let ready = tauri::async_runtime::spawn_blocking(move || engine_present(&dir)).await.map_err(|e| e.to_string())?;
     Ok(BackgroundRemovalStatus {
         state: if ready { "ready" } else { "needs-download" },
         download_mb: (WHEEL_ASSET.size + MODEL_ASSET.size) / 1_000_000,

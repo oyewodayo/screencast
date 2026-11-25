@@ -374,6 +374,8 @@ fn add_overlay_args(
         args.extend(vec![
             "-f".to_string(),
             "dshow".to_string(),
+            "-rtbufsize".to_string(),
+            "100M".to_string(),
             "-video_size".to_string(),
             overlay_size.clone(),
             "-i".to_string(),
@@ -532,32 +534,44 @@ async fn start_camera_sidecar(
     let video_path = parts.video_path.with_file_name(format!("{}.camera.mkv", stem));
     let final_path = output_path.with_file_name(format!("{}_webcam.mp4", stem));
 
+    let mut args: Vec<String> = vec![
+        "-f".into(),
+        "dshow".into(),
+        "-rtbufsize".into(),
+        "100M".into(),
+        "-video_size".into(),
+        map_overlay_size(&form_data.overlay_size),
+        "-i".into(),
+        format!("video={}", form_data.video_devices[0]),
+        "-vf".into(),
+        FRAME_LOG_FILTER.into(),
+    ];
+    // Offload the sidecar webcam encode to the hardware encoder when available so it doesn't
+    // compete for CPU cores with the live screen recording.
+    match crate::services::hw_encoder::detect(ffmpeg_path) {
+        Some(hw) => {
+            args.extend(["-c:v".into(), hw.name().to_string()]);
+            args.extend(hw.quality_args());
+        }
+        None => {
+            args.extend(["-c:v".into(), "libx264".into(), "-preset".into(), "veryfast".into(), "-crf".into(), "20".into()]);
+        }
+    }
+    args.extend([
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-bf".into(),
+        "0".into(),
+        "-fps_mode:v".into(),
+        "vfr".into(),
+        "-f".into(),
+        "matroska".into(),
+        "-y".into(),
+        path_to_str(&video_path)?.to_string(),
+    ]);
+
     let mut cmd = silent_command(ffmpeg_path);
-    cmd.args([
-        "-f",
-        "dshow",
-        "-video_size",
-        &map_overlay_size(&form_data.overlay_size),
-        "-i",
-        &format!("video={}", form_data.video_devices[0]),
-        "-vf",
-        FRAME_LOG_FILTER,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-bf",
-        "0",
-        "-fps_mode:v",
-        "vfr",
-        "-f",
-        "matroska",
-        "-y",
-    ])
-    .arg(&video_path)
-    .stderr(Stdio::piped());
+    cmd.args(&args).stderr(Stdio::piped());
     crate::services::orphan_guard::before_spawn(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -790,6 +804,8 @@ pub async fn recording_with_output_v(
         args.extend(vec![
             "-f".to_string(),
             "dshow".to_string(),
+            "-rtbufsize".to_string(),
+            "100M".to_string(),
             "-i".to_string(),
             format!("video={}", camera),
         ]);
@@ -1026,6 +1042,8 @@ pub async fn recording_with_output_va(
         args.extend(vec![
             "-f".to_string(),
             "dshow".to_string(),
+            "-rtbufsize".to_string(),
+            "100M".to_string(),
             "-i".to_string(),
             format!("video={}", camera),
         ]);

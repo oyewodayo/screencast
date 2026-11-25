@@ -67,6 +67,7 @@ const RecordingOverlayWindow = () => {
     useEffect(() => {
         document.documentElement.style.background = "transparent";
         document.body.style.background = "transparent";
+        invoke("exclude_from_screen_capture").catch(() => {});
     }, []);
     const [elapsedTime, setElapsedTime] = useState<number>(0);
     const [isMinimized, setIsMinimized] = useState<boolean>(false);

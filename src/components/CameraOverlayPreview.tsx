@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { IoVideocamOffOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, subscribePhoneCamera } from "../services/phoneCamera";
 import { cameraStatusText, useCameraStreams } from "../hooks/useCameraStreams";
-import { useCameraEffectFeed } from "../utils/cameraEffect";
+import { cameraEffectSpec, useCameraEffectFeed } from "../utils/cameraEffect";
 import type { CameraBackgroundPref } from "../utils/appSettings";
 
 interface CameraOverlayPreviewProps {
@@ -25,6 +25,8 @@ interface CameraOverlayPreviewProps {
     // engine downloads, to start it.
     cameraBackground?: CameraBackgroundPref;
     engineGeneration?: number;
+    // Optional real snapshot of the selected display or window shown behind the camera bubble.
+    screenPreviewUrl?: string;
 }
 
 // Every number below mirrors OverlayStyle and friends in src-tauri/src/commands/recording.rs,
@@ -114,12 +116,15 @@ const CameraOverlayPreview = ({
     variant = "overlay",
     cameraBackground,
     engineGeneration = 0,
+    screenPreviewUrl,
 }: CameraOverlayPreviewProps) => {
     // The first camera, with a live background on, is opened by the effect feed rather than the
-    // browser (one owner per camera).
+    // browser (one owner per camera). Check `cameraEffectSpec` synchronously on render #1 so
+    // `useCameraStreams` never races `ffmpeg` for exclusive DirectShow camera ownership on mount.
     const effectDevice = variant === "overlay" && videoDevices[0] && videoDevices[0] !== PHONE_CAMERA_DEVICE ? videoDevices[0] : null;
+    const wantsEffect = Boolean(effectDevice && cameraEffectSpec(cameraBackground));
     const feed = useCameraEffectFeed(effectDevice, overlayShape, overlaySize, cameraBackground, engineGeneration);
-    const feedOwnsFirst = feed.phase === "starting" || feed.phase === "running";
+    const feedOwnsFirst = wantsEffect && feed.phase !== "needs-engine" && feed.phase !== "error";
     const { streams, errors } = useCameraStreams(feedOwnsFirst ? videoDevices.slice(1) : videoDevices);
 
     // The phone's stream is owned by the phoneCamera service, not acquired here: it arrives over
@@ -191,10 +196,21 @@ const CameraOverlayPreview = ({
     return (
         <div>
             {showLabel && <label className="block text-sm font-medium mb-2">Preview</label>}
-            <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-gradient-to-br from-slate-200 via-slate-100 to-slate-300 dark:from-neutral-800 dark:via-neutral-800 dark:to-neutral-900 border border-neutral-200 dark:border-neutral-700">
-                <div className="absolute inset-0 flex items-center justify-center text-gray-400 dark:text-neutral-600 text-xs">
-                    Your screen
-                </div>
+            {/* Cap height at ~42vh while keeping exact 16:9 proportions so the default bottom-right
+                camera bubble never clips off the bottom of standard laptop viewports. */}
+            <div className="relative w-full max-w-[min(100%,calc(42vh*16/9))] mx-auto aspect-video rounded-xl overflow-hidden bg-gradient-to-br from-neutral-200 via-neutral-100 to-neutral-200/80 dark:from-neutral-900 dark:via-neutral-900 dark:to-neutral-950 ring-1 ring-black/[0.08] dark:ring-white/[0.08] shadow-sm">
+                {screenPreviewUrl ? (
+                    <img
+                        src={screenPreviewUrl}
+                        alt="Screen preview"
+                        className="absolute inset-0 w-full h-full object-cover select-none"
+                        draggable={false}
+                    />
+                ) : (
+                    <div className="absolute inset-0 flex items-center justify-center text-neutral-400 dark:text-neutral-600 text-xs font-medium tracking-wide">
+                        Your screen
+                    </div>
+                )}
 
                 {videoDevices.map((label, index) => {
                     const { xBase, yBase } = resolveAnchor(overlayPosition);
@@ -276,16 +292,31 @@ const CameraOverlayPreview = ({
                 )}
                 {feed.phase !== "off" && feed.phase !== "needs-engine" && (
                     <div
-                        className={`absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur ${
-                            feed.phase === "error" ? "bg-red-500/80 text-white" : "bg-black/55 text-white"
+                        className={`absolute top-2.5 left-2.5 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium tracking-tight shadow-sm ${
+                            feed.phase === "error"
+                                ? "bg-red-600/90 text-white"
+                                : "bg-neutral-950/75 text-white/95 ring-1 ring-white/10"
                         }`}
                         title={feed.message}
                     >
-                        {feed.phase === "error"
-                            ? "Background effect unavailable"
-                            : feed.phase === "starting" || !feed.engine || feed.engine === "starting"
-                              ? "Getting your background ready…"
-                              : `Live background · ${Math.round(feed.fps ?? 0)} fps`}
+                        {feed.phase !== "error" && (
+                            <span
+                                className={`w-1.5 h-1.5 rounded-full ${
+                                    feed.phase === "starting" || !feed.engine || feed.engine === "starting"
+                                        ? "bg-amber-400 animate-pulse"
+                                        : "bg-emerald-400"
+                                }`}
+                            />
+                        )}
+                        <span>
+                            {feed.phase === "error"
+                                ? "Background effect unavailable"
+                                : feed.phase === "starting" || !feed.engine || feed.engine === "starting"
+                                  ? "Preparing background…"
+                                  : feed.fps && feed.fps > 0
+                                    ? `Live · ${Math.round(feed.fps)} fps`
+                                    : "Live background"}
+                        </span>
                     </div>
                 )}
             </div>

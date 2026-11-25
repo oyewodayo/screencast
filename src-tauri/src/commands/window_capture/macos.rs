@@ -41,6 +41,72 @@ use crate::commands::recording::macos::list_avfoundation_devices;
 const NOT_IMPLEMENTED: &str = "Window focus monitoring isn't implemented on macOS yet";
 const WINDOW_FIELD_SEP: &str = "|||";
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DisplayBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    is_primary: bool,
+}
+
+/// Active display geometry in macOS global display coordinates (primary display origin at 0,0),
+/// ordered to match AVFoundation's "Capture screen N" enumeration.
+fn active_display_bounds() -> Vec<DisplayBounds> {
+    let mut ids = [0u32; 16];
+    let mut count = 0u32;
+    let err = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if err != 0 || count == 0 {
+        return Vec::new();
+    }
+    let main_id = unsafe { CGMainDisplayID() };
+    ids[..(count as usize).min(ids.len())]
+        .iter()
+        .map(|&id| {
+            let rect = unsafe { CGDisplayBounds(id) };
+            DisplayBounds {
+                x: rect.origin.x.round() as i32,
+                y: rect.origin.y.round() as i32,
+                width: rect.size.width.round().max(0.0) as i32,
+                height: rect.size.height.round().max(0.0) as i32,
+                is_primary: id == main_id,
+            }
+        })
+        .collect()
+}
+
 struct AppleScriptWindow {
     process_name: String,
     title: String,
@@ -134,19 +200,23 @@ return outputLines as string"#,
 // position, so this function and that one must stay in lock-step on the filter/ordering.
 pub fn get_monitors(app_handle: &AppHandle) -> Result<Vec<MonitorInfo>, String> {
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
+    let bounds = active_display_bounds();
 
     let screens: Vec<MonitorInfo> = video_devices
         .iter()
         .filter(|d| d.name.starts_with("Capture screen"))
         .enumerate()
-        .map(|(i, d)| MonitorInfo {
-            id: format!("monitor_{}", i),
-            name: d.name.clone(),
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-            is_primary: i == 0,
+        .map(|(i, d)| {
+            let b = bounds.get(i).copied();
+            MonitorInfo {
+                id: format!("monitor_{}", i),
+                name: d.name.clone(),
+                x: b.map(|v| v.x).unwrap_or(0),
+                y: b.map(|v| v.y).unwrap_or(0),
+                width: b.map(|v| v.width).unwrap_or(0),
+                height: b.map(|v| v.height).unwrap_or(0),
+                is_primary: b.map(|v| v.is_primary).unwrap_or(i == 0),
+            }
         })
         .collect();
 
@@ -219,12 +289,53 @@ pub async fn activate_and_open_window(title: &str) -> Result<(), String> {
     .map_err(|e| format!("Activate window task panicked: {}", e))?
 }
 
-// Used by recording::macos to crop a full-display avfoundation capture down to just this window -
-// avfoundation has no per-window capture mode at all (only whole displays or camera devices), so
-// unlike Windows (where cropping is a deliberate choice over a worse-but-available gdigrab window
-// mode, see recording/win.rs's gdigrab_input_args comment) there simply is no alternative here.
-// See this file's own module comment for the known multi-monitor coordinate-origin caveat.
+// Resolves a window title to BOTH the display ordinal (matching AVFoundation's "Capture screen N"
+// order) and a display-local, clamped, even-dimensioned `(x, y, width, height)` crop rect.
+// Translating System Events' global coordinates into the containing display's local origin fixes
+// window recording on secondary monitors.
+pub fn get_window_target_by_title(title: &str) -> Result<(usize, (i32, i32, i32, i32)), String> {
+    let windows = list_windows_via_osascript()?;
+    let win = windows
+        .into_iter()
+        .find(|w| w.title == title)
+        .ok_or_else(|| format!("Window '{}' not found", title))?;
+
+    let bounds = active_display_bounds();
+    if bounds.is_empty() {
+        let w = (win.width & !1).max(2);
+        let h = (win.height & !1).max(2);
+        return Ok((0, (win.x.max(0), win.y.max(0), w, h)));
+    }
+
+    let cx = win.x + win.width / 2;
+    let cy = win.y + win.height / 2;
+    let display_idx = bounds
+        .iter()
+        .position(|d| cx >= d.x && cx < d.x + d.width && cy >= d.y && cy < d.y + d.height)
+        .or_else(|| bounds.iter().position(|d| d.is_primary))
+        .unwrap_or(0);
+
+    let d = bounds[display_idx];
+    let local_x = (win.x - d.x).clamp(0, (d.width - 2).max(0));
+    let local_y = (win.y - d.y).clamp(0, (d.height - 2).max(0));
+    let max_w = (d.width - local_x).max(2);
+    let max_h = (d.height - local_y).max(2);
+    let local_w = (win.width.min(max_w) & !1).max(2);
+    let local_h = (win.height.min(max_h) & !1).max(2);
+
+    Ok((display_idx, (local_x, local_y, local_w, local_h)))
+}
+
+#[allow(dead_code)]
 pub fn get_window_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), String> {
+    let (_, rect) = get_window_target_by_title(title)?;
+    Ok(rect)
+}
+
+/// Global screen-space rect of `title` (matching `CGEventGetLocation` coordinates for click and
+/// pointer tracking).
+#[allow(dead_code)]
+pub fn get_window_global_rect_by_title(title: &str) -> Result<(i32, i32, i32, i32), String> {
     let windows = list_windows_via_osascript()?;
     windows
         .into_iter()

@@ -1,7 +1,7 @@
 import { IoClose, IoScanOutline, IoApps, IoReload, IoArrowBack, IoVideocam, IoMic, IoDesktopOutline, IoSwapHorizontal, IoPencil, IoPhonePortraitOutline, IoVolumeHigh, IoHandLeftOutline, IoTvOutline, IoSearch, IoNavigateOutline, IoBrowsersOutline, IoShieldCheckmarkOutline, IoInformationCircleOutline, IoSparklesOutline, IoKeypadOutline } from "react-icons/io5";
 import { PHONE_CAMERA_DEVICE, PHONE_CAMERA_LABEL } from "../services/phoneCamera";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import { FiMonitor } from "react-icons/fi";
 import { WindowInfo, MonitorInfo, CaptureCapabilities } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
@@ -135,7 +135,7 @@ interface SelectionTarget {
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 const MOD = isMac ? "⌘" : "Ctrl";
 
-// A segmented control - one rounded track, the selected option raised on it.
+// A segmented control - one subtle track, the active option raised cleanly on it.
 const Segmented = <T extends string>({
     value,
     options,
@@ -145,17 +145,17 @@ const Segmented = <T extends string>({
     options: { value: T; label: React.ReactNode; title?: string }[];
     onChange: (v: T) => void;
 }) => (
-    <div className="flex p-1 gap-1 rounded-xl bg-neutral-100 dark:bg-neutral-800/80">
+    <div className="flex p-0.5 gap-0.5 rounded-lg bg-neutral-200/70 dark:bg-neutral-800/90 ring-1 ring-black/[0.04] dark:ring-white/[0.06]">
         {options.map((o) => (
             <button
                 key={o.value}
                 type="button"
                 title={o.title}
                 onClick={() => onChange(o.value)}
-                className={`flex-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                className={`flex-1 px-2 py-1.5 rounded-[7px] text-xs font-medium transition-colors duration-100 ${
                     value === o.value
-                        ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
-                        : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                        ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)]"
+                        : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200"
                 }`}
             >
                 {o.label}
@@ -164,15 +164,35 @@ const Segmented = <T extends string>({
     </div>
 );
 
+// Crisp tactile pill switch used across capture/studio options (replaces heavy checkbox cards).
+const ToggleSwitch = ({ checked, disabled = false }: { checked: boolean; disabled?: boolean }) => (
+    <span
+        aria-hidden="true"
+        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-150 ${
+            disabled
+                ? "bg-neutral-200 dark:bg-neutral-800"
+                : checked
+                ? "bg-emerald-600 dark:bg-emerald-500"
+                : "bg-neutral-300/90 dark:bg-neutral-700"
+        }`}
+    >
+        <span
+            className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                checked && !disabled ? "translate-x-[18px]" : "translate-x-[3px]"
+            }`}
+        />
+    </span>
+);
+
 const SectionLabel = ({ children, hint }: { children: React.ReactNode; hint?: React.ReactNode }) => (
     <div className="flex items-baseline justify-between mb-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{children}</span>
+        <span className="text-[11px] font-semibold uppercase tracking-[0.06em] text-neutral-500 dark:text-neutral-400">{children}</span>
         {hint && <span className="text-[11px] text-neutral-400 dark:text-neutral-500">{hint}</span>}
     </div>
 );
 
 const Kbd = ({ children }: { children: React.ReactNode }) => (
-    <kbd className="px-1.5 py-0.5 rounded-md border border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-800 text-[10px] font-mono text-neutral-600 dark:text-neutral-300 shadow-[0_1px_0_rgba(0,0,0,0.08)]">
+    <kbd className="px-1.5 py-0.5 rounded-[5px] border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-800 text-[10px] font-mono text-neutral-500 dark:text-neutral-300 shadow-[0_1px_0_rgba(0,0,0,0.06)]">
         {children}
     </kbd>
 );
@@ -218,12 +238,59 @@ const EnhancedScreenOptions = ({
     isOpenScreen,
     onCloseScreen,
     onStartRecording,
-    setOpen,
+    setOpen: _setOpen,
     setSelectedScreen,
     onRecordTypeChange,
     error,
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>("main");
+    // Optimistic local mirrors for props owned by the large parent Dashboard.tsx: clicking shape,
+    // size, position, or record-type buttons paints in <16 ms while parent reconciliation runs
+    // non-blockingly inside startTransition.
+    const [localShape, setLocalShape] = useState(overlayShape);
+    const [localSize, setLocalSize] = useState(overlaySize);
+    const [localPosition, setLocalPosition] = useState(overlayPosition);
+    const [localRecordType, setLocalRecordType] = useState(recordType);
+    const [localSeparateCam, setLocalSeparateCam] = useState(separateWebcamCapture);
+    const [localSystemAudio, setLocalSystemAudio] = useState(includeSystemAudio);
+    const [localTrackClicks, setLocalTrackClicks] = useState(trackClicks);
+    useEffect(() => setLocalShape(overlayShape), [overlayShape]);
+    useEffect(() => setLocalSize(overlaySize), [overlaySize]);
+    useEffect(() => setLocalPosition(overlayPosition), [overlayPosition]);
+    useEffect(() => setLocalRecordType(recordType), [recordType]);
+    useEffect(() => setLocalSeparateCam(separateWebcamCapture), [separateWebcamCapture]);
+    useEffect(() => setLocalSystemAudio(includeSystemAudio), [includeSystemAudio]);
+    useEffect(() => setLocalTrackClicks(trackClicks), [trackClicks]);
+
+    const pickShape = (v: string) => {
+        setLocalShape(v);
+        startTransition(() => setOverlayShape(v));
+    };
+    const pickSize = (v: string) => {
+        setLocalSize(v);
+        startTransition(() => setOverlaySize(v));
+    };
+    const pickPosition = (v: string) => {
+        setLocalPosition(v);
+        startTransition(() => setOverlayPosition(v));
+    };
+    const pickRecordType = (v: string) => {
+        if (v === localRecordType) return;
+        setLocalRecordType(v);
+        startTransition(() => onRecordTypeChange(v));
+    };
+    const toggleSeparateCam = () => {
+        setLocalSeparateCam((v) => !v);
+        startTransition(() => setSeparateWebcamCapture((v) => !v));
+    };
+    const toggleSystemAudio = () => {
+        setLocalSystemAudio((v) => !v);
+        startTransition(() => onToggleIncludeSystemAudio());
+    };
+    const toggleTrackClicks = () => {
+        setLocalTrackClicks((v) => !v);
+        startTransition(() => onToggleTrackClicks());
+    };
     // "Present": the live camera display (PresentationControls.tsx) instead of a recording setup.
     // Opens straight into it while the display is live, so reopening the modal finds the controls.
     const [presentMode, setPresentMode] = useState(() => getPresentationState().active);
@@ -239,9 +306,9 @@ const EnhancedScreenOptions = ({
     };
     // The header title doubles as the recording's file name - click it to rename.
     const [editingName, setEditingName] = useState(false);
-    const isCameraOnly = CAMERA_ONLY_TYPES.includes(recordType);
-    const isAudioOnly = AUDIO_ONLY_TYPES.includes(recordType);
-    const hasCameraBubble = recordType === "sva";
+    const isCameraOnly = CAMERA_ONLY_TYPES.includes(localRecordType);
+    const isAudioOnly = AUDIO_ONLY_TYPES.includes(localRecordType);
+    const hasCameraBubble = localRecordType === "sva";
     const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
     const [windows, setWindows] = useState<WindowInfo[]>([]);
     const [selectedMonitor, setSelectedMonitor] = useState<string>("");
@@ -259,6 +326,27 @@ const EnhancedScreenOptions = ({
             .then(setCaps)
             .catch(() => setCaps({ window_isolated: false }));
     }, []);
+    // Proactive macOS privacy permission checks (Screen Recording + Accessibility) so users get
+    // one-click onboarding instead of an opaque ffmpeg failure or blank capture.
+    const isMac = /Mac/i.test(navigator.platform || navigator.userAgent);
+    const [macPerms, setMacPerms] = useState<{ screen_recording: boolean; accessibility: boolean } | null>(null);
+    useEffect(() => {
+        if (!isMac || !isOpenScreen) return;
+        let active = true;
+        const refresh = () => {
+            invoke<{ screen_recording: boolean; accessibility: boolean }>("check_macos_permissions")
+                .then((st) => {
+                    if (active) setMacPerms(st);
+                })
+                .catch(() => {});
+        };
+        refresh();
+        window.addEventListener("focus", refresh);
+        return () => {
+            active = false;
+            window.removeEventListener("focus", refresh);
+        };
+    }, [isMac, isOpenScreen]);
     // Remembered between recordings (appSettings) and sent with every capture by Dashboard.
     const [captureCursor, setCaptureCursor] = useState(() => loadSettings().captureCursor);
     const [windowTitleBar, setWindowTitleBar] = useState(() => loadSettings().windowTitleBar);
@@ -271,8 +359,9 @@ const EnhancedScreenOptions = ({
         if (next.editablePointer !== undefined) setEditablePointer(next.editablePointer);
         if (next.recordShortcuts !== undefined) setRecordShortcuts(next.recordShortcuts);
     };
-    // The pointer/shortcut recording is a Windows input hook (services/input_tracker.rs).
-    const inputTrackingSupported = navigator.userAgent.includes("Windows");
+    // Pointer and shortcut recording is implemented on Windows (Win32 hooks), macOS (CoreGraphics),
+    // and Linux (X11 via x11rb) in services/input_tracker.rs.
+    const inputTrackingSupported = true;
     // Bubble border, remembered between recordings (appSettings) and sent with every recording
     // by Dashboard's handleStartRecording.
     const [border, setBorder] = useState(() => loadSettings().cameraBorder);
@@ -286,11 +375,35 @@ const EnhancedScreenOptions = ({
     // Live background behind you in the bubble (cameraEffect.ts), remembered between recordings.
     // The engine downloads once, the first time it's wanted; the preview then shows the real effect.
     const [cameraBg, setCameraBg] = useState<CameraBackgroundPref>(() => loadSettings().cameraBackground ?? DEFAULT_SETTINGS.cameraBackground);
+    const [blurDraft, setBlurDraft] = useState<number>(() => (loadSettings().cameraBackground ?? DEFAULT_SETTINGS.cameraBackground).amount);
+    const blurCommitTimerRef = useRef<number | null>(null);
     const updateCameraBg = (patch: Partial<CameraBackgroundPref>) => {
-        const next = { ...cameraBg, ...patch };
-        saveSettings({ ...loadSettings(), cameraBackground: next });
-        setCameraBg(next);
+        setCameraBg((prev) => {
+            const next = { ...prev, ...patch };
+            saveSettings({ ...loadSettings(), cameraBackground: next });
+            return next;
+        });
     };
+    const handleBlurSliderChange = (value: number) => {
+        setBlurDraft(value);
+        if (blurCommitTimerRef.current !== null) window.clearTimeout(blurCommitTimerRef.current);
+        blurCommitTimerRef.current = window.setTimeout(() => {
+            blurCommitTimerRef.current = null;
+            updateCameraBg({ amount: value });
+        }, 60);
+    };
+    const flushBlurSlider = () => {
+        if (blurCommitTimerRef.current !== null) {
+            window.clearTimeout(blurCommitTimerRef.current);
+            blurCommitTimerRef.current = null;
+            updateCameraBg({ amount: blurDraft });
+        }
+    };
+    useEffect(() => {
+        return () => {
+            if (blurCommitTimerRef.current !== null) window.clearTimeout(blurCommitTimerRef.current);
+        };
+    }, []);
     const [engine, setEngine] = useState<{ state: "unknown" | "ready" | "needs-download" | "unsupported" | "downloading" | "failed"; progress?: number; mb?: number }>({ state: "unknown" });
     const [engineGeneration, setEngineGeneration] = useState(0);
     useEffect(() => {
@@ -338,6 +451,14 @@ const EnhancedScreenOptions = ({
             loadMonitors();
         }
     }, [mode]);
+
+    // Preload a lightweight monitor snapshot for the main preview when opening in a screen+camera
+    // mode so the user sees their actual display behind the camera bubble instead of a blank box.
+    useEffect(() => {
+        if (!isOpenScreen || !hasCameraBubble || Object.keys(monitorPreviewsRef.current).length > 0) return;
+        loadMonitorPreviews();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isOpenScreen, hasCameraBubble]);
 
     // If the parent's window-capture invoke rejects outright, selectScreen never flips true and
     // the effect above never runs - clear isLoading on an error that's new since this load began.
@@ -407,9 +528,9 @@ const EnhancedScreenOptions = ({
     };
 
     const closeModal = () => {
-        setOpen(false);
+        // Single state update to unmount cleanly — avoids double-triggering setOpen + setMode
+        // while the component is already unmounting.
         onCloseScreen();
-        setMode("main");
     };
 
     const resolveCurrentTarget = (): SelectionTarget => {
@@ -424,13 +545,15 @@ const EnhancedScreenOptions = ({
         return { screenSize: "fullscreen", selectedScreen: "" };
     };
 
-    // Also updates screenSize/selectedScreen for code that still reads them ambiently - but the
-    // capture itself is driven by `target`, so it's correct immediately.
+    // Close the modal FIRST so browser preview tracks (useCameraStreams / LiveMicMeter) unmount
+    // and release DirectShow/WASAPI handles before ffmpeg tries to open the camera/mic.
     const confirmAndStart = (target: SelectionTarget) => {
         setScreenSize(target.screenSize);
         setSelectedScreen(target.selectedScreen);
-        onStartRecording(target);
         closeModal();
+        window.setTimeout(() => {
+            onStartRecording(target);
+        }, 120);
     };
 
     // Screenshotting a window is a single click: picking it *is* confirming the target. Video
@@ -452,19 +575,23 @@ const EnhancedScreenOptions = ({
     };
 
     // Enter starts, Escape closes - the two things a keyboard user reaches for in a dialog.
+    // Keep the latest handler in a ref so the window listener binds once while open rather than
+    // tearing down and re-attaching on every re-render.
+    const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
+    keyHandlerRef.current = (e: KeyboardEvent) => {
+        if (e.key === "Escape") closeModal();
+        if (e.key === "Enter" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLButtonElement)) {
+            if (presentMode) {
+                if (!presentation.active) void togglePresentation();
+            } else confirmAndStart(resolveCurrentTarget());
+        }
+    };
     useEffect(() => {
         if (!isOpenScreen) return;
-        const onKey = (e: KeyboardEvent) => {
-            if (e.key === "Escape") closeModal();
-            if (e.key === "Enter" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLButtonElement)) {
-                if (presentMode) {
-                    if (!presentation.active) void togglePresentation();
-                } else confirmAndStart(resolveCurrentTarget());
-            }
-        };
+        const onKey = (e: KeyboardEvent) => keyHandlerRef.current(e);
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
-    });
+    }, [isOpenScreen]);
 
     const fullscreenSelected = !selectedMonitor && selectedWindow === null;
     const sourceCard = (
@@ -477,24 +604,24 @@ const EnhancedScreenOptions = ({
         <button
             type="button"
             onClick={onClick}
-            className={`group flex items-center gap-3 p-4 rounded-2xl border text-left transition-all ${
+            className={`group flex items-center gap-3 px-3.5 py-3 rounded-xl border text-left transition-colors duration-100 ${
                 active
-                    ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-500/10 ring-4 ring-emerald-500/10"
-                    : "border-neutral-200 dark:border-neutral-700/80 bg-white dark:bg-neutral-900 hover:border-neutral-300 dark:hover:border-neutral-600 hover:shadow-sm"
+                    ? "border-emerald-600/80 dark:border-emerald-500/80 bg-emerald-50/50 dark:bg-emerald-500/[0.08] shadow-[0_1px_2px_rgba(0,0,0,0.04)]"
+                    : "border-neutral-200/90 dark:border-neutral-800 bg-white dark:bg-neutral-900/60 hover:border-neutral-300 dark:hover:border-neutral-700 hover:bg-neutral-50/70 dark:hover:bg-neutral-800/50"
             }`}
         >
             <span
-                className={`flex items-center justify-center w-11 h-11 rounded-xl text-2xl transition-colors ${
+                className={`flex items-center justify-center w-9 h-9 rounded-lg text-lg shrink-0 transition-colors duration-100 ${
                     active
-                        ? "bg-emerald-500 text-white"
-                        : "bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 group-hover:bg-neutral-200 dark:group-hover:bg-neutral-700"
+                        ? "bg-emerald-600 text-white shadow-sm"
+                        : "bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 group-hover:bg-neutral-200/80 dark:group-hover:bg-neutral-700"
                 }`}
             >
                 {icon}
             </span>
             <span className="min-w-0">
-                <span className="block text-sm font-semibold text-neutral-900 dark:text-neutral-100">{title}</span>
-                <span className="block text-xs text-neutral-500 dark:text-neutral-400 truncate">{subtitle}</span>
+                <span className="block text-[13px] font-semibold tracking-tight text-neutral-900 dark:text-neutral-100">{title}</span>
+                <span className="block text-[11px] text-neutral-500 dark:text-neutral-400 truncate">{subtitle}</span>
             </span>
         </button>
     );
@@ -738,7 +865,7 @@ const EnhancedScreenOptions = ({
     );
 
     const renderCameraPanel = () => (
-        <div className="space-y-6">
+        <div className="space-y-5">
             <div>
                 <SectionLabel>Shape</SectionLabel>
                 <div className="grid grid-cols-3 gap-2">
@@ -746,59 +873,68 @@ const EnhancedScreenOptions = ({
                         <button
                             key={shape.value}
                             type="button"
-                            onClick={() => setOverlayShape(shape.value)}
-                            className={`flex flex-col items-center gap-2 py-3 rounded-xl border transition-all ${
-                                overlayShape === shape.value
-                                    ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-500/10"
-                                    : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600"
+                            onClick={() => pickShape(shape.value)}
+                            className={`flex flex-col items-center gap-2 py-2.5 rounded-xl border transition-colors duration-100 ${
+                                localShape === shape.value
+                                    ? "border-emerald-600/80 dark:border-emerald-500/80 bg-white dark:bg-neutral-800/90 shadow-sm"
+                                    : "border-neutral-200/80 dark:border-neutral-800 bg-white/60 dark:bg-neutral-900/40 hover:border-neutral-300 dark:hover:border-neutral-700"
                             }`}
                         >
                             <span
-                                className={`w-9 h-9 bg-gradient-to-br from-neutral-300 to-neutral-400 dark:from-neutral-600 dark:to-neutral-500 ${shape.className}`}
+                                className={`w-8 h-8 bg-gradient-to-br from-neutral-300 to-neutral-400 dark:from-neutral-600 dark:to-neutral-500 ${shape.className}`}
                                 style={border !== "none" ? { boxShadow: `0 0 0 ${border === "thick" ? 3 : border === "medium" ? 2 : 1}px ${borderColor}` } : undefined}
                             />
-                            <span className="text-xs font-medium">{shape.label}</span>
+                            <span className={`text-[11px] font-medium ${localShape === shape.value ? "text-neutral-900 dark:text-white" : "text-neutral-600 dark:text-neutral-400"}`}>
+                                {shape.label}
+                            </span>
                         </button>
                     ))}
                 </div>
             </div>
 
             <div>
-                <SectionLabel hint="of the video's width">Size</SectionLabel>
+                <SectionLabel hint="of frame width">Size</SectionLabel>
                 <Segmented
-                    value={overlaySize}
-                    onChange={setOverlaySize}
+                    value={localSize}
+                    onChange={pickSize}
                     options={SIZES.map((s) => ({ value: s.value, label: s.label, title: `${s.hint} of the video's width` }))}
                 />
             </div>
 
             <div>
-                <SectionLabel>Position</SectionLabel>
-                <div className="relative aspect-video rounded-xl border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-800/50 p-2 grid grid-cols-3 grid-rows-3 gap-1.5">
+                <SectionLabel hint={POSITION_LABELS[localPosition] ?? "Bottom right"}>Position</SectionLabel>
+                <div className="relative aspect-video rounded-xl border border-neutral-200/90 dark:border-neutral-800 bg-white dark:bg-neutral-900/70 p-2 grid grid-cols-3 grid-rows-3 gap-1">
                     {POSITIONS.map((pos) => (
                         <button
                             key={pos}
                             type="button"
                             title={POSITION_LABELS[pos]}
-                            onClick={() => setOverlayPosition(pos)}
+                            onClick={() => pickPosition(pos)}
                             className={`flex ${pos.startsWith("top") ? "items-start" : pos.startsWith("bottom") ? "items-end" : "items-center"} ${
                                 pos.endsWith("left") ? "justify-start" : pos.endsWith("right") ? "justify-end" : "justify-center"
-                            } p-1.5 rounded-lg transition-colors ${
-                                overlayPosition === pos ? "bg-emerald-500/10" : "hover:bg-neutral-200/60 dark:hover:bg-neutral-700/60"
+                            } p-1.5 rounded-lg transition-colors duration-100 ${
+                                localPosition === pos
+                                    ? "bg-emerald-500/12 dark:bg-emerald-500/15"
+                                    : "hover:bg-neutral-100 dark:hover:bg-neutral-800/80"
                             }`}
                         >
                             <span
-                                className={`w-5 h-4 transition-all ${
-                                    overlayShape === "circle" ? "rounded-full w-4" : overlayShape === "rounded" ? "rounded-md" : "rounded-sm"
-                                } ${overlayPosition === pos ? "bg-emerald-500 shadow" : "bg-neutral-300 dark:bg-neutral-600"}`}
+                                className={`h-3.5 transition-colors duration-100 ${
+                                    localShape === "circle"
+                                        ? "rounded-full w-3.5"
+                                        : localShape === "rounded"
+                                        ? "rounded-[4px] w-4.5"
+                                        : "rounded-[2px] w-4.5"
+                                } ${localPosition === pos ? "bg-emerald-600 dark:bg-emerald-500 shadow-sm" : "bg-neutral-300 dark:bg-neutral-700"}`}
                             />
                         </button>
                     ))}
                 </div>
-                <p className="mt-1.5 text-[11px] text-neutral-500">
-                    {POSITION_LABELS[overlayPosition] ?? "Bottom right"}
-                    {videoDevices.length > 1 ? " - several cameras line up in a row from here" : ""}
-                </p>
+                {videoDevices.length > 1 && (
+                    <p className="mt-1.5 text-[11px] text-neutral-500">
+                        Multiple cameras line up horizontally from this anchor.
+                    </p>
+                )}
             </div>
 
             <div>
@@ -809,25 +945,25 @@ const EnhancedScreenOptions = ({
                     options={BORDERS.map((b) => ({ value: b.value, label: b.label }))}
                 />
                 {border !== "none" && (
-                    <div className="mt-3 flex items-center gap-2 flex-wrap">
+                    <div className="mt-2.5 flex items-center gap-1.5 flex-wrap">
                         {BORDER_COLORS.map((c) => (
                             <button
                                 key={c}
                                 type="button"
                                 title={c}
                                 onClick={() => updateBorder({ cameraBorderColor: c })}
-                                className={`w-7 h-7 rounded-full border border-black/10 dark:border-white/20 transition-transform hover:scale-110 ${
-                                    borderColor.toLowerCase() === c ? "ring-2 ring-offset-2 ring-emerald-500 dark:ring-offset-neutral-900" : ""
+                                className={`w-6 h-6 rounded-full border border-black/10 dark:border-white/20 transition-transform duration-100 hover:scale-110 ${
+                                    borderColor.toLowerCase() === c ? "ring-2 ring-offset-2 ring-emerald-600 dark:ring-offset-[#151619]" : ""
                                 }`}
                                 style={{ background: c }}
                             />
                         ))}
                         <label
-                            className="relative w-7 h-7 rounded-full border border-dashed border-neutral-400 dark:border-neutral-500 flex items-center justify-center cursor-pointer overflow-hidden"
+                            className="relative w-6 h-6 rounded-full border border-dashed border-neutral-400 dark:border-neutral-600 flex items-center justify-center cursor-pointer overflow-hidden hover:border-neutral-500"
                             title="Custom colour"
                             style={!BORDER_COLORS.includes(borderColor.toLowerCase()) ? { background: borderColor, borderStyle: "solid" } : undefined}
                         >
-                            {BORDER_COLORS.includes(borderColor.toLowerCase()) && <span className="text-xs text-neutral-500">+</span>}
+                            {BORDER_COLORS.includes(borderColor.toLowerCase()) && <span className="text-[11px] text-neutral-500">+</span>}
                             <ColorInput
                                 value={borderColor}
                                 onChange={(e) => updateBorder({ cameraBorderColor: e.target.value })}
@@ -838,10 +974,10 @@ const EnhancedScreenOptions = ({
                 )}
             </div>
 
-            {engine.state !== "unsupported" && !(separateWebcamCapture && videoDevices.length === 1) && (
+            {engine.state !== "unsupported" && !(localSeparateCam && videoDevices.length === 1) && (
                 <div>
-                    <SectionLabel hint="live, while you record">Background</SectionLabel>
-                    <div className="grid grid-cols-4 gap-2">
+                    <SectionLabel hint="real-time">Background</SectionLabel>
+                    <div className="grid grid-cols-4 gap-1.5">
                         {([
                             ["off", "Off", "No effect - your camera as it is"],
                             ["blur", "Blur", "Your own room, softly blurred"],
@@ -853,15 +989,15 @@ const EnhancedScreenOptions = ({
                                 type="button"
                                 title={hint}
                                 onClick={() => (kind === "image" && !cameraBg.imagePath ? void pickBgPicture() : updateCameraBg({ kind }))}
-                                className={`flex flex-col items-center gap-1.5 py-2.5 rounded-xl border transition-all ${
+                                className={`flex flex-col items-center gap-1.5 py-2 rounded-xl border transition-colors duration-100 ${
                                     cameraBg.kind === kind
-                                        ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-500/10"
-                                        : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600"
+                                        ? "border-emerald-600/80 dark:border-emerald-500/80 bg-white dark:bg-neutral-800/90 shadow-sm"
+                                        : "border-neutral-200/80 dark:border-neutral-800 bg-white/60 dark:bg-neutral-900/40 hover:border-neutral-300 dark:hover:border-neutral-700"
                                 }`}
                             >
-                                <span className="relative w-9 h-9 rounded-full overflow-hidden ring-1 ring-black/10 dark:ring-white/10">
+                                <span className="relative w-8 h-8 rounded-full overflow-hidden ring-1 ring-black/10 dark:ring-white/10">
                                     {kind === "off" && <span className="absolute inset-0 bg-gradient-to-br from-stone-300 to-stone-500" />}
-                                    {kind === "blur" && <span className="absolute inset-0 bg-gradient-to-br from-amber-200 via-sky-400 to-indigo-600 blur-[3px] scale-125" />}
+                                    {kind === "blur" && <span className="absolute inset-0 bg-gradient-to-br from-amber-200 via-sky-400 to-indigo-600 blur-[2px] scale-125" />}
                                     {kind === "color" && <span className="absolute inset-0" style={{ background: cameraBg.color }} />}
                                     {kind === "image" &&
                                         (cameraBg.imagePath ? (
@@ -869,49 +1005,56 @@ const EnhancedScreenOptions = ({
                                         ) : (
                                             <span className="absolute inset-0 bg-gradient-to-br from-emerald-300 to-teal-600" />
                                         ))}
-                                    <span className="absolute left-1/2 top-[22%] -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-white/90" />
-                                    <span className="absolute left-1/2 bottom-0 -translate-x-1/2 w-5 h-3 rounded-t-full bg-white/90" />
+                                    <span className="absolute left-1/2 top-[22%] -translate-x-1/2 w-2 h-2 rounded-full bg-white/90" />
+                                    <span className="absolute left-1/2 bottom-0 -translate-x-1/2 w-4.5 h-2.5 rounded-t-full bg-white/90" />
                                 </span>
-                                <span className="text-xs font-medium">{label}</span>
+                                <span className={`text-[11px] font-medium ${cameraBg.kind === kind ? "text-neutral-900 dark:text-white" : "text-neutral-600 dark:text-neutral-400"}`}>
+                                    {label}
+                                </span>
                             </button>
                         ))}
                     </div>
                     {cameraBg.kind === "blur" && (
-                        <label className="mt-3 flex items-center gap-3 text-xs">
-                            <span className="w-14 text-neutral-500">Amount</span>
+                        <label className="mt-2.5 flex items-center gap-3 text-xs">
+                            <span className="w-14 text-neutral-500">Strength</span>
                             <input
                                 type="range"
                                 min={0.15}
                                 max={1}
                                 step={0.01}
-                                value={cameraBg.amount}
-                                onChange={(e) => updateCameraBg({ amount: Number(e.target.value) })}
-                                className="flex-1 accent-emerald-500"
+                                value={blurDraft}
+                                onChange={(e) => handleBlurSliderChange(Number(e.target.value))}
+                                onPointerUp={flushBlurSlider}
+                                onBlur={flushBlurSlider}
+                                className="flex-1 accent-emerald-600 cursor-pointer"
                             />
+                            <span className="w-8 text-right font-mono text-[11px] tabular-nums text-neutral-500">
+                                {Math.round(blurDraft * 100)}%
+                            </span>
                         </label>
                     )}
                     {cameraBg.kind === "color" && (
-                        <div className="mt-3 flex items-center gap-2 flex-wrap">
+                        <div className="mt-2.5 flex items-center gap-1.5 flex-wrap">
                             {BACKGROUND_SWATCHES.map((c) => (
                                 <button
                                     key={c}
                                     type="button"
                                     title={c}
                                     onClick={() => updateCameraBg({ color: c })}
-                                    className={`w-7 h-7 rounded-full border border-black/10 dark:border-white/20 transition-transform hover:scale-110 ${
-                                        cameraBg.color.toLowerCase() === c ? "ring-2 ring-offset-2 ring-emerald-500 dark:ring-offset-neutral-900" : ""
+                                    className={`w-6 h-6 rounded-full border border-black/10 dark:border-white/20 transition-transform duration-100 hover:scale-110 ${
+                                        cameraBg.color.toLowerCase() === c ? "ring-2 ring-offset-2 ring-emerald-600 dark:ring-offset-[#151619]" : ""
                                     }`}
                                     style={{ background: c }}
                                 />
                             ))}
-                            <label className="relative w-7 h-7 rounded-full border border-dashed border-neutral-400 dark:border-neutral-500 flex items-center justify-center cursor-pointer overflow-hidden" title="Any colour">
-                                <span className="text-xs text-neutral-500">+</span>
+                            <label className="relative w-6 h-6 rounded-full border border-dashed border-neutral-400 dark:border-neutral-600 flex items-center justify-center cursor-pointer overflow-hidden" title="Any colour">
+                                <span className="text-[11px] text-neutral-500">+</span>
                                 <ColorInput value={cameraBg.color} onChange={(e) => updateCameraBg({ color: e.target.value })} className="absolute inset-0 opacity-0 cursor-pointer" />
                             </label>
                         </div>
                     )}
                     {cameraBg.kind === "image" && (
-                        <button type="button" onClick={() => void pickBgPicture()} className="mt-3 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:underline">
+                        <button type="button" onClick={() => void pickBgPicture()} className="mt-2.5 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:underline">
                             Choose another picture…
                         </button>
                     )}
@@ -932,7 +1075,7 @@ const EnhancedScreenOptions = ({
                                     <span className="text-neutral-600 dark:text-neutral-300">
                                         {engine.state === "failed" ? "The download didn't finish." : `A one-time ${engine.mb ?? 40} MB download makes this work.`}
                                     </span>
-                                    <button type="button" onClick={getEngine} className="shrink-0 px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white font-medium">
+                                    <button type="button" onClick={getEngine} className="shrink-0 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium">
                                         {engine.state === "failed" ? "Try again" : "Get it"}
                                     </button>
                                 </div>
@@ -940,40 +1083,39 @@ const EnhancedScreenOptions = ({
                         </div>
                     )}
                     {cameraBg.kind !== "off" && engine.state === "ready" && (
-                        <p className="mt-2 text-[11px] text-neutral-500">Done live on your computer, in the preview above and in the recording.</p>
+                        <p className="mt-2 text-[11px] text-neutral-400 dark:text-neutral-500">Processed locally on your GPU — stays private and works offline.</p>
                     )}
                 </div>
             )}
 
             {videoDevices.length === 1 && (
-                <label className="flex items-start gap-3 p-3 rounded-xl border border-neutral-200 dark:border-neutral-700 cursor-pointer hover:border-neutral-300 dark:hover:border-neutral-600">
-                    <input
-                        type="checkbox"
-                        checked={separateWebcamCapture}
-                        onChange={() => setSeparateWebcamCapture((v) => !v)}
-                        className="mt-0.5 w-4 h-4 accent-emerald-500"
-                    />
+                <button
+                    type="button"
+                    role="switch"
+                    aria-checked={localSeparateCam}
+                    onClick={toggleSeparateCam}
+                    className="w-full flex items-start justify-between gap-3 p-3 rounded-xl border border-neutral-200/90 dark:border-neutral-800 bg-white dark:bg-neutral-900/60 hover:border-neutral-300 dark:hover:border-neutral-700 text-left transition-colors duration-100"
+                >
                     <span className="min-w-0">
-                        <span className="flex items-center gap-1.5 text-sm font-medium">
-                            <IoSwapHorizontal className="text-emerald-500" /> Record webcam separately
+                        <span className="flex items-center gap-1.5 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
+                            <IoSwapHorizontal className="text-emerald-600 dark:text-emerald-400 shrink-0" /> Record webcam separately
                         </span>
-                        <span className="block mt-0.5 text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed">
-                            Keeps the camera as its own layer: move, resize and restyle it later in the editor, and while
-                            recording cut between your screen and a full-frame camera with <Kbd>{isMac ? "⌥" : "Alt"}</Kbd> <Kbd>Shift</Kbd> <Kbd>V</Kbd> or the Screen/Camera
-                            buttons.
+                        <span className="block mt-1 text-[11px] text-neutral-500 dark:text-neutral-400 leading-relaxed">
+                            Saves camera as its own editable layer and unlocks live Screen/Camera cuts (<Kbd>{isMac ? "⌥" : "Alt"}</Kbd> <Kbd>Shift</Kbd> <Kbd>V</Kbd>).
                         </span>
                     </span>
-                </label>
+                    <ToggleSwitch checked={localSeparateCam} />
+                </button>
             )}
         </div>
     );
 
 
-    const isScreenType = recordType === "sva" || recordType === "sa" || recordType === "s";
-    const hasMic = ["sva", "sa", "va", "a"].includes(recordType);
-    const hasCamera = ["sva", "va", "v"].includes(recordType);
+    const isScreenType = localRecordType === "sva" || localRecordType === "sa" || localRecordType === "s";
+    const hasMic = ["sva", "sa", "va", "a"].includes(localRecordType);
+    const hasCamera = ["sva", "va", "v"].includes(localRecordType);
     const selectClass =
-        "w-full px-3 py-2 rounded-xl text-sm bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/40";
+        "w-full px-3 py-2 rounded-lg text-[13px] bg-white dark:bg-neutral-900 border border-neutral-200/90 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 transition-colors duration-100";
     const toggleRow = (
         checked: boolean,
         onChange: () => void,
@@ -982,36 +1124,42 @@ const EnhancedScreenOptions = ({
         hint: string,
         disabled = false
     ) => (
-        <label
-            className={`flex items-start gap-3 p-3 rounded-xl border transition-colors ${
+        <button
+            type="button"
+            role="switch"
+            aria-checked={checked && !disabled}
+            disabled={disabled}
+            onClick={() => !disabled && onChange()}
+            className={`w-full flex items-center justify-between gap-4 px-3.5 py-2.5 text-left transition-colors duration-100 ${
                 disabled
-                    ? "border-neutral-200 dark:border-neutral-800 opacity-50 cursor-not-allowed"
-                    : checked
-                    ? "border-emerald-500/60 bg-emerald-50/60 dark:bg-emerald-500/10 cursor-pointer"
-                    : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600 cursor-pointer"
+                    ? "opacity-45 cursor-not-allowed"
+                    : "hover:bg-neutral-50/90 dark:hover:bg-neutral-800/40 cursor-pointer"
             }`}
         >
-            <input type="checkbox" checked={checked && !disabled} disabled={disabled} onChange={onChange} className="mt-0.5 w-4 h-4 accent-emerald-500" />
-            <span className="min-w-0">
-                <span className="flex items-center gap-1.5 text-sm font-medium">{icon}{title}</span>
-                <span className="block mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">{hint}</span>
+            <span className="min-w-0 flex items-start gap-2.5">
+                <span className="mt-0.5 text-neutral-500 dark:text-neutral-400 shrink-0">{icon}</span>
+                <span className="min-w-0">
+                    <span className="block text-[13px] font-medium text-neutral-900 dark:text-neutral-100 leading-snug">{title}</span>
+                    <span className="block text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug">{hint}</span>
+                </span>
             </span>
-        </label>
+            <ToggleSwitch checked={checked} disabled={disabled} />
+        </button>
     );
 
-    const capturesScreen = isScreenType || recordType === "c";
+    const capturesScreen = isScreenType || localRecordType === "c";
     const windowPicked = selectedWindow !== null;
     const renderCaptureToggles = () => (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="rounded-xl border border-neutral-200/80 dark:border-neutral-800 bg-white dark:bg-neutral-900/50 divide-y divide-neutral-200/70 dark:divide-neutral-800/80 overflow-hidden">
             {toggleRow(
                 captureCursor || (isScreenType && editablePointer && inputTrackingSupported),
                 () => updateCapturePrefs({ captureCursor: !captureCursor }),
-                <IoNavigateOutline className="text-emerald-500 -scale-x-100" />,
+                <IoNavigateOutline className="-scale-x-100" />,
                 "Show cursor",
-                recordType === "c"
+                localRecordType === "c"
                     ? "Include the mouse pointer in the screenshot."
                     : isScreenType && editablePointer && inputTrackingSupported
-                    ? "Drawn by the editor - see Editable pointer."
+                    ? "Managed by Editable pointer for smooth playback."
                     : "Include the mouse pointer in the video.",
                 isScreenType && editablePointer && inputTrackingSupported
             )}
@@ -1019,192 +1167,198 @@ const EnhancedScreenOptions = ({
                 toggleRow(
                     editablePointer && inputTrackingSupported,
                     () => updateCapturePrefs({ editablePointer: !editablePointer }),
-                    <IoSparklesOutline className="text-emerald-500" />,
+                    <IoSparklesOutline />,
                     "Editable pointer",
-                    inputTrackingSupported
-                        ? "Records the pointer separately, so the editor can smooth and enlarge it and ripple every click (Screen style). The recorded file itself has no pointer."
-                        : "Windows only for now.",
+                    "Records cursor path separately for smoothing, enlargement, and click ripples in the editor.",
                     !inputTrackingSupported
                 )}
             {isScreenType &&
                 toggleRow(
                     recordShortcuts && inputTrackingSupported,
                     () => updateCapturePrefs({ recordShortcuts: !recordShortcuts }),
-                    <IoKeypadOutline className="text-emerald-500" />,
+                    <IoKeypadOutline />,
                     "Record shortcuts",
-                    inputTrackingSupported
-                        ? "Keys you press with Ctrl, Alt or Win (and Enter, Esc, Tab, F-keys), shown as keycaps in the editor. Ordinary typing is never recorded."
-                        : "Windows only for now.",
+                    "Captures modifier combos and action keys (never ordinary typing) for editor keycaps.",
                     !inputTrackingSupported
+                )}
+            {isScreenType &&
+                toggleRow(
+                    localSystemAudio,
+                    toggleSystemAudio,
+                    <IoVolumeHigh />,
+                    "System audio",
+                    "Record audio playing through your speakers or headphones."
+                )}
+            {isScreenType &&
+                toggleRow(
+                    localTrackClicks,
+                    toggleTrackClicks,
+                    <IoHandLeftOutline />,
+                    "Track clicks",
+                    isClickTrackingSupported
+                        ? "Log click positions so the editor can auto-zoom on interactions."
+                        : "Unavailable on this platform.",
+                    !isClickTrackingSupported
                 )}
             {windowPicked &&
                 toggleRow(
                     windowTitleBar,
                     () => updateCapturePrefs({ windowTitleBar: !windowTitleBar }),
-                    <IoBrowsersOutline className="text-emerald-500" />,
+                    <IoBrowsersOutline />,
                     "Include title bar",
-                    "Keep the window's title bar and frame - off captures just its content."
+                    "Keep the window's title bar and frame; off captures content only."
                 )}
         </div>
     );
 
     const renderOptions = () => (
-        <div className="space-y-5">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {hasMic && (
-                    <div>
-                        <div className="flex items-center justify-between mb-1">
-                            <SectionLabel>Microphone</SectionLabel>
-                            <LiveMicMeter audioDevice={audioDevice} />
+        <div className="space-y-4">
+            <div className="rounded-xl border border-neutral-200/80 dark:border-neutral-800 bg-neutral-50/60 dark:bg-neutral-900/40 p-4 space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                    {hasMic && (
+                        <div>
+                            <div className="flex items-center justify-between mb-1.5">
+                                <span className="text-[11px] font-semibold uppercase tracking-[0.06em] text-neutral-500 dark:text-neutral-400">Microphone</span>
+                                <LiveMicMeter audioDevice={audioDevice} />
+                            </div>
+                            <select className={selectClass} value={audioDevice} onChange={(e) => onAudioDeviceChange(e.target.value)}>
+                                {connectedAudioDevices && connectedAudioDevices.length > 0 ? (
+                                    connectedAudioDevices.map((d) => (
+                                        <option key={d} value={d}>{d}</option>
+                                    ))
+                                ) : (
+                                    <option value="">No microphone detected</option>
+                                )}
+                            </select>
                         </div>
-                        <select className={selectClass} value={audioDevice} onChange={(e) => onAudioDeviceChange(e.target.value)}>
-                            {connectedAudioDevices && connectedAudioDevices.length > 0 ? (
-                                connectedAudioDevices.map((d) => (
-                                    <option key={d} value={d}>{d}</option>
-                                ))
+                    )}
+                    <div>
+                        <SectionLabel>File format</SectionLabel>
+                        <select className={selectClass} value={fileExt.toLowerCase()} onChange={(e) => onFileExtChange(e.target.value)}>
+                            {localRecordType === "c" ? (
+                                <>
+                                    <option value="png">PNG</option>
+                                    <option value="jpeg">JPEG</option>
+                                    <option value="webp">WebP</option>
+                                </>
+                            ) : localRecordType === "a" ? (
+                                <>
+                                    <option value="mp3">MP3</option>
+                                    <option value="wav">WAV</option>
+                                    <option value="aac">AAC</option>
+                                    <option value="wma">WMA</option>
+                                </>
                             ) : (
-                                <option value="">No microphone detected</option>
+                                <>
+                                    <option value="mp4">MP4 (recommended)</option>
+                                    <option value="mkv">MKV</option>
+                                    <option value="mov">MOV</option>
+                                    <option value="webm">WebM</option>
+                                    <option value="avi">AVI</option>
+                                </>
                             )}
                         </select>
                     </div>
-                )}
-                <div>
-                    <SectionLabel>File format</SectionLabel>
-                    <select className={selectClass} value={fileExt.toLowerCase()} onChange={(e) => onFileExtChange(e.target.value)}>
-                        {recordType === "c" ? (
-                            <>
-                                <option value="png">PNG</option>
-                                <option value="jpeg">JPEG</option>
-                                <option value="webp">WebP</option>
-                            </>
-                        ) : recordType === "a" ? (
-                            <>
-                                <option value="mp3">MP3</option>
-                                <option value="wav">WAV</option>
-                                <option value="aac">AAC</option>
-                                <option value="wma">WMA</option>
-                            </>
-                        ) : (
-                            <>
-                                <option value="mp4">MP4 (recommended)</option>
-                                <option value="mkv">MKV</option>
-                                <option value="mov">MOV</option>
-                                <option value="webm">WebM</option>
-                                <option value="avi">AVI</option>
-                            </>
-                        )}
-                    </select>
+                    {isScreenType && (
+                        <>
+                            <div>
+                                <SectionLabel>Resolution</SectionLabel>
+                                <select
+                                    className={selectClass}
+                                    value={resolutionWidth ?? ""}
+                                    onChange={(e) => onResolutionWidthChange(e.target.value ? Number(e.target.value) : null)}
+                                >
+                                    <option value="">Auto (full GPU resolution)</option>
+                                    <option value="1280">720p</option>
+                                    <option value="1920">1080p</option>
+                                    <option value="2560">1440p</option>
+                                    <option value={NATIVE_RESOLUTION_WIDTH}>Native</option>
+                                </select>
+                            </div>
+                            <div>
+                                <SectionLabel>Frame rate</SectionLabel>
+                                <select
+                                    className={selectClass}
+                                    value={framerate ?? ""}
+                                    onChange={(e) => onFramerateChange(e.target.value ? Number(e.target.value) : null)}
+                                >
+                                    <option value="">Auto (up to 60 fps)</option>
+                                    <option value="24">24 fps</option>
+                                    <option value="30">30 fps</option>
+                                    <option value="60">60 fps</option>
+                                </select>
+                            </div>
+                        </>
+                    )}
                 </div>
-                {isScreenType && (
-                    <>
-                        <div>
-                            <SectionLabel>Resolution</SectionLabel>
-                            <select
-                                className={selectClass}
-                                value={resolutionWidth ?? ""}
-                                onChange={(e) => onResolutionWidthChange(e.target.value ? Number(e.target.value) : null)}
-                            >
-                                <option value="">Auto - full resolution on supported GPUs</option>
-                                <option value="1280">720p</option>
-                                <option value="1920">1080p</option>
-                                <option value="2560">1440p</option>
-                                <option value={NATIVE_RESOLUTION_WIDTH}>Native</option>
-                            </select>
+
+                {hasCamera && (
+                    <div className="pt-3 border-t border-neutral-200/70 dark:border-neutral-800/80">
+                        <SectionLabel
+                            hint={
+                                <button type="button" onClick={onRefreshDevices} className="flex items-center gap-1 hover:text-neutral-700 dark:hover:text-neutral-200 transition-colors">
+                                    <IoReload /> Refresh
+                                </button>
+                            }
+                        >
+                            Cameras
+                        </SectionLabel>
+                        <div className="flex flex-wrap gap-2">
+                            {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
+                                connectedCameraDevices.map((device) => {
+                                    const isPhone = device === PHONE_CAMERA_DEVICE;
+                                    const on = videoDevices.includes(device);
+                                    return (
+                                        <button
+                                            key={device}
+                                            type="button"
+                                            onClick={() => (isPhone && !isPhoneCameraConnected ? onOpenPhoneCamera() : startTransition(() => onToggleVideoDevice(device)))}
+                                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors duration-100 ${
+                                                on
+                                                    ? "border-emerald-600/80 dark:border-emerald-500/80 bg-emerald-50/60 dark:bg-emerald-500/12 text-emerald-800 dark:text-emerald-200"
+                                                    : "border-neutral-200/90 dark:border-neutral-800 bg-white dark:bg-neutral-900 text-neutral-700 dark:text-neutral-300 hover:border-neutral-300 dark:hover:border-neutral-700"
+                                            }`}
+                                        >
+                                            {isPhone ? <IoPhonePortraitOutline /> : <IoVideocam />}
+                                            <span className="truncate max-w-[14rem]">{isPhone ? PHONE_CAMERA_LABEL : device}</span>
+                                            {isPhone && (
+                                                <span
+                                                    className={`text-[10px] px-1.5 py-px rounded-full ${
+                                                        isPhoneCameraConnected
+                                                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300"
+                                                            : "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                                                    }`}
+                                                >
+                                                    {isPhoneCameraConnected ? "Connected" : "Pair"}
+                                                </span>
+                                            )}
+                                        </button>
+                                    );
+                                })
+                            ) : (
+                                <span className="text-xs text-neutral-500">No cameras detected</span>
+                            )}
                         </div>
-                        <div>
-                            <SectionLabel>Frame rate</SectionLabel>
-                            <select
-                                className={selectClass}
-                                value={framerate ?? ""}
-                                onChange={(e) => onFramerateChange(e.target.value ? Number(e.target.value) : null)}
-                            >
-                                <option value="">Auto - 60 fps on supported GPUs</option>
-                                <option value="24">24 fps</option>
-                                <option value="30">30 fps</option>
-                                <option value="60">60 fps</option>
-                            </select>
-                        </div>
-                    </>
+                    </div>
                 )}
             </div>
 
-            {hasCamera && (
-                <div>
-                    <SectionLabel
-                        hint={
-                            <button type="button" onClick={onRefreshDevices} className="flex items-center gap-1 hover:text-neutral-700 dark:hover:text-neutral-200">
-                                <IoReload /> Refresh
-                            </button>
-                        }
-                    >
-                        Cameras
-                    </SectionLabel>
-                    <div className="flex flex-wrap gap-2">
-                        {connectedCameraDevices && connectedCameraDevices.length > 0 ? (
-                            connectedCameraDevices.map((device) => {
-                                const isPhone = device === PHONE_CAMERA_DEVICE;
-                                const on = videoDevices.includes(device);
-                                return (
-                                    <button
-                                        key={device}
-                                        type="button"
-                                        onClick={() => (isPhone && !isPhoneCameraConnected ? onOpenPhoneCamera() : onToggleVideoDevice(device))}
-                                        className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-sm transition-colors ${
-                                            on
-                                                ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
-                                                : "border-neutral-200 dark:border-neutral-700 hover:border-neutral-300 dark:hover:border-neutral-600"
-                                        }`}
-                                    >
-                                        {isPhone ? <IoPhonePortraitOutline /> : <IoVideocam />}
-                                        <span className="truncate max-w-[14rem]">{isPhone ? PHONE_CAMERA_LABEL : device}</span>
-                                        {isPhone && (
-                                            <span
-                                                className={`text-[10px] px-1.5 py-px rounded-full ${
-                                                    isPhoneCameraConnected
-                                                        ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300"
-                                                        : "bg-neutral-100 text-neutral-500 dark:bg-neutral-700 dark:text-neutral-400"
-                                                }`}
-                                            >
-                                                {isPhoneCameraConnected ? "Connected" : "Set up"}
-                                            </span>
-                                        )}
-                                    </button>
-                                );
-                            })
-                        ) : (
-                            <span className="text-sm text-neutral-500">No cameras detected</span>
-                        )}
-                    </div>
-                </div>
-            )}
-
             {capturesScreen && renderCaptureToggles()}
-
-            {isScreenType && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {toggleRow(
-                        includeSystemAudio,
-                        onToggleIncludeSystemAudio,
-                        <IoVolumeHigh className="text-emerald-500" />,
-                        "System audio",
-                        "Also record what's playing through your speakers."
-                    )}
-                    {toggleRow(
-                        trackClicks,
-                        onToggleTrackClicks,
-                        <IoHandLeftOutline className="text-emerald-500" />,
-                        "Track clicks",
-                        isClickTrackingSupported
-                            ? "Remember where you click, so the editor can zoom in on each one."
-                            : "Windows-only for now.",
-                        !isClickTrackingSupported
-                    )}
-                </div>
-            )}
         </div>
     );
 
     if (!isOpenScreen) return null;
+
+    const activeScreenPreviewUrl = (() => {
+        if (selectedWindowInfo && (selectedWindowInfo as any).imageUrl) {
+            return (selectedWindowInfo as any).imageUrl as string;
+        }
+        if (selectedMonitor && monitorPreviews[selectedMonitor]) {
+            return convertFileSrc(monitorPreviews[selectedMonitor]);
+        }
+        const firstMonitorPath = monitorPreviews["monitor_0"] ?? Object.values(monitorPreviews)[0];
+        return firstMonitorPath ? convertFileSrc(firstMonitorPath) : undefined;
+    })();
 
     const summary =
         selectedMonitorInfo
@@ -1215,11 +1369,12 @@ const EnhancedScreenOptions = ({
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5">
-            <div className="absolute inset-0 bg-neutral-950/60 backdrop-blur-sm" onClick={closeModal} />
+            {/* Solid translucent scrim (no full-viewport backdrop-blur) keeps GPU compositor 60 fps on integrated GPUs. */}
+            <div className="absolute inset-0 bg-neutral-950/65" onClick={closeModal} />
 
-            <div className="relative w-full max-w-[1600px] h-full max-h-[1000px] flex flex-col rounded-3xl bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 shadow-2xl ring-1 ring-black/5 dark:ring-white/10 overflow-hidden">
+            <div className="relative w-full max-w-[1220px] h-[min(90vh,860px)] flex flex-col rounded-2xl bg-white dark:bg-[#111214] text-neutral-900 dark:text-neutral-100 shadow-[0_24px_80px_rgba(0,0,0,0.3)] ring-1 ring-black/[0.08] dark:ring-white/[0.08] overflow-hidden [contain:layout_style_paint]">
                 {/* Header */}
-                <div className="flex items-center gap-4 px-6 py-4 border-b border-neutral-200/80 dark:border-neutral-800">
+                <div className="flex items-center gap-4 px-6 py-3.5 border-b border-neutral-200/80 dark:border-neutral-800/90 bg-white dark:bg-[#111214]">
                     <div className="min-w-0">
                         {editingName ? (
                             <input
@@ -1233,39 +1388,39 @@ const EnhancedScreenOptions = ({
                                         setEditingName(false);
                                     }
                                 }}
-                                placeholder={recordType === "c" ? "Screenshot name" : "Recording name"}
-                                className="text-lg font-semibold leading-tight bg-transparent border-b-2 border-emerald-500 outline-none w-72 max-w-full"
+                                placeholder={localRecordType === "c" ? "Screenshot name" : "Recording name"}
+                                className="text-[15px] font-semibold tracking-tight leading-tight bg-transparent border-b-2 border-emerald-600 outline-none w-72 max-w-full"
                             />
                         ) : (
                             <button
                                 type="button"
                                 onClick={() => setEditingName(true)}
-                                title="Rename"
-                                className="group flex items-center gap-2 text-lg font-semibold leading-tight text-left max-w-[28rem]"
+                                title="Click to rename"
+                                className="group flex items-center gap-1.5 text-[15px] font-semibold tracking-tight leading-tight text-left max-w-[24rem]"
                             >
                                 <span className="truncate">
-                                    {fileName.trim() || (recordType === "c" ? "Take a screenshot" : "New recording")}
+                                    {fileName.trim() || (localRecordType === "c" ? "Take a screenshot" : "New recording")}
                                 </span>
-                                <IoPencil className="text-sm text-neutral-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+                                <IoPencil className="text-xs text-neutral-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
                             </button>
                         )}
-                        <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                            {presentMode ? "Live camera display" : RECORD_TYPE_LABELS[recordType] ?? recordType}
+                        <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5">
+                            {presentMode ? "Live camera display" : RECORD_TYPE_LABELS[localRecordType] ?? localRecordType}
                         </p>
                     </div>
                     {/* Screenshot is a separate flow the caller manages - switching type mid-way would fight it. */}
-                    {recordType !== "c" && !presentMode && (
-                        <div className="hidden md:flex mx-auto p-1 gap-1 rounded-2xl bg-neutral-100 dark:bg-neutral-800/80">
+                    {localRecordType !== "c" && !presentMode && (
+                        <div className="hidden md:flex mx-auto p-1 gap-0.5 rounded-xl bg-neutral-100 dark:bg-neutral-800/90 ring-1 ring-black/[0.04] dark:ring-white/[0.06]">
                             {RECORD_TYPE_OPTIONS.map((opt) => (
                                 <button
                                     key={opt.value}
                                     type="button"
                                     title={RECORD_TYPE_LABELS[opt.value]}
-                                    onClick={() => opt.value !== recordType && onRecordTypeChange(opt.value)}
-                                    className={`flex items-center gap-1 px-3 py-1.5 rounded-xl text-sm transition-all ${
-                                        opt.value === recordType
-                                            ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
-                                            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                                    onClick={() => pickRecordType(opt.value)}
+                                    className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[13px] transition-colors duration-100 ${
+                                        opt.value === localRecordType
+                                            ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)]"
+                                            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200"
                                     }`}
                                 >
                                     {opt.icons}
@@ -1276,10 +1431,11 @@ const EnhancedScreenOptions = ({
                     <button
                         type="button"
                         onClick={closeModal}
-                        className="ml-auto p-2 rounded-xl text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-white"
+                        className="ml-auto w-8 h-8 flex items-center justify-center rounded-lg text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-white transition-colors duration-100"
                         title="Close (Esc)"
+                        aria-label="Close"
                     >
-                        <IoClose className="text-2xl" />
+                        <IoClose className="text-xl" />
                     </button>
                 </div>
 
@@ -1289,30 +1445,98 @@ const EnhancedScreenOptions = ({
                         <PresentationPanel connectedCameraDevices={connectedCameraDevices} />
                     </div>
                 ) : (
-                <div className={`flex-1 min-h-0 grid ${hasCameraBubble ? "lg:grid-cols-[minmax(0,1fr)_400px]" : "grid-cols-1"}`}>
-                    <div className="min-h-0 overflow-y-auto p-6 space-y-6">
+                <div className={`flex-1 min-h-0 grid ${hasCameraBubble ? "lg:grid-cols-[minmax(0,1fr)_356px]" : "grid-cols-1"}`}>
+                    <div className="min-h-0 overflow-y-auto p-6 space-y-5">
                         {!isCameraOnly && !isAudioOnly && (
                             <>
+                                {isMac && macPerms && (!macPerms.screen_recording || !macPerms.accessibility) && (
+                                    <div className="rounded-xl border border-amber-300/80 dark:border-amber-700/60 bg-amber-50/90 dark:bg-amber-950/40 px-4 py-3 text-xs text-amber-950 dark:text-amber-100 space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <IoShieldCheckmarkOutline className="mt-0.5 shrink-0 text-base text-amber-600 dark:text-amber-400" />
+                                            <div className="min-w-0 flex-1 space-y-1">
+                                                <p className="font-semibold">macOS permissions needed for screen recording</p>
+                                                <p className="text-amber-900/80 dark:text-amber-200/80">
+                                                    {!macPerms.screen_recording
+                                                        ? "Grant Screen Recording access so Briefcast can capture your display instead of a blank screen."
+                                                        : "Grant Accessibility access to pick individual windows and record click/shortcut telemetry."}
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-2 pl-6">
+                                            {!macPerms.screen_recording && (
+                                                <>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            invoke<boolean>("request_macos_screen_recording_permission")
+                                                                .then((granted) =>
+                                                                    setMacPerms((prev) =>
+                                                                        prev ? { ...prev, screen_recording: granted } : prev
+                                                                    )
+                                                                )
+                                                                .catch(() => {});
+                                                        }}
+                                                        className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-medium transition-colors"
+                                                    >
+                                                        Allow Screen Recording
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() =>
+                                                            invoke("open_macos_permission_settings", { pane: "screen_recording" }).catch(() => {})
+                                                        }
+                                                        className="px-2.5 py-1 rounded-lg border border-amber-400/70 dark:border-amber-600/70 hover:bg-amber-100 dark:hover:bg-amber-900/50 font-medium transition-colors"
+                                                    >
+                                                        Open Screen Recording Settings
+                                                    </button>
+                                                </>
+                                            )}
+                                            {!macPerms.accessibility && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                        invoke("open_macos_permission_settings", { pane: "accessibility" }).catch(() => {})
+                                                    }
+                                                    className="px-2.5 py-1 rounded-lg border border-amber-400/70 dark:border-amber-600/70 hover:bg-amber-100 dark:hover:bg-amber-900/50 font-medium transition-colors"
+                                                >
+                                                    Open Accessibility Settings
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
                                 <div>
-                                    <SectionLabel>What to record</SectionLabel>
+                                    <SectionLabel>Source</SectionLabel>
                                     {renderSources()}
                                 </div>
                                 {mode === "monitors" && renderMonitors()}
                                 {mode === "windows" && renderWindows()}
                                 {mode === "main" && hasCameraBubble && (
                                     <div>
-                                        <SectionLabel hint="live">Preview</SectionLabel>
-                                        <CameraOverlayPreview
-                                            videoDevices={videoDevices}
-                                            overlayShape={overlayShape}
-                                            overlayPosition={overlayPosition}
-                                            overlaySize={overlaySize}
-                                            overlayBorder={border}
-                                            overlayBorderColor={borderColor}
-                                            showLabel={false}
-                                            cameraBackground={previewBg}
-                                            engineGeneration={engineGeneration}
-                                        />
+                                        <SectionLabel
+                                            hint={
+                                                <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-neutral-500 dark:text-neutral-400">
+                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                                                    Live preview
+                                                </span>
+                                            }
+                                        >
+                                            Stage
+                                        </SectionLabel>
+                                        <div className="rounded-2xl bg-neutral-100/80 dark:bg-black/35 p-2.5 ring-1 ring-black/[0.05] dark:ring-white/[0.06]">
+                                            <CameraOverlayPreview
+                                                videoDevices={videoDevices}
+                                                overlayShape={localShape}
+                                                overlayPosition={localPosition}
+                                                overlaySize={localSize}
+                                                overlayBorder={border}
+                                                overlayBorderColor={borderColor}
+                                                showLabel={false}
+                                                cameraBackground={previewBg}
+                                                engineGeneration={engineGeneration}
+                                                screenPreviewUrl={activeScreenPreviewUrl}
+                                            />
+                                        </div>
                                     </div>
                                 )}
                             </>
@@ -1320,62 +1544,63 @@ const EnhancedScreenOptions = ({
                         {isCameraOnly && (
                             <div className="max-w-4xl mx-auto space-y-3">
                                 <SectionLabel hint="live">Camera</SectionLabel>
-                                <CameraOverlayPreview
-                                    videoDevices={videoDevices}
-                                    overlayShape={overlayShape}
-                                    overlayPosition={overlayPosition}
-                                    overlaySize={overlaySize}
-                                    variant="full"
-                                    showLabel={false}
-                                />
-                                <p className="text-sm text-neutral-500 dark:text-neutral-400">
+                                <div className="rounded-2xl bg-neutral-100/80 dark:bg-black/35 p-2.5 ring-1 ring-black/[0.05] dark:ring-white/[0.06]">
+                                    <CameraOverlayPreview
+                                        videoDevices={videoDevices}
+                                        overlayShape={localShape}
+                                        overlayPosition={localPosition}
+                                        overlaySize={localSize}
+                                        variant="full"
+                                        showLabel={false}
+                                    />
+                                </div>
+                                <p className="text-xs text-neutral-500 dark:text-neutral-400">
                                     {videoDevices.length === 0
-                                        ? "Pick a camera in the recording bar's Video device(s) list to record."
-                                        : "Only the camera is recorded - nothing on your screen is captured."}
+                                        ? "Pick a camera below to record."
+                                        : "Only the camera is recorded — nothing on your screen is captured."}
                                 </p>
                             </div>
                         )}
                         {isAudioOnly && (
                             <div className="flex flex-col items-center justify-center text-center gap-3 py-10">
-                                <span className="w-16 h-16 rounded-2xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center text-3xl">
+                                <span className="w-14 h-14 rounded-2xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-2xl ring-1 ring-emerald-500/20">
                                     <IoMic />
                                 </span>
-                                <p className="text-sm text-neutral-500 dark:text-neutral-400 max-w-sm">
-                                    Recording audio only - no screen or camera is captured. Press Start when you're ready.
+                                <p className="text-xs text-neutral-500 dark:text-neutral-400 max-w-sm">
+                                    Recording audio only — no screen or camera is captured. Press Start when ready.
                                 </p>
                             </div>
                         )}
                         {!isAudioOnly && (
-                            <div className="pt-2 border-t border-neutral-200/80 dark:border-neutral-800">
-                                <div className="pt-4">
-                                    <SectionLabel>Options</SectionLabel>
-                                </div>
+                            <div className="pt-1">
+                                <SectionLabel>Recording setup</SectionLabel>
                                 {renderOptions()}
                             </div>
                         )}
                     </div>
 
                     {hasCameraBubble && (
-                        <aside className="min-h-0 overflow-y-auto border-t lg:border-t-0 lg:border-l border-neutral-200/80 dark:border-neutral-800 bg-neutral-50/70 dark:bg-neutral-900/60 p-6">
-                            <div className="flex items-center gap-2 mb-5">
-                                <IoVideocam className="text-emerald-500" />
-                                <h3 className="text-sm font-semibold">Camera</h3>
+                        <aside className="min-h-0 overflow-y-auto border-t lg:border-t-0 lg:border-l border-neutral-200/80 dark:border-neutral-800/90 bg-neutral-50/90 dark:bg-[#151619] p-5">
+                            <div className="flex items-center gap-2 mb-4">
+                                <IoVideocam className="text-emerald-600 dark:text-emerald-400 text-sm" />
+                                <h3 className="text-[13px] font-semibold tracking-tight text-neutral-900 dark:text-neutral-100">Camera</h3>
                                 {videoDevices.length === 0 && (
                                     <span className="ml-auto text-[11px] text-amber-600 dark:text-amber-400">No camera selected</span>
                                 )}
                             </div>
                             {mode !== "main" && (
-                                <div className="mb-6">
+                                <div className="mb-5">
                                     <CameraOverlayPreview
                                         videoDevices={videoDevices}
-                                        overlayShape={overlayShape}
-                                        overlayPosition={overlayPosition}
-                                        overlaySize={overlaySize}
+                                        overlayShape={localShape}
+                                        overlayPosition={localPosition}
+                                        overlaySize={localSize}
                                         overlayBorder={border}
                                         overlayBorderColor={borderColor}
                                         showLabel={false}
                                         cameraBackground={previewBg}
                                         engineGeneration={engineGeneration}
+                                        screenPreviewUrl={activeScreenPreviewUrl}
                                     />
                                 </div>
                             )}
@@ -1386,10 +1611,10 @@ const EnhancedScreenOptions = ({
                 )}
 
                 {/* Footer */}
-                <div className="flex items-center gap-4 px-6 py-4 border-t border-neutral-200/80 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/80">
+                <div className="flex items-center gap-3 px-6 py-3.5 border-t border-neutral-200/80 dark:border-neutral-800/90 bg-white dark:bg-[#111214]">
                     <div className="min-w-0 flex items-center gap-3 text-sm">
-                        {recordType !== "c" && (
-                            <div className="flex p-1 gap-1 rounded-xl bg-neutral-100 dark:bg-neutral-800" role="tablist" aria-label="Mode">
+                        {localRecordType !== "c" && (
+                            <div className="flex p-0.5 gap-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-800/90 ring-1 ring-black/[0.04] dark:ring-white/[0.06]" role="tablist" aria-label="Mode">
                                 {([
                                     ["record", "Record", <IoVideocam key="r" />],
                                     ["present", "Present", <IoTvOutline key="p" />],
@@ -1403,10 +1628,10 @@ const EnhancedScreenOptions = ({
                                             aria-selected={active}
                                             onClick={() => setPresentMode(value === "present")}
                                             title={value === "present" ? "Show cameras live, full screen on a TV or projector" : "Set up a recording"}
-                                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                                            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-[7px] text-xs font-medium transition-colors duration-100 ${
                                                 active
-                                                    ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm"
-                                                    : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                                                    ? "bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)]"
+                                                    : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200"
                                             }`}
                                         >
                                             {icon}
@@ -1424,15 +1649,15 @@ const EnhancedScreenOptions = ({
                         ) : (
                         <>
                         {!isCameraOnly && !isAudioOnly && (
-                            <span className="truncate px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs font-medium">
+                            <span className="truncate px-2.5 py-1 rounded-md bg-neutral-100 dark:bg-neutral-800/90 text-neutral-700 dark:text-neutral-300 text-xs font-medium ring-1 ring-black/[0.04] dark:ring-white/[0.06]">
                                 {summary}
                             </span>
                         )}
-                        <span className="hidden lg:flex items-center gap-1 text-xs text-neutral-400">
+                        <span className="hidden lg:flex items-center gap-1 text-[11px] text-neutral-400">
                             <Kbd>{MOD}</Kbd>
                             <Kbd>Shift</Kbd>
                             <Kbd>R</Kbd>
-                            <span className="ml-1">starts and stops a recording anytime</span>
+                            <span className="ml-1">toggle recording</span>
                         </span>
                         </>
                         )}
@@ -1442,10 +1667,10 @@ const EnhancedScreenOptions = ({
                         type="button"
                         onClick={() => void togglePresentation()}
                         disabled={!presentation.active && presentation.cameras.length === 0}
-                        className={`ml-auto flex items-center gap-2 px-6 py-2.5 rounded-xl text-white text-sm font-semibold shadow-sm active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                        className={`ml-auto flex items-center gap-2 px-5 py-2 rounded-xl text-white text-[13px] font-semibold shadow-sm active:scale-[0.98] transition-colors duration-100 disabled:opacity-50 disabled:cursor-not-allowed ${
                             presentation.active
                                 ? "bg-neutral-900 hover:bg-neutral-800 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-100"
-                                : "bg-red-600 hover:bg-red-500 shadow-red-600/30"
+                                : "bg-red-600 hover:bg-red-500"
                         }`}
                     >
                         <IoTvOutline className="text-base" />
@@ -1455,10 +1680,10 @@ const EnhancedScreenOptions = ({
                     <button
                         type="button"
                         onClick={() => confirmAndStart(resolveCurrentTarget())}
-                        className="ml-auto flex items-center gap-2 px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] text-white text-sm font-semibold shadow-sm shadow-emerald-600/30 transition-all"
+                        className="ml-auto flex items-center gap-2 px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] text-white text-[13px] font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.12),inset_0_1px_0_rgba(255,255,255,0.15)] transition-colors duration-100"
                     >
-                        <span className="w-2.5 h-2.5 rounded-full bg-white/90" />
-                        {recordType === "c" ? "Take Screenshot" : "Start Recording"}
+                        <span className="w-2 h-2 rounded-full bg-white" />
+                        {localRecordType === "c" ? "Take Screenshot" : "Start Recording"}
                     </button>
                     )}
                 </div>

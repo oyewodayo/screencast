@@ -40,7 +40,10 @@ pub use win::*;
 #[cfg(target_os = "macos")]
 pub use mac::*;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub use linux::*;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub use fallback::*;
 
 #[cfg(target_os = "windows")]
@@ -253,7 +256,77 @@ mod mac {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{now_hns, ClickEvent};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt as _, KeyButMask};
+
+    pub struct ClickCapture {
+        running: Arc<AtomicBool>,
+        handle: JoinHandle<Vec<ClickEvent>>,
+        pub started_hns: i64,
+    }
+
+    impl ClickCapture {
+        pub fn start(origin: (i32, i32), size: (i32, i32)) -> Result<Self, String> {
+            let (conn, screen_num) = x11rb::connect(None)
+                .map_err(|e| format!("Failed to connect to X11 for click tracking: {e}"))?;
+            let root = conn.setup().roots[screen_num].root;
+            let started_hns = now_hns();
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+
+            let handle = std::thread::spawn(move || {
+                let start = Instant::now();
+                let mut events = Vec::new();
+                let mut was_down = false;
+                let (ox, oy) = origin;
+                let (w, h) = size;
+
+                while r.load(Ordering::Relaxed) {
+                    if let Ok(cookie) = conn.query_pointer(root) {
+                        if let Ok(reply) = cookie.reply() {
+                            let is_down = reply.mask.contains(KeyButMask::BUTTON1);
+                            if is_down && !was_down && w > 0 && h > 0 {
+                                let x = (reply.root_x as i32 - ox) as f64 / w as f64;
+                                let y = (reply.root_y as i32 - oy) as f64 / h as f64;
+                                if (0.0..1.0).contains(&x) && (0.0..1.0).contains(&y) {
+                                    events.push(ClickEvent {
+                                        elapsed_secs: start.elapsed().as_secs_f64(),
+                                        x_fraction: x,
+                                        y_fraction: y,
+                                    });
+                                }
+                            }
+                            was_down = is_down;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                events
+            });
+
+            Ok(Self {
+                running,
+                handle,
+                started_hns,
+            })
+        }
+
+        pub fn stop(self) -> Vec<ClickEvent> {
+            self.running.store(false, Ordering::Relaxed);
+            self.handle.join().unwrap_or_default()
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod fallback {
     use super::{now_hns, ClickEvent};
 

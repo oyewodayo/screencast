@@ -113,7 +113,12 @@ export const useCameraStreams = (labels: string[], quality: CameraQuality = "pre
                                       height: { ideal: 1080 },
                                       frameRate: { ideal: 30 },
                                   }
-                                : { deviceId: { exact: deviceId } },
+                                : {
+                                      deviceId: { exact: deviceId },
+                                      width: { ideal: 640 },
+                                      height: { ideal: 480 },
+                                      frameRate: { ideal: 30 },
+                                  },
                     };
                     // A camera another part of the app is just handing over (the live-background
                     // feed releasing it, a recording ending) is "in use" for a moment - asked again a
@@ -155,11 +160,17 @@ export const useCameraStreams = (labels: string[], quality: CameraQuality = "pre
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [key, quality]);
 
-    // Stop every open camera on unmount (modal closed, display window closed).
+    // Stop every open camera on unmount (modal closed, display window closed). Deferred to the
+    // next macrotask so closing the modal paints immediately without waiting on DirectShow teardown.
     useEffect(() => {
         return () => {
-            Object.values(streamsRef.current).forEach((stream) => stream.getTracks().forEach((t) => t.stop()));
+            const toStop = Object.values(streamsRef.current);
             streamsRef.current = {};
+            if (toStop.length > 0) {
+                window.setTimeout(() => {
+                    toStop.forEach((stream) => stream.getTracks().forEach((t) => t.stop()));
+                }, 0);
+            }
         };
     }, []);
 

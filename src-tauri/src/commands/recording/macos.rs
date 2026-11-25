@@ -15,6 +15,8 @@
 // before relying on it.
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, State};
 
@@ -30,23 +32,28 @@ pub(crate) struct AvDevice {
     pub(crate) name: String,
 }
 
-// Parses `ffmpeg -f avfoundation -list_devices true -i ""`'s stderr, which looks like:
-//   [AVFoundation indev @ 0x...] AVFoundation video devices:
-//   [AVFoundation indev @ 0x...] [0] FaceTime HD Camera
-//   [AVFoundation indev @ 0x...] [1] Capture screen 0
-//   [AVFoundation indev @ 0x...] AVFoundation audio devices:
-//   [AVFoundation indev @ 0x...] [0] MacBook Pro Microphone
+static AV_DEVICE_CACHE: Mutex<Option<(Instant, Vec<AvDevice>, Vec<AvDevice>)>> = Mutex::new(None);
+const AV_CACHE_TTL: Duration = Duration::from_secs(15);
+
+// Parses `ffmpeg -f avfoundation -list_devices true -i ""`'s stderr, cached briefly so starting
+// a recording doesn't spawn an extra ffmpeg probe subprocess on every start.
 pub(crate) fn list_avfoundation_devices(
     app_handle: &AppHandle,
 ) -> Result<(Vec<AvDevice>, Vec<AvDevice>), String> {
+    {
+        let cache = AV_DEVICE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, ref v, ref a)) = *cache {
+            if at.elapsed() < AV_CACHE_TTL {
+                return Ok((v.clone(), a.clone()));
+            }
+        }
+    }
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    // ffmpeg exits non-zero here (there's no real input, only a device listing was asked for) —
-    // .output() rather than .status() is used specifically so that expected failure doesn't
-    // stop us from reading stderr, which is where the actual device list was printed.
-    let output = Command::new(&ffmpeg_path)
-        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .output()
+    // Bounded timeout so a stalled AVFoundation device driver cannot hang recording startup.
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(["-f", "avfoundation", "-list_devices", "true", "-i", ""]);
+    let output = crate::services::responsiveness::output_with_timeout(cmd, Duration::from_secs(10))
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -92,6 +99,9 @@ pub(crate) fn list_avfoundation_devices(
             audio.push(AvDevice { index, name });
         }
     }
+
+    *AV_DEVICE_CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((Instant::now(), video.clone(), audio.clone()));
 
     Ok((video, audio))
 }
@@ -217,7 +227,15 @@ const KNOWN_LOOPBACK_AUDIO_DEVICES: &[&str] = &[
 fn detect_system_audio_device(audio_devices: &[AvDevice]) -> Option<&AvDevice> {
     KNOWN_LOOPBACK_AUDIO_DEVICES
         .iter()
-        .find_map(|&known| audio_devices.iter().find(|d| d.name == known))
+        .find_map(|&known| audio_devices.iter().find(|d| d.name.eq_ignore_ascii_case(known)))
+        .or_else(|| {
+            audio_devices.iter().find(|d| {
+                let lower = d.name.to_lowercase();
+                lower.contains("blackhole")
+                    || lower.contains("loopback")
+                    || lower.contains("soundflower")
+            })
+        })
 }
 
 // Builds the -i/-filter_complex/-map args for a plain screen capture (no camera overlay) with an
@@ -235,8 +253,10 @@ fn screen_capture_args(
     let mut args: Vec<String> = vec![
         "-f".to_string(),
         "avfoundation".to_string(),
+        "-thread_queue_size".to_string(),
+        "64".to_string(),
         "-capture_cursor".to_string(),
-        "1".to_string(),
+        (form_data.capture_cursor as u8).to_string(),
         "-framerate".to_string(),
         resolved_framerate(form_data, 30).to_string(),
         "-i".to_string(),
@@ -364,8 +384,15 @@ fn resolve_screen_target(
         } else {
             &form_data.window_title
         };
-        let rect = crate::commands::window_capture::macos::get_window_rect_by_title(title)?;
-        return Ok((require_screen_index(video_devices)?, Some(rect)));
+        let (display_ordinal, rect) =
+            crate::commands::window_capture::macos::get_window_target_by_title(title)?;
+        let screen_idx = resolve_screen_index(video_devices, &format!("monitor_{display_ordinal}"))
+            .or_else(|| find_screen_index(video_devices))
+            .ok_or_else(|| {
+                "No screen capture device found (expected a 'Capture screen N' entry from avfoundation)"
+                    .to_string()
+            })?;
+        return Ok((screen_idx, Some(rect)));
     }
     if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
         return resolve_screen_index(video_devices, monitor_id)
@@ -387,23 +414,15 @@ pub async fn recording_with_output_sva(
     let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
     let audio_index = find_index(&audio_devices, &form_data.audio_device);
     let has_camera_overlay = !form_data.video_devices.is_empty();
-    // See detect_system_audio_device's own doc comment for why this can't just always work the
-    // way it does on Windows/Linux. Skipped entirely alongside a camera overlay - mixing a THIRD
-    // source (mic + system audio) into an already-composited camera-overlay filter_complex is a
-    // rare enough combination that it's not worth the added risk in a pass with no way to test any
-    // of it; falls back to mic-only, same as if no loopback device had been found at all.
-    let system_audio_index = if form_data.include_system_audio && !has_camera_overlay {
+    let system_audio_index = if form_data.include_system_audio {
         match detect_system_audio_device(&audio_devices) {
             Some(d) => Some(d.index),
             None => {
-                log::warn!("include_system_audio was requested but no known loopback device (BlackHole/Loopback/Soundflower) was found - recording without system audio");
+                log::warn!("include_system_audio was requested but no virtual loopback device (BlackHole/Loopback/Soundflower) was found - recording without system audio");
                 None
             }
         }
     } else {
-        if form_data.include_system_audio && has_camera_overlay {
-            log::warn!("include_system_audio isn't supported together with a camera overlay on macOS yet - recording with mic audio only");
-        }
         None
     };
 
@@ -420,32 +439,73 @@ pub async fn recording_with_output_sva(
         let mut args: Vec<String> = vec![
             "-f".to_string(),
             "avfoundation".to_string(),
+            "-thread_queue_size".to_string(),
+            "64".to_string(),
             "-capture_cursor".to_string(),
-            "1".to_string(),
+            (form_data.capture_cursor as u8).to_string(),
             "-framerate".to_string(),
             resolved_framerate(form_data, 30).to_string(),
             "-i".to_string(),
             av_input_spec(Some(screen_index), None),
             "-f".to_string(),
             "avfoundation".to_string(),
+            "-thread_queue_size".to_string(),
+            "64".to_string(),
             "-framerate".to_string(),
             resolved_framerate(form_data, 30).to_string(),
             "-i".to_string(),
             av_input_spec(Some(camera_index), None),
         ];
-        if let Some(index) = audio_index {
+        let mut next_idx = 2usize;
+        let mic_input_idx = audio_index.map(|index| {
+            let idx = next_idx;
+            next_idx += 1;
             args.extend(vec![
                 "-f".to_string(),
                 "avfoundation".to_string(),
                 "-i".to_string(),
                 av_input_spec(None, Some(index)),
             ]);
-        }
+            idx
+        });
+        let sys_input_idx = system_audio_index.map(|index| {
+            let idx = next_idx;
+            next_idx += 1;
+            args.extend(vec![
+                "-f".to_string(),
+                "avfoundation".to_string(),
+                "-i".to_string(),
+                av_input_spec(None, Some(index)),
+            ]);
+            idx
+        });
+        let _ = next_idx;
 
-        // Output 1: Screen (+ mic audio if present)
+        let audio_map = match (mic_input_idx, sys_input_idx) {
+            (Some(m), Some(s)) => {
+                args.extend(vec![
+                    "-filter_complex".to_string(),
+                    format!("[{m}:a][{s}:a]amix=inputs=2:duration=first[aout]"),
+                ]);
+                Some("[aout]".to_string())
+            }
+            (Some(m), None) => Some(format!("{m}:a")),
+            (None, Some(s)) => Some(format!("{s}:a")),
+            (None, None) => None,
+        };
+
+        // Output 1: Screen (+ mic/system audio if present)
         args.extend(vec!["-map".to_string(), "0:v".to_string()]);
-        if audio_index.is_some() {
-            args.extend(vec!["-map".to_string(), "2:a".to_string()]);
+        if let Some(a_map) = audio_map {
+            args.extend(vec!["-map".to_string(), a_map]);
+        }
+        if let Some((x, y, w, h)) = crop {
+            args.extend(vec![
+                "-vf".to_string(),
+                format!("crop={w}:{h}:{x}:{y},{}", super::desktop_scale_filter(form_data)),
+            ]);
+        } else {
+            args.extend(vec!["-vf".to_string(), super::desktop_scale_filter(form_data)]);
         }
         args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
         args.push(path_to_str(output_path)?.to_string());
@@ -462,8 +522,10 @@ pub async fn recording_with_output_sva(
         let mut args: Vec<String> = vec![
             "-f".to_string(),
             "avfoundation".to_string(),
+            "-thread_queue_size".to_string(),
+            "64".to_string(),
             "-capture_cursor".to_string(),
-            "1".to_string(),
+            (form_data.capture_cursor as u8).to_string(),
             "-framerate".to_string(),
             resolved_framerate(form_data, 30).to_string(),
             "-i".to_string(),
@@ -471,17 +533,50 @@ pub async fn recording_with_output_sva(
         ];
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_camera_overlay_args(app_handle, &mut args, form_data, &video_devices, crop)?;
-        // The screen input above was left audio-less (its side of av_input_spec was None) so the
-        // mic gets its own dedicated input instead - same reasoning as win.rs's sva mode keeping
-        // camera and audio as separate dshow inputs rather than trying to bundle mic audio onto
-        // whichever camera happens to be first.
-        if let Some(index) = audio_index {
+        let filter_complex_idx = args.len() - 1;
+        args[filter_complex_idx].push_str("[vout]");
+
+        let mut next_idx = 1 + form_data.video_devices.len();
+        let mic_input_idx = audio_index.map(|index| {
+            let idx = next_idx;
+            next_idx += 1;
             args.extend(vec![
                 "-f".to_string(),
                 "avfoundation".to_string(),
                 "-i".to_string(),
                 av_input_spec(None, Some(index)),
             ]);
+            idx
+        });
+        let sys_input_idx = system_audio_index.map(|index| {
+            let idx = next_idx;
+            next_idx += 1;
+            args.extend(vec![
+                "-f".to_string(),
+                "avfoundation".to_string(),
+                "-i".to_string(),
+                av_input_spec(None, Some(index)),
+            ]);
+            idx
+        });
+        let _ = next_idx;
+
+        args.extend(vec!["-map".to_string(), "[vout]".to_string()]);
+        match (mic_input_idx, sys_input_idx) {
+            (Some(m), Some(s)) => {
+                args[filter_complex_idx] = format!(
+                    "{}; [{m}:a][{s}:a]amix=inputs=2:duration=first[aout]",
+                    args[filter_complex_idx]
+                );
+                args.extend(vec!["-map".to_string(), "[aout]".to_string()]);
+            }
+            (Some(m), None) => {
+                args.extend(vec!["-map".to_string(), format!("{m}:a")]);
+            }
+            (None, Some(s)) => {
+                args.extend(vec!["-map".to_string(), format!("{s}:a")]);
+            }
+            (None, None) => {}
         }
         args
     } else {
@@ -674,7 +769,7 @@ pub async fn take_screenshot(
             "-f".to_string(),
             "avfoundation".to_string(),
             "-capture_cursor".to_string(),
-            "1".to_string(),
+            (form_data.capture_cursor as u8).to_string(),
             "-i".to_string(),
             av_input_spec(Some(screen_index), None),
         ];

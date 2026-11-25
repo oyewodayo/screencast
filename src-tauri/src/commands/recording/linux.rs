@@ -222,6 +222,14 @@ fn list_v4l2_devices() -> Result<Vec<(String, String)>, String> {
 
     let mut devices = Vec::new();
     for entry in entries.flatten() {
+        // Modern UVC cameras expose multiple /dev/videoN nodes (index 0 = video capture, index 1+ =
+        // metadata). Keep index 0 (or nodes without an index file) so metadata nodes aren't listed.
+        let index_path = entry.path().join("index");
+        if let Ok(idx) = fs::read_to_string(&index_path) {
+            if idx.trim() != "0" {
+                continue;
+            }
+        }
         let dir_name = entry.file_name().to_string_lossy().to_string();
         let name_path = entry.path().join("name");
         let Ok(name) = fs::read_to_string(&name_path) else {
@@ -229,6 +237,7 @@ fn list_v4l2_devices() -> Result<Vec<(String, String)>, String> {
         };
         devices.push((format!("/dev/{}", dir_name), name.trim().to_string()));
     }
+    devices.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(devices)
 }
@@ -298,6 +307,110 @@ fn add_camera_overlay_args(app_handle: &AppHandle, args: &mut Vec<String>, form_
     Ok(())
 }
 
+fn is_h264_container(ext: &str) -> bool {
+    matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "avi" | "mov")
+}
+
+/// Returns global pre-input args (e.g. `-vaapi_device /dev/dri/renderD128`) when VA-API will be
+/// used for `ext`.
+fn hw_pre_input_args(ext: &str, ffmpeg_path: &std::path::Path) -> Vec<String> {
+    if !is_h264_container(ext) {
+        return Vec::new();
+    }
+    crate::services::hw_encoder::detect(ffmpeg_path)
+        .map(|hw| hw.pre_input_args())
+        .unwrap_or_default()
+}
+
+/// Appends the hardware upload filter (`format=nv12,hwupload`) to a `-vf` chain when VA-API is
+/// active for `ext`.
+fn hw_vf_chain(base: String, ext: &str, ffmpeg_path: &std::path::Path) -> String {
+    if !is_h264_container(ext) {
+        return base;
+    }
+    match crate::services::hw_encoder::detect(ffmpeg_path).and_then(|hw| hw.video_filter_suffix()) {
+        Some(suffix) if !base.is_empty() => format!("{base},{suffix}"),
+        Some(suffix) => suffix.to_string(),
+        None => base,
+    }
+}
+
+/// Returns the optional hardware upload suffix for a filter_complex video chain when VA-API is
+/// active for `ext`.
+fn hw_filter_suffix(ext: &str, ffmpeg_path: &std::path::Path) -> Option<&'static str> {
+    if !is_h264_container(ext) {
+        return None;
+    }
+    crate::services::hw_encoder::detect(ffmpeg_path).and_then(|hw| hw.video_filter_suffix())
+}
+
+/// Builds the screen video input arguments for Linux:
+/// - On Wayland (`WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`), negotiates a PipeWire stream via
+///   the XDG Desktop Portal (`org.freedesktop.portal.ScreenCast`) and feeds it as `yuv4mpegpipe`
+///   through a local FIFO so native Wayland compositors (Ubuntu 22.04/24.04, Fedora, KDE, GNOME)
+///   capture cleanly instead of recording a black screen.
+/// - If the portal/GStreamer bridge is unavailable AND an X11 `DISPLAY` exists (e.g. XWayland/WSLg),
+///   falls back to `x11grab` automatically.
+async fn screen_input_args(
+    app_handle: &AppHandle,
+    state: &State<'_, AppState>,
+    form_data: &FormData,
+) -> Result<Vec<String>, String> {
+    let fps = resolved_framerate(form_data, 30);
+    if crate::services::wayland_portal::is_wayland_session() {
+        let prefer_window = form_data.screen_size.starts_with("window:");
+        match crate::services::wayland_portal::start_screencast(
+            prefer_window,
+            form_data.capture_cursor,
+            fps,
+        )
+        .await
+        {
+            Ok(session) => {
+                let fifo = path_to_str(session.fifo_path())?.to_string();
+                *state.wayland_session.lock().await = Some(session);
+                return Ok(vec![
+                    "-f".to_string(),
+                    "yuv4mpegpipe".to_string(),
+                    "-thread_queue_size".to_string(),
+                    "64".to_string(),
+                    "-i".to_string(),
+                    fifo,
+                ]);
+            }
+            Err(crate::services::wayland_portal::PortalError::Cancelled) => {
+                return Err("Screen selection was cancelled.".to_string());
+            }
+            Err(crate::services::wayland_portal::PortalError::Unavailable(reason)) => {
+                if env::var("DISPLAY").is_err() {
+                    return Err(format!(
+                        "Wayland screen capture failed ({reason}). Install `gstreamer1.0-pipewire` \
+                         and an `xdg-desktop-portal` backend for your desktop, or switch to an X11 session."
+                    ));
+                }
+                log::warn!(
+                    "Wayland ScreenCast portal unavailable ({reason}); falling back to x11grab via DISPLAY"
+                );
+            }
+        }
+    }
+
+    let mut args = vec![
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-thread_queue_size".to_string(),
+        "64".to_string(),
+        "-draw_mouse".to_string(),
+        (form_data.capture_cursor as u8).to_string(),
+        "-framerate".to_string(),
+        fps.to_string(),
+    ];
+    args.extend(x11grab_input_args(&resolve_capture_target(
+        app_handle, form_data,
+    ))?);
+    Ok(args)
+}
+
 //Screen, optional camera overlay, and audio
 pub async fn recording_with_output_sva(
     app_handle: &AppHandle,
@@ -306,17 +419,6 @@ pub async fn recording_with_output_sva(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "x11grab".to_string(),
-        "-framerate".to_string(),
-        resolved_framerate(form_data, 30).to_string(),
-    ];
-    args.extend(x11grab_input_args(&resolve_capture_target(
-        app_handle, form_data,
-    ))?);
-
     let has_camera_overlay = !form_data.video_devices.is_empty();
     let separate_webcam_capture = has_camera_overlay
         && form_data.separate_webcam_capture
@@ -327,13 +429,11 @@ pub async fn recording_with_output_sva(
         let camera_device = &form_data.video_devices[0];
         let camera_args = camera_input_args(camera_device, &map_overlay_size(&form_data.overlay_size))?;
 
-        let mut args: Vec<String> = vec![
-            "-f".to_string(),
-            "x11grab".to_string(),
-            "-framerate".to_string(),
-            resolved_framerate(form_data, 30).to_string(),
-        ];
-        args.extend(x11grab_input_args(&resolve_capture_target(app_handle, form_data))?);
+        let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+        if args.is_empty() {
+            args.extend(hw_pre_input_args("mp4", &ffmpeg_path));
+        }
+        args.extend(screen_input_args(app_handle, &state, form_data).await?);
         args.extend(camera_args);
 
         let mic_input_index = 2;
@@ -347,34 +447,35 @@ pub async fn recording_with_output_sva(
         // Output 1: Screen (+ mic audio)
         args.extend(vec!["-map".to_string(), "0:v".to_string()]);
         args.extend(vec!["-map".to_string(), format!("{mic_input_index}:a")]);
-        args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+        args.extend(vec![
+            "-vf".to_string(),
+            hw_vf_chain(desktop_scale_filter(form_data), &form_data.file_ext, &ffmpeg_path),
+        ]);
         args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
         args.push(path_to_str(output_path)?.to_string());
 
         // Output 2: Webcam alone, for post-recording PiP editing
         args.extend(vec!["-map".to_string(), "1:v".to_string()]);
+        if let Some(suffix) = hw_filter_suffix("mp4", &ffmpeg_path) {
+            args.extend(vec!["-vf".to_string(), suffix.to_string()]);
+        }
         args.extend(codec_args_for_ext_hw("mp4", &ffmpeg_path));
         args.push(path_to_str(&webcam_path)?.to_string());
 
         return spawn_recording(app_handle, &state, output_path, &ffmpeg_path, args).await;
     }
+
+    let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+    args.extend(screen_input_args(app_handle, &state, form_data).await?);
+
     if has_camera_overlay {
         log::debug!("{} camera(s) overlaid", form_data.video_devices.len());
         add_camera_overlay_args(app_handle, &mut args, form_data)?;
-        // Pulse can't be bundled into the screen or camera input the way avfoundation/dshow
-        // combine video+audio in one -i — it's always its own input on Linux. With
-        // filter_complex already in play for the video composite, the output stream selection
-        // is made explicit here (rather than relying on ffmpeg's default auto-selection, which
-        // is a needless ambiguity to leave in place once there's more than one video-capable
-        // input) by labeling the filtergraph's output and mapping both it and the audio input
-        // in. The audio input lands right after the screen input (index 0) and however many
-        // camera inputs add_camera_overlay_args just added, so its index has to be computed
-        // rather than the single-camera-only hardcoded "2:a" this used to be.
-        //
-        // Its index is captured here (rather than re-finding it with args.last_mut() later)
-        // because more args - the mic and, if requested, system-audio pulse inputs - get pushed
-        // in between before an amix stage might need to be appended to this same string.
         let filter_complex_idx = args.len() - 1;
+        if let Some(suffix) = hw_filter_suffix(&form_data.file_ext, &ffmpeg_path) {
+            args[filter_complex_idx].push(',');
+            args[filter_complex_idx].push_str(suffix);
+        }
         args[filter_complex_idx].push_str("[vout]");
 
         let mic_input_index = 1 + form_data.video_devices.len();
@@ -393,9 +494,6 @@ pub async fn recording_with_output_sva(
                 "-i".to_string(),
                 source,
             ]);
-            // ffmpeg accepts only one -filter_complex per invocation - append the audio mix to
-            // the video one already built above rather than adding a second, separate one, same
-            // "; "-joined multi-stage convention build_camera_overlay_filter_complex itself uses.
             args[filter_complex_idx] = format!(
                 "{}; [{}:a][{}:a]amix=inputs=2:duration=first[aout]",
                 args[filter_complex_idx], mic_input_index, system_input_index
@@ -413,7 +511,10 @@ pub async fn recording_with_output_sva(
         ]);
     } else {
         plain_audio_args(&mut args, form_data, 1);
-        args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+        args.extend(vec![
+            "-vf".to_string(),
+            hw_vf_chain(desktop_scale_filter(form_data), &form_data.file_ext, &ffmpeg_path),
+        ]);
     }
 
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
@@ -431,20 +532,13 @@ pub async fn recording_with_output_sa(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "x11grab".to_string(),
-        "-framerate".to_string(),
-        resolved_framerate(form_data, 30).to_string(),
-    ];
-    args.extend(x11grab_input_args(&resolve_capture_target(
-        app_handle, form_data,
-    ))?);
+    let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+    args.extend(screen_input_args(app_handle, &state, form_data).await?);
     plain_audio_args(&mut args, form_data, 1);
-    args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
-    // The container's codec table, as the other screen mode (sva) and Windows already apply:
-    // without it ffmpeg picks yuv444 from x11grab's raw frames (many players and WebViews can't
-    // decode that) and an mp4 isn't fragmented, so a force-killed recording is unplayable.
+    args.extend(vec![
+        "-vf".to_string(),
+        hw_vf_chain(desktop_scale_filter(form_data), &form_data.file_ext, &ffmpeg_path),
+    ]);
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.extend(vec![
         "-y".to_string(),
@@ -462,22 +556,19 @@ pub async fn recording_with_output_v(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    // Standalone video recording (no screen) only ever uses one camera, same as win.rs's own
-    // recording_with_output_v - multi-camera only applies to the overlay-onto-screen modes above.
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
     let camera_path = require_v4l2_path(&video_device)?;
 
-    let mut args: Vec<String> = vec![
+    let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+    args.extend(vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
         camera_path,
-    ];
-    // Hardware encoding, and the container's own codec table, rather than the bare `-c:v mpeg4`
-    // this used to hardcode. That old default ignored the file type the user picked entirely and
-    // produced MPEG-4 Part 2 - a pre-H.264 codec with markedly worse quality per byte, and one
-    // most players treat as legacy - while the equivalent Windows path had been using the shared
-    // H.264 table all along. It also meant camera recordings carried no audio codec choice at all.
+    ]);
+    if let Some(suffix) = hw_filter_suffix(&form_data.file_ext, &ffmpeg_path) {
+        args.extend(vec!["-vf".to_string(), suffix.to_string()]);
+    }
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
@@ -500,8 +591,6 @@ pub async fn recording_with_output_a(
         "-i".to_string(),
         form_data.audio_device.clone(),
     ];
-    // Explicit audio codec and bitrate for the chosen container, as Windows does - ffmpeg's own
-    // per-container default measured out to 128k for mp3.
     args.extend(audio_codec_args_for_ext(&form_data.file_ext));
     args.extend(vec!["-y".to_string(), path_to_str(output_path)?.to_string()]);
 
@@ -516,14 +605,11 @@ pub async fn recording_with_output_va(
     form_data: &FormData,
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
-    // Same single-camera restriction as recording_with_output_v above.
     let video_device = form_data.video_devices.first().cloned().unwrap_or_default();
     let camera_path = require_v4l2_path(&video_device)?;
 
-    // v4l2 and pulse can't be combined into one -i (unlike dshow/avfoundation) — two separate
-    // inputs, one video-only stream and one audio-only stream, which ffmpeg's default stream
-    // selection maps unambiguously since each type has exactly one candidate.
-    let mut args: Vec<String> = vec![
+    let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+    args.extend(vec![
         "-f".to_string(),
         "v4l2".to_string(),
         "-i".to_string(),
@@ -532,10 +618,10 @@ pub async fn recording_with_output_va(
         "pulse".to_string(),
         "-i".to_string(),
         form_data.audio_device.clone(),
-    ];
-    // Same change as recording_with_output_v above: the container's own codec table plus hardware
-    // encoding, instead of a hardcoded `-c:v mpeg4` that ignored the chosen file type and left the
-    // audio codec entirely to the muxer's default.
+    ]);
+    if let Some(suffix) = hw_filter_suffix(&form_data.file_ext, &ffmpeg_path) {
+        args.extend(vec!["-vf".to_string(), suffix.to_string()]);
+    }
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
@@ -552,19 +638,8 @@ pub async fn recording_with_output_s(
 ) -> Result<String, String> {
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
 
-    let mut args: Vec<String> = vec![
-        "-f".to_string(),
-        "x11grab".to_string(),
-        "-framerate".to_string(),
-        resolved_framerate(form_data, 30).to_string(),
-    ];
-    args.extend(x11grab_input_args(&resolve_capture_target(
-        app_handle, form_data,
-    ))?);
-    // No mic in this mode at all (screen only) - system audio, if requested and available, is the
-    // only audio this can ever add, so there's nothing to mix; a plain second input is enough
-    // (same "each type has exactly one candidate" default stream selection recording_with_output_va
-    // already relies on for its own two-input case).
+    let mut args: Vec<String> = hw_pre_input_args(&form_data.file_ext, &ffmpeg_path);
+    args.extend(screen_input_args(app_handle, &state, form_data).await?);
     if let Some(source) = resolve_system_audio_source(form_data) {
         args.extend(vec![
             "-f".to_string(),
@@ -573,7 +648,10 @@ pub async fn recording_with_output_s(
             source,
         ]);
     }
-    args.extend(vec!["-vf".to_string(), desktop_scale_filter(form_data)]);
+    args.extend(vec![
+        "-vf".to_string(),
+        hw_vf_chain(desktop_scale_filter(form_data), &form_data.file_ext, &ffmpeg_path),
+    ]);
     args.extend(codec_args_for_ext_hw(&form_data.file_ext, &ffmpeg_path));
     args.push("-y".to_string());
     args.push(path_to_str(output_path)?.to_string());
@@ -596,7 +674,12 @@ pub async fn take_screenshot(
     let input_args = x11grab_input_args(&resolve_capture_target(app_handle, form_data))?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut args: Vec<String> = vec!["-f".to_string(), "x11grab".to_string()];
+        let mut args: Vec<String> = vec![
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-draw_mouse".to_string(),
+        (form_data.capture_cursor as u8).to_string(),
+    ];
         args.extend(input_args);
         args.extend(vec![
             "-frames:v".to_string(),

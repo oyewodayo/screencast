@@ -199,11 +199,16 @@ pub(crate) fn probed_size(params: &str) -> Option<(i32, i32)> {
 // ffmpeg arguments re-encoding one part of a restarted capture to `size`, so mismatched parts can
 // still be joined: letterboxed rather than stretched, every timestamp kept as captured (-copyts,
 // passthrough) since the concat list places the parts by them, and no B-frames for the same reason
-// the capture has none (see Segments::setts_expr).
-pub(crate) fn normalize_part_args(input: &Path, output: &Path, size: (i32, i32)) -> Result<Vec<String>, String> {
+// the capture has none (see Segments::setts_expr). Uses hardware encoding when available.
+pub(crate) fn normalize_part_args(
+    ffmpeg_path: Option<&Path>,
+    input: &Path,
+    output: &Path,
+    size: (i32, i32),
+) -> Result<Vec<String>, String> {
     let path = |p: &Path| crate::services::utility::path_to_str(p).map(|s| s.to_string());
     let (w, h) = size;
-    Ok(vec![
+    let mut args: Vec<String> = vec![
         "-y".into(),
         "-copyts".into(),
         "-i".into(),
@@ -216,12 +221,20 @@ pub(crate) fn normalize_part_args(input: &Path, output: &Path, size: (i32, i32))
         format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"),
         "-fps_mode".into(),
         "passthrough".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
-        "20".into(),
+    ];
+    match ffmpeg_path
+        .and_then(crate::services::hw_encoder::detect)
+        .filter(|e| !e.is_vaapi())
+    {
+        Some(hw) => {
+            args.extend(["-c:v".into(), hw.name().to_string()]);
+            args.extend(hw.quality_args());
+        }
+        None => {
+            args.extend(["-c:v".into(), "libx264".into(), "-preset".into(), "veryfast".into(), "-crf".into(), "20".into()]);
+        }
+    }
+    args.extend([
         "-bf".into(),
         "0".into(),
         "-c:a".into(),
@@ -229,7 +242,8 @@ pub(crate) fn normalize_part_args(input: &Path, output: &Path, size: (i32, i32))
         "-f".into(),
         "matroska".into(),
         path(output)?,
-    ])
+    ]);
+    Ok(args)
 }
 
 // Capture latency of the screen: Desktop Duplication hands over a frame as it's composed, so the
@@ -268,14 +282,16 @@ pub(crate) fn spawn_frame_timing(
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                // Stamped before anything else so parsing can't add to the measured latency.
-                let arrival = audio_capture::now_hns();
                 let text = String::from_utf8_lossy(&line);
-                let mut t = shared.lock().unwrap_or_else(|p| p.into_inner());
-                match parse_frame_pts(&text) {
-                    Some(pts) => t.frame(pts, arrival),
-                    None if text.contains("bc_frame=") => {}
-                    None => t.other_line(text.trim_end().to_string()),
+                // Every frame emits two metadata lines: the pts_time header and `bc_frame=1`.
+                // Fast-skip the value line BEFORE stamping QPC or locking FrameTiming (cuts lock
+                // acquisitions and QPC syscalls in half at 60 fps).
+                if let Some(pts) = parse_frame_pts(&text) {
+                    let arrival = audio_capture::now_hns();
+                    shared.lock().unwrap_or_else(|p| p.into_inner()).frame(pts, arrival);
+                } else if !text.contains("bc_frame=") {
+                    let trimmed = text.trim_end().to_string();
+                    shared.lock().unwrap_or_else(|p| p.into_inner()).other_line(trimmed);
                 }
             }
         });
@@ -630,39 +646,61 @@ pub(crate) fn assemble_args(parts: &Parts, output: &Path) -> Result<Vec<String>,
 
 // ffmpeg arguments re-timing a separately captured webcam (`input`, timed by `camera_offset_hns`
 // - its FrameTiming offset) onto the final recording's timeline: the same kept stretches, black
-// where the camera hadn't started yet, constant 30fps for the editor's seeking.
-pub(crate) fn webcam_args(segments: &Segments, camera_offset_hns: i64, input: &Path, output: &Path) -> Result<Vec<String>, String> {
+// where the camera hadn't started yet, constant 30fps for the editor's seeking. Uses hardware
+// encoding when `ffmpeg_path` is provided and one is available.
+pub(crate) fn webcam_args(
+    ffmpeg_path: Option<&Path>,
+    segments: &Segments,
+    camera_offset_hns: i64,
+    input: &Path,
+    output: &Path,
+) -> Result<Vec<String>, String> {
     let path = |p: &Path| crate::services::utility::path_to_str(p).map(|s| s.to_string());
     let mut chains = Vec::new();
     let n = segments.kept.len();
-    chains.push(format!("[0:v]split={}{}", n, (0..n).map(|k| format!("[c{}]", k)).collect::<String>()));
     // How long after the recording's start the camera's first frame came - it's shifted that late,
     // and the fps stage holds its first picture over the gap. (tpad's padding doesn't move the
     // frames after it, which left the whole layer that much early.)
     let mut lead = 0.0f64;
-    for (k, (a, b)) in segments.kept.iter().enumerate() {
+    let total_dur = segments.duration().max(0.1);
+    if n == 1 {
+        let (a, b) = segments.kept[0];
         let start = (segments.offset_hns + (a * 1e7) as i64 - camera_offset_hns) as f64 / 1e7;
         let len = b - a;
-        if k == 0 {
-            lead = (-start).max(0.0).min(len);
-        }
+        lead = (-start).max(0.0).min(len);
         let from = start.max(0.0);
-        let to = if k == 0 { from + len - lead } else { from + len };
+        let to = from + len - lead;
         chains.push(format!(
-            "[c{k}]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS[s{k}]",
-            from,
-            to,
-            k = k
+            "[0:v]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS+{:.6}/TB,fps=30:start_time=0,tpad=stop_mode=clone:stop_duration={:.3},trim=duration={:.6}[cam]",
+            from, to, lead, total_dur, total_dur
+        ));
+    } else {
+        chains.push(format!("[0:v]split={}{}", n, (0..n).map(|k| format!("[c{}]", k)).collect::<String>()));
+        for (k, (a, b)) in segments.kept.iter().enumerate() {
+            let start = (segments.offset_hns + (a * 1e7) as i64 - camera_offset_hns) as f64 / 1e7;
+            let len = b - a;
+            if k == 0 {
+                lead = (-start).max(0.0).min(len);
+            }
+            let from = start.max(0.0);
+            let to = if k == 0 { from + len - lead } else { from + len };
+            chains.push(format!(
+                "[c{k}]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS[s{k}]",
+                from,
+                to,
+                k = k
+            ));
+        }
+        chains.push(format!(
+            "{}concat=n={}:v=1:a=0,setpts=PTS+{:.6}/TB,fps=30:start_time=0,tpad=stop_mode=clone:stop_duration={:.3},trim=duration={:.6}[cam]",
+            (0..n).map(|k| format!("[s{}]", k)).collect::<String>(),
+            n,
+            lead,
+            total_dur,
+            total_dur
         ));
     }
-    chains.push(format!(
-        "{}concat=n={}:v=1:a=0,setpts=PTS+{:.6}/TB,fps=30:start_time=0,tpad=stop_mode=clone:stop_duration=1,trim=duration={:.6}[cam]",
-        (0..n).map(|k| format!("[s{}]", k)).collect::<String>(),
-        n,
-        lead,
-        segments.duration()
-    ));
-    Ok(vec![
+    let mut args: Vec<String> = vec![
         "-y".into(),
         "-i".into(),
         path(input)?,
@@ -670,18 +708,27 @@ pub(crate) fn webcam_args(segments: &Segments, camera_offset_hns: i64, input: &P
         chains.join(";"),
         "-map".into(),
         "[cam]".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
-        "20".into(),
+    ];
+    match ffmpeg_path
+        .and_then(crate::services::hw_encoder::detect)
+        .filter(|e| !e.is_vaapi())
+    {
+        Some(hw) => {
+            args.extend(["-c:v".into(), hw.name().to_string()]);
+            args.extend(hw.quality_args());
+        }
+        None => {
+            args.extend(["-c:v".into(), "libx264".into(), "-preset".into(), "veryfast".into(), "-crf".into(), "20".into()]);
+        }
+    }
+    args.extend([
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-movflags".into(),
         "+faststart".into(),
         path(output)?,
-    ])
+    ]);
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -790,7 +837,7 @@ mod tests {
     fn webcam_is_cut_like_the_screen_and_padded_until_it_started() {
         // Screen pts 0 at QPC 10s; the camera's pts 0 at QPC 10.5s - it came up half a second late.
         let s = Segments { offset_hns: 100_000_000, kept: vec![(0.0, 2.0), (5.0, 6.0)] };
-        let args = webcam_args(&s, 105_000_000, Path::new("in.mkv"), Path::new("out.mp4")).unwrap();
+        let args = webcam_args(None, &s, 105_000_000, Path::new("in.mkv"), Path::new("out.mp4")).unwrap();
         let fc = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert!(fc.contains("[c0]trim=start=0.000000:end=1.500000,setpts=PTS-STARTPTS"), "{}", fc);
         assert!(fc.contains("setpts=PTS+0.500000/TB,fps=30:start_time=0"), "{}", fc);

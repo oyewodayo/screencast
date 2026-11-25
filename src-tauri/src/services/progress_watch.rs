@@ -15,6 +15,7 @@
 // no deadlock risk. This module just polls that file on a timer and forwards the latest block to
 // the frontend as a `recording-progress` event.
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
@@ -22,6 +23,10 @@ use std::time::Duration;
 
 use tauri::async_runtime::Mutex;
 use tauri::{AppHandle, Emitter};
+
+// One ffmpeg -progress block is ~220-320 bytes; reading the last 4 KB guarantees at least one
+// complete block in O(1) time regardless of how many hours the recording has been running.
+const TAIL_BYTES: u64 = 4096;
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,16 +88,18 @@ pub fn watch(
                 break;
             }
 
-            let Ok(contents) = std::fs::read_to_string(&progress_path) else {
+            let path = progress_path.clone();
+            let prev_len = last_len;
+            let polled = tauri::async_runtime::spawn_blocking(move || read_tail_if_grown(&path, prev_len))
+                .await
+                .ok()
+                .flatten();
+            let Some((len, tail)) = polled else {
                 continue;
             };
-            let len = contents.len() as u64;
-            if len == last_len {
-                continue;
-            }
             last_len = len;
 
-            if let Some(progress) = parse_latest_block(&contents) {
+            if let Some(progress) = parse_latest_block(&tail) {
                 let _ = app_handle.emit("recording-progress", progress);
             }
         }
@@ -100,6 +107,21 @@ pub fn watch(
             let _ = std::fs::remove_file(&progress_path);
         }
     });
+}
+
+// Reads only the last TAIL_BYTES of `path` when its size changed, keeping polling O(1) in both
+// I/O and memory even on multi-hour recordings.
+fn read_tail_if_grown(path: &Path, last_len: u64) -> Option<(u64, String)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 || len == last_len {
+        return None;
+    }
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    Some((len, String::from_utf8_lossy(&buf).into_owned()))
 }
 
 // ffmpeg's -progress file is a sequence of key=value blocks, each one terminated by a

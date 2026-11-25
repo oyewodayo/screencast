@@ -1805,6 +1805,11 @@ useEffect(() => {
     const unlistenPromise = listen<{ isPaused: boolean; pauseStartedAt: number | null; pausedAccumulatedMs: number }>(
       'recording-pause-changed',
       (event) => {
+        if (event.payload.isPaused) {
+          phoneCaptureRef.current?.pause();
+        } else {
+          phoneCaptureRef.current?.resume();
+        }
         setIsPaused(event.payload.isPaused);
         setPauseStartedAt(event.payload.pauseStartedAt);
         setPausedAccumulatedMs(event.payload.pausedAccumulatedMs);
@@ -2063,19 +2068,9 @@ const setScreen = () => {
     try {
         await activateTargetWindowIfNeeded(formData);
 
-        // Play audio notification
-        const playAudioNotification = () => {
-          return new Promise<void>((resolve) => {
-            const audio = new Audio("/sounds/icq-modern-notification-sound.mp3");
-            audio.onended = () => resolve();
-            audio.play().catch(err => {
-              console.error("Error playing audio:", err);
-              resolve();
-            });
-          });
-        };
-
-        await playAudioNotification();
+        // Play audio notification asynchronously so we don't delay capture start waiting on MP3 end.
+        const audio = new Audio("/sounds/icq-modern-notification-sound.mp3");
+        audio.play().catch(err => console.error("Error playing audio:", err));
 
         // Timestamped before start_recording so the offset handed to the backend covers the
         // whole gap - spawning ffmpeg plus its own half-second early-exit check - rather than
@@ -2246,15 +2241,24 @@ const setScreen = () => {
   const stopRecordingOnce = async () => {
     setError("");
 
-    // Flushed and written BEFORE stop_recording, so the finished camera file is already on disk
-    // next to the screen recording by the time the completion UI points the user at it.
-    if (phoneCaptureRef.current) {
-      const capture = phoneCaptureRef.current;
-      phoneCaptureRef.current = null;
+    // Flush the phone MediaRecorder (~50ms) first so no extra phone frames accumulate, then stop
+    // main capture immediately instead of waiting on the full phone re-encode while ffmpeg keeps
+    // recording extra footage. For phone-only recordings, join_phone_only_recording needs
+    // `_webcam.mp4` on disk before stop_recording runs; for screen+phone, both finalize in parallel.
+    const phoneCapture = phoneCaptureRef.current;
+    phoneCaptureRef.current = null;
+    const isPhoneOnly =
+      (recordType === "v" || recordType === "va") &&
+      videoDevices.length === 1 &&
+      videoDevices[0] === PHONE_CAMERA_DEVICE;
+    if (phoneCapture) {
       try {
-        await capture.stop();
+        await phoneCapture.stopRecording();
+        if (isPhoneOnly) {
+          await phoneCapture.finalize();
+        }
       } catch (e) {
-        console.error("Error saving phone camera recording:", e);
+        console.error("Error flushing phone camera recording:", e);
       }
     }
 
@@ -2282,8 +2286,9 @@ const setScreen = () => {
     }
 
     try {
-      // The finished path is shown by the completion window, so no toast repeats it here.
-      await invoke<string>("stop_recording");
+      // Run main stop/assembly and screen+phone conversion in parallel so stop finishes faster.
+      const phoneFinalize = phoneCapture && !isPhoneOnly ? phoneCapture.finalize() : Promise.resolve();
+      await Promise.all([invoke<string>("stop_recording"), phoneFinalize]);
       trackEvent("recording_finished", { durationSeconds, stoppedFrom: "main" });
     } catch (error) {
       // A second Stop (from the overlay, a shortcut) while the first is still finishing - the
@@ -2311,6 +2316,7 @@ const setScreen = () => {
   const handlePauseRecording = async () => {
     try {
       await invoke("pause_recording");
+      phoneCaptureRef.current?.pause();
       const now = Date.now();
       setIsPaused(true);
       setPauseStartedAt(now);
@@ -2336,6 +2342,7 @@ const setScreen = () => {
   const handleResumeRecording = async () => {
     try {
       await invoke("resume_recording");
+      phoneCaptureRef.current?.resume();
       // Folds the just-finished pause into the running total before clearing pauseStartedAt -
       // this is the one moment pausedAccumulatedMs actually changes (see its own doc comment).
       const addedMs = pauseStartedAt ? Date.now() - pauseStartedAt : 0;
