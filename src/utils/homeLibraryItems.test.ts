@@ -38,6 +38,26 @@ describe("buildHomeItems", () => {
     const docs = Array.from({ length: 20 }, (_, i) => ({ id: `d${i}`, name: `Doc ${i}`, updated_at: new Date(T - i).toISOString() }));
     expect(buildHomeItems({ ...base, docs, limit: 5 })).toHaveLength(5);
   });
+
+  it("supports pinning creations and searching across the entire library", () => {
+    const items = buildHomeItems({
+      ...base,
+      pinnedPaths: ["whiteboard:w1"],
+      recentPaths: ["/a.mp4"],
+      docs: [{ id: "d1", name: "Quantum Notes", updated_at: new Date(T - 20_000).toISOString() }],
+      whiteboards: [{ id: "w1", name: "Sprint Board", updated_at: new Date(T - 600_000).toISOString() }],
+    });
+    expect(items[0]).toMatchObject({ key: "whiteboard:w1", pinned: true });
+
+    // Searching reaches un-opened files like /c.png as well as creations.
+    const searched = buildHomeItems({
+      ...base,
+      recentPaths: ["/a.mp4"],
+      docs: [{ id: "d1", name: "Quantum Notes", updated_at: new Date(T - 20_000).toISOString() }],
+      query: "c.png",
+    });
+    expect(searched.map((i) => i.key)).toEqual(["/c.png"]);
+  });
 });
 
 describe("relativeTime", () => {

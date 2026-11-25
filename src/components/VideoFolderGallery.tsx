@@ -28,6 +28,12 @@ import { useBatchedRecord } from "../hooks/useBatchedRecord";
 import InlineRenameInput from "./InlineRenameInput";
 import FloatingContextMenu from "./FloatingContextMenu";
 import { isVideoProjectPath } from "../utils/videoEditTypes";
+import {
+  VideoHoverPreviewOverlay,
+  cancelVideoPreview,
+  scheduleVideoPreview,
+  stopAllVideoPreviews,
+} from "./video/VideoHoverPreview";
 
 interface GalleryFile {
   name: string;
@@ -148,6 +154,7 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
 
   useEffect(() => () => {
     if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+    stopAllVideoPreviews();
   }, []);
 
   const flashStatus = (message: string) => {
@@ -197,12 +204,27 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
               lastClickedIndexRef.current = index;
             }
           }}
-          onDoubleClick={() => latest.current.onOpenVideo(file)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") latest.current.onOpenVideo(file);
+          onDoubleClick={() => {
+            cancelVideoPreview("gallery", file.path);
+            latest.current.onOpenVideo(file);
           }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              cancelVideoPreview("gallery", file.path);
+              latest.current.onOpenVideo(file);
+            }
+          }}
+          onPointerEnter={() => {
+            if (renamingFile !== file.path) scheduleVideoPreview("gallery", file.path, file.size);
+          }}
+          onPointerLeave={() => cancelVideoPreview("gallery", file.path)}
+          onFocus={() => {
+            if (renamingFile !== file.path) scheduleVideoPreview("gallery", file.path, file.size);
+          }}
+          onBlur={() => cancelVideoPreview("gallery", file.path)}
           onContextMenu={(e) => {
             e.preventDefault();
+            cancelVideoPreview("gallery", file.path);
             openMenuFor(file, e.clientX, e.clientY);
           }}
           title={renamingFile === file.path ? undefined : file.name}
@@ -246,6 +268,12 @@ const VideoFolderGallery: React.FC<VideoFolderGalleryProps> = ({
                 <IoPlay size={14} className="text-white translate-x-[1px]" />
               </div>
             </div>
+            <VideoHoverPreviewOverlay
+              scope="gallery"
+              path={file.path}
+              fit="contain"
+              backdropClassName="bg-black"
+            />
           </div>
           {renamingFile === file.path ? (
             <InlineRenameInput

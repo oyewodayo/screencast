@@ -25,6 +25,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { thumbnailLimiter } from "../utils/concurrencyLimiter";
+import { VideoHoverPreviewOverlay } from "./video/VideoHoverPreview";
 
 // Module-level thumbnail URL cache so closing/reopening the sidebar or switching tabs/views
 // renders already-resolved thumbnails synchronously on first paint with zero IPC round-trip.
@@ -80,6 +81,8 @@ interface SidebarFileIconProps {
   // Grid view: a full-width 16:9 tile instead of the 20px row icon. Same lazy/limited resolve;
   // `isImage` just means "has a thumbnail to resolve" (the grid also passes videos).
   large?: boolean;
+  // Enables the shared single-decoder hover/focus preview overlay on large video tiles.
+  isVideo?: boolean;
 }
 
 const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
@@ -90,6 +93,7 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
   fallbackIcon,
   fallbackClassName,
   large = false,
+  isVideo = false,
 }) => {
   const tileRef = useRef<HTMLDivElement>(null);
   const [thumbUrl, setThumbUrl] = useState<string | null>(() => (isImage ? resolvedThumbCache.get(path) ?? null : null));
@@ -139,7 +143,7 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
       ref={tileRef}
       className={
         large
-          ? `w-full aspect-video rounded-lg overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ring-1 ring-black/5 dark:ring-white/5 ${
+          ? `relative w-full aspect-video rounded-lg overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ring-1 ring-black/5 dark:ring-white/5 ${
               isLoadingThumb ? "animate-pulse bg-gray-200/80 dark:bg-neutral-800/90" : ""
             }`
           : `shrink-0 w-5 h-5 rounded-md overflow-hidden bg-gray-100 dark:bg-neutral-800 flex items-center justify-center ${
@@ -152,6 +156,7 @@ const SidebarFileIcon: React.FC<SidebarFileIconProps> = ({
       ) : (
         <span className={`${fallbackClassName} ${large ? "scale-[1.8]" : ""} ${isLoadingThumb ? "opacity-40" : ""}`}>{fallbackIcon}</span>
       )}
+      {large && isVideo && <VideoHoverPreviewOverlay scope="sidebar" path={path} fit="cover" />}
     </div>
   );
 };

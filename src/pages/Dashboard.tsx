@@ -25,7 +25,7 @@ import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewW
 import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
 import { fadeTotalMs } from '../utils/annotationStyles';
 import { describeShortcutFailures, onGlobalShortcut, onShortcutFailures, type ShortcutAction } from '../services/globalShortcuts';
-import { formatFileName, formatFileSize, formatMediaDuration, truncateFileName } from "../utils/Formater";
+import { formatFileName, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
 import {
   canMoveFolder,
@@ -80,6 +80,7 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import HomeLibrarySection from "../components/HomeLibrarySection";
 import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
 import SidebarHeader from "../components/sidebar/SidebarHeader";
 import { FILE_CATEGORY_TABS } from "../components/sidebar/categoryTabs";
@@ -187,7 +188,7 @@ import {
 } from "../utils/homeScreenFiles";
 import { getArrivals, getOpenedAt, recordFileArrived, recordItemOpened } from "../utils/homeScreenFiles";
 import { onUsbImported } from "../services/usbPhone";
-import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../utils/homeLibraryItems";
+import { buildHomeItems, homeItemKey, type HomeItem } from "../utils/homeLibraryItems";
 import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
 import type { WhiteboardSummary } from "../utils/whiteboardTypes";
 import type { MindmapSummary } from "../utils/mindmapTypes";
@@ -209,7 +210,6 @@ import {
   IoArrowUndoOutline,
   IoFolderOutline,
   IoOptionsOutline,
-  IoPin,
   IoLocateOutline,
   IoCutOutline,
   IoDocumentTextOutline,
@@ -217,7 +217,6 @@ import {
   IoMapOutline,
   IoImagesOutline,
   IoFolderOpenOutline,
-  IoPhonePortraitOutline,
 } from "react-icons/io5";
 import { MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
@@ -454,6 +453,25 @@ const Dashboard = () => {
   const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
   const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
   const [externalFiles, setExternalFiles] = useState<Record<string, ExternalFileMetadata>>(() => getExternalFiles());
+  const [homeLibraryView, setHomeLibraryView] = useState<"list" | "grid">(() => {
+    try {
+      return localStorage.getItem("briefcast.homeLibraryViewMode") === "grid" ? "grid" : "list";
+    } catch {
+      return "list";
+    }
+  });
+  const [homeLibrarySearch, setHomeLibrarySearch] = useState("");
+  const handleHomeLibraryViewChange = useCallback((mode: "list" | "grid") => {
+    setHomeLibraryView(mode);
+    try {
+      localStorage.setItem("briefcast.homeLibraryViewMode", mode);
+    } catch {
+      // ignore storage quota / private-mode errors
+    }
+  }, []);
+  const handleTogglePinHomeKey = useCallback((key: string) => {
+    setPinnedPaths(togglePin(key));
+  }, []);
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
@@ -3690,9 +3708,17 @@ const setScreen = () => {
 				whiteboards: whiteboardIndex,
 				mindmaps: mindmapIndex,
 				externalFiles,
+				query: homeLibrarySearch,
 			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles]
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles, homeLibrarySearch]
 	);
+	const hasAnyHomeItems =
+		allLibraryFiles.length > 0 ||
+		pinnedPaths.length > 0 ||
+		docsIndex.some((d) => !d.deleted_at) ||
+		whiteboardIndex.length > 0 ||
+		mindmapIndex.length > 0 ||
+		Object.keys(externalFiles).length > 0;
 	// Extended history list for the quick-switcher dropup in the dock when navigating outside home
 	const historyItems = useMemo(
 		() =>
@@ -6021,30 +6047,25 @@ const setScreen = () => {
               {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
                 <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
               ) : (
-              <div className="relative flex flex-col items-center gap-5 text-center w-full max-w-3xl">
-                <div>
-                  <p className="text-xl text-gray-800 dark:text-neutral-100 font-semibold">
-                    What would you like to create today?
-                  </p>
-                  <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-                    Jump into a tool, open a file from your computer, or pick up something from your library.
-                  </p>
-                </div>
-                {/* Same tools (and icons) as the bottom dock's tool row, surfaced here with labels
-                    so a first-time user can see what the app does without hovering icons. */}
-                <div className="flex flex-wrap justify-center gap-2">
+              <div className="relative flex flex-col items-center gap-4 text-center w-full max-w-3xl">
+                <p className="text-xl text-gray-800 dark:text-neutral-100 font-semibold tracking-tight">
+                  What would you like to create?
+                </p>
+                {/* Same tools (and icons) as the bottom dock's tool row, aligned cleanly to the
+                    same max-w-3xl width as the library grid below. */}
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 w-full">
                   {[
-                    { label: "Edit a video", icon: <IoCutOutline size={22} />, onClick: handleOpenVideoEditor },
-                    { label: "Write a document", icon: <IoDocumentTextOutline size={22} />, onClick: handleOpenDocs },
-                    { label: "Whiteboard", icon: <IoGitNetworkOutline size={22} />, onClick: handleOpenWhiteboard },
-                    { label: "Board", icon: <IoImagesOutline size={22} />, onClick: handleOpenBoard },
-                    { label: "Open a file", icon: <IoFolderOpenOutline size={22} />, onClick: handleOpenExternalFile },
+                    { label: "Video", icon: <IoCutOutline size={20} />, onClick: handleOpenVideoEditor },
+                    { label: "Document", icon: <IoDocumentTextOutline size={20} />, onClick: handleOpenDocs },
+                    { label: "Whiteboard", icon: <IoGitNetworkOutline size={20} />, onClick: handleOpenWhiteboard },
+                    { label: "Board", icon: <IoImagesOutline size={20} />, onClick: handleOpenBoard },
+                    { label: "Open file", icon: <IoFolderOpenOutline size={20} />, onClick: handleOpenExternalFile },
                   ].map((action) => (
                     <button
                       key={action.label}
                       type="button"
                       onClick={action.onClick}
-                      className="flex flex-col items-center justify-center gap-2 w-28 h-24 rounded-lg bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-400 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                      className="flex flex-col items-center justify-center gap-2 h-[84px] rounded-xl bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200/80 dark:border-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-400/80 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 hover:shadow-sm transition-all"
                     >
                       {action.icon}
                       <span className="text-xs font-medium">{action.label}</span>
@@ -6054,69 +6075,24 @@ const setScreen = () => {
               </div>
               )}
 
-              {homeItems.length > 0 && (
-                <div className="relative w-full max-w-md">
-                  <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
-                    From your library
-                  </p>
-                  <div className="flex flex-col gap-1">
-                    {homeItems.map((item) => {
-                      const file = item.kind === "file" ? libraryFilesByPath.get(item.id) : undefined;
-                      const kind = item.kind === "file" ? null : HOME_KIND[item.kind];
-                      return (
-                        <button
-                          key={item.key}
-                          type="button"
-                          onClick={() => openHomeItem(item)}
-                          className="flex items-center gap-3 px-3 py-2 rounded-md bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors"
-                        >
-                          <span className={`shrink-0 ${kind ? kind.color : "text-gray-400 dark:text-neutral-500"}`}>
-                            {kind ? kind.icon : categoryIcon(getFileCategory(item.name))}
-                          </span>
-                          <span className="text-sm text-gray-700 dark:text-neutral-200 truncate">
-                            {file ? truncateFileName(file.name) : item.name}
-                          </span>
-                          <span className="ml-auto flex items-center gap-2 shrink-0 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
-                            {file && arrivals[file.path] ? (
-                              <span
-                                className="flex items-center gap-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 px-2 py-0.5"
-                                title={`Sent from ${arrivals[file.path].from} ${relativeTime(arrivals[file.path].at)}`}
-                              >
-                                <IoPhonePortraitOutline size={12} />
-                                <span className="max-w-[9rem] truncate">{arrivals[file.path].from}</span>
-                                {arrivals[file.path].count > 1 && <span>· +{arrivals[file.path].count - 1} more</span>}
-                                <span aria-hidden>·</span>
-                                <span>{relativeTime(arrivals[file.path].at)}</span>
-                              </span>
-                            ) : file ? (
-                              <>
-                                {libraryPreviewDurations.has(file.path) && (
-                                  <>
-                                    <span>{formatMediaDuration(libraryPreviewDurations.get(file.path)!)}</span>
-                                    <span aria-hidden>·</span>
-                                  </>
-                                )}
-                                <span>{formatFileSize(file.size)}</span>
-                              </>
-                            ) : (
-                              <>
-                                <span>{kind ? kind.label : (getFileCategory(item.name) ?? "File")}</span>
-                                {item.time > 0 && (
-                                  <>
-                                    <span aria-hidden>·</span>
-                                    <span>{relativeTime(item.time)}</span>
-                                  </>
-                                )}
-                              </>
-                            )}
-                            {item.pinned && <IoPin size={13} />}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
+              <HomeLibrarySection
+                items={homeItems}
+                hasAnyItems={hasAnyHomeItems}
+                viewMode={homeLibraryView}
+                onViewModeChange={handleHomeLibraryViewChange}
+                searchQuery={homeLibrarySearch}
+                onSearchQueryChange={setHomeLibrarySearch}
+                libraryFilesByPath={libraryFilesByPath}
+                arrivals={arrivals}
+                durations={libraryPreviewDurations}
+                homeKinds={HOME_KIND}
+                categoryIcon={categoryIcon}
+                categoryIconColorClassName={categoryIconColorClassName}
+                resolveImageThumbnailUrl={resolveImageThumbnailUrl}
+                resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
+                onOpenItem={openHomeItem}
+                onTogglePinKey={handleTogglePinHomeKey}
+              />
             </div>
           )}
           </div>

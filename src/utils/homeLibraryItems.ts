@@ -49,9 +49,11 @@ export function buildHomeItems(input: {
   whiteboards: HomeCreationLike[];
   mindmaps: HomeCreationLike[];
   externalFiles?: Record<string, HomeFileLike> | HomeFileLike[];
+  query?: string;
   limit?: number;
 }): HomeItem[] {
   const { files, pinnedPaths, recentPaths, openedAt, limit = HOME_LIST_SIZE } = input;
+  const q = input.query?.trim().toLowerCase() ?? "";
   const byPath = new Map<string, HomeFileLike>(files.map((f) => [f.path, f]));
 
   if (input.externalFiles) {
@@ -83,27 +85,48 @@ export function buildHomeItems(input: {
     pinned,
   });
 
-  const pinned = pinnedPaths
-    .map(resolveFile)
-    .map((f) => fileItem(f, true));
-
-  // Files compete on recency once opened here, including external files.
-  // Before any open history exists, falls back to the whole library by modified time.
-  const recentFiles = recentPaths.map(resolveFile);
-  const fileCandidates = (recentFiles.length > 0 ? recentFiles : files).filter((f) => !pinnedPaths.includes(f.path)).map((f) => fileItem(f, false));
-
   const creation = (kind: Exclude<HomeItemKind, "file">) => (c: HomeCreationLike): HomeItem => {
     const key = homeItemKey(kind, c.id);
     return { key, kind, id: c.id, name: c.name || "Untitled", time: Math.max(openedAt[key] ?? 0, parseTime(c.updated_at)), pinned: false };
   };
-  const rest = [
-    ...fileCandidates,
+
+  const allCreations: HomeItem[] = [
     ...input.docs.map(creation("doc")),
     ...input.whiteboards.map(creation("whiteboard")),
     ...input.mindmaps.map(creation("mindmap")),
+  ];
+  const creationByKey = new Map(allCreations.map((c) => [c.key, c]));
+
+  const isCreationKey = (k: string) => k.startsWith("doc:") || k.startsWith("whiteboard:") || k.startsWith("mindmap:");
+  const pinned: HomeItem[] = [];
+  const pinnedKeys = new Set<string>();
+  for (const p of pinnedPaths) {
+    if (pinnedKeys.has(p)) continue;
+    if (creationByKey.has(p)) {
+      pinned.push({ ...creationByKey.get(p)!, pinned: true });
+      pinnedKeys.add(p);
+    } else if (!isCreationKey(p)) {
+      pinned.push(fileItem(resolveFile(p), true));
+      pinnedKeys.add(p);
+    }
+  }
+
+  // When searching, match across the entire library (files + creations) instead of only recent opens.
+  // Otherwise files compete on recency once opened here, falling back to modified time before history exists.
+  const recentFiles = recentPaths.map(resolveFile);
+  const candidateFileList = q ? Array.from(byPath.values()) : recentFiles.length > 0 ? recentFiles : files;
+  const fileCandidates = candidateFileList
+    .filter((f) => !pinnedKeys.has(f.path))
+    .map((f) => fileItem(f, false));
+
+  const rest = [
+    ...fileCandidates,
+    ...allCreations.filter((c) => !pinnedKeys.has(c.key)),
   ].sort((a, b) => b.time - a.time);
 
-  return [...pinned, ...rest].slice(0, limit);
+  const combined = [...pinned, ...rest];
+  const filtered = q ? combined.filter((item) => item.name.toLowerCase().includes(q)) : combined;
+  return filtered.slice(0, limit);
 }
 
 export function relativeTime(ms: number, now = Date.now()): string {

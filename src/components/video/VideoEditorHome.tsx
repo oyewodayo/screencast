@@ -23,7 +23,13 @@
 // VideoEditorScreen for the two states that model that.
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import {
+  VideoHoverPlayer,
+  cancelVideoPreview,
+  scheduleVideoPreview,
+  stopAllVideoPreviews,
+  useIsVideoPreviewActive,
+} from "./VideoHoverPreview";
 import {
   IoArrowForward,
   IoClose,
@@ -89,8 +95,6 @@ interface VideoEditorHomeProps {
 // Below this many videos the search box is more clutter than help - same threshold reasoning as
 // WhiteboardHome's own search box.
 const SEARCH_VISIBLE_THRESHOLD = 6;
-// How long the pointer rests on a tile before it starts moving.
-const HOVER_PREVIEW_DELAY_MS = 350;
 
 type Filter = "all" | "edited" | "vertical" | "exports" | "projects";
 type Sort = "recent" | "name" | "length" | "size";
@@ -132,19 +136,18 @@ interface TileProps {
   thumbUrl: string | undefined;
   probe: VideoProbe | undefined;
   edit: EditSummary | null | undefined;
-  previewing: boolean;
   picking: boolean;
   // Its exports, newest first - shown on it rather than as tiles of their own.
   exports: VideoEditorFile[] | undefined;
   onOpen: (video: VideoEditorFile) => void;
   onVisible: (path: string) => void;
-  onHover: (path: string | null) => void;
   onSendToPhone: (video: VideoEditorFile) => void;
 }
 
 // Memoized so a thumbnail or a probe arriving re-renders its own tile, not the whole grid.
-const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previewing, picking, exports, onOpen, onVisible, onHover, onSendToPhone }: TileProps) {
+const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, picking, exports, onOpen, onVisible, onSendToPhone }: TileProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const previewing = useIsVideoPreviewActive("editor-home", video.path);
   // Asks for its poster, length and edit only once it scrolls into view.
   useEffect(() => {
     const el = ref.current;
@@ -163,10 +166,21 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
       ref={ref}
       role="button"
       tabIndex={0}
-      onClick={() => onOpen(video)}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onOpen(video))}
-      onPointerEnter={() => onHover(video.path)}
-      onPointerLeave={() => onHover(null)}
+      onClick={() => {
+        cancelVideoPreview("editor-home", video.path);
+        onOpen(video);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          cancelVideoPreview("editor-home", video.path);
+          onOpen(video);
+        }
+      }}
+      onPointerEnter={() => scheduleVideoPreview("editor-home", video.path, video.size)}
+      onPointerLeave={() => cancelVideoPreview("editor-home", video.path)}
+      onFocus={() => scheduleVideoPreview("editor-home", video.path, video.size)}
+      onBlur={() => cancelVideoPreview("editor-home", video.path)}
       title={picking ? `Use ${video.name}` : `Edit ${video.name}`}
       className={`group text-left rounded-xl overflow-hidden bg-white dark:bg-neutral-900 border shadow-sm hover:shadow-md transition-all outline-none cursor-pointer focus-visible:ring-2 focus-visible:ring-blue-500 ${
         picking ? "border-blue-300 dark:border-blue-500/50 hover:border-blue-500 hover:-translate-y-0.5" : "border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500"
@@ -174,7 +188,15 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
     >
       <div className="relative aspect-video bg-neutral-100 dark:bg-neutral-950 overflow-hidden">
         {thumbUrl ? <Poster url={thumbUrl} vertical={isVertical(probe)} /> : <span className="absolute inset-0 flex items-center justify-center"><IoFilmOutline size={28} className="text-neutral-300 dark:text-neutral-700" /></span>}
-        {previewing && <HoverPreview path={video.path} start={probe?.duration ? probe.duration * 0.15 : 0} vertical={isVertical(probe)} />}
+        {previewing && (
+          <VideoHoverPlayer
+            path={video.path}
+            start={probe?.duration ? probe.duration * 0.15 : undefined}
+            fit={isVertical(probe) ? "contain" : "cover"}
+            backdropClassName={isVertical(probe) ? "bg-black/40" : ""}
+            onFailed={() => cancelVideoPreview("editor-home", video.path)}
+          />
+        )}
         <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/10 transition-colors pointer-events-none">
           {!previewing && <IoPlay size={26} className="text-white opacity-0 group-hover:opacity-90 transition-opacity drop-shadow" />}
         </div>
@@ -227,26 +249,6 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
     </div>
   );
 });
-
-// The tile's video moving under the pointer - one at a time (the webview has few decoders to
-// spare), muted, from a little way in.
-const HoverPreview: React.FC<{ path: string; start: number; vertical: boolean }> = ({ path, start, vertical }) => {
-  const [shown, setShown] = useState(false);
-  return (
-    <video
-      src={convertFileSrc(path)}
-      muted
-      autoPlay
-      loop
-      playsInline
-      onLoadedMetadata={(e) => {
-        if (start > 0) e.currentTarget.currentTime = start;
-      }}
-      onPlaying={() => setShown(true)}
-      className={`absolute inset-0 w-full h-full ${vertical ? "object-contain bg-black/40" : "object-cover"} transition-opacity duration-300 ${shown ? "opacity-100" : "opacity-0"}`}
-    />
-  );
-};
 
 // ---- Starters -------------------------------------------------------------------------------
 
@@ -385,8 +387,6 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
   const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
   const [probes, putProbe] = useBatchedRecord<VideoProbe>();
   const [edits, setEdits] = useState<Record<string, EditSummary | null>>({});
-  const [hovered, setHovered] = useState<string | null>(null);
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const libraryRef = useRef<HTMLElement>(null);
 
@@ -509,15 +509,8 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [droppedPaths]);
 
-  // A tile moves once the pointer has rested on it a moment.
-  useEffect(() => {
-    if (!hovered) {
-      setPreviewPath(null);
-      return;
-    }
-    const timer = window.setTimeout(() => setPreviewPath(hovered), HOVER_PREVIEW_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, [hovered]);
+  // Release any active preview when leaving the Video Editor home screen.
+  useEffect(() => () => stopAllVideoPreviews(), []);
 
   // VideoPlayer's "set current frame as thumbnail" rewrites the cached jpg at the same path -
   // bypassCache=true is what gets the new bytes.
@@ -574,12 +567,10 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
       thumbUrl={thumbUrls[video.path]}
       probe={probes[video.path]}
       edit={edits[video.path]}
-      previewing={previewPath === video.path}
       picking={!!picking}
       exports={filter === "exports" || isExportName(video.path) ? undefined : exportsByBase.get(exportBase(video.path))}
       onOpen={openVideo}
       onVisible={loadMeta}
-      onHover={setHovered}
       onSendToPhone={sendToPhone}
     />
   );
