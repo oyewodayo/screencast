@@ -7,7 +7,8 @@ import { WindowInfo, MonitorInfo, CaptureCapabilities } from "../Types";
 import CameraOverlayPreview from "./CameraOverlayPreview";
 import LiveMicMeter from "./LiveMicMeter";
 import { RECORD_TYPE_LABELS } from "./ActiveRecordingState";
-import { DEFAULT_SETTINGS, loadSettings, saveSettings, type CameraBackgroundPref } from "../utils/appSettings";
+import { DEFAULT_SETTINGS, loadSettings, saveSettings, SETTINGS_CHANGED_DOM_EVENT, type AppSettings, type CameraBackgroundPref } from "../utils/appSettings";
+import { isPrivacyShieldArmed, privacyShieldSummary } from "../utils/privacyShield";
 import { backgroundRemovalStatus, downloadBackgroundEngine } from "../utils/backgroundRemoval";
 import { BACKGROUND_SWATCHES } from "../utils/cutoutBackground";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -69,6 +70,8 @@ interface ScreenOptionsProps {
     setOpen: React.Dispatch<React.SetStateAction<boolean>>;
     // Lets the header switch what's being recorded without closing the modal.
     onRecordTypeChange: (recordType: string) => void;
+    // Opens Settings directly on Annotate & Privacy Shield without discarding the setup modal.
+    onOpenAnnotationSettings?: () => void;
     error?: string;
 }
 
@@ -241,6 +244,7 @@ const EnhancedScreenOptions = ({
     setOpen: _setOpen,
     setSelectedScreen,
     onRecordTypeChange,
+    onOpenAnnotationSettings,
     error,
 }: ScreenOptionsProps) => {
     const [mode, setMode] = useState<SelectionMode>("main");
@@ -352,6 +356,20 @@ const EnhancedScreenOptions = ({
     const [windowTitleBar, setWindowTitleBar] = useState(() => loadSettings().windowTitleBar);
     const [editablePointer, setEditablePointer] = useState(() => loadSettings().editablePointer);
     const [recordShortcuts, setRecordShortcuts] = useState(() => loadSettings().recordShortcuts);
+    const [shieldSettings, setShieldSettings] = useState<AppSettings>(() => loadSettings());
+    useEffect(() => {
+        const onSettings = (e: Event) => {
+            const detail = (e as CustomEvent<AppSettings>).detail;
+            setShieldSettings(detail ?? loadSettings());
+        };
+        window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
+        return () => window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
+    }, []);
+    const updateShieldPrefs = (patch: Partial<AppSettings>) => {
+        const next = { ...loadSettings(), ...patch };
+        saveSettings(next);
+        setShieldSettings(next);
+    };
     const updateCapturePrefs = (next: { captureCursor?: boolean; windowTitleBar?: boolean; editablePointer?: boolean; recordShortcuts?: boolean }) => {
         saveSettings({ ...loadSettings(), ...next });
         if (next.captureCursor !== undefined) setCaptureCursor(next.captureCursor);
@@ -1344,6 +1362,165 @@ const EnhancedScreenOptions = ({
             </div>
 
             {capturesScreen && renderCaptureToggles()}
+
+            {capturesScreen && (() => {
+                const shieldOn = isPrivacyShieldArmed(shieldSettings);
+                const whatsappOn = shieldSettings.annotationAutoBlurWhatsApp !== "off";
+                const textOn = shieldSettings.annotationAutoBlurText !== "off";
+                const toggleShieldMaster = () => {
+                    if (shieldOn) {
+                        updateShieldPrefs({
+                            annotationAutoBlurWhatsApp: "off",
+                            annotationAutoBlurText: "off",
+                        });
+                    } else {
+                        updateShieldPrefs({
+                            annotationAutoBlurWhatsApp: "recording",
+                            annotationAutoBlurText: "recording",
+                        });
+                    }
+                };
+                return (
+                    <div className="rounded-xl border border-neutral-200/80 dark:border-neutral-800 bg-white dark:bg-neutral-900/50 divide-y divide-neutral-200/70 dark:divide-neutral-800/80 overflow-hidden">
+                        <div className="px-3.5 py-2.5 space-y-2">
+                            <div className="flex items-center justify-between gap-4">
+                                <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={shieldOn}
+                                    onClick={toggleShieldMaster}
+                                    className="min-w-0 flex-1 flex items-start gap-2.5 text-left cursor-pointer"
+                                >
+                                    <span className={`mt-0.5 shrink-0 ${shieldOn ? "text-emerald-600 dark:text-emerald-400" : "text-neutral-500 dark:text-neutral-400"}`}>
+                                        <IoShieldCheckmarkOutline />
+                                    </span>
+                                    <span className="min-w-0">
+                                        <span className="flex items-center gap-2 flex-wrap">
+                                            <span className="text-[13px] font-medium text-neutral-900 dark:text-neutral-100 leading-snug">
+                                                Privacy Shield
+                                            </span>
+                                            <span
+                                                className={`text-[10px] font-medium px-1.5 py-px rounded-full ${
+                                                    shieldOn
+                                                        ? "bg-emerald-500/12 text-emerald-700 dark:text-emerald-300"
+                                                        : "bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400"
+                                                }`}
+                                            >
+                                                {privacyShieldSummary(shieldSettings)}
+                                            </span>
+                                        </span>
+                                        <span className="block text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug">
+                                            Auto-blurs WhatsApp chats, passwords, API keys &amp; cards live during capture.
+                                        </span>
+                                    </span>
+                                </button>
+                                <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={shieldOn}
+                                    aria-label="Toggle Privacy Shield"
+                                    onClick={toggleShieldMaster}
+                                    className="cursor-pointer shrink-0"
+                                >
+                                    <ToggleSwitch checked={shieldOn} />
+                                </button>
+                            </div>
+                            <div className="pl-6 flex items-center justify-between gap-2 flex-wrap">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                    <button
+                                        type="button"
+                                        onClick={() =>
+                                            updateShieldPrefs({
+                                                annotationAutoBlurWhatsApp: whatsappOn ? "off" : "recording",
+                                            })
+                                        }
+                                        className={`px-2 py-0.5 rounded-md text-[11px] font-medium border transition-colors ${
+                                            whatsappOn
+                                                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                                                : "border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                                        }`}
+                                    >
+                                        WhatsApp {shieldSettings.annotationAutoBlurWhatsApp === "always" ? "(Always)" : whatsappOn ? "(Rec)" : ""}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() =>
+                                            updateShieldPrefs({
+                                                annotationAutoBlurText: textOn ? "off" : "recording",
+                                            })
+                                        }
+                                        className={`px-2 py-0.5 rounded-md text-[11px] font-medium border transition-colors ${
+                                            textOn
+                                                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                                                : "border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200"
+                                        }`}
+                                    >
+                                        Sensitive text {shieldSettings.annotationAutoBlurText === "always" ? "(Always)" : textOn ? "(Rec)" : ""}
+                                    </button>
+                                </div>
+                                {onOpenAnnotationSettings && (
+                                    <button
+                                        type="button"
+                                        onClick={onOpenAnnotationSettings}
+                                        className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                                    >
+                                        Customize…
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                        {isScreenType && (
+                            <div className="flex items-center justify-between gap-4 px-3.5 py-2.5 hover:bg-neutral-50/90 dark:hover:bg-neutral-800/40 transition-colors duration-100">
+                                <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={shieldSettings.enableAnnotationTool}
+                                    onClick={() => updateShieldPrefs({ enableAnnotationTool: !shieldSettings.enableAnnotationTool })}
+                                    className="min-w-0 flex-1 flex items-start gap-2.5 text-left cursor-pointer"
+                                >
+                                    <span className={`mt-0.5 shrink-0 ${shieldSettings.enableAnnotationTool ? "text-blue-600 dark:text-blue-400" : "text-neutral-500 dark:text-neutral-400"}`}>
+                                        <IoPencil />
+                                    </span>
+                                    <span className="min-w-0">
+                                        <span className="flex items-center gap-1.5 flex-wrap">
+                                            <span className="text-[13px] font-medium text-neutral-900 dark:text-neutral-100 leading-snug">
+                                                Screen annotation
+                                            </span>
+                                            <Kbd>{MOD}</Kbd>
+                                            <Kbd>Shift</Kbd>
+                                            <Kbd>D</Kbd>
+                                        </span>
+                                        <span className="block text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug">
+                                            Draw over any app, point with the presenter hand, or drag Privacy Blur (B) live.
+                                        </span>
+                                    </span>
+                                </button>
+                                <div className="flex items-center gap-3 shrink-0">
+                                    {onOpenAnnotationSettings && (
+                                        <button
+                                            type="button"
+                                            onClick={onOpenAnnotationSettings}
+                                            className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                                        >
+                                            Style…
+                                        </button>
+                                    )}
+                                    <button
+                                        type="button"
+                                        role="switch"
+                                        aria-checked={shieldSettings.enableAnnotationTool}
+                                        aria-label="Toggle screen annotation"
+                                        onClick={() => updateShieldPrefs({ enableAnnotationTool: !shieldSettings.enableAnnotationTool })}
+                                        className="cursor-pointer"
+                                    >
+                                        <ToggleSwitch checked={shieldSettings.enableAnnotationTool} />
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+            })()}
         </div>
     );
 

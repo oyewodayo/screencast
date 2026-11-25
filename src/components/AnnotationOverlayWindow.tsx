@@ -8,16 +8,19 @@
 // regardless of whether draw mode is still on - so a circle drawn just before exiting draw mode
 // still gets to fade naturally instead of vanishing instantly.
 import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
-import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute, IoEyeOff } from 'react-icons/io5';
+import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute, IoShieldCheckmarkOutline, IoOptionsOutline, IoSettingsOutline } from 'react-icons/io5';
 import { BsHighlighter } from 'react-icons/bs';
-import { loadSettings } from '../utils/appSettings';
+import { AppSettings, loadSettings, SETTINGS_CHANGED_DOM_EVENT, updateSettings } from '../utils/appSettings';
+import type { AutoBlurMode } from '../utils/privacyShield';
 import AnnotationPointer, { AnnotationPointerHandle, resolvePointer } from './AnnotationPointer';
 import ScreenBlurLayer from './ScreenBlurLayer';
 import useScreenBlur from '../hooks/useScreenBlur';
 import { playTapSound } from '../utils/annotationSound';
 import {
   ANNOTATION_COLORS,
+  ANNOTATION_FADES,
   ANNOTATION_POINTERS,
   ANNOTATION_STYLES,
   ANNOTATION_TAP_SOUNDS,
@@ -112,15 +115,32 @@ const AnnotationOverlayWindow = () => {
   const [toolbarPos, setToolbarPos] = useState<{ x: number; y: number } | null>(null);
   // The toolbar gets out of the way (fades, stops catching the mouse) while a stroke is in progress.
   const [drawing, setDrawing] = useState(false);
-  // Which toolbar popover (pointer / tap sound picker) is open.
-  const [menu, setMenu] = useState<'pointer' | 'sound' | null>(null);
+  // Which toolbar popover (pointer / tap sound / live options & Privacy Shield) is open.
+  const [menu, setMenu] = useState<'pointer' | 'sound' | 'options' | null>(null);
+  const [shieldCfg, setShieldCfg] = useState(() => {
+    const st = loadSettings();
+    return {
+      strength: st.annotationBlurStrength,
+      autoWhatsApp: st.annotationAutoBlurWhatsApp,
+      autoText: st.annotationAutoBlurText,
+    };
+  });
+  const drawModeActiveRef = useRef(false);
+  drawModeActiveRef.current = drawModeActive;
   const toolbarRef = useRef<HTMLDivElement>(null);
   const pointerRef = useRef<AnnotationPointerHandle>(null);
   const pressRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const pointerKind = resolvePointer(pointerCfg.kind, pointerCfg.image);
-  // "blur" swaps drawing for placing privacy blur regions (B). Regions outlive draw mode - they're
-  // native windows (services/screen_blur.rs) that stay up, click-through, until removed.
-  const [tool, setTool] = useState<'ink' | 'blur'>('ink');
+  // "blur" swaps drawing for placing Privacy Shield blur regions (B). Regions outlive draw mode -
+  // they're native windows (services/screen_blur.rs) that stay up, click-through, until removed.
+  const [tool, setToolState] = useState<'ink' | 'blur'>('ink');
+  const setTool = (next: 'ink' | 'blur' | ((prev: 'ink' | 'blur') => 'ink' | 'blur')) => {
+    setToolState((prev) => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      if (resolved !== prev) void emit('annotation-tool-changed', { tool: resolved });
+      return resolved;
+    });
+  };
   const blur = useScreenBlur(drawModeActive);
   const dragStateRef = useRef({ dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 });
 
@@ -152,17 +172,27 @@ const AnnotationOverlayWindow = () => {
     };
   }, []);
 
-  // Draw-mode on/off comes from the main window (global hotkey) - Dashboard.tsx is the one that
-  // actually flips this window's click-through state on the window handle; this listener just
-  // drives the toolbar's visibility/cursor here.
+  // Draw-mode on/off comes from the main window (global hotkey, dock or recording pill) -
+  // Dashboard.tsx flips this window's click-through state; this listener drives the toolbar's
+  // visibility/cursor and optional initial tool here.
   useEffect(() => {
-    const unlistenPromise = listen<{ active: boolean }>('annotation-mode-changed', (event) => {
+    const unlistenPromise = listen<{ active: boolean; tool?: 'ink' | 'blur' }>('annotation-mode-changed', (event) => {
       if (event.payload.active) {
+        if (drawModeActiveRef.current && event.payload.tool) {
+          setToolState(event.payload.tool);
+          return;
+        }
         const st = loadSettings();
         setInk({ color: st.annotationColor, width: st.annotationWidth, style: st.annotationStyle, fade: st.annotationFade, shadow: st.annotationShadow });
         setShowToolbar(st.annotationShowToolbar);
         setPointerCfg(readPointerConfig());
-        setTool('ink');
+        setShieldCfg({
+          strength: st.annotationBlurStrength,
+          autoWhatsApp: st.annotationAutoBlurWhatsApp,
+          autoText: st.annotationAutoBlurText,
+        });
+        setMenu(null);
+        setToolState(event.payload.tool ?? 'ink');
       } else {
         // "Until I exit" strokes end with draw mode; fading ones get to finish.
         strokesRef.current = strokesRef.current.filter((st) => fadeTotalMs(st.style, st.fade) > 0);
@@ -170,11 +200,22 @@ const AnnotationOverlayWindow = () => {
         pressRef.current = null;
         pointerRef.current?.hide();
         setDrawing(false);
+        setMenu(null);
         requestRender();
       }
       setDrawModeActive(event.payload.active);
     });
+    const onSettings = (e: Event) => {
+      const st = (e as CustomEvent<AppSettings>).detail ?? loadSettings();
+      setShieldCfg({
+        strength: st.annotationBlurStrength,
+        autoWhatsApp: st.annotationAutoBlurWhatsApp,
+        autoText: st.annotationAutoBlurText,
+      });
+    };
+    window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
     return () => {
+      window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
       unlistenPromise.then((fn) => fn());
     };
   }, []);
@@ -454,7 +495,10 @@ const AnnotationOverlayWindow = () => {
         <ScreenBlurLayer
           regions={blur.regions}
           interactive={tool === 'blur'}
-          onBegin={blur.begin}
+          onBegin={(id, mode, rect, pointer) => {
+            setMenu(null);
+            blur.begin(id, mode, rect, pointer);
+          }}
           onTrack={blur.track}
           onEnd={blur.end}
           onRemove={blur.remove}
@@ -510,15 +554,19 @@ const AnnotationOverlayWindow = () => {
 
           <button
             onClick={() => setTool((t) => (t === 'blur' ? 'ink' : 'blur'))}
-            data-tip="Blur - drag over anything private. You can still type underneath."
+            data-tip="Privacy Shield - drag to blur anything private. You can still click and type underneath."
             data-tip-kbd="B"
-            aria-label="Blur"
+            aria-label="Privacy Shield"
             aria-pressed={tool === 'blur'}
             className={`relative w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
-              tool === 'blur' ? 'bg-white/20 text-white' : 'text-white/60 hover:text-white hover:bg-white/10'
+              tool === 'blur'
+                ? 'bg-sky-500/30 text-sky-300 ring-1 ring-sky-400/50'
+                : blur.count > 0 || shieldCfg.autoWhatsApp !== 'off' || shieldCfg.autoText !== 'off'
+                ? 'text-emerald-300 hover:text-emerald-200 hover:bg-white/10'
+                : 'text-white/60 hover:text-white hover:bg-white/10'
             }`}
           >
-            <IoEyeOff size={15} />
+            <IoShieldCheckmarkOutline size={15} />
             {blur.count > 0 && (
               <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 rounded-full bg-sky-500 text-[9px] font-semibold leading-[14px] text-white text-center">
                 {blur.count}
@@ -608,7 +656,7 @@ const AnnotationOverlayWindow = () => {
                           }
                           setMenu(null);
                         }}
-                        data-tip={o.disabled ? 'Upload an image in Settings > Annotation' : undefined}
+                        data-tip={o.disabled ? 'Upload an image in Settings > Annotate & Shield' : undefined}
                         className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors disabled:opacity-35 ${
                           current === o.id ? 'bg-white/20 text-white' : 'text-white/75 hover:text-white hover:bg-white/10'
                         }`}
@@ -622,6 +670,178 @@ const AnnotationOverlayWindow = () => {
               </div>
             );
           })}
+
+          <div className="relative">
+            <button
+              onClick={() => setMenu(menu === 'options' ? null : 'options')}
+              aria-label="Ink & Privacy Shield options"
+              aria-expanded={menu === 'options'}
+              data-tip="Ink size, fade & Privacy Shield"
+              className={`w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
+                menu === 'options' ? 'bg-white/20 text-white' : 'text-white/70 hover:text-white hover:bg-white/10'
+              }`}
+            >
+              <IoOptionsOutline size={15} />
+            </button>
+            {menu === 'options' && (
+              <div
+                className={`absolute right-0 w-72 p-3 rounded-2xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/12 text-white space-y-3 ${
+                  toolbarPos && toolbarPos.y < 360 ? 'top-full mt-3' : 'bottom-full mb-3'
+                }`}
+              >
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-white/45">Ink</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextShadow = !ink.shadow;
+                        setInk((prev) => ({ ...prev, shadow: nextShadow }));
+                        updateSettings({ annotationShadow: nextShadow });
+                      }}
+                      className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                        ink.shadow ? 'bg-white/20 text-white' : 'text-white/55 hover:text-white hover:bg-white/10'
+                      }`}
+                    >
+                      Shadow {ink.shadow ? 'On' : 'Off'}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-xs text-white/75 w-10">Size</span>
+                    <input
+                      type="range"
+                      min={2}
+                      max={20}
+                      step={1}
+                      value={ink.width}
+                      onChange={(e) => {
+                        const width = Number(e.target.value);
+                        setInk((prev) => ({ ...prev, width }));
+                        updateSettings({ annotationWidth: width });
+                      }}
+                      className="flex-1 accent-blue-400 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono tabular-nums text-white/60 w-5 text-right">{ink.width}</span>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-white/75">Fade</span>
+                    <div className="flex p-0.5 gap-0.5 rounded-lg bg-white/8">
+                      {ANNOTATION_FADES.map((f) => (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() => {
+                            setInk((prev) => ({ ...prev, fade: f.id }));
+                            updateSettings({ annotationFade: f.id });
+                          }}
+                          className={`px-1.5 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                            ink.fade === f.id ? 'bg-white/20 text-white' : 'text-white/55 hover:text-white'
+                          }`}
+                        >
+                          {f.id === 'never' ? 'Stay' : f.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-t border-white/10 pt-2.5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300/90">
+                      <IoShieldCheckmarkOutline size={12} /> Privacy Shield
+                    </span>
+                    {blur.count > 0 && (
+                      <button
+                        type="button"
+                        onClick={blur.clear}
+                        className="text-[11px] font-medium text-sky-300 hover:text-sky-200 hover:underline"
+                      >
+                        Unblur all ({blur.count})
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-xs text-white/75 w-14">Blur</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={shieldCfg.strength}
+                      onChange={(e) => {
+                        const strength = Number(e.target.value);
+                        setShieldCfg((prev) => ({ ...prev, strength }));
+                        updateSettings({ annotationBlurStrength: strength });
+                        void invoke('screen_blur_configure', { config: { strength } }).catch(() => {});
+                      }}
+                      className="flex-1 accent-sky-400 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono tabular-nums text-white/60 w-6 text-right">{shieldCfg.strength}</span>
+                  </div>
+
+                  {(
+                    [
+                      ['WhatsApp', 'autoWhatsApp', 'annotationAutoBlurWhatsApp'] as const,
+                      ['Sensitive text', 'autoText', 'annotationAutoBlurText'] as const,
+                    ]
+                  ).map(([label, localKey, settingKey]) => (
+                    <div key={localKey} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-white/75">{label}</span>
+                      <div className="flex p-0.5 gap-0.5 rounded-lg bg-white/8">
+                        {(
+                          [
+                            ['off', 'Off'],
+                            ['recording', 'Rec'],
+                            ['always', 'Always'],
+                          ] as [AutoBlurMode, string][]
+                        ).map(([mode, modeLabel]) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => {
+                              setShieldCfg((prev) => ({ ...prev, [localKey]: mode }));
+                              updateSettings({ [settingKey]: mode });
+                            }}
+                            className={`px-1.5 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                              shieldCfg[localKey] === mode
+                                ? mode === 'off'
+                                  ? 'bg-white/20 text-white'
+                                  : 'bg-emerald-500/30 text-emerald-200'
+                                : 'text-white/55 hover:text-white'
+                            }`}
+                          >
+                            {modeLabel}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+
+                  <div className="flex items-center justify-between text-[11px] text-white/50 pt-0.5">
+                    <span>Blur active window anywhere</span>
+                    <kbd className="px-1.5 py-0.5 rounded bg-white/10 font-mono text-[10px] text-white/80">Ctrl+Alt+B</kbd>
+                  </div>
+                </div>
+
+                <div className="border-t border-white/10 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenu(null);
+                      void emit('open-settings-request', { section: 'annotation' });
+                    }}
+                    className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/8 hover:bg-white/15 text-xs font-medium text-white/85 hover:text-white transition-colors"
+                  >
+                    <IoSettingsOutline size={13} />
+                    All Annotate &amp; Privacy Shield settings…
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="w-px h-5 bg-white/20 mx-1" />
 

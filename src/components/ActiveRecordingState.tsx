@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { PhonesDockButton } from './PhonesHub';
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoCutOutline } from 'react-icons/io5'
+import { IoBrushOutline, IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoCutOutline } from 'react-icons/io5'
 import RecentHistoryDropup from './RecentHistoryDropup';
 import type { HomeItem } from '../utils/homeLibraryItems';
 import type { FileEntry } from '../utils/libraryEntries';
@@ -76,6 +76,10 @@ interface Props {
     // Same idea as onStartRecordingClick, but for RecordingDocker's other button - a screenshot
     // is a standalone one-shot action, not part of the screen/webcam/mic toggle combo above.
     onScreenshotClick?: () => void;
+    // System-wide screen annotation & Privacy Shield overlay toggle (Ctrl+Shift+D).
+    isAnnotating?: boolean;
+    hasActiveBlur?: boolean;
+    onToggleAnnotation?: () => void;
     // Hides the screenshot/screen-webcam-mic/record-button cluster entirely (Ctrl+Shift+B, see
     // Dashboard.tsx's PANEL_BUTTONS_TOGGLE_SHORTCUT) - for hiding Briefcast's own controls right
     // before presenting/recording a screen that includes this window, so they don't end up baked
@@ -94,7 +98,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,isAnnotating,hasActiveBlur,onToggleAnnotation,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
         historyItems,onOpenHistoryItem,libraryFilesByPath,arrivals,libraryPreviewDurations
 
     }:Props) => {
@@ -261,6 +265,20 @@ const ActiveRecordingState = (
                         >
                             <IoCameraOutline />
                         </button>
+                        {onToggleAnnotation && (
+                            <button
+                                type="button"
+                                title={hasActiveBlur ? "Annotate & Privacy Shield (active) — Ctrl+Shift+D" : "Annotate & Privacy Shield (Ctrl+Shift+D)"}
+                                onClick={onToggleAnnotation}
+                                aria-pressed={isAnnotating}
+                                className={`relative ${iconButtonClass(isAnnotating)}`}
+                            >
+                                <IoBrushOutline />
+                                {hasActiveBlur && (
+                                    <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-emerald-500 ring-1 ring-neutral-50 dark:ring-neutral-900" />
+                                )}
+                            </button>
+                        )}
                         <div className="w-px h-4 mx-1 bg-neutral-300 dark:bg-white/20" />
                         {(() => {
                             const flags = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };

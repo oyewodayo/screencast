@@ -359,14 +359,18 @@ export function updateSettings(patch: Partial<AppSettings>): boolean {
 }
 
 export function saveSettings(settings: AppSettings): void {
-  cache = { ...settings };
+  const next = { ...settings };
+  cache = next;
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_DOM_EVENT, { detail: next }));
+  }
   if (backendAvailable) {
-    pendingWrite = cache;
+    pendingWrite = next;
     void flushWrites();
     return;
   }
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch (err) {
     console.error("Failed to save settings:", err);
   }

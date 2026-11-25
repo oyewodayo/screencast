@@ -173,7 +173,8 @@ import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../u
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { AppSettings, loadSettings, saveSettings, updateSettings } from "../utils/appSettings";
+import { AppSettings, loadSettings, saveSettings, SETTINGS_CHANGED_DOM_EVENT, updateSettings } from "../utils/appSettings";
+import { isPrivacyShieldActiveNow, syncScreenBlurConfig } from "../utils/privacyShield";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
   getPinnedPaths,
@@ -1737,8 +1738,12 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // Mirrors whether the overlay is currently in "draw mode" (capturing input) vs click-through.
   // A ref, not state — read inside the global-shortcut callback and the turn-off-request
   // listener, both registered once and needing the *current* value, not whatever was in scope
-  // when they were set up.
+  // when they were set up. State mirrors it for dock highlight.
   const annotationDrawModeRef = useRef<boolean>(false);
+  const [annotationDrawMode, setAnnotationDrawMode] = useState<boolean>(false);
+  const annotationToolRef = useRef<'ink' | 'blur'>('ink');
+  const [activeBlurCount, setActiveBlurCount] = useState<number>(0);
+  const [privacyShieldActiveNow, setPrivacyShieldActiveNow] = useState<boolean>(() => isPrivacyShieldActiveNow(loadSettings(), false));
   // Pending "hide the overlay" timeout scheduled when draw mode turns off (see
   // toggleAnnotationDrawMode) — tracked so a quick off-then-on re-toggle can cancel it instead of
   // hiding a window the user just turned drawing back on for.
@@ -2848,11 +2853,31 @@ const setScreen = () => {
 	// here, over the union of every monitor, each time it's shown - so a monitor plugged in or
 	// rearranged since last time is covered too. Building and placing it from a Rust command instead
 	// deadlocked the whole app on a 4K/250% display (what kept this feature switched off).
-	const toggleAnnotationDrawMode = useCallback(async (forceOff = false) => {
+	const toggleAnnotationDrawMode = useCallback(async (forceOff = false, requestedTool?: 'ink' | 'blur') => {
 		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
 		if (!overlay) return;
+
+		// Already drawing and asked for the *other* tool (e.g. clicking Privacy Shield on the
+		// floating recording pill while Draw is open): switch tools in place instead of closing.
+		if (!forceOff && annotationDrawModeRef.current && requestedTool && annotationToolRef.current !== requestedTool) {
+			annotationToolRef.current = requestedTool;
+			try {
+				await overlay.setFocus();
+				await emit('annotation-mode-changed', { active: true, tool: requestedTool });
+			} catch (err) {
+				console.error('Failed to switch annotation tool:', err);
+			}
+			return;
+		}
+
 		const next = forceOff ? false : !annotationDrawModeRef.current;
 		annotationDrawModeRef.current = next;
+		setAnnotationDrawMode(next);
+		if (next) {
+			annotationToolRef.current = requestedTool ?? 'ink';
+		} else {
+			annotationToolRef.current = 'ink';
+		}
 
 		if (annotationHideTimeoutRef.current !== null) {
 			window.clearTimeout(annotationHideTimeoutRef.current);
@@ -2875,9 +2900,9 @@ const setScreen = () => {
 				// Focused so Esc reaches the overlay's own keydown listener; hiding it hands focus
 				// back to whatever was underneath (the slides, the browser...).
 				await overlay.setFocus();
-				await overlay.emit('annotation-mode-changed', { active: true });
+				await emit('annotation-mode-changed', { active: true, tool: annotationToolRef.current });
 			} else {
-				await overlay.emit('annotation-mode-changed', { active: false });
+				await emit('annotation-mode-changed', { active: false });
 				await overlay.setIgnoreCursorEvents(true);
 				// Not hidden immediately - a still-fading stroke should keep fading, not vanish the
 				// instant draw mode turns off. annotationFadeGraceMs covers the overlay's own fade
@@ -2894,6 +2919,16 @@ const setScreen = () => {
 		}
 	}, []);
 
+	// Clicking an explicit Annotate / Privacy Shield button in the dock or recording pill should
+	// always work even if the user previously turned the hotkey toggle off in Settings.
+	const handleToggleAnnotationFromUI = useCallback(async (requestedTool?: 'ink' | 'blur') => {
+		if (!loadSettings().enableAnnotationTool) {
+			updateSettings({ enableAnnotationTool: true });
+			setAnnotationEnabled(true);
+		}
+		await toggleAnnotationDrawMode(false, requestedTool);
+	}, [toggleAnnotationDrawMode]);
+
 	// Turning the annotation tool off ends draw mode and hides its overlay. Its shortcuts are
 	// registered and dropped by Rust from the same setting (services/shortcuts.rs), and the
 	// dispatcher below ignores a press while the tool is off.
@@ -2908,39 +2943,69 @@ const setScreen = () => {
 		})();
 	}, [annotationEnabled, toggleAnnotationDrawMode]);
 
-	// Privacy blur strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
-	// starts/stops (the WhatsApp rule defaults to "while recording") and whenever Settings closes -
-	// saved or cancelled, which also undoes the strength slider's unsaved live preview.
+	// Privacy Shield strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
+	// starts/stops (the rules default to "while recording"), whenever Settings closes, and whenever
+	// any window updates Privacy Shield settings live (Recording Setup modal or Annotation overlay).
 	useEffect(() => {
 		if (showSettings) return;
-		const st = loadSettings();
-		const active = (mode: 'off' | 'recording' | 'always') => mode === 'always' || (mode === 'recording' && isRecording);
-		invoke('screen_blur_configure', {
-			config: {
-				strength: st.annotationBlurStrength,
-				autoWhatsapp: active(st.annotationAutoBlurWhatsApp),
-				whatsappParts: st.annotationBlurWhatsAppParts,
-				autoText: active(st.annotationAutoBlurText),
-				textRules: {
-					...st.annotationBlurTextRules,
-					keywords: st.annotationBlurKeywords.split(',').map((k) => k.trim()).filter(Boolean),
-				},
-			},
-		}).catch((err) => console.error('Screen blur config:', err));
+		const applyFrom = (st: AppSettings) => {
+			setAnnotationEnabled(st.enableAnnotationTool);
+			setPrivacyShieldActiveNow(isPrivacyShieldActiveNow(st, isRecording));
+			void syncScreenBlurConfig(st, isRecording);
+		};
+		applyFrom(loadSettings());
+		const onSettings = (e: Event) => {
+			const detail = (e as CustomEvent<AppSettings>).detail;
+			applyFrom(detail ?? loadSettings());
+		};
+		window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
+		return () => window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
 	}, [isRecording, showSettings]);
 
-	// The overlay's own Esc key / toolbar close button can't reach annotationDrawModeRef directly
-	// (different window, different JS context) - it asks via this event instead.
+	// Track live blur region count so the dock indicator reflects active Privacy Shield regions.
 	useEffect(() => {
-		const unlistenPromise = listen('annotation-turn-off-request', () => {
+		const unlisten = listen<unknown[]>('screen-blur-changed', (e) => {
+			setActiveBlurCount(Array.isArray(e.payload) ? e.payload.length : 0);
+		});
+		invoke<unknown[]>('screen_blur_list').then((list) => setActiveBlurCount(list.length)).catch(() => {});
+		return () => {
+			unlisten.then((fn) => fn());
+		};
+	}, []);
+
+	// Cross-window annotation & settings requests (overlay Esc/close, recording pill buttons,
+	// overlay Options popover "All settings...").
+	useEffect(() => {
+		const unlistenTurnOff = listen('annotation-turn-off-request', () => {
 			if (annotationDrawModeRef.current) {
 				void toggleAnnotationDrawMode(true);
 			}
 		});
+		const unlistenToggle = listen<{ tool?: 'ink' | 'blur' }>('annotation-toggle-request', (e) => {
+			void handleToggleAnnotationFromUI(e.payload?.tool);
+		});
+		const unlistenTool = listen<{ tool: 'ink' | 'blur' }>('annotation-tool-changed', (e) => {
+			annotationToolRef.current = e.payload.tool;
+		});
+		const unlistenOpenSettings = listen<{ section?: SettingsInitialTarget }>('open-settings-request', (e) => {
+			void (async () => {
+				if (annotationDrawModeRef.current) {
+					await toggleAnnotationDrawMode(true);
+				}
+				const mainWin = getCurrentWebviewWindow();
+				await mainWin.show().catch(() => {});
+				await mainWin.unminimize().catch(() => {});
+				await mainWin.setFocus().catch(() => {});
+				handleOpenSettings(e.payload?.section ?? 'annotation');
+			})();
+		});
 		return () => {
-			unlistenPromise.then((fn) => fn());
+			unlistenTurnOff.then((fn) => fn());
+			unlistenToggle.then((fn) => fn());
+			unlistenTool.then((fn) => fn());
+			unlistenOpenSettings.then((fn) => fn());
 		};
-	}, [toggleAnnotationDrawMode]);
+	}, [toggleAnnotationDrawMode, handleToggleAnnotationFromUI]);
 
 	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
 	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
@@ -6340,6 +6405,10 @@ const setScreen = () => {
         libraryFilesByPath={libraryFilesByPath}
         arrivals={arrivals}
         libraryPreviewDurations={libraryPreviewDurations}
+        isAnnotating={annotationDrawMode}
+        hasActiveBlur={activeBlurCount > 0 || privacyShieldActiveNow}
+        onToggleAnnotation={() => void handleToggleAnnotationFromUI()}
+        onOpenAnnotationSettings={() => handleOpenSettings("annotation")}
       />
       )}
 

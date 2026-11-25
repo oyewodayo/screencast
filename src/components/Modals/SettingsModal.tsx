@@ -172,7 +172,7 @@ const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "recording", label: "Recording" },
   { key: "storage", label: "Storage" },
   { key: "cache", label: "Cache" },
-  { key: "annotation", label: "Annotation" },
+  { key: "annotation", label: "Annotate & Shield" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
   { key: "privacy", label: "Privacy" },
@@ -1213,10 +1213,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </Section>
 
-              <Section title="Privacy blur">
+              <Section title="Privacy Shield (Live Blur)">
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                  Press B while drawing and drag over anything private. The blur stays on screen and in recordings, and you
-                  can still click and type underneath it.
+                  Auto-blurs WhatsApp chats and sensitive text live, or press B while annotating to drag a blur over anything private. Stays blurred on screen and in recordings while you click and type underneath.
                 </p>
                 <Field label="Strength">
                   <div className="flex items-center gap-2">

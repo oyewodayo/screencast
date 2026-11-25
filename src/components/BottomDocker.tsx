@@ -246,6 +246,10 @@ interface Props {
   libraryFilesByPath?: Map<string, FileEntry>;
   arrivals?: Record<string, { from: string; at: number; count: number }>;
   libraryPreviewDurations?: Map<string, number>;
+  isAnnotating?: boolean;
+  hasActiveBlur?: boolean;
+  onToggleAnnotation?: () => void;
+  onOpenAnnotationSettings?: () => void;
 }
 
 type ConnectedDevice = string[];
@@ -375,6 +379,10 @@ const BottomDocker = ({
   libraryFilesByPath,
   arrivals,
   libraryPreviewDurations,
+  isAnnotating,
+  hasActiveBlur,
+  onToggleAnnotation,
+  onOpenAnnotationSettings,
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -665,6 +673,7 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
       onRecordTypeChange={handleRecordTypeSelected}
+      onOpenAnnotationSettings={onOpenAnnotationSettings}
     />
     )}
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
@@ -703,6 +712,9 @@ const BottomDocker = ({
             onToggleRecordSource={toggleRecordSource}
             onStartRecordingClick={() => openModalScreen()}
             onScreenshotClick={handleScreenshotClick}
+            isAnnotating={isAnnotating}
+            hasActiveBlur={hasActiveBlur}
+            onToggleAnnotation={onToggleAnnotation}
             showRecordingPanelButtons={showRecordingPanelButtons}
             historyItems={historyItems}
             onOpenHistoryItem={onOpenHistoryItem}
