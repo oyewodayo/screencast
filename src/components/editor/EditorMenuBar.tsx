@@ -46,6 +46,7 @@ export interface EditorMenuBarProps {
   onMoveOrCopy?: () => void;
   onTransferToPhone?: () => void;
   onSetThumbnail?: () => void;
+  onOpenFrameInDesign?: () => void;
   onShowInFolder?: () => void;
   onExport?: () => void;
   onClose?: () => void;
@@ -101,6 +102,7 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
   onMoveOrCopy,
   onTransferToPhone,
   onSetThumbnail,
+  onOpenFrameInDesign,
   onShowInFolder,
   onExport,
   onClose,
@@ -331,6 +333,17 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
                 >
                   <span className="flex items-center gap-2">
                     <IoImageOutline size={14} /> Set thumbnail…
+                  </span>
+                </button>
+              )}
+              {onOpenFrameInDesign && (
+                <button
+                  type="button"
+                  className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-blue-600 hover:text-white"
+                  onClick={() => triggerAction(onOpenFrameInDesign)}
+                >
+                  <span className="flex items-center gap-2">
+                    <IoSparklesOutline size={14} /> Open frame in Design
                   </span>
                 </button>
               )}

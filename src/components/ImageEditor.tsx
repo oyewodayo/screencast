@@ -936,12 +936,12 @@ const ImageEditor: React.FC<ImageEditorProps> = ({ sourcePath, title, onSaved, s
         {onOpenWithBoard && (
           <button
             type="button"
-            title="Open on board - arrange, style, and edit on a canvas"
+            title="Open in Design — arrange, beautify, remove background, and compose"
             onClick={onOpenWithBoard}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] border border-black/[0.06] dark:border-white/[0.08] transition-colors"
           >
             <IoImagesOutline size={14} className="text-blue-500" />
-            <span>Open with board</span>
+            <span>Open in Design</span>
           </button>
         )}
         <div className="flex items-center gap-3 shrink-0 ml-auto">

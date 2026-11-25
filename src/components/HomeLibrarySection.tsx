@@ -6,6 +6,7 @@
 // shared single-decoder hover/focus video preview.
 
 import React, { memo, useEffect, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   IoClose,
@@ -58,6 +59,7 @@ interface HomeLibrarySectionProps {
   searchQuery: string;
   onSearchQueryChange: (query: string) => void;
   libraryFilesByPath: Map<string, FileEntry>;
+  boardThumbById?: Map<string, string>;
   arrivals: Record<string, FileArrival>;
   durations: Map<string, number>;
   homeKinds: Record<Exclude<HomeItem["kind"], "file">, HomeKindMeta>;
@@ -72,6 +74,7 @@ interface HomeLibrarySectionProps {
 const SURFACE_TINT: Record<string, string> = {
   whiteboard: "bg-amber-50/70 dark:bg-amber-500/[0.08]",
   mindmap: "bg-amber-50/70 dark:bg-amber-500/[0.08]",
+  board: "bg-emerald-50/70 dark:bg-emerald-500/[0.08]",
   doc: "bg-blue-50/70 dark:bg-blue-500/[0.08]",
   pdf: "bg-rose-50/70 dark:bg-rose-500/[0.08]",
   audio: "bg-pink-50/70 dark:bg-pink-500/[0.08]",
@@ -81,6 +84,7 @@ const SURFACE_TINT: Record<string, string> = {
 interface HomeGridThumbProps {
   item: HomeItem;
   file: FileEntry | undefined;
+  boardThumbPath?: string;
   category: FileCategory | null;
   kind: HomeKindMeta | null;
   durationSec: number | undefined;
@@ -94,6 +98,7 @@ const HomeGridThumb: React.FC<HomeGridThumbProps> = memo(
   ({
     item,
     file,
+    boardThumbPath,
     category,
     kind,
     durationSec,
@@ -171,6 +176,21 @@ const HomeGridThumb: React.FC<HomeGridThumbProps> = memo(
       );
     }
 
+    if (item.kind === "board" && boardThumbPath) {
+      return (
+        <div className="relative w-full aspect-video bg-neutral-100 dark:bg-neutral-800/80 overflow-hidden flex items-center justify-center">
+          <img
+            src={convertFileSrc(boardThumbPath)}
+            alt=""
+            draggable={false}
+            loading="lazy"
+            decoding="async"
+            className="w-full h-full object-cover"
+          />
+        </div>
+      );
+    }
+
     const tintKey = kind ? item.kind : (category ?? "");
     const tint = SURFACE_TINT[tintKey] ?? "bg-gray-100/70 dark:bg-neutral-800/60";
     return (
@@ -194,6 +214,7 @@ const HomeLibrarySection: React.FC<HomeLibrarySectionProps> = memo(
     searchQuery,
     onSearchQueryChange,
     libraryFilesByPath,
+    boardThumbById,
     arrivals,
     durations,
     homeKinds,
@@ -351,6 +372,7 @@ const HomeLibrarySection: React.FC<HomeLibrarySectionProps> = memo(
                   <HomeGridThumb
                     item={item}
                     file={file}
+                    boardThumbPath={item.kind === "board" ? boardThumbById?.get(item.id) : undefined}
                     category={category}
                     kind={kind}
                     durationSec={durationSec}

@@ -178,7 +178,7 @@ const ActiveRecordingState = (
                     type="button"
                     className={iconButtonClass(isBoard)}
                     onClick={() => handleOpenBoard()}
-                    title="Board"
+                    title="Design"
                     >
                       <IoImagesOutline />
                     </button>

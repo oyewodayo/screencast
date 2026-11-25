@@ -72,7 +72,7 @@ import PdfFolderGallery from "../components/PdfFolderGallery";
 import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import { BoardEditorHandle } from "../components/board/BoardEditor";
-import { createEmptyBoardDocument, createDefaultBoardImage } from "../utils/boardTypes";
+import { createEmptyBoardDocument, createDefaultBoardImage, type BoardSummary } from "../utils/boardTypes";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { ItemLinksProvider } from "../contexts/ItemLinksContext";
 import LinksControl from "../components/links/LinksControl";
@@ -492,6 +492,7 @@ const Dashboard = () => {
   // docsIndex below), and when each library item was last opened - see utils/homeLibraryItems.ts.
   const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
   const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
+  const [boardIndex, setBoardIndex] = useState<BoardSummary[]>([]);
   const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
   // Files that came in from a phone - tagged on the home screen with where from (homeScreenFiles.ts).
   const [arrivals, setArrivals] = useState(() => getArrivals());
@@ -2581,6 +2582,7 @@ const setScreen = () => {
 	const openedDocId = docsScreen?.mode === "editor" ? docsScreen.docId : null;
 	const openedWhiteboardId = whiteboardScreen?.mode === "editor" ? whiteboardScreen.whiteboardId : null;
 	const openedMindmapId = mindmapScreen?.mode === "editor" ? mindmapScreen.mindmapId : null;
+	const openedBoardId = boardScreen?.mode === "editor" ? boardScreen.boardId : null;
 	useEffect(() => {
 		if (openedDocId) setOpenedAt(recordItemOpened(homeItemKey("doc", openedDocId)));
 	}, [openedDocId]);
@@ -2590,10 +2592,13 @@ const setScreen = () => {
 	useEffect(() => {
 		if (openedMindmapId) setOpenedAt(recordItemOpened(homeItemKey("mindmap", openedMindmapId)));
 	}, [openedMindmapId]);
+	useEffect(() => {
+		if (openedBoardId) setOpenedAt(recordItemOpened(homeItemKey("board", openedBoardId)));
+	}, [openedBoardId]);
 
 	// The home screen is whatever shows when no tool and no file is open. Its library list is
-	// refreshed every time it comes back into view, so a document just written or a whiteboard just
-	// drawn is there straight away.
+	// refreshed every time it comes back into view, so a document just written, a design just
+	// composed, or a whiteboard just drawn is there straight away.
 	const onHomeScreen = videoEditorScreen?.mode !== "home" && !mindmapScreen && !whiteboardScreen && !boardScreen && !docsScreen && !selectedFile;
 	useEffect(() => {
 		if (!onHomeScreen) return;
@@ -2606,6 +2611,9 @@ const setScreen = () => {
 		invoke<MindmapSummary[]>("list_mindmaps")
 			.then((list) => live && setMindmapIndex(list))
 			.catch((error) => console.error("Failed to load mind maps for the home screen:", error));
+		invoke<BoardSummary[]>("list_boards")
+			.then((list) => live && setBoardIndex(list))
+			.catch((error) => console.error("Failed to load designs for the home screen:", error));
 		return () => {
 			live = false;
 		};
@@ -3573,11 +3581,11 @@ const setScreen = () => {
 				existingBoards = await invoke<{ id: string; name: string }[]>("list_boards");
 			} catch {}
 			const baseName = file.name.replace(/\.[^/.]+$/, "");
-			let boardName = `Board (${baseName})`;
+			let boardName = `Design (${baseName})`;
 			let counter = 1;
 			while (existingBoards.some((b) => b.name.toLowerCase() === boardName.toLowerCase())) {
 				counter++;
-				boardName = `Board (${baseName} ${counter})`;
+				boardName = `Design (${baseName} ${counter})`;
 			}
 
 			// Generate a fresh unique board ID, retrying with a new UUID if an id collision ever occurs
@@ -3637,12 +3645,92 @@ const setScreen = () => {
 			boardImg.y = Math.round((doc.canvasHeight - boardImg.height) / 2);
 			doc.images = [boardImg];
 
-			// Persist the board document with the placed image
+			// Persist the design document with the placed image
 			await invoke("save_board", { id, json: JSON.stringify(doc) });
 			setSelectedFile(null);
 			setBoardScreen({ mode: "editor", boardId: id });
 		} catch (err) {
-			console.error("Failed to open image with board:", err);
+			console.error("Failed to open image in Design:", err);
+			setError(err instanceof Error ? err.message : String(err));
+		}
+	};
+
+	const handleOpenVideoFrameInDesign = async (file: { name: string; sourcePath: string }) => {
+		try {
+			const video = videoPlayerRef.current?.getVideoElement();
+			if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+				setError("Wait for the video frame to load before opening it in Design.");
+				return;
+			}
+			const canvas = document.createElement("canvas");
+			canvas.width = video.videoWidth;
+			canvas.height = video.videoHeight;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) throw new Error("Canvas 2D context unavailable");
+			ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+			const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+			if (!blob) throw new Error("Failed to capture current video frame");
+			const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+
+			let existingBoards: { id: string; name: string }[] = [];
+			try {
+				existingBoards = await invoke<{ id: string; name: string }[]>("list_boards");
+			} catch {}
+			const baseName = file.name.replace(/\.[^/.]+$/, "");
+			let designName = `Thumbnail (${baseName})`;
+			let counter = 1;
+			while (existingBoards.some((b) => b.name.toLowerCase() === designName.toLowerCase())) {
+				counter++;
+				designName = `Thumbnail (${baseName} ${counter})`;
+			}
+
+			const id = crypto.randomUUID();
+			const doc = {
+				...createEmptyBoardDocument(id, designName),
+				canvasWidth: 1280,
+				canvasHeight: 720,
+				backgroundMode: "gradient" as const,
+				backgroundColor: "#0f172a",
+				backgroundGradient: { from: "#0f172a", to: "#312e81", angleDeg: 135 },
+				padding: 0,
+			};
+			await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
+
+			const assetFileName = await invoke<string>("save_board_image_bytes", {
+				boardId: id,
+				assetId: crypto.randomUUID(),
+				bytes,
+				ext: "png",
+			});
+			const maxW = 1060;
+			const maxH = 596;
+			const scale = Math.min(maxW / canvas.width, maxH / canvas.height);
+			const fitW = Math.round(canvas.width * scale);
+			const fitH = Math.round(canvas.height * scale);
+			const boardImg = createDefaultBoardImage(
+				crypto.randomUUID(),
+				assetFileName,
+				canvas.width,
+				canvas.height,
+				Math.round((doc.canvasWidth - fitW) / 2),
+				Math.round((doc.canvasHeight - fitH) / 2)
+			);
+			boardImg.width = fitW;
+			boardImg.height = fitH;
+			boardImg.padding = 0;
+			boardImg.borderWidth = 2;
+			boardImg.borderColor = "#ffffff";
+			boardImg.cornerRadius = 20;
+			boardImg.backgroundColor = "transparent";
+			boardImg.shadow = { blur: 36, offsetX: 0, offsetY: 16, color: "rgba(0,0,0,0.42)" };
+			doc.images = [boardImg];
+
+			await invoke("save_board", { id, json: JSON.stringify(doc) });
+			setSelectedFile(null);
+			setDockerMode("record");
+			setBoardScreen({ mode: "editor", boardId: id });
+		} catch (err) {
+			console.error("Failed to open video frame in Design:", err);
 			setError(err instanceof Error ? err.message : String(err));
 		}
 	};
@@ -3697,6 +3785,10 @@ const setScreen = () => {
 		}
 		return map;
 	}, [allLibraryFiles, externalFiles]);
+	const boardThumbById = useMemo(
+		() => new Map(boardIndex.filter((b) => b.thumbnail_path).map((b) => [b.id, b.thumbnail_path!] as const)),
+		[boardIndex]
+	);
 	const homeItems = useMemo(
 		() =>
 			buildHomeItems({
@@ -3707,10 +3799,11 @@ const setScreen = () => {
 				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
 				whiteboards: whiteboardIndex,
 				mindmaps: mindmapIndex,
+				boards: boardIndex,
 				externalFiles,
 				query: homeLibrarySearch,
 			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles, homeLibrarySearch]
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, boardIndex, externalFiles, homeLibrarySearch]
 	);
 	const hasAnyHomeItems =
 		allLibraryFiles.length > 0 ||
@@ -3718,6 +3811,7 @@ const setScreen = () => {
 		docsIndex.some((d) => !d.deleted_at) ||
 		whiteboardIndex.length > 0 ||
 		mindmapIndex.length > 0 ||
+		boardIndex.length > 0 ||
 		Object.keys(externalFiles).length > 0;
 	// Extended history list for the quick-switcher dropup in the dock when navigating outside home
 	const historyItems = useMemo(
@@ -3730,10 +3824,11 @@ const setScreen = () => {
 				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
 				whiteboards: whiteboardIndex,
 				mindmaps: mindmapIndex,
+				boards: boardIndex,
 				externalFiles,
 				limit: 30,
 			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, externalFiles]
+		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, boardIndex, externalFiles]
 	);
 	const homeFiles = useMemo(
 		() => homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : [])),
@@ -3753,6 +3848,9 @@ const setScreen = () => {
 		} else if (item.kind === "whiteboard") {
 			handleOpenWhiteboard();
 			setWhiteboardScreen({ mode: "editor", whiteboardId: item.id });
+		} else if (item.kind === "board") {
+			handleOpenBoard();
+			setBoardScreen({ mode: "editor", boardId: item.id });
 		} else {
 			// Legacy standalone mindmaps open seamlessly inside Whiteboard via idempotent migration.
 			void openOrMigrateLegacyMindmap(item.id)
@@ -3782,6 +3880,7 @@ const setScreen = () => {
 		doc: { label: "Document", icon: <IoDocumentTextOutline size={18} />, color: "text-blue-500 dark:text-blue-400" },
 		whiteboard: { label: "Whiteboard", icon: <IoGitNetworkOutline size={18} />, color: "text-amber-500 dark:text-amber-400" },
 		mindmap: { label: "Mind map", icon: <IoMapOutline size={18} />, color: "text-teal-500 dark:text-teal-400" },
+		board: { label: "Design", icon: <IoImagesOutline size={18} />, color: "text-emerald-500 dark:text-emerald-400" },
 	};
 	// Length shown next to each audio/video row's size - probed only for those (at most
 	// HOME_LIST_SIZE) rows, never the whole library.
@@ -5551,6 +5650,7 @@ const setScreen = () => {
                     }}
                     onTransferToPhone={() => openPhoneTransfer([selectedFile])}
                     onSetThumbnail={() => videoPlayerRef.current?.openThumbnailPicker()}
+                    onOpenFrameInDesign={() => void handleOpenVideoFrameInDesign(selectedFile)}
                     onShowInFolder={() => void invoke("open_file_from_directory", { filepath: selectedFile.sourcePath })}
                     onExport={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "save" } }))}
                     onClose={() => {
@@ -6058,7 +6158,7 @@ const setScreen = () => {
                     { label: "Video", icon: <IoCutOutline size={20} />, onClick: handleOpenVideoEditor },
                     { label: "Document", icon: <IoDocumentTextOutline size={20} />, onClick: handleOpenDocs },
                     { label: "Whiteboard", icon: <IoGitNetworkOutline size={20} />, onClick: handleOpenWhiteboard },
-                    { label: "Board", icon: <IoImagesOutline size={20} />, onClick: handleOpenBoard },
+                    { label: "Design", icon: <IoImagesOutline size={20} />, onClick: handleOpenBoard },
                     { label: "Open file", icon: <IoFolderOpenOutline size={20} />, onClick: handleOpenExternalFile },
                   ].map((action) => (
                     <button
@@ -6083,6 +6183,7 @@ const setScreen = () => {
                 searchQuery={homeLibrarySearch}
                 onSearchQueryChange={setHomeLibrarySearch}
                 libraryFilesByPath={libraryFilesByPath}
+                boardThumbById={boardThumbById}
                 arrivals={arrivals}
                 durations={libraryPreviewDurations}
                 homeKinds={HOME_KIND}

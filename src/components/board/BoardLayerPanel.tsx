@@ -7,7 +7,7 @@
 // and click a row to select that item directly - handy once several items overlap and picking the
 // right one by clicking the canvas gets fiddly.
 import React, { useRef, useState } from "react";
-import { IoChevronDown, IoChevronUp, IoCloseOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoShapesOutline, IoText } from "react-icons/io5";
+import { IoChevronDown, IoChevronUp, IoCloseOutline, IoEyeOffOutline, IoEyeOutline, IoImageOutline, IoLockClosed, IoLockOpenOutline, IoShapesOutline, IoText } from "react-icons/io5";
 import { TbBlur, TbGripVertical } from "react-icons/tb";
 import { BoardItem, BoardShape } from "../../utils/boardTypes";
 
@@ -26,6 +26,7 @@ interface BoardLayerPanelProps {
   // (blocks canvas hit-testing/dragging; this panel remains the one place a locked item can still
   // be selected, unlocked, reordered, or deleted).
   onToggleLock: (id: string) => void;
+  onToggleHidden: (id: string) => void;
   onClose: () => void;
 }
 
@@ -57,7 +58,7 @@ function layerLabel(item: BoardItem): string {
   return "Image";
 }
 
-const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onReorder, onToggleLock, onClose }) => {
+const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, onSelect, onStepReorder, onReorder, onToggleLock, onToggleHidden, onClose }) => {
   // Front-to-back for display; each row still knows its own true index in `items` (the array
   // BoardEditor.tsx and onStepReorder both work in) via `items.length - 1 - displayIndex`.
   const frontToBack = [...items].reverse();
@@ -148,8 +149,7 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
   };
 
   return (
-    <div className="absolute top-3 right-3 bottom-[calc(var(--docker-height,60px)+10px)] w-64 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 z-30 animate-[boardPanelIn_180ms_ease-out]">
-      <style>{"@keyframes boardPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
+    <div className="absolute top-3 right-3 bottom-[calc(var(--docker-height,60px)+10px)] w-64 bg-white dark:bg-neutral-900 ring-1 ring-black/[0.08] dark:ring-white/[0.09] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 z-30">
       <div className="shrink-0 flex items-center justify-between px-3.5 h-11 border-b border-black/[0.05] dark:border-white/[0.06]">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-100">Layers</span>
@@ -168,7 +168,7 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto p-1.5">
-        {frontToBack.length === 0 && <div className="px-2 py-6 text-center text-xs text-neutral-400 dark:text-neutral-500">Nothing on the board yet</div>}
+        {frontToBack.length === 0 && <div className="px-2 py-6 text-center text-xs text-neutral-400 dark:text-neutral-500">No layers yet</div>}
         {frontToBack.map((item, displayIndex) => {
           const trueIndex = items.length - 1 - displayIndex;
           const isSelected = selectedIds.has(item.id);
@@ -197,8 +197,24 @@ const BoardLayerPanel: React.FC<BoardLayerPanelProps> = ({ items, selectedIds, o
               >
                 <TbGripVertical size={13} className="pointer-events-none" />
               </div>
-              <span className={`shrink-0 pointer-events-none ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"}`}>{KIND_ICON[item.kind]}</span>
-              <span className={`min-w-0 flex-1 truncate text-sm pointer-events-none ${item.locked ? "italic text-neutral-400 dark:text-neutral-500" : ""}`}>{layerLabel(item)}</span>
+              <span className={`shrink-0 pointer-events-none ${isSelected ? "text-blue-500" : "text-neutral-400 dark:text-neutral-500"} ${item.hidden ? "opacity-40" : ""}`}>{KIND_ICON[item.kind]}</span>
+              <span className={`min-w-0 flex-1 truncate text-sm pointer-events-none ${item.hidden ? "line-through opacity-45" : ""} ${item.locked ? "italic text-neutral-400 dark:text-neutral-500" : ""}`}>{layerLabel(item)}</span>
+              <button
+                type="button"
+                title={item.hidden ? "Show layer" : "Hide layer"}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleHidden(item.id);
+                }}
+                className={`shrink-0 w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                  item.hidden
+                    ? "text-neutral-500 dark:text-neutral-400 hover:bg-neutral-200 dark:hover:bg-neutral-700"
+                    : "text-neutral-300 dark:text-neutral-600 opacity-0 group-hover:opacity-100 hover:bg-neutral-200 dark:hover:bg-neutral-700 hover:text-neutral-600 dark:hover:text-neutral-300"
+                }`}
+              >
+                {item.hidden ? <IoEyeOffOutline size={12} /> : <IoEyeOutline size={12} />}
+              </button>
               <button
                 type="button"
                 title={item.locked ? "Unlock - re-enables dragging/resizing on the canvas" : "Lock - can't be clicked, dragged, or resized on the canvas until unlocked"}

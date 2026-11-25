@@ -6,7 +6,7 @@
 // in pin order (homeScreenFiles.ts); everything else ranks by the later of when it was last opened
 // here and when it last changed.
 
-export type HomeItemKind = "file" | "doc" | "whiteboard" | "mindmap";
+export type HomeItemKind = "file" | "doc" | "whiteboard" | "mindmap" | "board";
 
 export interface HomeItem {
   key: string; // file path, or "<kind>:<id>"
@@ -48,6 +48,7 @@ export function buildHomeItems(input: {
   docs: HomeCreationLike[];
   whiteboards: HomeCreationLike[];
   mindmaps: HomeCreationLike[];
+  boards?: HomeCreationLike[];
   externalFiles?: Record<string, HomeFileLike> | HomeFileLike[];
   query?: string;
   limit?: number;
@@ -94,10 +95,12 @@ export function buildHomeItems(input: {
     ...input.docs.map(creation("doc")),
     ...input.whiteboards.map(creation("whiteboard")),
     ...input.mindmaps.map(creation("mindmap")),
+    ...(input.boards ?? []).map(creation("board")),
   ];
   const creationByKey = new Map(allCreations.map((c) => [c.key, c]));
 
-  const isCreationKey = (k: string) => k.startsWith("doc:") || k.startsWith("whiteboard:") || k.startsWith("mindmap:");
+  const isCreationKey = (k: string) =>
+    k.startsWith("doc:") || k.startsWith("whiteboard:") || k.startsWith("mindmap:") || k.startsWith("board:");
   const pinned: HomeItem[] = [];
   const pinnedKeys = new Set<string>();
   for (const p of pinnedPaths) {

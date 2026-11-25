@@ -6,7 +6,20 @@
 // no shared code, per the Board feature's "build from scratch" requirement (the single-image
 // editor's tools don't fit this feature's per-image padding/border/margin/radius needs).
 
-import { BoardBackgroundMode, BoardBlur, BoardCommand, BoardDocument, BoardGradientBackground, BoardGridBackground, BoardImage, BoardItem, BoardShape, BoardText } from "../utils/boardTypes";
+import {
+  BoardBackgroundMode,
+  BoardBlur,
+  BoardCommand,
+  BoardDocument,
+  BoardGradientBackground,
+  BoardGridBackground,
+  BoardImage,
+  BoardImageAdjustments,
+  BoardImageMaskShape,
+  BoardItem,
+  BoardShape,
+  BoardText,
+} from "../utils/boardTypes";
 
 // ---- Geometry helpers -----------------------------------------------------------------------
 
@@ -61,13 +74,161 @@ function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w:
   ctx.closePath();
 }
 
+function heartMaskPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
+  const cx = x + w / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, y + h * 0.92);
+  ctx.bezierCurveTo(x + w * 0.08, y + h * 0.62, x, y + h * 0.34, x + w * 0.24, y + h * 0.14);
+  ctx.bezierCurveTo(x + w * 0.39, y + h * 0.02, cx, y + h * 0.16, cx, y + h * 0.28);
+  ctx.bezierCurveTo(cx, y + h * 0.16, x + w * 0.61, y + h * 0.02, x + w * 0.76, y + h * 0.14);
+  ctx.bezierCurveTo(x + w, y + h * 0.34, x + w * 0.92, y + h * 0.62, cx, y + h * 0.92);
+  ctx.closePath();
+}
+
+function archMaskPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
+  const r = Math.min(w / 2, h);
+  ctx.beginPath();
+  ctx.moveTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arc(x + w / 2, y + r, r, Math.PI, 0, false);
+  ctx.lineTo(x + w, y + h);
+  ctx.closePath();
+}
+
+function squircleMaskPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
+  const k = 0.28;
+  const rx = w * k;
+  const ry = h * k;
+  ctx.beginPath();
+  ctx.moveTo(x + rx, y);
+  ctx.lineTo(x + w - rx, y);
+  ctx.bezierCurveTo(x + w - rx * 0.12, y, x + w, y + ry * 0.12, x + w, y + ry);
+  ctx.lineTo(x + w, y + h - ry);
+  ctx.bezierCurveTo(x + w, y + h - ry * 0.12, x + w - rx * 0.12, y + h, x + w - rx, y + h);
+  ctx.lineTo(x + rx, y + h);
+  ctx.bezierCurveTo(x + rx * 0.12, y + h, x, y + h - ry * 0.12, x, y + h - ry);
+  ctx.lineTo(x, y + ry);
+  ctx.bezierCurveTo(x, y + ry * 0.12, x + rx * 0.12, y, x + rx, y);
+  ctx.closePath();
+}
+
+function imageMaskPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  radius: number,
+  mask: BoardImageMaskShape = "rect"
+): void {
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  if (mask === "circle") {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, w / 2, h / 2, 0, 0, Math.PI * 2);
+  } else if (mask === "squircle") {
+    squircleMaskPath(ctx, x, y, w, h);
+  } else if (mask === "arch") {
+    archMaskPath(ctx, x, y, w, h);
+  } else if (mask === "diamond") {
+    ctx.beginPath();
+    ctx.moveTo(cx, y);
+    ctx.lineTo(x + w, cy);
+    ctx.lineTo(cx, y + h);
+    ctx.lineTo(x, cy);
+    ctx.closePath();
+  } else if (mask === "hexagon") {
+    regularPolygonPath(ctx, cx, cy, w / 2, h / 2, 6);
+  } else if (mask === "star") {
+    starPath(ctx, cx, cy, w / 2, h / 2, 5, 0.46);
+  } else if (mask === "heart") {
+    heartMaskPath(ctx, x, y, w, h);
+  } else {
+    roundedRectPath(ctx, x, y, w, h, radius);
+  }
+}
+
+export function buildImageFilterCss(adj?: BoardImageAdjustments): string {
+  if (!adj) return "none";
+  const parts: string[] = [];
+  if (adj.brightness !== undefined && adj.brightness !== 100) parts.push(`brightness(${adj.brightness}%)`);
+  if (adj.contrast !== undefined && adj.contrast !== 100) parts.push(`contrast(${adj.contrast}%)`);
+  if (adj.saturation !== undefined && adj.saturation !== 100) parts.push(`saturate(${adj.saturation}%)`);
+  if (adj.sepia !== undefined && adj.sepia > 0) parts.push(`sepia(${adj.sepia}%)`);
+  if (adj.hue !== undefined && adj.hue !== 0) parts.push(`hue-rotate(${adj.hue}deg)`);
+  if (adj.blur !== undefined && adj.blur > 0) parts.push(`blur(${adj.blur}px)`);
+  return parts.length > 0 ? parts.join(" ") : "none";
+}
+
+function drawFittedPhoto(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  naturalWidth: number,
+  naturalHeight: number,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  fitMode: "cover" | "contain",
+  cropZoom: number,
+  cropOffsetX: number,
+  cropOffsetY: number,
+  flipH: boolean,
+  flipV: boolean
+): void {
+  const nw = naturalWidth || img.naturalWidth;
+  const nh = naturalHeight || img.naturalHeight;
+  if (nw <= 0 || nh <= 0 || dw <= 0 || dh <= 0) return;
+  const zoom = Math.max(1, Math.min(3, cropZoom || 1));
+
+  ctx.save();
+  if (flipH || flipV) {
+    ctx.translate(dx + dw / 2, dy + dh / 2);
+    ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+    ctx.translate(-(dx + dw / 2), -(dy + dh / 2));
+  }
+
+  if (fitMode === "contain") {
+    const scale = Math.min(dw / nw, dh / nh) * zoom;
+    const drawW = nw * scale;
+    const drawH = nh * scale;
+    const ox = (dw - drawW) / 2 + (cropOffsetX * (dw - drawW)) / 2;
+    const oy = (dh - drawH) / 2 + (cropOffsetY * (dh - drawH)) / 2;
+    ctx.drawImage(img, 0, 0, nw, nh, dx + ox, dy + oy, drawW, drawH);
+  } else {
+    const base = coverFitRect(nw, nh, dw, dh);
+    const sw = base.sw / zoom;
+    const sh = base.sh / zoom;
+    const maxPanX = (nw - sw) / 2;
+    const maxPanY = (nh - sh) / 2;
+    const sx = Math.max(0, Math.min(nw - sw, (nw - sw) / 2 - cropOffsetX * maxPanX));
+    const sy = Math.max(0, Math.min(nh - sh, (nh - sh) / 2 - cropOffsetY * maxPanY));
+    ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+  }
+  ctx.restore();
+}
+
+// Reusable scratch buffer so transparent-background photos/masks with shadows cast crisp
+// alpha-following drop shadows (for AI cutouts, rounded cards, arch/circle masks) without
+// allocating a new canvas per frame.
+let imageShadowBuffer: HTMLCanvasElement | null = null;
+function getImageShadowBuffer(w: number, h: number): HTMLCanvasElement | null {
+  if (typeof document === "undefined") return null;
+  if (!imageShadowBuffer) imageShadowBuffer = document.createElement("canvas");
+  const pw = Math.max(1, Math.ceil(w));
+  const ph = Math.max(1, Math.ceil(h));
+  if (imageShadowBuffer.width !== pw) imageShadowBuffer.width = pw;
+  if (imageShadowBuffer.height !== ph) imageShadowBuffer.height = ph;
+  return imageShadowBuffer;
+}
+
 // ---- Rendering --------------------------------------------------------------------------------
 
 // Draws one image's frame (background box + border) and, inset by borderWidth+padding, the photo
-// itself clipped to a matching rounded rect and cover-fit into the resulting content area. `img`
-// is null while the asset is still decoding - the caller's preload effect redraws once it's ready
-// (same "frame renders immediately, photo pops in" split the rest of this app already accepts).
+// itself clipped to its shape mask (or rounded rect), with optional filters, focal zoom/pan,
+// flip, blend mode, and silhouette-following drop shadow.
 export function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImage, img: HTMLImageElement | null): void {
+  if (image.hidden) return;
   ctx.save();
   const cx = image.x + image.width / 2;
   const cy = image.y + image.height / 2;
@@ -75,26 +236,26 @@ export function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImag
   ctx.rotate(image.rotation);
   ctx.translate(-cx, -cy);
   ctx.globalAlpha = image.opacity;
+  if (image.blendMode && image.blendMode !== "source-over") {
+    ctx.globalCompositeOperation = image.blendMode;
+  }
 
-  if (image.shadow) {
+  const mask: BoardImageMaskShape = image.maskShape ?? "rect";
+  const hasBgColor = Boolean(
+    image.backgroundColor && image.backgroundColor !== "transparent" && image.backgroundColor !== "rgba(0,0,0,0)"
+  );
+
+  if (hasBgColor && image.shadow) {
     ctx.shadowBlur = image.shadow.blur;
     ctx.shadowOffsetX = image.shadow.offsetX;
     ctx.shadowOffsetY = image.shadow.offsetY;
     ctx.shadowColor = image.shadow.color;
   }
 
-  const hasBgColor = image.backgroundColor && image.backgroundColor !== "transparent" && image.backgroundColor !== "rgba(0,0,0,0)";
   if (hasBgColor) {
-    roundedRectPath(ctx, image.x, image.y, image.width, image.height, image.cornerRadius);
+    imageMaskPath(ctx, image.x, image.y, image.width, image.height, image.cornerRadius, mask);
     ctx.fillStyle = image.backgroundColor;
     ctx.fill();
-  }
-
-  if (image.borderWidth > 0) {
-    ctx.shadowColor = "transparent"; // shadow already applied by the fill above - don't double it on the stroke
-    ctx.lineWidth = image.borderWidth;
-    ctx.strokeStyle = image.borderColor;
-    ctx.stroke();
   }
 
   const inset = image.borderWidth + image.padding;
@@ -102,15 +263,84 @@ export function renderBoardImage(ctx: CanvasRenderingContext2D, image: BoardImag
   const contentY = image.y + inset;
   const contentWidth = Math.max(0, image.width - inset * 2);
   const contentHeight = Math.max(0, image.height - inset * 2);
+  const filterCss = buildImageFilterCss(image.adjustments);
+  const fitMode = image.fitMode ?? "cover";
+  const cropZoom = image.cropZoom ?? 1;
+  const cropOffsetX = image.cropOffsetX ?? 0;
+  const cropOffsetY = image.cropOffsetY ?? 0;
+  const flipH = Boolean(image.flipH);
+  const flipV = Boolean(image.flipV);
 
   if (img && contentWidth > 0 && contentHeight > 0) {
+    const contentRadius = Math.max(0, image.cornerRadius - image.borderWidth);
+    const needsShadowOnPhoto = !hasBgColor && Boolean(image.shadow);
+    const offscreen = needsShadowOnPhoto ? getImageShadowBuffer(contentWidth, contentHeight) : null;
+    const offCtx = offscreen?.getContext("2d") ?? null;
+
+    if (needsShadowOnPhoto && offscreen && offCtx && image.shadow) {
+      offCtx.clearRect(0, 0, offscreen.width, offscreen.height);
+      offCtx.save();
+      imageMaskPath(offCtx, 0, 0, contentWidth, contentHeight, contentRadius, mask);
+      offCtx.clip();
+      if (filterCss !== "none") offCtx.filter = filterCss;
+      drawFittedPhoto(
+        offCtx,
+        img,
+        image.naturalWidth,
+        image.naturalHeight,
+        0,
+        0,
+        contentWidth,
+        contentHeight,
+        fitMode,
+        cropZoom,
+        cropOffsetX,
+        cropOffsetY,
+        flipH,
+        flipV
+      );
+      offCtx.restore();
+
+      ctx.save();
+      ctx.shadowBlur = image.shadow.blur;
+      ctx.shadowOffsetX = image.shadow.offsetX;
+      ctx.shadowOffsetY = image.shadow.offsetY;
+      ctx.shadowColor = image.shadow.color;
+      ctx.drawImage(offscreen, 0, 0, offscreen.width, offscreen.height, contentX, contentY, contentWidth, contentHeight);
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.shadowColor = "transparent";
+      imageMaskPath(ctx, contentX, contentY, contentWidth, contentHeight, contentRadius, mask);
+      ctx.clip();
+      if (filterCss !== "none") ctx.filter = filterCss;
+      drawFittedPhoto(
+        ctx,
+        img,
+        image.naturalWidth,
+        image.naturalHeight,
+        contentX,
+        contentY,
+        contentWidth,
+        contentHeight,
+        fitMode,
+        cropZoom,
+        cropOffsetX,
+        cropOffsetY,
+        flipH,
+        flipV
+      );
+      ctx.restore();
+    }
+  }
+
+  if (image.borderWidth > 0) {
     ctx.save();
     ctx.shadowColor = "transparent";
-    const contentRadius = Math.max(0, image.cornerRadius - image.borderWidth);
-    roundedRectPath(ctx, contentX, contentY, contentWidth, contentHeight, contentRadius);
-    ctx.clip();
-    const { sx, sy, sw, sh } = coverFitRect(image.naturalWidth, image.naturalHeight, contentWidth, contentHeight);
-    ctx.drawImage(img, sx, sy, sw, sh, contentX, contentY, contentWidth, contentHeight);
+    imageMaskPath(ctx, image.x, image.y, image.width, image.height, image.cornerRadius, mask);
+    ctx.lineWidth = image.borderWidth;
+    ctx.strokeStyle = image.borderColor;
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -157,14 +387,23 @@ function getMeasureContext(): CanvasRenderingContext2D | null {
 // what this predicts always matches what actually gets drawn. Returns item.height unchanged if a
 // measurement context isn't available (SSR/non-browser) or the item has no usable content width -
 // never smaller than a single line, so an empty text box still gets a sane minimum.
+function applyTextTransform(text: string, transform?: BoardText["textTransform"]): string {
+  if (transform === "uppercase") return text.toUpperCase();
+  if (transform === "lowercase") return text.toLowerCase();
+  return text;
+}
+
 export function measureBoardTextContentHeight(item: BoardText): number {
   const ctx = getMeasureContext();
-  const lineHeight = item.fontSize * 1.25;
+  const lineHeight = item.fontSize * (item.lineHeight ?? 1.25);
   if (!ctx) return item.height;
   const contentWidth = Math.max(0, item.width - item.padding * 2);
   if (contentWidth <= 0) return item.height;
   ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
-  const lineCount = Math.max(1, wrapText(ctx, item.text, contentWidth).length);
+  if ("letterSpacing" in ctx) {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = item.letterSpacing ? `${item.letterSpacing}px` : "0px";
+  }
+  const lineCount = Math.max(1, wrapText(ctx, applyTextTransform(item.text, item.textTransform), contentWidth).length);
   return Math.ceil(lineCount * lineHeight + item.padding * 2);
 }
 
@@ -180,24 +419,32 @@ export function growTextItemToFitContent(item: BoardText): BoardText {
   return needed > item.height ? { ...item, height: needed } : item;
 }
 
-// Draws one text item's background box (if any) and its word-wrapped content, clipped to the box
-// so an overflowing paragraph is cropped rather than spilling onto whatever's next to it - the
-// text-editing UI (BoardStylePanel) has no live "does this fit" preview, so silently cropping is
-// safer than an unreadable overlap. `padding` insets the text from the box on every side, same
-// convention renderBoardImage's own borderWidth+padding inset uses for the photo inside its frame.
 function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
+  if (item.hidden) return;
   ctx.save();
   const cx = item.x + item.width / 2;
   const cy = item.y + item.height / 2;
   ctx.translate(cx, cy);
   ctx.rotate(item.rotation);
+  if (item.flipH || item.flipV) ctx.scale(item.flipH ? -1 : 1, item.flipV ? -1 : 1);
   ctx.translate(-cx, -cy);
   ctx.globalAlpha = item.opacity;
+  if (item.blendMode && item.blendMode !== "source-over") {
+    ctx.globalCompositeOperation = item.blendMode;
+  }
 
   if (item.backgroundColor) {
+    ctx.save();
+    if (item.shadow) {
+      ctx.shadowBlur = item.shadow.blur;
+      ctx.shadowOffsetX = item.shadow.offsetX;
+      ctx.shadowOffsetY = item.shadow.offsetY;
+      ctx.shadowColor = item.shadow.color;
+    }
     roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
     ctx.fillStyle = item.backgroundColor;
     ctx.fill();
+    ctx.restore();
   }
 
   const contentX = item.x + item.padding;
@@ -207,18 +454,45 @@ function renderBoardText(ctx: CanvasRenderingContext2D, item: BoardText): void {
 
   if (contentWidth > 0 && contentHeight > 0 && item.text) {
     ctx.save();
+    // Allow text stroke & drop shadow to extend past the inner text box cleanly without hard clipping.
+    const strokePad = (item.strokeWidth ?? 0) + (item.shadow ? item.shadow.blur + Math.max(Math.abs(item.shadow.offsetX), Math.abs(item.shadow.offsetY)) : 0);
     ctx.beginPath();
-    ctx.rect(contentX, contentY, contentWidth, contentHeight);
+    ctx.rect(contentX - strokePad, contentY - strokePad, contentWidth + strokePad * 2, contentHeight + strokePad * 2);
     ctx.clip();
 
     ctx.fillStyle = item.color;
     ctx.font = `${item.fontStyle} ${item.fontWeight} ${item.fontSize}px ${item.fontFamily}`;
     ctx.textBaseline = "top";
     ctx.textAlign = item.textAlign;
+    if ("letterSpacing" in ctx) {
+      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = item.letterSpacing ? `${item.letterSpacing}px` : "0px";
+    }
 
+    const displayText = applyTextTransform(item.text, item.textTransform);
     const anchorX = item.textAlign === "center" ? contentX + contentWidth / 2 : item.textAlign === "right" ? contentX + contentWidth : contentX;
-    const lineHeight = item.fontSize * 1.25;
-    wrapText(ctx, item.text, contentWidth).forEach((line, i) => {
+    const lineHeight = item.fontSize * (item.lineHeight ?? 1.25);
+    const lines = wrapText(ctx, displayText, contentWidth);
+
+    if (!item.backgroundColor && item.shadow) {
+      ctx.shadowBlur = item.shadow.blur;
+      ctx.shadowOffsetX = item.shadow.offsetX;
+      ctx.shadowOffsetY = item.shadow.offsetY;
+      ctx.shadowColor = item.shadow.color;
+    }
+
+    if ((item.strokeWidth ?? 0) > 0) {
+      ctx.lineWidth = (item.strokeWidth ?? 0) * 2;
+      ctx.strokeStyle = item.strokeColor ?? "#000000";
+      ctx.lineJoin = "round";
+      ctx.miterLimit = 2;
+      lines.forEach((line, i) => {
+        ctx.strokeText(line, anchorX, contentY + i * lineHeight);
+      });
+      // Don't double-apply shadow on the fill pass over the outline.
+      ctx.shadowColor = "transparent";
+    }
+
+    lines.forEach((line, i) => {
       ctx.fillText(line, anchorX, contentY + i * lineHeight);
     });
     ctx.restore();
@@ -302,13 +576,24 @@ function applyShapeStrokeDash(ctx: CanvasRenderingContext2D, strokeStyle: BoardS
 // along the box's own local midline) rather than a dedicated two-point model, and why every other
 // shapeType inscribes/stretches into that same box rather than each having its own geometry model.
 function renderBoardShape(ctx: CanvasRenderingContext2D, item: BoardShape): void {
+  if (item.hidden) return;
   ctx.save();
   const cx = item.x + item.width / 2;
   const cy = item.y + item.height / 2;
   ctx.translate(cx, cy);
   ctx.rotate(item.rotation);
+  if (item.flipH || item.flipV) ctx.scale(item.flipH ? -1 : 1, item.flipV ? -1 : 1);
   ctx.translate(-cx, -cy);
   ctx.globalAlpha = item.opacity;
+  if (item.blendMode && item.blendMode !== "source-over") {
+    ctx.globalCompositeOperation = item.blendMode;
+  }
+  if (item.shadow) {
+    ctx.shadowBlur = item.shadow.blur;
+    ctx.shadowOffsetX = item.shadow.offsetX;
+    ctx.shadowOffsetY = item.shadow.offsetY;
+    ctx.shadowColor = item.shadow.color;
+  }
   ctx.strokeStyle = item.strokeColor;
   ctx.lineWidth = item.strokeWidth;
   ctx.lineJoin = "round";
@@ -355,9 +640,24 @@ function renderBoardShape(ctx: CanvasRenderingContext2D, item: BoardShape): void
     } else {
       roundedRectPath(ctx, item.x, item.y, item.width, item.height, item.cornerRadius);
     }
-    if (item.fillColor) {
+    if (item.fillGradient) {
+      const radians = ((item.fillGradient.angleDeg - 90) * Math.PI) / 180;
+      const half = Math.hypot(item.width, item.height) / 2;
+      const grad = ctx.createLinearGradient(
+        cx - Math.cos(radians) * half,
+        cy - Math.sin(radians) * half,
+        cx + Math.cos(radians) * half,
+        cy + Math.sin(radians) * half
+      );
+      grad.addColorStop(0, item.fillGradient.from);
+      grad.addColorStop(1, item.fillGradient.to);
+      ctx.fillStyle = grad;
+      ctx.fill();
+      if (item.shadow) ctx.shadowColor = "transparent";
+    } else if (item.fillColor) {
       ctx.fillStyle = item.fillColor;
       ctx.fill();
+      if (item.shadow) ctx.shadowColor = "transparent";
     }
     if (item.strokeWidth > 0) ctx.stroke();
   }
@@ -379,7 +679,7 @@ function renderBoardShape(ctx: CanvasRenderingContext2D, item: BoardShape): void
 // part of the board (whatever rotation carried into view) rather than blurring what's actually
 // under the clip window - the rotation belongs only to the clip shape, never to the sampling.
 function renderBoardBlur(ctx: CanvasRenderingContext2D, canvasSource: HTMLCanvasElement, item: BoardBlur): void {
-  if (item.strength <= 0) return;
+  if (item.hidden || item.strength <= 0) return;
   ctx.save();
   ctx.globalAlpha = item.opacity;
 
@@ -578,6 +878,7 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
   ctx.save();
   ctx.translate(padding, padding);
   for (const item of doc.images) {
+    if (item.hidden) continue;
     if (item.kind === "text") renderBoardText(ctx, item);
     else if (item.kind === "blur") renderBoardBlur(ctx, canvas, item);
     else if (item.kind === "shape") renderBoardShape(ctx, item);
@@ -596,7 +897,7 @@ export function renderBoardToCanvas(canvas: HTMLCanvasElement, doc: BoardDocumen
 export function hitTestBoardItem(items: BoardItem[], x: number, y: number): BoardItem | null {
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
-    if (item.locked) continue;
+    if (item.locked || item.hidden) continue;
     const cx = item.x + item.width / 2;
     const cy = item.y + item.height / 2;
     const local = unrotatePoint(x, y, cx, cy, item.rotation);

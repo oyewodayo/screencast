@@ -11,7 +11,7 @@
 // Live drag/resize/rotate updates are staged locally (liveImages) and only committed to the store
 // as a single edit/batch-edit on pointer release - a "stage locally, commit once" discipline that
 // keeps a whole drag gesture to exactly one undo step.
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IoCopyOutline, IoDownloadOutline, IoSwapHorizontalOutline, IoTrashOutline } from "react-icons/io5";
 import { TbScissors, TbStackBack, TbStackFront } from "react-icons/tb";
@@ -260,7 +260,7 @@ const BoardCanvas: React.FC<BoardCanvasProps> = ({
   }, [doc, displayImages, imageBitmaps, selectedIds, zoom, marqueeRect, snapGuides, fontsReadyTick]);
 
   const canvasRestoreTick = useCanvasRestoreTick();
-  useEffect(() => {
+  useLayoutEffect(() => {
     draw();
   }, [draw, canvasRestoreTick]);
 

@@ -39,24 +39,27 @@ describe("buildHomeItems", () => {
     expect(buildHomeItems({ ...base, docs, limit: 5 })).toHaveLength(5);
   });
 
-  it("supports pinning creations and searching across the entire library", () => {
+  it("supports pinning creations, including Designs, and searching across the entire library", () => {
     const items = buildHomeItems({
       ...base,
       pinnedPaths: ["whiteboard:w1"],
       recentPaths: ["/a.mp4"],
       docs: [{ id: "d1", name: "Quantum Notes", updated_at: new Date(T - 20_000).toISOString() }],
       whiteboards: [{ id: "w1", name: "Sprint Board", updated_at: new Date(T - 600_000).toISOString() }],
+      boards: [{ id: "b1", name: "IG Carousel", updated_at: new Date(T - 5_000).toISOString() }],
     });
     expect(items[0]).toMatchObject({ key: "whiteboard:w1", pinned: true });
+    expect(items[1]).toMatchObject({ key: "board:b1", kind: "board", name: "IG Carousel" });
 
     // Searching reaches un-opened files like /c.png as well as creations.
     const searched = buildHomeItems({
       ...base,
       recentPaths: ["/a.mp4"],
       docs: [{ id: "d1", name: "Quantum Notes", updated_at: new Date(T - 20_000).toISOString() }],
-      query: "c.png",
+      boards: [{ id: "b1", name: "IG Carousel", updated_at: new Date(T - 5_000).toISOString() }],
+      query: "carousel",
     });
-    expect(searched.map((i) => i.key)).toEqual(["/c.png"]);
+    expect(searched.map((i) => i.key)).toEqual(["board:b1"]);
   });
 });
 

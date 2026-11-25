@@ -683,7 +683,11 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         cornerRadius: source.cornerRadius,
         backgroundColor: source.backgroundColor,
         opacity: source.opacity,
+        blendMode: source.blendMode,
         shadow: source.shadow,
+        maskShape: source.maskShape,
+        fitMode: source.fitMode,
+        adjustments: source.adjustments ? { ...source.adjustments } : undefined,
         updatedAt: Date.now(),
       }));
       store.batchEditImages(targets, styled);
@@ -709,6 +713,13 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         backgroundColor: source.backgroundColor,
         cornerRadius: source.cornerRadius,
         padding: source.padding,
+        strokeColor: source.strokeColor,
+        strokeWidth: source.strokeWidth,
+        shadow: source.shadow,
+        letterSpacing: source.letterSpacing,
+        lineHeight: source.lineHeight,
+        textTransform: source.textTransform,
+        blendMode: source.blendMode,
         opacity: source.opacity,
         updatedAt: Date.now(),
       }));
@@ -750,9 +761,13 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       const styled = targets.map((s) => ({
         ...s,
         fillColor: source.fillColor,
+        fillGradient: source.fillGradient ? { ...source.fillGradient } : source.fillGradient,
         strokeColor: source.strokeColor,
         strokeWidth: source.strokeWidth,
+        strokeStyle: source.strokeStyle,
         cornerRadius: source.cornerRadius,
+        shadow: source.shadow,
+        blendMode: source.blendMode,
         opacity: source.opacity,
         updatedAt: Date.now(),
       }));
@@ -946,6 +961,16 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
       const before = store.doc.images.find((img) => img.id === id);
       if (!before) return;
       store.editImage(before, { ...before, locked: !before.locked, updatedAt: Date.now() });
+    },
+    [store]
+  );
+
+  const handleToggleHidden = useCallback(
+    (id: string) => {
+      if (!store.doc) return;
+      const before = store.doc.images.find((img) => img.id === id);
+      if (!before) return;
+      store.editImage(before, { ...before, hidden: !before.hidden, updatedAt: Date.now() });
     },
     [store]
   );
@@ -1154,11 +1179,14 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     [store, applyAutoLayout, singleSelectedImageId]
   );
 
+  const [exportScale, setExportScale] = useState<1 | 2 | 3>(2);
+  const [exportFormat, setExportFormat] = useState<"png" | "jpg" | "webp">("png");
+
   const renderOffscreen = useCallback(
-    (maxDimension?: number): HTMLCanvasElement | null => {
+    (maxDimension?: number, pixelScale = 1): HTMLCanvasElement | null => {
       if (!store.doc) return null;
       const { width, height } = paddedCanvasSize(store.doc);
-      const scale = maxDimension ? Math.min(1, maxDimension / Math.max(width, height)) : 1;
+      const scale = maxDimension ? Math.min(1, maxDimension / Math.max(width, height)) : pixelScale;
       const canvas = document.createElement("canvas");
       canvas.width = Math.round(width * scale);
       canvas.height = Math.round(height * scale);
@@ -1168,6 +1196,28 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     [store.doc, imageBitmaps]
   );
 
+  const encodeCanvasBytes = useCallback(async (canvas: HTMLCanvasElement, format: "png" | "jpg" | "webp"): Promise<Uint8Array> => {
+    if (format === "png") return canvasToPngBytes(canvas);
+    let target = canvas;
+    if (format === "jpg") {
+      // JPEG has no alpha channel — composite over white so transparent areas don't turn black.
+      const flat = document.createElement("canvas");
+      flat.width = canvas.width;
+      flat.height = canvas.height;
+      const ctx = flat.getContext("2d");
+      if (ctx) {
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, flat.width, flat.height);
+        ctx.drawImage(canvas, 0, 0);
+        target = flat;
+      }
+    }
+    const mime = format === "jpg" ? "image/jpeg" : "image/webp";
+    const blob = await new Promise<Blob | null>((resolve) => target.toBlob(resolve, mime, 0.92));
+    if (!blob) throw new Error(`Failed to encode ${format.toUpperCase()} image`);
+    return new Uint8Array(await blob.arrayBuffer());
+  }, []);
+
   // "Save to library" - one of the three actions behind the toolbar's "Share" menu (see
   // shareMenuAnchor below). Always lands in briefcast_dir()/Board/, so it shows up in the sidebar's
   // Image tab immediately - the fast, no-decisions option for "I just want this in my library."
@@ -1176,42 +1226,48 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     setIsExporting(true);
     setExportError(null);
     try {
-      const canvas = renderOffscreen();
+      const canvas = renderOffscreen(undefined, exportScale);
       if (!canvas) return;
       const bytes = await canvasToPngBytes(canvas);
       await invoke<string>("export_board_png", { boardName: store.doc.name, bytes: Array.from(bytes) });
+      setCopyStatus(`Saved (${exportScale}× PNG)`);
+      if (copyStatusTimerRef.current) clearTimeout(copyStatusTimerRef.current);
+      copyStatusTimerRef.current = setTimeout(() => setCopyStatus(null), 1800);
     } catch (err) {
-      console.error("Failed to export board:", err);
+      console.error("Failed to export design:", err);
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsExporting(false);
     }
-  }, [store.doc, renderOffscreen]);
+  }, [store.doc, renderOffscreen, exportScale]);
 
-  // "Save As..." - the other download option behind "Share": lets the user pick the exact
-  // destination (Desktop, Downloads, anywhere) via the OS's own native save dialog, rather than
-  // always landing in the library's Board folder the way handleExport above does. Goes through the
-  // same import_board_image-style write-then-rename on the Rust side (export_board_png_to_path) but
-  // to a caller-chosen path instead of one this app derives itself.
+  // "Save As..." - supports PNG, JPG, and WebP at 1× / 2× / 3× scale.
   const handleSaveAs = useCallback(async () => {
     if (!store.doc) return;
     setIsExporting(true);
     setExportError(null);
     try {
-      const canvas = renderOffscreen();
+      const canvas = renderOffscreen(undefined, exportScale);
       if (!canvas) return;
-      const bytes = await canvasToPngBytes(canvas);
-      const safeName = store.doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Board";
-      const destPath = await saveFileDialog({ defaultPath: `${safeName}.png`, filters: [{ name: "PNG Image", extensions: ["png"] }] });
+      const bytes = await encodeCanvasBytes(canvas, exportFormat);
+      const safeName = store.doc.name.trim().replace(/[^a-zA-Z0-9 _-]/g, "_") || "Design";
+      const filterName = exportFormat === "png" ? "PNG Image" : exportFormat === "jpg" ? "JPEG Image" : "WebP Image";
+      const destPath = await saveFileDialog({
+        defaultPath: `${safeName}.${exportFormat}`,
+        filters: [{ name: filterName, extensions: [exportFormat] }],
+      });
       if (!destPath) return;
       await invoke("export_board_png_to_path", { destPath, bytes: Array.from(bytes) });
+      setCopyStatus(`Exported ${exportScale}× ${exportFormat.toUpperCase()}`);
+      if (copyStatusTimerRef.current) clearTimeout(copyStatusTimerRef.current);
+      copyStatusTimerRef.current = setTimeout(() => setCopyStatus(null), 1800);
     } catch (err) {
-      console.error("Failed to save board:", err);
+      console.error("Failed to save design:", err);
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsExporting(false);
     }
-  }, [store.doc, renderOffscreen]);
+  }, [store.doc, renderOffscreen, exportScale, exportFormat, encodeCanvasBytes]);
 
   // Same flattened-PNG render as handleExport above, just handed to the OS clipboard instead of
   // written into the library - the fast path for "show someone this board right now" (paste into
@@ -1235,20 +1291,20 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
     setIsCopyingToClipboard(true);
     setExportError(null);
     try {
-      const canvas = renderOffscreen();
+      const canvas = renderOffscreen(undefined, exportScale);
       if (!canvas) return;
       const bytes = await canvasToPngBytes(canvas);
       await navigator.clipboard.write([new ClipboardItem({ "image/png": new Blob([bytes], { type: "image/png" }) })]);
-      setCopyStatus("Copied to clipboard");
+      setCopyStatus(`Copied (${exportScale}×)`);
       if (copyStatusTimerRef.current) clearTimeout(copyStatusTimerRef.current);
       copyStatusTimerRef.current = setTimeout(() => setCopyStatus(null), 1800);
     } catch (err) {
-      console.error("Failed to copy board to clipboard:", err);
+      console.error("Failed to copy design to clipboard:", err);
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsCopyingToClipboard(false);
     }
-  }, [store.doc, renderOffscreen]);
+  }, [store.doc, renderOffscreen, exportScale]);
 
   const handleBack = useCallback(async () => {
     store.flushSave();
@@ -1316,8 +1372,8 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           comment) - once every chip refuses to shrink, something has to give when the window is
           narrow, and a horizontal scroll on the bar itself beats any chip silently wrapping its
           own label. shrink-0 on the back button/divider too, for the same reason. */}
-      <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl overflow-x-auto">
-        <button type="button" onClick={handleBack} title="Back to boards" className={TOOLBAR_ICON_BTN}>
+      <div className="shrink-0 h-12 flex items-center gap-1.5 px-3 border-b border-neutral-200/80 dark:border-neutral-800/80 bg-white dark:bg-neutral-900 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <button type="button" onClick={handleBack} title="Back to designs" className={TOOLBAR_ICON_BTN}>
           <IoArrowBack size={16} />
         </button>
 
@@ -1325,7 +1381,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           ref={nameInputRef}
           value={store.doc?.name ?? ""}
           onChange={(e) => store.renameBoard(e.target.value)}
-          placeholder="Untitled board"
+          placeholder="Untitled design"
           className="min-w-[80px] shrink w-[150px] px-2 py-1 rounded-lg text-xs font-semibold bg-transparent border border-transparent hover:bg-neutral-100 dark:hover:bg-neutral-800 focus:bg-white dark:focus:bg-neutral-900 focus:border-blue-400 dark:focus:border-blue-500 focus:ring-2 focus:ring-blue-500/10 outline-none text-neutral-900 dark:text-neutral-100 transition-colors"
         />
 
@@ -1960,22 +2016,11 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
 
         <div className="flex-1" />
 
-        {store.isSaving && <span className="text-xs text-neutral-400 dark:text-neutral-500 mr-1">Saving…</span>}
-        {copyStatus && (
-          <span className="flex items-center gap-1 text-xs font-medium text-blue-600 dark:text-blue-400 mr-1">
-            <IoCheckmarkCircle size={13} /> {copyStatus}
-          </span>
-        )}
-
-        {/* "Share" - one menu for every way to get the board out of Briefcast: an instant copy
-            (paste into a chat/doc/anywhere - the practical "share to any platform" on desktop),
-            or a download to either the library's own Board folder or a location the user picks
-            themselves. Same portal-dropdown pattern as Arrange/Background - see arrangeMenuAnchor's
-            own doc comment for why. */}
+        {/* "Share" - one menu for every way to get the design out of Briefcast */}
         <button
           ref={shareButtonRef}
           type="button"
-          title="Share this board - copy, or save as an image"
+          title="Share this design - copy, or save as an image"
           onClick={(e) => {
             e.stopPropagation();
             if (isShareMenuOpen) {
@@ -1991,24 +2036,59 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
             }
           }}
           disabled={!store.doc || store.doc.images.length === 0}
-          className="shrink-0 flex items-center gap-1.5 h-9 px-3.5 rounded-lg text-sm font-semibold tracking-tight bg-gradient-to-b from-neutral-800 to-neutral-950 dark:from-white dark:to-neutral-100 text-white dark:text-neutral-900 shadow-[0_1px_2px_rgba(0,0,0,0.25)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.3)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
+          className="shrink-0 flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold tracking-tight bg-gradient-to-b from-neutral-800 to-neutral-950 dark:from-white dark:to-neutral-100 text-white dark:text-neutral-900 shadow-[0_1px_2px_rgba(0,0,0,0.25)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.3)] active:shadow-none transition-all disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
         >
-          <IoShareOutline size={16} />
+          <IoShareOutline size={15} />
           {isExporting ? "Saving…" : isCopyingToClipboard ? "Copying…" : "Share"}
-          <IoChevronDown size={12} className={`transition-transform ${isShareMenuOpen ? "rotate-180" : ""}`} />
+          <IoChevronDown size={11} className={`transition-transform ${isShareMenuOpen ? "rotate-180" : ""}`} />
         </button>
-        {copyStatus && (
-          <span className="flex items-center gap-1 text-xs font-medium text-blue-600 dark:text-blue-400 ml-1">
-            <IoCheckmarkCircle size={13} /> {copyStatus}
-          </span>
-        )}
         {shareMenuAnchor &&
           createPortal(
             <div
               onPointerDown={(e) => e.stopPropagation()}
-              style={{ position: "fixed", top: shareMenuAnchor.top, left: shareMenuAnchor.left }}
-              className="w-56 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-[9999] py-1"
+              style={{ position: "fixed", top: shareMenuAnchor.top, left: Math.max(12, shareMenuAnchor.left - 24) }}
+              className="w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xl ring-1 ring-black/5 overflow-hidden z-[9999] py-1.5"
             >
+              <div className="px-3 py-1.5 border-b border-black/[0.06] dark:border-white/[0.08] flex flex-col gap-2 mb-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">Resolution</span>
+                  <div className="inline-flex rounded-md border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+                    {([1, 2, 3] as const).map((s) => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => setExportScale(s)}
+                        className={`px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                          exportScale === s
+                            ? "bg-blue-50 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                            : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                        }`}
+                      >
+                        {s}×
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">Save As format</span>
+                  <div className="inline-flex rounded-md border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+                    {(["png", "jpg", "webp"] as const).map((fmt) => (
+                      <button
+                        key={fmt}
+                        type="button"
+                        onClick={() => setExportFormat(fmt)}
+                        className={`px-2 py-0.5 text-[11px] font-medium uppercase transition-colors ${
+                          exportFormat === fmt
+                            ? "bg-blue-50 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                            : "text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+                        }`}
+                      >
+                        {fmt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
               <button
                 type="button"
                 onClick={() => {
@@ -2019,8 +2099,8 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               >
                 <IoCopyOutline size={16} className="shrink-0 mt-0.5 text-neutral-400 dark:text-neutral-500" />
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium">Copy to clipboard</span>
-                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Paste into a chat, doc, or anywhere else</span>
+                  <span className="block text-sm font-medium">Copy to clipboard ({exportScale}×)</span>
+                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Paste into a chat, doc, or social post</span>
                 </span>
               </button>
               <button
@@ -2033,8 +2113,8 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               >
                 <IoCloudDownloadOutline size={16} className="shrink-0 mt-0.5 text-neutral-400 dark:text-neutral-500" />
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium">Save to library</span>
-                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Into your library's Board folder</span>
+                  <span className="block text-sm font-medium">Save to library ({exportScale}× PNG)</span>
+                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Into your library's Design folder</span>
                 </span>
               </button>
               <button
@@ -2047,8 +2127,8 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               >
                 <IoSaveOutline size={16} className="shrink-0 mt-0.5 text-neutral-400 dark:text-neutral-500" />
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium">Save As…</span>
-                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Choose exactly where to save</span>
+                  <span className="block text-sm font-medium">Save As {exportFormat.toUpperCase()} ({exportScale}×)…</span>
+                  <span className="block text-xs text-neutral-400 dark:text-neutral-500">Choose destination on disk</span>
                 </span>
               </button>
             </div>,
@@ -2068,7 +2148,13 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
         </div>
       )}
 
-      <div className="flex-1 min-h-0 flex">
+      <div className="relative flex-1 min-h-0 flex">
+        {copyStatus && (
+          <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-40 flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/90 dark:bg-white/95 text-white dark:text-neutral-900 text-xs font-medium shadow-md">
+            <IoCheckmarkCircle size={13} className="text-emerald-400 dark:text-emerald-600" />
+            {copyStatus}
+          </div>
+        )}
         <div
           ref={containerRef}
           // grid + place-items-center, not flex + items-center/justify-center - the two look
@@ -2112,7 +2198,7 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
           {isDragOverCanvas && draggedLibraryImagePaths.length > 0 && (
             <div className="absolute inset-3 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-blue-400 dark:border-blue-500 bg-white/70 dark:bg-neutral-900/70 pointer-events-none">
               <span className="text-sm font-medium text-blue-600 dark:text-blue-400">
-                Drop to add {draggedLibraryImagePaths.length} image{draggedLibraryImagePaths.length === 1 ? "" : "s"} to board
+                Drop to add {draggedLibraryImagePaths.length} image{draggedLibraryImagePaths.length === 1 ? "" : "s"} to design
               </span>
             </div>
           )}
@@ -2135,50 +2221,53 @@ const BoardEditor = forwardRef<BoardEditorHandle, BoardEditorProps>(({ boardId, 
               onDeleteItem={(item) => handleDeleteSelected(new Set([item.id]))}
             />
           ) : store.loadError ? (
-            <span className="text-red-500 dark:text-red-400 text-sm">Failed to load board: {store.loadError}</span>
+            <span className="text-red-500 dark:text-red-400 text-sm">Failed to load design: {store.loadError}</span>
           ) : (
-            <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading board…</span>
-          )}
-
-          {showLayerPanel && store.doc && (
-            <BoardLayerPanel
-              items={store.doc.images}
-              selectedIds={selectedIds}
-              onSelect={setSelectedIds}
-              onStepReorder={handleStepReorder}
-              onReorder={handleReorderLayer}
-              onToggleLock={handleToggleLock}
-              onClose={() => setShowLayerPanel(false)}
-            />
-          )}
-
-          {selectedImages.length > 0 && (
-            <BoardStylePanel
-              offsetRight={showLayerPanel}
-              items={selectedImages}
-              onChange={handleStyleChange}
-              onDelete={handleDeleteSelected}
-              onDuplicate={handleDuplicateSelected}
-              onBringToFront={handleBringToFront}
-              onSendToBack={handleSendToBack}
-              onApplyStyleToAllImages={handleApplyImageStyleToAll}
-              onApplyStyleToAllTexts={handleApplyTextStyleToAll}
-              onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
-              onApplyStyleToAllShapes={handleApplyShapeStyleToAll}
-              boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
-              boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
-              boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
-              boardShapeCount={store.doc?.images.filter((item) => item.kind === "shape").length ?? 0}
-              onReplaceImage={(image) => void handleReplaceImage(image)}
-              isReplacingImage={isReplacingImage}
-              onRemoveBackground={(image) => void handleRemoveImageBackground(image)}
-              isRemovingBackground={isRemovingBackground}
-              onDownloadImage={(image) => void handleDownloadImage(image)}
-              isDownloadingImage={isDownloadingImage}
-              onNudge={handleNudge}
-            />
+            <span className="text-neutral-400 dark:text-neutral-500 text-sm italic">Loading design…</span>
           )}
         </div>
+
+        {/* Floating inspector & layer panels live outside the scrollable canvas container so
+            clicking/focusing controls inside them never scrolls or jerks the canvas viewport. */}
+        {showLayerPanel && store.doc && (
+          <BoardLayerPanel
+            items={store.doc.images}
+            selectedIds={selectedIds}
+            onSelect={setSelectedIds}
+            onStepReorder={handleStepReorder}
+            onReorder={handleReorderLayer}
+            onToggleLock={handleToggleLock}
+            onToggleHidden={handleToggleHidden}
+            onClose={() => setShowLayerPanel(false)}
+          />
+        )}
+
+        {selectedImages.length > 0 && (
+          <BoardStylePanel
+            offsetRight={showLayerPanel}
+            items={selectedImages}
+            onChange={handleStyleChange}
+            onDelete={handleDeleteSelected}
+            onDuplicate={handleDuplicateSelected}
+            onBringToFront={handleBringToFront}
+            onSendToBack={handleSendToBack}
+            onApplyStyleToAllImages={handleApplyImageStyleToAll}
+            onApplyStyleToAllTexts={handleApplyTextStyleToAll}
+            onApplyStyleToAllBlurs={handleApplyBlurStyleToAll}
+            onApplyStyleToAllShapes={handleApplyShapeStyleToAll}
+            boardImageCount={store.doc?.images.filter((item) => item.kind === "image").length ?? 0}
+            boardTextCount={store.doc?.images.filter((item) => item.kind === "text").length ?? 0}
+            boardBlurCount={store.doc?.images.filter((item) => item.kind === "blur").length ?? 0}
+            boardShapeCount={store.doc?.images.filter((item) => item.kind === "shape").length ?? 0}
+            onReplaceImage={(image) => void handleReplaceImage(image)}
+            isReplacingImage={isReplacingImage}
+            onRemoveBackground={(image) => void handleRemoveImageBackground(image)}
+            isRemovingBackground={isRemovingBackground}
+            onDownloadImage={(image) => void handleDownloadImage(image)}
+            isDownloadingImage={isDownloadingImage}
+            onNudge={handleNudge}
+          />
+        )}
       </div>
     </div>
   );

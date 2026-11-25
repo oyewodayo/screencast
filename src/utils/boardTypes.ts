@@ -14,6 +14,54 @@ export interface BoardShadow {
   color: string;
 }
 
+export type BoardBlendMode =
+  | "source-over"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "color-dodge"
+  | "color-burn"
+  | "hard-light"
+  | "soft-light"
+  | "difference"
+  | "exclusion"
+  | "hue"
+  | "saturation"
+  | "color"
+  | "luminosity";
+
+export const BOARD_BLEND_MODES: { value: BoardBlendMode; label: string }[] = [
+  { value: "source-over", label: "Normal" },
+  { value: "multiply", label: "Multiply" },
+  { value: "screen", label: "Screen" },
+  { value: "overlay", label: "Overlay" },
+  { value: "darken", label: "Darken" },
+  { value: "lighten", label: "Lighten" },
+  { value: "color-dodge", label: "Color Dodge" },
+  { value: "color-burn", label: "Color Burn" },
+  { value: "hard-light", label: "Hard Light" },
+  { value: "soft-light", label: "Soft Light" },
+  { value: "difference", label: "Difference" },
+  { value: "exclusion", label: "Exclusion" },
+  { value: "hue", label: "Hue" },
+  { value: "saturation", label: "Saturation" },
+  { value: "color", label: "Color" },
+  { value: "luminosity", label: "Luminosity" },
+];
+
+export type BoardImageMaskShape = "rect" | "circle" | "squircle" | "arch" | "diamond" | "hexagon" | "star" | "heart";
+
+export interface BoardImageAdjustments {
+  brightness?: number; // 100 = default (50..180)
+  contrast?: number; // 100 = default (50..180)
+  saturation?: number; // 100 = default (0..200)
+  sepia?: number; // 0 = default (0..100)
+  hue?: number; // 0 = default (-180..180 deg)
+  blur?: number; // 0 = default (0..20 px)
+}
+
 // Fields every board item - image or text - shares: geometry (the same border-box model
 // imageEditTypes.ts's PlacedImageObject uses - x/y/width/height describe the outer edge
 // pre-rotation, rotation applied around the box's own center at render time, so move/resize math
@@ -35,6 +83,10 @@ interface BoardItemBase {
   // it can't be accidentally dragged/resized/rotated; it's still fully manageable (select, unlock,
   // reorder, delete) from BoardLayerPanel, which selects by id rather than by hit-testing.
   locked?: boolean;
+  hidden?: boolean;
+  blendMode?: BoardBlendMode;
+  flipH?: boolean;
+  flipV?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -56,6 +108,12 @@ export interface BoardImage extends BoardItemBase {
   cornerRadius: number;
   backgroundColor: string;
   shadow?: BoardShadow;
+  maskShape?: BoardImageMaskShape;
+  fitMode?: "cover" | "contain";
+  cropZoom?: number; // 1..3 (default 1)
+  cropOffsetX?: number; // -1..1 (default 0)
+  cropOffsetY?: number; // -1..1 (default 0)
+  adjustments?: BoardImageAdjustments;
 }
 
 // A free-floating text box - the Board feature's second item kind alongside BoardImage (see
@@ -80,6 +138,12 @@ export interface BoardText extends BoardItemBase {
   backgroundColor: string | null;
   cornerRadius: number; // rounds the background box, when backgroundColor isn't null
   padding: number;
+  strokeColor?: string;
+  strokeWidth?: number;
+  shadow?: BoardShadow;
+  letterSpacing?: number; // px, default 0
+  lineHeight?: number; // multiplier, default 1.25
+  textTransform?: "none" | "uppercase" | "lowercase";
 }
 
 // A free-floating blur region - the Board feature's third item kind, for obscuring something in a
@@ -139,6 +203,8 @@ export interface BoardShape extends BoardItemBase {
   // "star" only, 0-1 - how far the inner (concave) vertices sit toward the center relative to the
   // outer points; smaller = spikier. Absent on an older star - resolves to 0.45.
   innerRadiusRatio?: number;
+  fillGradient?: BoardGradientBackground | null;
+  shadow?: BoardShadow;
 }
 
 export type BoardItem = BoardImage | BoardText | BoardBlur | BoardShape;

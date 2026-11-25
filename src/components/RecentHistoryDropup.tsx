@@ -93,7 +93,7 @@ export default function RecentHistoryDropup({
     return items.filter((item) => {
       const name = item.name.toLowerCase();
       if (name.includes(q)) return true;
-      if (item.kind !== "file" && item.kind.toLowerCase().includes(q)) return true;
+      if (item.kind !== "file" && (item.kind.toLowerCase().includes(q) || (item.kind === "board" && "design".includes(q)))) return true;
       if (item.kind === "file") {
         const cat = getFileCategory(item.name);
         if (cat && cat.toLowerCase().includes(q)) return true;
@@ -110,7 +110,10 @@ export default function RecentHistoryDropup({
       return <IoGitNetworkOutline size={16} className="text-amber-500 dark:text-amber-400 shrink-0" />;
     }
     if (item.kind === "mindmap") {
-      return <IoMapOutline size={16} className="text-emerald-500 dark:text-emerald-400 shrink-0" />;
+      return <IoMapOutline size={16} className="text-teal-500 dark:text-teal-400 shrink-0" />;
+    }
+    if (item.kind === "board") {
+      return <IoImagesOutline size={16} className="text-emerald-500 dark:text-emerald-400 shrink-0" />;
     }
 
     const cat = getFileCategory(item.name);
@@ -163,6 +166,7 @@ export default function RecentHistoryDropup({
       doc: "Document",
       whiteboard: "Whiteboard",
       mindmap: "Mind map",
+      board: "Design",
     };
     const label = kindLabels[item.kind] || item.kind;
     const timeStr = item.time > 0 ? relativeTime(item.time) : null;

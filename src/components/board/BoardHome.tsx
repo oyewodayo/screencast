@@ -16,6 +16,10 @@ import FileInfoModal from "../Modals/FileInfoModal";
 // Small CSS-only preview swatch for a template card - no need for a real canvas render just to
 // preview a background choice, since a template only ever sets background/padding fields.
 function templatePreviewStyle(template: BoardTemplate): React.CSSProperties {
+  if (template.backgroundMode === "gradient" && template.backgroundGradient) {
+    const { from, to, angleDeg } = template.backgroundGradient;
+    return { backgroundImage: `linear-gradient(${angleDeg}deg, ${from}, ${to})` };
+  }
   if (template.backgroundMode === "grid" && template.backgroundGrid) {
     const { spacing, lineColor, baseColor } = template.backgroundGrid;
     // Scaled down from the board's own (much larger) spacing to something that reads as a grid
@@ -29,6 +33,24 @@ function templatePreviewStyle(template: BoardTemplate): React.CSSProperties {
   }
   return { backgroundColor: template.backgroundColor ?? "transparent" };
 }
+
+interface QuickSocialStarter {
+  id: string;
+  label: string;
+  sizeLabel: string;
+  width: number;
+  height: number;
+  aspectClass: string;
+  templateId: string;
+}
+
+const QUICK_SOCIAL_STARTERS: QuickSocialStarter[] = [
+  { id: "youtube-thumb", label: "YouTube Thumb", sizeLabel: "1280×720", width: 1280, height: 720, aspectClass: "w-7 h-4", templateId: "midnight-indigo" },
+  { id: "ig-portrait", label: "IG / LinkedIn", sizeLabel: "1080×1350", width: 1080, height: 1350, aspectClass: "w-4 h-5", templateId: "sunset-glow" },
+  { id: "ig-post", label: "Square Post", sizeLabel: "1080×1080", width: 1080, height: 1080, aspectClass: "w-5 h-5", templateId: "soft-grid" },
+  { id: "ig-story", label: "Story / Reel", sizeLabel: "1080×1920", width: 1080, height: 1920, aspectClass: "w-3.5 h-6", templateId: "lavender-dusk" },
+  { id: "twitter-post", label: "X / Social", sizeLabel: "1600×900", width: 1600, height: 900, aspectClass: "w-7 h-4", templateId: "ocean-mist" },
+];
 
 interface BoardHomeProps {
   onOpenBoard: (id: string) => void;
@@ -115,7 +137,7 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
         const json = await invoke<string>("load_board", { id: newId });
         const doc = JSON.parse(json);
         doc.id = newId;
-        doc.name = `${board.name || "Untitled board"} copy`;
+        doc.name = `${board.name || "Untitled design"} copy`;
         const now = new Date().toISOString();
         doc.createdAt = now;
         doc.updatedAt = now;
@@ -148,37 +170,39 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
   }, [showTemplates]);
 
   const handleCreate = useCallback(
-    async (template: BoardTemplate) => {
+    async (template: BoardTemplate, sizeOverride?: { width: number; height: number; namePrefix?: string }) => {
       setIsCreating(true);
       setShowTemplates(false);
       setError(null);
       try {
         const id = crypto.randomUUID();
         const existingCount = boards?.length ?? 0;
-        let doc = applyBoardTemplate(createEmptyBoardDocument(id, `Board ${existingCount + 1}`), template);
-        if (selectedSize) doc = { ...doc, canvasWidth: selectedSize.width, canvasHeight: selectedSize.height };
+        const name = sizeOverride?.namePrefix ? `${sizeOverride.namePrefix} ${existingCount + 1}` : `Design ${existingCount + 1}`;
+        let doc = applyBoardTemplate(createEmptyBoardDocument(id, name), template);
+        const targetSize = sizeOverride ?? selectedSize;
+        if (targetSize) doc = { ...doc, canvasWidth: targetSize.width, canvasHeight: targetSize.height };
         await invoke("create_board", { id, name: doc.name, json: JSON.stringify(doc) });
         onOpenBoard(id);
       } catch (err) {
-        console.error("Failed to create board:", err);
+        console.error("Failed to create design:", err);
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setIsCreating(false);
       }
     },
-    [boards, onOpenBoard]
+    [boards, onOpenBoard, selectedSize]
   );
 
   return (
     <div className="relative flex flex-col items-center justify-start h-full w-full gap-6 px-8 py-10 overflow-y-auto">
-      <div className="relative flex flex-col items-center gap-3 text-center">
-        <div className="flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
-          <IoImagesOutline size={28} />
+      <div className="relative flex flex-col items-center gap-3 text-center w-full max-w-3xl">
+        <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-gray-200/80 dark:bg-neutral-800 text-gray-600 dark:text-neutral-300">
+          <IoImagesOutline size={26} />
         </div>
         <div>
-          <p className="text-gray-700 dark:text-neutral-200 font-medium">Boards</p>
-          <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-            Arrange several images into one composed layout, then export it as a new image.
+          <p className="text-lg text-gray-800 dark:text-neutral-100 font-semibold tracking-tight">Design</p>
+          <p className="text-gray-500 dark:text-neutral-400 text-sm mt-0.5">
+            Create social posts, collages, and thumbnails with cutouts, frames, and typography.
           </p>
         </div>
         <div className="relative">
@@ -189,26 +213,17 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
               setShowTemplates((prev) => !prev);
             }}
             disabled={isCreating}
-            className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+            className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-lg bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
           >
-            <IoAdd size={16} /> New board
+            <IoAdd size={16} /> New design
             <IoChevronDown size={14} className={`transition-transform ${showTemplates ? "rotate-180" : ""}`} />
           </button>
 
-          {/* Template picker - a starting background/padding preset, not a locked-in choice (see
-              boardTemplates.ts's own doc comment: every field it sets stays freely editable
-              afterward). No portal needed here (unlike BoardEditor.tsx's own dropdowns) - nothing
-              in this tree uses a stacking-context-creating filter/backdrop-blur. */}
           {showTemplates && (
             <div
               onClick={(e) => e.stopPropagation()}
               className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-80 rounded-xl bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 shadow-xl p-3 z-20"
             >
-              {/* Paired with the style template grid below (see selectedSize's own doc comment) -
-                  picks the new board's starting canvas size, most usefully one of the named
-                  social-platform presets (Instagram Post/Story, etc. - see boardCanvasSizes.ts) so
-                  a board meant for a specific platform starts at that platform's exact pixel
-                  dimensions instead of needing a resize later. */}
               <label className="flex items-center justify-between gap-2 mb-3 px-1">
                 <span className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500">Size</span>
                 <select
@@ -230,35 +245,60 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                   ))}
                 </select>
               </label>
-              <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 px-1">Start from a template</p>
-              <div className="grid grid-cols-3 gap-2">
+              <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 px-1">Start from a backdrop</p>
+              <div className="grid grid-cols-4 gap-2">
                 {BOARD_TEMPLATES.map((template) => (
                   <button
                     key={template.id}
                     type="button"
                     onClick={() => void handleCreate(template)}
                     disabled={isCreating}
-                    className="group flex flex-col gap-1.5 rounded-lg text-left disabled:opacity-50"
+                    className="group flex flex-col gap-1 rounded-lg text-left disabled:opacity-50"
                   >
                     <div
                       style={templatePreviewStyle(template)}
                       className="aspect-square rounded-md border border-gray-200 dark:border-neutral-700 group-hover:border-blue-400 dark:group-hover:border-blue-500 transition-colors"
                     />
-                    <span className="text-[11px] text-gray-600 dark:text-neutral-300 truncate px-0.5">{template.name}</span>
+                    <span className="text-[10.5px] text-gray-600 dark:text-neutral-300 truncate px-0.5">{template.name}</span>
                   </button>
                 ))}
               </div>
             </div>
           )}
         </div>
+
+        {/* 1-click social canvas format starters */}
+        <div className="w-full pt-2">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            {QUICK_SOCIAL_STARTERS.map((starter) => {
+              const tpl = BOARD_TEMPLATES.find((t) => t.id === starter.templateId) ?? BOARD_TEMPLATES[0];
+              return (
+                <button
+                  key={starter.id}
+                  type="button"
+                  disabled={isCreating}
+                  onClick={() => void handleCreate(tpl, { width: starter.width, height: starter.height, namePrefix: starter.label })}
+                  className="group flex flex-col items-center justify-center gap-1.5 px-2.5 py-2.5 rounded-xl bg-white/90 dark:bg-neutral-900/90 border border-gray-200/80 dark:border-neutral-800 hover:border-blue-400/80 dark:hover:border-blue-500 hover:shadow-sm transition-all disabled:opacity-50"
+                >
+                  <span
+                    style={templatePreviewStyle(tpl)}
+                    className={`${starter.aspectClass} rounded-[4px] border border-black/15 dark:border-white/15 shadow-xs group-hover:scale-105 transition-transform`}
+                  />
+                  <span className="text-xs font-medium text-gray-700 dark:text-neutral-200 truncate max-w-full">{starter.label}</span>
+                  <span className="text-[10px] tabular-nums text-gray-400 dark:text-neutral-500">{starter.sizeLabel}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
         {error && <p className="text-red-500 dark:text-red-400 text-xs">{error}</p>}
       </div>
 
       {boards && boards.length > 0 && (
         <div className="relative w-full max-w-3xl">
-          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Your boards</p>
-          {/* Only worth the extra chrome once there's enough boards that scanning the grid by eye
-              stops being faster than typing a name - a handful of boards doesn't need a search box
+          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Your designs</p>
+          {/* Only worth the extra chrome once there's enough designs that scanning the grid by eye
+              stops being faster than typing a name - a handful of designs doesn't need a search box
               sitting above them. */}
           {boards.length > 6 && (
             <div className="relative max-w-xs mx-auto mb-3">
@@ -267,16 +307,16 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search boards..."
+                placeholder="Search designs..."
                 className="w-full h-8 pl-8 pr-2.5 rounded-md border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-sm text-gray-700 dark:text-neutral-200 outline-none focus:border-blue-400 dark:focus:border-blue-500 transition-colors"
               />
             </div>
           )}
           {(() => {
             const query = searchQuery.trim().toLowerCase();
-            const filteredBoards = query ? boards.filter((board) => (board.name || "Untitled board").toLowerCase().includes(query)) : boards;
+            const filteredBoards = query ? boards.filter((board) => (board.name || "Untitled design").toLowerCase().includes(query)) : boards;
             if (filteredBoards.length === 0) {
-              return <p className="text-center text-sm text-gray-400 dark:text-neutral-500 py-6">No boards match "{searchQuery.trim()}"</p>;
+              return <p className="text-center text-sm text-gray-400 dark:text-neutral-500 py-6">No designs match "{searchQuery.trim()}"</p>;
             }
             return (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
@@ -303,7 +343,7 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                 <div className="absolute top-1.5 right-1.5 z-10">
                   <button
                     type="button"
-                    title="Board options"
+                    title="Design options"
                     onClick={(e) => {
                       e.stopPropagation();
                       setConfirmDeleteId(null);
@@ -328,12 +368,12 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                         className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
                       >
                         <IoCopyOutline size={14} />
-                        {duplicatingId === board.id ? "Duplicating…" : "Duplicate board"}
+                        {duplicatingId === board.id ? "Duplicating…" : "Duplicate design"}
                       </button>
                       <button
                         type="button"
                         onClick={() => {
-                          setInfoItem({ id: board.id, name: board.name || "Untitled board" });
+                          setInfoItem({ id: board.id, name: board.name || "Untitled design" });
                           setOpenMenuId(null);
                         }}
                         className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700"
@@ -348,7 +388,7 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                         className="w-full flex items-center gap-1.5 text-left px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10"
                       >
                         <IoTrashOutline size={14} />
-                        {confirmDeleteId === board.id ? "Confirm delete?" : "Delete board"}
+                        {confirmDeleteId === board.id ? "Confirm delete?" : "Delete design"}
                       </button>
                     </div>
                   )}
@@ -362,7 +402,7 @@ const BoardHome: React.FC<BoardHomeProps> = ({ onOpenBoard }) => {
                   )}
                 </div>
                 <div className="px-2.5 py-2">
-                  <p className="text-sm text-gray-700 dark:text-neutral-200 truncate">{board.name || "Untitled board"}</p>
+                  <p className="text-sm text-gray-700 dark:text-neutral-200 truncate">{board.name || "Untitled design"}</p>
                   <p className="text-xs text-gray-400 dark:text-neutral-500">{formatUpdatedAt(board.updated_at)}</p>
                 </div>
               </div>

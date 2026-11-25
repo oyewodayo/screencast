@@ -469,7 +469,7 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
                 >
                   <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                   <span className="flex-1 text-left">
-                    {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
+                    {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to Design` : "Add to Design"}
                   </span>
                 </button>
               )}
