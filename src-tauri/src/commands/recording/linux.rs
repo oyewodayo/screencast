@@ -672,13 +672,14 @@ pub async fn take_screenshot(
     let ffmpeg_path = get_ffmpeg_path(app_handle)?;
     let output_path = output_path.clone();
     let input_args = x11grab_input_args(&resolve_capture_target(app_handle, form_data))?;
+    let capture_cursor = form_data.capture_cursor;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<String> = vec![
         "-f".to_string(),
         "x11grab".to_string(),
         "-draw_mouse".to_string(),
-        (form_data.capture_cursor as u8).to_string(),
+        (capture_cursor as u8).to_string(),
     ];
         args.extend(input_args);
         args.extend(vec![

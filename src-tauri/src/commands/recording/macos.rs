@@ -763,13 +763,14 @@ pub async fn take_screenshot(
     let (video_devices, _audio_devices) = list_avfoundation_devices(app_handle)?;
     let (screen_index, crop) = resolve_screen_target(&video_devices, form_data)?;
     let output_path = output_path.clone();
+    let capture_cursor = form_data.capture_cursor;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<String> = vec![
             "-f".to_string(),
             "avfoundation".to_string(),
             "-capture_cursor".to_string(),
-            (form_data.capture_cursor as u8).to_string(),
+            (capture_cursor as u8).to_string(),
             "-i".to_string(),
             av_input_spec(Some(screen_index), None),
         ];
