@@ -12,6 +12,7 @@
 
 import { wrapTextToWidth } from "../utils/canvasText";
 import { preloadWhiteboardFontsForNodes } from "../utils/whiteboardFonts";
+import { drawStickerIcon } from "../utils/stickerIcons";
 import { buildTaperedFreehandPathD } from "./whiteboardFreehand";
 import { getCollapsedState } from "./whiteboardMindmapHandlers";
 import katex from "katex";
@@ -63,6 +64,89 @@ export const DEFAULT_SHADOW_BLUR = 12;
 export const DEFAULT_SHADOW_OFFSET_X = 0;
 export const DEFAULT_SHADOW_OFFSET_Y = 4;
 export const DEFAULT_SHADOW_OPACITY = 0.25;
+
+export function shadeHexColor(hex: string, factor: number): string {
+  const clean = hex.trim().replace("#", "");
+  const full = clean.length === 3 ? clean.split("").map((ch) => ch + ch).join("") : clean;
+  const num = parseInt(full, 16);
+  if (isNaN(num)) return "#1d4ed8";
+  const adjust = (ch: number) => Math.max(0, Math.min(255, Math.round(factor < 0 ? ch * (1 + factor) : ch + (255 - ch) * factor)));
+  const r = adjust((num >> 16) & 255);
+  const g = adjust((num >> 8) & 255);
+  const b = adjust(num & 255);
+  return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+
+export interface FolderGeometry {
+  tabH: number;
+  pocketY: number;
+  radius: number;
+  backD: string;
+  frontD: string;
+  paperRect: { x: number; y: number; w: number; h: number; r: number };
+}
+
+/**
+ * Shared realistic layered folder geometry (rounded back tab plate, peeking crisp paper sheet, and
+ * front pocket cover with customizable cornerRadius) used identically across live canvas, shape
+ * previews, PNG/PDF export, and vector SVG export.
+ */
+export function buildFolderGeometry(w: number, h: number, cornerRadius = 12): FolderGeometry {
+  const f = (v: number) => +v.toFixed(2);
+  const tabH = Math.max(8, Math.min(28, h * 0.17));
+  const tabW = Math.max(24, Math.min(w * 0.46, w * 0.38));
+  const shoulder = Math.min(tabH * 0.85, (w - tabW) * 0.35);
+  const pocketY = tabH + Math.max(5, Math.min(12, h * 0.065));
+  const r = Math.max(0, Math.min(cornerRadius, w * 0.28, (h - pocketY) * 0.45));
+  const trTab = Math.min(Math.max(3, r * 0.65), tabH * 0.6, tabW * 0.35);
+  const trBack = Math.min(Math.max(3, r * 0.7), (h - tabH) * 0.25);
+
+  const backD = [
+    `M${f(trTab)},0`,
+    `L${f(tabW - trTab)},0`,
+    `Q${f(tabW)},0 ${f(tabW + shoulder * 0.35)},${f(tabH * 0.45)}`,
+    `L${f(tabW + shoulder * 0.7)},${f(tabH * 0.85)}`,
+    `Q${f(tabW + shoulder)},${f(tabH)} ${f(tabW + shoulder + 4)},${f(tabH)}`,
+    `L${f(w - trBack)},${f(tabH)}`,
+    `Q${f(w)},${f(tabH)} ${f(w)},${f(tabH + trBack)}`,
+    `L${f(w)},${f(h - r)}`,
+    r > 0 ? `Q${f(w)},${f(h)} ${f(w - r)},${f(h)}` : "",
+    `L${f(r)},${f(h)}`,
+    r > 0 ? `Q0,${f(h)} 0,${f(h - r)}` : "",
+    `L0,${f(trTab)}`,
+    `Q0,0 ${f(trTab)},0`,
+    "Z",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const frontTopR = Math.min(r, (h - pocketY) * 0.32);
+  const frontD = [
+    `M${f(frontTopR)},${f(pocketY)}`,
+    `L${f(w - frontTopR)},${f(pocketY)}`,
+    frontTopR > 0 ? `Q${f(w)},${f(pocketY)} ${f(w)},${f(pocketY + frontTopR)}` : "",
+    `L${f(w)},${f(h - r)}`,
+    r > 0 ? `Q${f(w)},${f(h)} ${f(w - r)},${f(h)}` : "",
+    `L${f(r)},${f(h)}`,
+    r > 0 ? `Q0,${f(h)} 0,${f(h - r)}` : "",
+    `L0,${f(pocketY + frontTopR)}`,
+    frontTopR > 0 ? `Q0,${f(pocketY)} ${f(frontTopR)},${f(pocketY)}` : "",
+    "Z",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const paperPadX = Math.max(6, w * 0.065);
+  const paperRect = {
+    x: f(paperPadX),
+    y: f(tabH + 2.5),
+    w: f(Math.max(8, w - paperPadX * 2)),
+    h: f(Math.max(8, h * 0.24)),
+    r: f(Math.min(5, Math.max(2, r * 0.35))),
+  };
+
+  return { tabH, pocketY, radius: r, backD, frontD, paperRect };
+}
 
 export function hexToRgba(color: string, alpha: number): string {
   const c = color.trim();
@@ -2902,13 +2986,37 @@ function baseShapeOutline(shapeType: WhiteboardShapeType, w: number, h: number, 
     }
     case "note": {
       // A rectangle with the top-right corner cut diagonally (the folded-corner sticky-note look),
-      // plus a crease line tracing the fold so the cut doesn't just look like a chamfered rectangle.
-      const fold = Math.min(w, h) * 0.28;
+      // plus a crease line tracing the fold. Supports rounding the three non-folded corners cleanly
+      // via `cornerRadius` without detaching the fold crease.
+      const fold = Math.min(w, h) * 0.24;
+      const maxR = Math.max(0, Math.min(w - fold - 4, h - fold - 4, Math.min(w, h) / 2));
+      const r = Math.max(0, Math.min(opts?.cornerRadius ?? 0, maxR));
+      if (r > 0) {
+        const f = (v: number) => +v.toFixed(2);
+        const outer = [
+          `M${f(r)},0`,
+          `L${f(w - fold)},0`,
+          `L${f(w)},${f(fold)}`,
+          `L${f(w)},${f(h - r)}`,
+          `Q${f(w)},${f(h)} ${f(w - r)},${f(h)}`,
+          `L${f(r)},${f(h)}`,
+          `Q0,${f(h)} 0,${f(h - r)}`,
+          `L0,${f(r)}`,
+          `Q0,0 ${f(r)},0`,
+          "Z",
+        ].join(" ");
+        const crease = `M${f(w - fold)},0 L${f(w - fold)},${f(fold)} L${f(w)},${f(fold)}`;
+        return { kind: "path", d: `${outer} ${crease}` };
+      }
       return {
         kind: "polygon",
         points: [[0, 0], [w - fold, 0], [w, fold], [w, h], [0, h]],
         innerLines: [[[w - fold, 0], [w - fold, fold], [w, fold]]],
       };
+    }
+    case "folder": {
+      const geo = buildFolderGeometry(w, h, opts?.cornerRadius ?? 12);
+      return { kind: "path", d: geo.backD };
     }
     case "callout": {
       // A rectangle with a small triangular tail poking out of the bottom-left area - the
@@ -3245,6 +3353,8 @@ function cornerDirectionLabel(nx: number, ny: number): string {
 // a diamond; etc.), accounting for horizontal/vertical flips so labels match the on-screen corners.
 export function detectShapeCorners(node: WhiteboardNode): DetectedShapeCorner[] {
   if (!supportsCornerRadius(node)) return [];
+  // Note and Folder expose a single uniform Corner radius slider rather than per-vertex sliders.
+  if (node.shapeType === "note" || node.shapeType === "folder") return [];
   const { width: w, height: h } = node;
   let points: [number, number][];
   if (node.shapeType === "rectangle" || node.shapeType === "equation" || node.shapeType === "image") {
@@ -3305,7 +3415,7 @@ function roundOutlineCorners(
 // equation cards (their own rounded "rect" body), images (unless masked as an ellipse), and every plain polygon
 // outline roundOutlineCorners accepts.
 export function supportsCornerRadius(node: WhiteboardNode): boolean {
-  if (node.shapeType === "rectangle" || node.shapeType === "equation") return true;
+  if (node.shapeType === "rectangle" || node.shapeType === "equation" || node.shapeType === "note" || node.shapeType === "folder") return true;
   if (node.shapeType === "image") return (node.imageMask ?? "rect") !== "ellipse";
   if (node.shapeType === "table") return false;
   const outline = baseShapeOutline(node.shapeType, node.width, node.height, outlineOptionsFor(node));
@@ -4678,6 +4788,48 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
       const startDeg = (Math.atan2(first.y - afterFirst.y, first.x - afterFirst.x) * 180) / Math.PI;
       drawArrowhead(ctx, node.startArrowType ?? "none", first.x, first.y, startDeg, node.strokeColor, node.strokeWidth);
     }
+  } else if (node.shapeType === "folder") {
+    const baseFill = resolveNodeFill(node) ?? "#3b82f6";
+    const backFill = shadeHexColor(baseFill, -0.22);
+    const geo = buildFolderGeometry(node.width, node.height, node.cornerRadius ?? 12);
+    // 1. Back tab plate
+    ctx.fillStyle = backFill;
+    ctx.fill(new Path2D(geo.backD));
+    // 2. Peeking paper sheet
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(geo.paperRect.x, geo.paperRect.y, geo.paperRect.w, geo.paperRect.h, geo.paperRect.r);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.08)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+    // 3. Front pocket with subtle top highlight gradient
+    const frontPath = new Path2D(geo.frontD);
+    const grad = ctx.createLinearGradient(0, geo.pocketY, 0, node.height);
+    grad.addColorStop(0, shadeHexColor(baseFill, 0.12));
+    grad.addColorStop(1, shadeHexColor(baseFill, -0.06));
+    ctx.fillStyle = grad;
+    ctx.fill(frontPath);
+    if (node.strokeWidth > 0) {
+      ctx.strokeStyle = node.strokeColor;
+      ctx.lineWidth = node.strokeWidth;
+      ctx.stroke(frontPath);
+    }
+    paintNodeText(ctx, { ...node, y: node.y, height: node.height });
+  } else if (node.shapeType === "icon") {
+    if (node.fillColor) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(0, 0, node.width, node.height, node.cornerRadius || 12);
+      ctx.fillStyle = node.fillColor;
+      ctx.fill();
+      ctx.restore();
+    }
+    const padFrac = node.fillColor ? 0.68 : 0.92;
+    const iconSize = Math.min(node.width, node.height) * padFrac;
+    drawStickerIcon(ctx, node.iconName ?? "star", node.width / 2, node.height / 2, iconSize, node.strokeColor);
   } else if (node.shapeType === "equation") {
     // Card/background/border first (shapeOutlineFor already resolves "equation" to the same plain
     // "rect" kind as "rectangle"/"text" - see its own doc comment), THEN the typeset formula drawn

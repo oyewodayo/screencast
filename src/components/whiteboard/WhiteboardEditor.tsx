@@ -61,14 +61,17 @@ import {
   WhiteboardShapeType,
 } from "../../utils/whiteboardTypes";
 import { resolveCanvasTheme, WHITEBOARD_CANVAS_THEMES } from "../../utils/whiteboardThemes";
+import { StickerIcon } from "../../utils/stickerIcons";
 import { canvasesToMultiPagePdfBytes, canvasToPdfBytes, canvasToPngBytes } from "../../handlers/pdfExportHandlers";
 import {
+  buildFolderGeometry,
   computeContentBounds,
   LayerReorderAction,
   renderWhiteboardToCanvas,
   reorderPageItems,
   reorderPageItemsByDrag,
   resolveEdgeEndpoints,
+  shadeHexColor,
   shapeOutlineFor,
   CYLINDER_CAP_RATIO,
   SERIES_FILL_OPACITY,
@@ -83,9 +86,11 @@ import {
   AlignMode,
   alignNodes,
   applyStyleSnapshot,
+  arrangeArtboardFrames,
   DistributeAxis,
   distributeNodes,
   extractStyleSnapshot,
+  FrameArrangeAction,
   getOrderedArtboards,
   MatchSizeDimension,
   matchNodeSize,
@@ -108,12 +113,18 @@ import WhiteboardSearchBar from "./WhiteboardSearchBar";
 import WhiteboardTopicDrawer from "./WhiteboardTopicDrawer";
 import WhiteboardPresentationBar from "./WhiteboardPresentationBar";
 import WhiteboardCommandPalette, { WhiteboardCommandItem } from "./WhiteboardCommandPalette";
-import WhiteboardImportModal from "./WhiteboardImportModal";
+import WhiteboardImportModal, { WhiteboardImportTabId } from "./WhiteboardImportModal";
 import WhiteboardShortcutsModal from "./WhiteboardShortcutsModal";
 import WhiteboardToolRail from "./WhiteboardToolRail";
 import WhiteboardViewPill from "./WhiteboardViewPill";
 import WhiteboardEmptyState from "./WhiteboardEmptyState";
 import { exportWhiteboardToSvg, switchNodesShapeType } from "../../handlers/whiteboardInterchangeHandlers";
+import {
+  importPdfSlides,
+  importPptxSlides,
+  layoutImportedSlides,
+  SlideImageSaver,
+} from "../../handlers/whiteboardSlidesImport";
 import LinksControl from "../links/LinksControl";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
@@ -296,7 +307,17 @@ const MINDMAP_AND_FRAME_PRESETS: ShapePreset[] = [
   {
     type: "note",
     label: "Sticky Note",
-    overrides: { fillColor: "#fef08a", strokeColor: "#eab308", strokeWidth: 1.5, shadowEnabled: true, shadowBlur: 10, shadowOffsetY: 3, shadowOpacity: 0.14 },
+    overrides: { fillColor: "#fef08a", strokeColor: "#eab308", strokeWidth: 1.5, cornerRadius: 8, shadowEnabled: true, shadowBlur: 10, shadowOffsetY: 3, shadowOpacity: 0.14 },
+  },
+  {
+    type: "folder",
+    label: "Folder (Blue)",
+    overrides: { fillColor: "#3b82f6", strokeColor: "#1d4ed8", strokeWidth: 1.25, cornerRadius: 12, fontColor: "#ffffff", fontWeight: "bold", shadowEnabled: true, shadowBlur: 12, shadowOffsetY: 4, shadowOpacity: 0.16 },
+  },
+  {
+    type: "folder",
+    label: "Manila Folder",
+    overrides: { fillColor: "#f59e0b", strokeColor: "#b45309", strokeWidth: 1.25, cornerRadius: 12, fontColor: "#1f2937", fontWeight: "bold", shadowEnabled: true, shadowBlur: 12, shadowOffsetY: 4, shadowOpacity: 0.16 },
   },
   { type: "mindmapTopic", label: "Mind Map Topic" },
   { type: "mindmapSubtopic", label: "Subtopic" },
@@ -349,6 +370,20 @@ function ShapePresetPreview({ preset }: { preset: ShapePreset }) {
   // outline (a plain triangle looks like it has rounded corners purely from the stroke thickness),
   // out of proportion to how the shape actually renders once placed at normal size.
   const sw = 1.25;
+  if (preset.type === "folder") {
+    const baseFill = preset.overrides?.fillColor ?? "#3b82f6";
+    const backFill = shadeHexColor(baseFill, -0.22);
+    const geo = buildFolderGeometry(w, h, 4);
+    return (
+      <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
+        <g transform="translate(2,2)">
+          <path d={geo.backD} fill={backFill} />
+          <rect x={geo.paperRect.x} y={geo.paperRect.y} width={geo.paperRect.w} height={geo.paperRect.h} rx={1.5} fill="#ffffff" />
+          <path d={geo.frontD} fill={baseFill} stroke={stroke} strokeWidth={0.9} />
+        </g>
+      </svg>
+    );
+  }
   return (
     <svg width={TILE_W} height={TILE_H} viewBox={`0 0 ${TILE_W} ${TILE_H}`}>
       <g transform="translate(2,2)">
@@ -697,6 +732,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [exportingSelection, setExportingSelection] = useState(false);
   const [shapesMenuOpen, setShapesMenuOpen] = useState(false);
   const [arrowsMenuOpen, setArrowsMenuOpen] = useState(false);
+  const [iconsMenuOpen, setIconsMenuOpen] = useState(false);
+  const [emojisMenuOpen, setEmojisMenuOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -722,6 +759,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   const [topicDrawerNodeId, setTopicDrawerNodeId] = useState<string | null>(null);
   const [autoLayoutMenuOpen, setAutoLayoutMenuOpen] = useState(false);
   const [showMinimap, setShowMinimap] = useState(true);
+  const [showToolRail, setShowToolRail] = useState(true);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
@@ -738,7 +776,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     | null
   >(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const [importModalTab, setImportModalTab] = useState<"markdown" | "mermaid" | "exportMd" | null>(null);
+  const [importModalTab, setImportModalTab] = useState<WhiteboardImportTabId | null>(null);
+  const [slideDropStatus, setSlideDropStatus] = useState<string | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [editingEdgeLabel, setEditingEdgeLabel] = useState<{ edge: WhiteboardEdge; value: string } | null>(null);
 
@@ -794,6 +833,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     setFormatPainterArmed(false);
     setShapesMenuOpen(false);
     setArrowsMenuOpen(false);
+    setIconsMenuOpen(false);
+    setEmojisMenuOpen(false);
     setAutoLayoutMenuOpen(false);
     setThemeMenuOpen(false);
   }, []);
@@ -849,6 +890,20 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
   }, [arrowsMenuOpen]);
+
+  useEffect(() => {
+    if (!iconsMenuOpen) return;
+    const close = () => setIconsMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [iconsMenuOpen]);
+
+  useEffect(() => {
+    if (!emojisMenuOpen) return;
+    const close = () => setEmojisMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [emojisMenuOpen]);
 
   useEffect(() => {
     if (!quickConnectPicker) return;
@@ -972,6 +1027,34 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     const diff = tidyUpNodes(selectedNodes);
     if (diff.after.length > 0) store.batchEditNodes(diff.before, diff.after);
   }, [selectedNodes, store]);
+
+  const handleArrangeFrame = useCallback(
+    (action: FrameArrangeAction) => {
+      if (!page) return;
+      setContextMenu(null);
+      const diff = arrangeArtboardFrames(page.nodes, page.edges, action);
+      if (diff.afterNodes.length > 0 || diff.afterEdges.length > 0) {
+        if (diff.afterEdges.length > 0) {
+          store.batchEditItems(diff.beforeNodes, diff.afterNodes, diff.beforeEdges, diff.afterEdges);
+        } else {
+          store.batchEditNodes(diff.beforeNodes, diff.afterNodes);
+        }
+      }
+      const focusFrame = diff.targetFrameAfter;
+      if (focusFrame) {
+        setSelectedNodeIds(new Set([focusFrame.id]));
+        setSelectedEdgeIds(new Set());
+        requestAnimationFrame(() =>
+          canvasRef.current?.animateFitToBounds(
+            { minX: focusFrame.x, minY: focusFrame.y, maxX: focusFrame.x + focusFrame.width, maxY: focusFrame.y + focusFrame.height },
+            56,
+            320
+          )
+        );
+      }
+    },
+    [page, store]
+  );
 
   // ---- Phase 2 Pro Controls: Format Painter -----------------------------------------------------
   const handleCopyStyle = useCallback(() => {
@@ -1668,6 +1751,63 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [briefcastDir, whiteboardId]
   );
 
+  const saveSlideImage = useCallback<SlideImageSaver>(
+    async (bytes, mime) => {
+      if (!briefcastDir) throw new Error("Briefcast folder is not available yet");
+      const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+      const assetFileName = await importImageFromBlob(whiteboardId, blob, mime);
+      const url = whiteboardAssetUrl(briefcastDir, whiteboardId, assetFileName);
+      const { width, height } = await measureImage(url).catch(() => ({ width: 960, height: 540 }));
+      return { assetFileName, naturalWidth: width, naturalHeight: height };
+    },
+    [briefcastDir, whiteboardId]
+  );
+
+  const handleSlidesFileDrop = useCallback(
+    async (file: File, docPoint: { x: number; y: number }) => {
+      if (slideDropStatus) return;
+      const lower = file.name.toLowerCase();
+      const isPdf = lower.endsWith(".pdf") || file.type === "application/pdf";
+      setImageError(null);
+      setSlideDropStatus(isPdf ? `Importing ${file.name}…` : `Opening ${file.name}…`);
+      try {
+        const buf = await file.arrayBuffer();
+        const deck = isPdf
+          ? await importPdfSlides(buf, {
+              saveImage: saveSlideImage,
+              onProgress: (_c, _t, label) => setSlideDropStatus(label ?? "Rendering PDF slides…"),
+            })
+          : await importPptxSlides(buf, {
+              saveImage: saveSlideImage,
+              includeSpeakerNotes: true,
+              onProgress: (_c, _t, label) => setSlideDropStatus(label ?? "Importing PowerPoint slides…"),
+            });
+        const laidOut = layoutImportedSlides(deck, "frames", { x: Math.round(docPoint.x), y: Math.round(docPoint.y) });
+        if (laidOut.nodes.length > 0 || laidOut.edges.length > 0) {
+          store.pasteItems(laidOut.nodes, laidOut.edges);
+          setSelectedNodeIds(new Set());
+          setSelectedEdgeIds(new Set());
+          const firstFrame = laidOut.nodes.find((n) => n.shapeType === "artboard");
+          if (firstFrame) {
+            requestAnimationFrame(() =>
+              canvasRef.current?.animateFitToBounds(
+                { minX: firstFrame.x, minY: firstFrame.y, maxX: firstFrame.x + firstFrame.width, maxY: firstFrame.y + firstFrame.height },
+                48,
+                340
+              )
+            );
+          }
+        }
+      } catch (err) {
+        console.error("Failed to import dropped slide file:", err);
+        setImageError(err instanceof Error ? err.message : "Failed to import slide deck");
+      } finally {
+        setSlideDropStatus(null);
+      }
+    },
+    [slideDropStatus, saveSlideImage, store]
+  );
+
   // Plain text from the system clipboard lands as a text node at the middle of the view, its box
   // sized to the text (wrapping past TEXT_PASTE_MAX_WIDTH) rather than the 160x40 default.
   const addTextNode = useCallback(
@@ -1693,6 +1833,73 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     },
     [store]
   );
+
+  const handleInsertIconNode = useCallback(
+    (iconName: StickerIcon) => {
+      const at = viewportCenterDocPoint();
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), "icon", at.x, at.y, { iconName });
+      const node: WhiteboardNode = {
+        ...base,
+        strokeColor: activeCanvasTheme.isDark ? "#f8fafc" : "#111827",
+      };
+      store.addNode(node);
+      setSelectedNodeIds(new Set([node.id]));
+      setSelectedEdgeIds(new Set());
+      setIconsMenuOpen(false);
+    },
+    [viewportCenterDocPoint, activeCanvasTheme.isDark, store]
+  );
+
+  const handleInsertEmojiNode = useCallback(
+    (emoji: string) => {
+      const at = viewportCenterDocPoint();
+      const base = createDefaultWhiteboardNode(crypto.randomUUID(), "text", at.x, at.y);
+      const size = 72;
+      const node: WhiteboardNode = {
+        ...base,
+        x: Math.round(at.x - size / 2),
+        y: Math.round(at.y - size / 2),
+        width: size,
+        height: size,
+        text: emoji,
+        fontSize: 52,
+        textAlign: "center",
+        verticalAlign: "middle",
+      };
+      store.addNode(node);
+      setSelectedNodeIds(new Set([node.id]));
+      setSelectedEdgeIds(new Set());
+      setEmojisMenuOpen(false);
+    },
+    [viewportCenterDocPoint, store]
+  );
+
+  const handleInsertEquationNode = useCallback(() => {
+    deselectTools();
+    const at = viewportCenterDocPoint();
+    const base = createDefaultWhiteboardNode(crypto.randomUUID(), "equation", at.x, at.y);
+    const width = 260;
+    const height = 80;
+    const node: WhiteboardNode = {
+      ...base,
+      x: Math.round(at.x - width / 2),
+      y: Math.round(at.y - height / 2),
+      width,
+      height,
+      text: "y = mx + b",
+      fontSize: 28,
+      fontColor: activeCanvasTheme.isDark ? "#f8fafc" : "#111827",
+      textAlign: "center",
+      verticalAlign: "middle",
+    };
+    store.addNode(node);
+    setSelectedNodeIds(new Set([node.id]));
+    setSelectedEdgeIds(new Set());
+    // Auto-focus the live LaTeX editor in the right-hand Properties Panel
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent("wb-focus-math", { detail: node.id }));
+    }, 40);
+  }, [deselectTools, viewportCenterDocPoint, activeCanvasTheme.isDark, store]);
 
   // Ctrl+C / Ctrl+V go through the native copy/paste events (see canvasClipboard.ts for why), so a
   // screenshot, copied text, and copied shapes all paste through the same keystroke - whichever was
@@ -1731,6 +1938,26 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setCommandPaletteOpen((v) => !v);
+        return;
+      }
+      if (mod && e.key === "\\") {
+        e.preventDefault();
+        setShowToolRail((v) => !v);
+        return;
+      }
+      if (mod && (e.key === "+" || e.key === "=")) {
+        e.preventDefault();
+        canvasRef.current?.zoomBy(1.25);
+        return;
+      }
+      if (mod && e.key === "-") {
+        e.preventDefault();
+        canvasRef.current?.zoomBy(1 / 1.25);
+        return;
+      }
+      if (mod && e.key === "0" && page) {
+        e.preventDefault();
+        canvasRef.current?.fitToContent(computeContentBounds(page));
         return;
       }
       if (presentMode) {
@@ -1980,6 +2207,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       { id: "fit", category: "View", label: "Fit to content", shortcut: "0", run: () => page && canvasRef.current?.fitToContent(computeContentBounds(page)) },
       { id: "zoom-100", category: "View", label: "Reset zoom to 100%", shortcut: "1", run: () => canvasRef.current?.resetView() },
       { id: "minimap", category: "View", label: showMinimap ? "Hide minimap" : "Show minimap", run: () => setShowMinimap((v) => !v) },
+      { id: "tool-rail", category: "View", label: showToolRail ? "Hide tools panel" : "Show tools panel", shortcut: "Ctrl+\\", keywords: "toolbar rail sidebar hide show tools", run: () => setShowToolRail((v) => !v) },
       { id: "grid", category: "View", label: doc?.showGrid ? "Hide grid" : "Show grid", run: () => doc && store.setShowGrid(!doc.showGrid) },
       { id: "layers", category: "View", label: showLayerPanel ? "Hide layers panel" : "Show layers panel", run: () => setShowLayerPanel((v) => !v) },
       { id: "tool-select", category: "Tools", label: "Select tool", shortcut: "V", run: deselectTools },
@@ -1991,6 +2219,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       { id: "tool-ellipse", category: "Tools", label: "Insert Ellipse", shortcut: "O", run: () => { deselectTools(); setArmedShapeType("ellipse"); } },
       { id: "tool-diamond", category: "Tools", label: "Insert Diamond", shortcut: "D", run: () => { deselectTools(); setArmedShapeType("diamond"); } },
       { id: "tool-text", category: "Tools", label: "Insert Text", shortcut: "T", run: () => { deselectTools(); setArmedShapeType("text"); } },
+      { id: "tool-math", category: "Tools", label: "Insert Maths / Equation (LaTeX)", keywords: "math latex formula equation katex sigma", run: handleInsertEquationNode },
+      { id: "tool-icon", category: "Tools", label: "Insert Vector Icon…", keywords: "icon symbol badge glyph", run: () => { deselectTools(); setShowToolRail(true); setIconsMenuOpen(true); } },
+      { id: "tool-emoji", category: "Tools", label: "Insert Emoji…", keywords: "emoji sticker smiley reaction", run: () => { deselectTools(); setShowToolRail(true); setEmojisMenuOpen(true); } },
       { id: "tool-pen", category: "Tools", label: "Pen (tapered ink)", shortcut: "P", run: () => { deselectTools(); setPenHighlighter(false); setArmedShapeType("freehand"); } },
       { id: "tool-highlighter", category: "Tools", label: "Highlighter marker", run: () => { deselectTools(); setPenHighlighter(true); if (penColor === "#111111") setPenColor("#fde047"); if (penWidth < 6) setPenWidth(10); setArmedShapeType("freehand"); } },
       { id: "tool-arrow", category: "Tools", label: "Connector / Arrow", shortcut: "L", run: () => { deselectTools(); setConnectorArmed(true); } },
@@ -2002,6 +2233,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         run: () => store.setCanvasTheme(t.id),
       })),
       { id: "add-page", category: "Pages", label: "Add new page", run: store.addPage },
+      { id: "import-slides", category: "Import", label: "Import PowerPoint (.pptx), Google Slides, or PDF Deck…", keywords: "powerpoint pptx google slides deck pdf presentation", run: () => setImportModalTab("slides") },
       { id: "import-md", category: "Import", label: "Markdown Outline → Generate Mind Map…", keywords: "markdown bullets outline parse", run: () => setImportModalTab("markdown") },
       { id: "import-mermaid", category: "Import", label: "Mermaid Flowchart → Generate Diagram…", keywords: "mermaid code flowchart graph", run: () => setImportModalTab("mermaid") },
       { id: "export-md", category: "Export", label: "Export Mind Map as Markdown Outline…", keywords: "markdown docs copy", run: () => setImportModalTab("exportMd") },
@@ -2015,6 +2247,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     }
     if (orderedFrames.length > 0) {
       items.push({ id: "export-deck", category: "Export", label: `Export ${orderedFrames.length} frames as Slide Deck PDF…`, keywords: "slides presentation pdf", run: () => void handleExportMultiPagePdf("framesDeck", true) });
+    }
+    if (orderedFrames.length >= 2) {
+      items.push({ id: "arrange-frames", category: "Arrange", label: `Arrange all ${orderedFrames.length} slides/frames into neat grid`, keywords: "slides artboard frames grid order align tidy", run: () => handleArrangeFrame({ kind: "arrangeAll" }) });
     }
     if ((doc?.pages.length ?? 0) > 1) {
       items.push({ id: "export-all-pages", category: "Export", label: `Export all ${doc?.pages.length} pages as Multi-Page PDF…`, keywords: "pdf", run: () => void handleExportMultiPagePdf("allPages", true) });
@@ -2038,7 +2273,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       });
     }
     return items;
-  }, [orderedFrames.length, studyMode, showMinimap, showLayerPanel, doc, page, selectedNodes.length, store, enterPresentMode, handleAutoLayout, deselectTools, handleSaveAs, handleExportMultiPagePdf, handleTidyUp, handleAlign, insertTemplateOntoPage]);
+  }, [orderedFrames.length, studyMode, showMinimap, showToolRail, showLayerPanel, doc, page, selectedNodes.length, store, enterPresentMode, handleAutoLayout, deselectTools, handleSaveAs, handleExportMultiPagePdf, handleTidyUp, handleAlign, handleArrangeFrame, insertTemplateOntoPage]);
 
   const handleBack = useCallback(async () => {
     store.flushSave();
@@ -2307,9 +2542,9 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <IoSearchOutline size={15} />
         </ToolbarButton>
         <ToolbarButton
-          title="Import Markdown / Mermaid or export Markdown outline"
+          title="Import Slides (PowerPoint / Google Slides / PDF), Markdown, or Mermaid"
           active={importModalTab !== null}
-          onClick={() => setImportModalTab("markdown")}
+          onClick={() => setImportModalTab("slides")}
         >
           <IoCodeSlashOutline size={15} />
         </ToolbarButton>
@@ -2514,6 +2749,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           removingBackgroundNodeId={removingBackgroundNodeId}
           imageSrcFor={imageSrcFor}
           onImageDrop={(files, docPoint) => void addImagesFromBlobs(files, docPoint)}
+          onSlidesFileDrop={(file, docPoint) => void handleSlidesFileDrop(file, docPoint)}
           croppingNodeId={croppingNodeId}
           setCroppingNodeId={setCroppingNodeId}
           previewNodes={previewNodes}
@@ -2577,7 +2813,18 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           formatPainterActive={formatPainterArmed}
           onApplyFormatPainter={handleApplyFormatPainterToNode}
         />
-        {!presentMode && !studyMode && (
+        {!presentMode && !studyMode && !showToolRail && (
+          <button
+            type="button"
+            title="Show tools (Ctrl+\)"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => setShowToolRail(true)}
+            className="absolute left-2.5 top-1/2 -translate-y-1/2 z-20 flex items-center justify-center w-7 h-11 rounded-xl bg-white dark:bg-neutral-900 border border-gray-200/90 dark:border-neutral-700/90 shadow-lg text-neutral-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+          >
+            <IoChevronForward size={15} />
+          </button>
+        )}
+        {!presentMode && !studyMode && showToolRail && (
           <WhiteboardToolRail
             armedShapeType={armedShapeType}
             armedNodeIsSticky={armedNodeIsSticky}
@@ -2592,6 +2839,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             penWidth={penWidth}
             shapesMenuOpen={shapesMenuOpen}
             arrowsMenuOpen={arrowsMenuOpen}
+            iconsMenuOpen={iconsMenuOpen}
+            emojisMenuOpen={emojisMenuOpen}
             shapesPopover={
               shapesMenuOpen ? (
                 <div
@@ -2658,6 +2907,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
                 const next = !prev;
                 if (next) {
                   setArrowsMenuOpen(false);
+                  setIconsMenuOpen(false);
+                  setEmojisMenuOpen(false);
                   setLaserArmed(false);
                   setHandArmed(false);
                 }
@@ -2673,6 +2924,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
                   fillColor: "#fef08a",
                   strokeColor: "#eab308",
                   strokeWidth: 1.5,
+                  cornerRadius: 8,
                   shadowEnabled: true,
                   shadowBlur: 10,
                   shadowOffsetY: 3,
@@ -2696,6 +2948,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
                 const next = !prev;
                 if (next) {
                   setShapesMenuOpen(false);
+                  setIconsMenuOpen(false);
+                  setEmojisMenuOpen(false);
                   setLaserArmed(false);
                   setHandArmed(false);
                 }
@@ -2710,26 +2964,60 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
               deselectTools();
               if (next) setArmedShapeType("artboard");
             }}
-            onInsertImage={() => void handleInsertImage()}
-            onArmEquation={() => {
-              const next = armedShapeType !== "equation";
-              deselectTools();
-              if (next) setArmedShapeType("equation");
+            onToggleIconsMenu={(e) => {
+              e.stopPropagation();
+              setIconsMenuOpen((prev) => {
+                const next = !prev;
+                if (next) {
+                  setShapesMenuOpen(false);
+                  setArrowsMenuOpen(false);
+                  setEmojisMenuOpen(false);
+                  setLaserArmed(false);
+                  setHandArmed(false);
+                }
+                return next;
+              });
             }}
+            onInsertIcon={handleInsertIconNode}
+            onToggleEmojisMenu={(e) => {
+              e.stopPropagation();
+              setEmojisMenuOpen((prev) => {
+                const next = !prev;
+                if (next) {
+                  setShapesMenuOpen(false);
+                  setArrowsMenuOpen(false);
+                  setIconsMenuOpen(false);
+                  setLaserArmed(false);
+                  setHandArmed(false);
+                }
+                return next;
+              });
+            }}
+            onInsertEmoji={handleInsertEmojiNode}
+            onInsertImage={() => void handleInsertImage()}
+            onInsertEquation={handleInsertEquationNode}
             onToggleFormatPainter={handleToggleFormatPainter}
             onToggleLaser={() => {
               const next = !laserArmed;
               deselectTools();
               if (next) setLaserArmed(true);
             }}
+            onHideRail={() => setShowToolRail(false)}
           />
         )}
         {!presentMode && page.nodes.length === 0 && page.edges.length === 0 && (
           <WhiteboardEmptyState
             onInsertTemplate={insertTemplateOntoPage}
             onOpenImport={() => setImportModalTab("markdown")}
+            onOpenSlidesImport={() => setImportModalTab("slides")}
             isDarkCanvas={activeCanvasTheme.isDark}
           />
+        )}
+        {slideDropStatus && (
+          <div className="pointer-events-none absolute top-4 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3.5 py-2 rounded-full bg-neutral-900 text-white text-xs font-medium shadow-xl">
+            <span className="w-3 h-3 rounded-full border-2 border-white border-t-transparent animate-spin" />
+            <span>{slideDropStatus}</span>
+          </div>
         )}
         {!presentMode && (
           <WhiteboardViewPill
@@ -2777,16 +3065,35 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           <WhiteboardImportModal
             page={page}
             initialTab={importModalTab}
+            onSaveSlideImage={saveSlideImage}
+            onAppendPages={(newPages) => {
+              store.appendPages(newPages);
+              setSelectedNodeIds(new Set());
+              setSelectedEdgeIds(new Set());
+            }}
             onInsertItems={(newNodes, newEdges) => {
               store.pasteItems(newNodes, newEdges);
-              setSelectedNodeIds(new Set(newNodes.map((n) => n.id)));
-              setSelectedEdgeIds(new Set());
-              if (newNodes.length > 0) {
-                const minX = Math.min(...newNodes.map((n) => n.x));
-                const minY = Math.min(...newNodes.map((n) => n.y));
-                const maxX = Math.max(...newNodes.map((n) => n.x + n.width));
-                const maxY = Math.max(...newNodes.map((n) => n.y + n.height));
-                requestAnimationFrame(() => canvasRef.current?.animateFitToBounds({ minX, minY, maxX, maxY }, 64, 340));
+              const firstFrame = newNodes.find((n) => n.shapeType === "artboard");
+              if (firstFrame && newNodes.filter((n) => n.shapeType === "artboard").length >= 2) {
+                setSelectedNodeIds(new Set());
+                setSelectedEdgeIds(new Set());
+                requestAnimationFrame(() =>
+                  canvasRef.current?.animateFitToBounds(
+                    { minX: firstFrame.x, minY: firstFrame.y, maxX: firstFrame.x + firstFrame.width, maxY: firstFrame.y + firstFrame.height },
+                    48,
+                    340
+                  )
+                );
+              } else {
+                setSelectedNodeIds(new Set(newNodes.map((n) => n.id)));
+                setSelectedEdgeIds(new Set());
+                if (newNodes.length > 0) {
+                  const minX = Math.min(...newNodes.map((n) => n.x));
+                  const minY = Math.min(...newNodes.map((n) => n.y));
+                  const maxX = Math.max(...newNodes.map((n) => n.x + n.width));
+                  const maxY = Math.max(...newNodes.map((n) => n.y + n.height));
+                  requestAnimationFrame(() => canvasRef.current?.animateFitToBounds({ minX, minY, maxX, maxY }, 64, 340));
+                }
               }
             }}
             onClose={() => setImportModalTab(null)}
@@ -2990,10 +3297,10 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       {contextMenu && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="fixed z-30 w-52 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200"
+          className="fixed z-30 w-56 max-h-[80vh] overflow-y-auto bg-white dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-lg shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200"
           style={{
-            left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 216)),
-            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 240)),
+            left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 232)),
+            top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 360)),
           }}
         >
           <button
@@ -3096,15 +3403,65 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             const id = [...contextMenu.nodeIds][0];
             const node = page?.nodes.find((n) => n.id === id);
             if (!node || !isArtboardNode(node)) return null;
+            const frameIdx = orderedFrames.findIndex((f) => f.id === node.id);
+            const hasMultiple = orderedFrames.length >= 2;
             return (
-              <button
-                type="button"
-                disabled={exportingSelection}
-                onClick={() => void handleExportFramePng(node)}
-                className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
-              >
-                <IoImageOutline size={14} /> Export frame as PNG (2×)
-              </button>
+              <>
+                {hasMultiple && (
+                  <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70 pt-1">
+                    <p className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                      Slide / Frame Position
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleArrangeFrame({ kind: "moveToStart", frameId: node.id })}
+                      className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                    >
+                      <IoChevronBack size={13} /> Move to start (before Slide 1)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleArrangeFrame({ kind: "moveToEnd", frameId: node.id })}
+                      className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700"
+                    >
+                      <IoChevronForward size={13} /> Move to end (after last slide)
+                    </button>
+                    <div className="grid grid-cols-2 gap-1 px-2.5 py-1">
+                      <button
+                        type="button"
+                        disabled={frameIdx <= 0}
+                        onClick={() => handleArrangeFrame({ kind: "moveEarlier", frameId: node.id })}
+                        className="h-6 rounded text-[11px] font-medium bg-gray-50 dark:bg-neutral-700/60 hover:bg-blue-50 dark:hover:bg-blue-500/20 hover:text-blue-600 dark:hover:text-blue-300 disabled:opacity-35 transition-colors"
+                      >
+                        ← Earlier
+                      </button>
+                      <button
+                        type="button"
+                        disabled={frameIdx < 0 || frameIdx >= orderedFrames.length - 1}
+                        onClick={() => handleArrangeFrame({ kind: "moveLater", frameId: node.id })}
+                        className="h-6 rounded text-[11px] font-medium bg-gray-50 dark:bg-neutral-700/60 hover:bg-blue-50 dark:hover:bg-blue-500/20 hover:text-blue-600 dark:hover:text-blue-300 disabled:opacity-35 transition-colors"
+                      >
+                        Later →
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleArrangeFrame({ kind: "arrangeAll" })}
+                      className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 text-blue-600 dark:text-blue-400 font-medium"
+                    >
+                      Arrange all frames in grid
+                    </button>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  disabled={exportingSelection}
+                  onClick={() => void handleExportFramePng(node)}
+                  className="w-full flex items-center gap-2 text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700 disabled:opacity-50"
+                >
+                  <IoImageOutline size={14} /> Export frame as PNG (2×)
+                </button>
+              </>
             );
           })()}
           <div className="my-1 border-t border-gray-100 dark:border-neutral-700/70" />

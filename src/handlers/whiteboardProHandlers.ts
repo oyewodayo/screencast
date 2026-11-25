@@ -281,6 +281,257 @@ export function findContainedFrameItems(
   return { nodeIds: extraNodeIds, edgeIds: extraEdgeIds };
 }
 
+export type FrameArrangeAction =
+  | { kind: "moveToStart"; frameId: string }
+  | { kind: "moveToEnd"; frameId: string }
+  | { kind: "moveEarlier"; frameId: string }
+  | { kind: "moveLater"; frameId: string }
+  | { kind: "arrangeAll" };
+
+export interface FrameArrangeDiff {
+  beforeNodes: WhiteboardNode[];
+  afterNodes: WhiteboardNode[];
+  beforeEdges: WhiteboardEdge[];
+  afterEdges: WhiteboardEdge[];
+  targetFrameAfter: WhiteboardNode | null;
+}
+
+/**
+ * Reorders a Containment Frame (Artboard) to the start, end, earlier, or later position — or
+ * arranges all frames neatly into an evenly spaced slide grid starting at the existing slides'
+ * top-left origin.
+ *
+ * Key safeguards:
+ * - Every child node is assigned to AT MOST ONE owning frame (preferring full enclosure, then older
+ *   `createdAt`), so dropping a brand-new empty Frame on top of Slide 1 and moving it to the end
+ *   never steals Slide 1's logo/text!
+ * - An empty moved frame automatically adopts the existing deck's dominant slide dimensions (e.g.
+ *   960x540) so it matches neighboring slides cleanly.
+ * - Moves all owned child nodes, free-floating endpoints, and internal edge waypoints in one undo step.
+ */
+export function arrangeArtboardFrames(
+  allNodes: WhiteboardNode[],
+  allEdges: WhiteboardEdge[],
+  action: FrameArrangeAction
+): FrameArrangeDiff {
+  const ordered = getOrderedArtboards(allNodes);
+  if (ordered.length === 0) {
+    return { beforeNodes: [], afterNodes: [], beforeEdges: [], afterEdges: [], targetFrameAfter: null };
+  }
+  if (action.kind !== "arrangeAll" && ordered.length < 2) {
+    return { beforeNodes: [], afterNodes: [], beforeEdges: [], afterEdges: [], targetFrameAfter: null };
+  }
+
+  const targetId = action.kind === "arrangeAll" ? null : action.frameId;
+  const targetIdx = targetId ? ordered.findIndex((f) => f.id === targetId) : -1;
+  if (targetId && targetIdx < 0) {
+    return { beforeNodes: [], afterNodes: [], beforeEdges: [], afterEdges: [], targetFrameAfter: null };
+  }
+
+  // 1. Resolve unique frame ownership for every non-artboard node
+  const ownedNodesByFrame = new Map<string, WhiteboardNode[]>();
+  const ownerFrameOfNode = new Map<string, string>();
+  for (const f of ordered) ownedNodesByFrame.set(f.id, []);
+
+  const pickOwnerForPoint = (
+    px: number,
+    py: number,
+    nodeBox?: { x: number; y: number; w: number; h: number }
+  ): WhiteboardNode | null => {
+    const candidates = ordered.filter(
+      (ab) => px >= ab.x - 2 && px <= ab.x + ab.width + 2 && py >= ab.y - 2 && py <= ab.y + ab.height + 2
+    );
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+    candidates.sort((a, b) => {
+      if (nodeBox) {
+        const aEncloses =
+          nodeBox.x >= a.x - 4 &&
+          nodeBox.y >= a.y - 4 &&
+          nodeBox.x + nodeBox.w <= a.x + a.width + 4 &&
+          nodeBox.y + nodeBox.h <= a.y + a.height + 4;
+        const bEncloses =
+          nodeBox.x >= b.x - 4 &&
+          nodeBox.y >= b.y - 4 &&
+          nodeBox.x + nodeBox.w <= b.x + b.width + 4 &&
+          nodeBox.y + nodeBox.h <= b.y + b.height + 4;
+        if (aEncloses !== bEncloses) return aEncloses ? -1 : 1;
+      }
+      // Older frame keeps its existing contents when a brand-new frame is dropped overlapping it
+      if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+      return a.width * a.height - b.width * b.height;
+    });
+    return candidates[0];
+  };
+
+  for (const n of allNodes) {
+    if (isArtboardNode(n)) continue;
+    const owner = pickOwnerForPoint(n.x + n.width / 2, n.y + n.height / 2, {
+      x: n.x,
+      y: n.y,
+      w: n.width,
+      h: n.height,
+    });
+    if (owner) {
+      ownedNodesByFrame.get(owner.id)!.push(n);
+      ownerFrameOfNode.set(n.id, owner.id);
+    }
+  }
+
+  // 2. Measure existing slide grid geometry from reference frames (excluding the newly moved frame so
+  //    dropping a frame slightly above/left of Slide 1 doesn't shift the whole deck's origin!)
+  const refFrames = targetId ? ordered.filter((f) => f.id !== targetId) : ordered;
+  const originX = Math.round(Math.min(...refFrames.map((f) => f.x)));
+  const originY = Math.round(Math.min(...refFrames.map((f) => f.y)));
+
+  // Dominant slide dimensions (mode of width x height among reference frames)
+  const sizeCounts = new Map<string, { w: number; h: number; count: number }>();
+  for (const f of refFrames) {
+    const key = `${Math.round(f.width)}x${Math.round(f.height)}`;
+    const prev = sizeCounts.get(key);
+    sizeCounts.set(key, { w: Math.round(f.width), h: Math.round(f.height), count: (prev?.count ?? 0) + 1 });
+  }
+  let dominantW = Math.round(refFrames[0].width);
+  let dominantH = Math.round(refFrames[0].height);
+  let bestSizeCount = -1;
+  for (const entry of sizeCounts.values()) {
+    if (entry.count > bestSizeCount) {
+      bestSizeCount = entry.count;
+      dominantW = entry.w;
+      dominantH = entry.h;
+    }
+  }
+
+  // Detect column count from reference frames' first row band
+  const firstRowCount = refFrames.filter((f) => Math.abs(f.y - originY) < Math.max(40, dominantH * 0.45)).length;
+  const cols =
+    refFrames.length >= 2 && firstRowCount >= 1 && firstRowCount <= 6
+      ? Math.min(ordered.length, Math.max(firstRowCount, refFrames.length >= 3 ? firstRowCount : Math.min(3, ordered.length)))
+      : Math.min(3, ordered.length);
+
+  // Detect horizontal/vertical spacing from existing grid, falling back to clean 96x100 defaults
+  const firstRowSorted = refFrames
+    .filter((f) => Math.abs(f.y - originY) < Math.max(40, dominantH * 0.45))
+    .sort((a, b) => a.x - b.x);
+  let gapX = 96;
+  if (firstRowSorted.length >= 2) {
+    const measuredGapX = firstRowSorted[1].x - (firstRowSorted[0].x + firstRowSorted[0].width);
+    if (measuredGapX >= 24 && measuredGapX <= 240) gapX = Math.round(measuredGapX);
+  }
+  const secondRowFrames = refFrames
+    .filter((f) => f.y - originY >= Math.max(40, dominantH * 0.45))
+    .sort((a, b) => a.y - b.y);
+  let gapY = 100;
+  if (secondRowFrames.length >= 1) {
+    const measuredGapY = secondRowFrames[0].y - (originY + dominantH);
+    if (measuredGapY >= 32 && measuredGapY <= 260) gapY = Math.round(measuredGapY);
+  }
+
+  // 3. Build desired frame order
+  const nextOrder = [...ordered];
+  if (action.kind === "moveToStart" && targetIdx > 0) {
+    const [moved] = nextOrder.splice(targetIdx, 1);
+    nextOrder.unshift(moved);
+  } else if (action.kind === "moveToEnd" && targetIdx >= 0 && targetIdx < nextOrder.length - 1) {
+    const [moved] = nextOrder.splice(targetIdx, 1);
+    nextOrder.push(moved);
+  } else if (action.kind === "moveEarlier" && targetIdx > 0) {
+    [nextOrder[targetIdx - 1], nextOrder[targetIdx]] = [nextOrder[targetIdx], nextOrder[targetIdx - 1]];
+  } else if (action.kind === "moveLater" && targetIdx >= 0 && targetIdx < nextOrder.length - 1) {
+    [nextOrder[targetIdx], nextOrder[targetIdx + 1]] = [nextOrder[targetIdx + 1], nextOrder[targetIdx]];
+  }
+
+  // 4. Determine each frame's target width/height (empty moved frame matches existing slide size)
+  const targetDims = new Map<string, { w: number; h: number }>();
+  for (const f of nextOrder) {
+    const isMovedEmpty = targetId === f.id && (ownedNodesByFrame.get(f.id)?.length ?? 0) === 0;
+    targetDims.set(f.id, isMovedEmpty ? { w: dominantW, h: dominantH } : { w: f.width, h: f.height });
+  }
+
+  // 5. Compute neat grid coordinates
+  const cellW = Math.max(...nextOrder.map((f) => targetDims.get(f.id)!.w));
+  const rowCount = Math.ceil(nextOrder.length / cols);
+  const rowHeights = Array<number>(rowCount).fill(0);
+  nextOrder.forEach((f, idx) => {
+    const r = Math.floor(idx / cols);
+    rowHeights[r] = Math.max(rowHeights[r], targetDims.get(f.id)!.h);
+  });
+  const rowYOffsets: number[] = [];
+  let accY = originY;
+  for (let r = 0; r < rowCount; r++) {
+    rowYOffsets.push(accY);
+    accY += rowHeights[r] + gapY;
+  }
+
+  const frameDeltas = new Map<string, { dx: number; dy: number }>();
+  const beforeNodes: WhiteboardNode[] = [];
+  const afterNodes: WhiteboardNode[] = [];
+  let targetFrameAfter: WhiteboardNode | null = null;
+
+  nextOrder.forEach((f, idx) => {
+    const c = idx % cols;
+    const r = Math.floor(idx / cols);
+    const dims = targetDims.get(f.id)!;
+    const nx = Math.round(originX + c * (cellW + gapX));
+    const ny = Math.round(rowYOffsets[r]);
+    const dx = nx - f.x;
+    const dy = ny - f.y;
+    frameDeltas.set(f.id, { dx, dy });
+
+    const changed = dx !== 0 || dy !== 0 || dims.w !== f.width || dims.h !== f.height;
+    const updatedFrame: WhiteboardNode = changed
+      ? { ...f, x: nx, y: ny, width: dims.w, height: dims.h, updatedAt: Date.now() }
+      : f;
+    if (f.id === targetId) targetFrameAfter = updatedFrame;
+    if (changed) {
+      beforeNodes.push(f);
+      afterNodes.push(updatedFrame);
+    }
+
+    if (dx !== 0 || dy !== 0) {
+      for (const child of ownedNodesByFrame.get(f.id) ?? []) {
+        beforeNodes.push(child);
+        afterNodes.push({ ...child, x: Math.round(child.x + dx), y: Math.round(child.y + dy) });
+      }
+    }
+  });
+
+  // 6. Shift free-floating edge endpoints & internal waypoints belonging to moved frames
+  const beforeEdges: WhiteboardEdge[] = [];
+  const afterEdges: WhiteboardEdge[] = [];
+  for (const e of allEdges) {
+    const srcOwner = e.source.nodeId
+      ? ownerFrameOfNode.get(e.source.nodeId) ?? null
+      : e.source.x !== undefined && e.source.y !== undefined
+      ? pickOwnerForPoint(e.source.x, e.source.y)?.id ?? null
+      : null;
+    const tgtOwner = e.target.nodeId
+      ? ownerFrameOfNode.get(e.target.nodeId) ?? null
+      : e.target.x !== undefined && e.target.y !== undefined
+      ? pickOwnerForPoint(e.target.x, e.target.y)?.id ?? null
+      : null;
+
+    const srcDelta = !e.source.nodeId && srcOwner ? frameDeltas.get(srcOwner) : undefined;
+    const tgtDelta = !e.target.nodeId && tgtOwner ? frameDeltas.get(tgtOwner) : undefined;
+    const wpDelta = srcOwner && srcOwner === tgtOwner ? frameDeltas.get(srcOwner) : undefined;
+
+    const moveSrc = Boolean(srcDelta && (srcDelta.dx !== 0 || srcDelta.dy !== 0));
+    const moveTgt = Boolean(tgtDelta && (tgtDelta.dx !== 0 || tgtDelta.dy !== 0));
+    const moveWp = Boolean(wpDelta && (wpDelta.dx !== 0 || wpDelta.dy !== 0) && e.waypoints && e.waypoints.length > 0);
+    if (!moveSrc && !moveTgt && !moveWp) continue;
+
+    beforeEdges.push(e);
+    afterEdges.push({
+      ...e,
+      source: moveSrc && srcDelta ? { x: Math.round((e.source.x ?? 0) + srcDelta.dx), y: Math.round((e.source.y ?? 0) + srcDelta.dy) } : e.source,
+      target: moveTgt && tgtDelta ? { x: Math.round((e.target.x ?? 0) + tgtDelta.dx), y: Math.round((e.target.y ?? 0) + tgtDelta.dy) } : e.target,
+      waypoints: moveWp && wpDelta ? e.waypoints!.map((wp) => ({ x: Math.round(wp.x + wpDelta.dx), y: Math.round(wp.y + wpDelta.dy) })) : e.waypoints,
+    });
+  }
+
+  return { beforeNodes, afterNodes, beforeEdges, afterEdges, targetFrameAfter };
+}
+
 // ---- Format Painter ----------------------------------------------------------------------------
 
 export interface WhiteboardStyleSnapshot {

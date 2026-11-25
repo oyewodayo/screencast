@@ -70,6 +70,7 @@ export interface UseWhiteboardStoreResult {
   // ---- Pages - none of these are undo-tracked (same reasoning as renameWhiteboard: page
   // structure is workspace organization, not diagram content you'd expect Ctrl+Z to touch).
   addPage: () => void;
+  appendPages: (newPages: WhiteboardPage[]) => void;
   renamePage: (pageId: string, name: string) => void;
   // Refuses to delete the whiteboard's last remaining page - every whiteboard always has at least
   // one page, same invariant a spreadsheet enforces on its last sheet tab.
@@ -356,6 +357,25 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     scheduleAutosave();
   }, [scheduleAutosave]);
 
+  const appendPages = useCallback(
+    (newPages: WhiteboardPage[]) => {
+      if (newPages.length === 0) return;
+      setDoc((prev) => {
+        if (!prev) return prev;
+        // If the whiteboard currently has only a single completely blank page, replace it with the
+        // imported slide pages so Slide 1 isn't preceded by an orphan empty "Page 1".
+        const replaceOnlyBlank =
+          prev.pages.length === 1 && prev.pages[0].nodes.length === 0 && prev.pages[0].edges.length === 0;
+        const pages = replaceOnlyBlank ? newPages : [...prev.pages, ...newPages];
+        return { ...prev, pages, activePageId: newPages[0].id, updatedAt: new Date().toISOString() };
+      });
+      setUndoStack([]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
   const renamePage = useCallback(
     (pageId: string, name: string) => {
       setDoc((prev) => (prev ? { ...prev, pages: prev.pages.map((p) => (p.id === pageId ? { ...p, name } : p)), updatedAt: new Date().toISOString() } : prev));
@@ -479,6 +499,7 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     setGridStyle,
     renameWhiteboard,
     addPage,
+    appendPages,
     renamePage,
     deletePage,
     duplicatePage,

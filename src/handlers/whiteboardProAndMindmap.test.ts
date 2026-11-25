@@ -18,6 +18,7 @@ import {
 import {
   alignNodes,
   applyStyleSnapshot,
+  arrangeArtboardFrames,
   computeAutoTextBoxSize,
   cullVisibleItems,
   distributeNodes,
@@ -354,5 +355,31 @@ describe("whiteboardInterchangeHandlers", () => {
     const svg = exportWhiteboardToSvg(page, resolveCanvasTheme("blueprint").bg);
     expect(svg).toContain(`fill="${resolveCanvasTheme("blueprint").bg}"`);
     expect(svg).toContain(`fill="#2563eb"`);
+  });
+
+  it("moves a newly dropped artboard to start or end without stealing overlapping Slide 1 children and matches slide size", () => {
+    const s1 = { ...createDefaultWhiteboardNode("s1", "artboard", 0, 0), x: 80, y: 80, width: 960, height: 540, text: "Slide 1", createdAt: 1000 };
+    const s2 = { ...createDefaultWhiteboardNode("s2", "artboard", 0, 0), x: 1136, y: 80, width: 960, height: 540, text: "Slide 2", createdAt: 1001 };
+    const s3 = { ...createDefaultWhiteboardNode("s3", "artboard", 0, 0), x: 2192, y: 80, width: 960, height: 540, text: "Slide 3", createdAt: 1002 };
+    const s1Logo = { ...createDefaultWhiteboardNode("logo", "rectangle", 0, 0), x: 110, y: 110, width: 120, height: 80, text: "CERN", createdAt: 1000 };
+    const newFrame = { ...createDefaultWhiteboardNode("nf", "artboard", 0, 0), x: 60, y: 40, width: 640, height: 420, text: "Frame", createdAt: 2000 };
+
+    const allNodes = [s1, s2, s3, s1Logo, newFrame];
+
+    const toEnd = arrangeArtboardFrames(allNodes, [], { kind: "moveToEnd", frameId: "nf" });
+    expect(toEnd.targetFrameAfter?.width).toBe(960);
+    expect(toEnd.targetFrameAfter?.height).toBe(540);
+    expect(toEnd.targetFrameAfter?.x).toBe(80);
+    expect(toEnd.targetFrameAfter?.y).toBe(720);
+    expect(toEnd.afterNodes.find((n) => n.id === "logo")).toBeUndefined();
+
+    const toStart = arrangeArtboardFrames(allNodes, [], { kind: "moveToStart", frameId: "nf" });
+    expect(toStart.targetFrameAfter?.x).toBe(80);
+    expect(toStart.targetFrameAfter?.y).toBe(80);
+    expect(toStart.targetFrameAfter?.width).toBe(960);
+    const movedS1 = toStart.afterNodes.find((n) => n.id === "s1");
+    const movedLogo = toStart.afterNodes.find((n) => n.id === "logo");
+    expect(movedS1?.x).toBe(1136);
+    expect(movedLogo?.x).toBe(110 + (1136 - 80));
   });
 });

@@ -266,6 +266,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         services::whiteboards::save_whiteboard_thumbnail,
         services::whiteboards::export_whiteboard_file,
         services::whiteboards::export_whiteboard_to_path,
+        services::whiteboards::fetch_google_slides_export,
         services::docs::list_docs,
         services::docs::create_doc,
         services::docs::save_doc,

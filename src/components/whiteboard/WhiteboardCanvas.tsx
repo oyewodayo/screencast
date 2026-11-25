@@ -28,6 +28,7 @@ import { TbRotateClockwise, TbArrowsMove } from "react-icons/tb";
 import katex from "katex";
 import useCanvasWheel from "../../hooks/useCanvasWheel";
 import LatticeGaugeWidget from "./LatticeGaugeWidget";
+import WhiteboardIconGlyph from "./WhiteboardIconGlyph";
 import WhiteboardTable from "./WhiteboardTable";
 import { FillPaint, nodeFillPaint, PaintedShape } from "./NodeFillPaint";
 import { getCachedWhiteboardImage, preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
@@ -66,6 +67,7 @@ import {
   annotationCoordinateMapper,
   BoundsBox,
   buildEdgePath,
+  buildFolderGeometry,
   chartColumnLayout,
   clampAmpLeadTerminalY,
   computeCurveBowFromPath,
@@ -93,6 +95,7 @@ import {
   resolvePageLayerOrder,
   roundedRectSvgD,
   SERIES_FILL_OPACITY,
+  shadeHexColor,
   shapeOutlineFor,
   ChartLabel,
   ShapeOutline,
@@ -823,6 +826,7 @@ interface WhiteboardCanvasProps {
   // editor owns the actual import (it has the whiteboard id and the undo stack); this just reports
   // the gesture. Returning without a handler leaves drops to the browser's default (nothing).
   onImageDrop?: (files: File[], docPoint: { x: number; y: number }) => void;
+  onSlidesFileDrop?: (file: File, docPoint: { x: number; y: number }) => void;
   // Which image node is in crop mode, owned by WhiteboardEditor rather than locally here so the
   // style panel's own Crop button can drive the same state this canvas's double-click gesture does -
   // two entry points into one mode, not two modes. Transient view state, never saved: the crop
@@ -917,17 +921,15 @@ function smoothedPathD(points: { x: number; y: number }[]): string {
 function EquationDisplay({ source, fontSize, color }: { source: string; fontSize: number; color: string }) {
   const html = useMemo(() => {
     try {
-      return katex.renderToString(source, { throwOnError: false, displayMode: true, output: "html" });
+      const withSlots = (source || "").replace(/\{\s*\}/g, "{\\color{#9ca3af}{\\square}}");
+      return katex.renderToString(withSlots || "\\;", { throwOnError: false, displayMode: true, output: "html", strict: false });
     } catch {
       return "";
     }
   }, [source]);
   return (
     <div
-      // overflow visible rather than this file's usual text-label clipping - cutting a typeset
-      // formula off mid-glyph (an integral sign missing its bottom half, say) reads as broken in a
-      // way a plain truncated sentence doesn't, so a formula too big for its box is allowed to spill
-      // past the edges instead.
+      className="[&_.katex-display]:m-0"
       style={{ fontSize, color, lineHeight: 1.2 }}
       dangerouslySetInnerHTML={{ __html: html }}
     />
@@ -972,6 +974,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   onTableRangeChange,
   imageSrcFor,
   onImageDrop,
+  onSlidesFileDrop,
   croppingNodeId,
   setCroppingNodeId,
   previewNodes,
@@ -2565,9 +2568,84 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onBatchEditItems, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddNodeWithEdge, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
   );
 
+  // ---- Text editing ------------------------------------------------------------------------------
+  // Tracks which node is currently open for inline editing so pointerdown-outside (which unmounts
+  // the contentEditable div before the browser fires onBlur) can commit synchronously and any
+  // subsequent onBlur event for that same edit session becomes a safe no-op.
+  const activeEditingIdRef = useRef<string | null>(null);
+
+  const commitTextEdit = useCallback(
+    (node: WhiteboardNode, text: string) => {
+      if (activeEditingIdRef.current !== node.id) {
+        setEditingNodeId(null);
+        return;
+      }
+      activeEditingIdRef.current = null;
+      const normalized = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+      if (node.shapeType === "text") {
+        if (normalized.trim().length === 0) {
+          // Auto-clean empty ghost text boxes dropped accidentally without typing.
+          onDeleteNode(node);
+          onSelectionChange(new Set(), new Set());
+          setEditingNodeId(null);
+          return;
+        }
+        const auto = computeAutoTextBoxSize(normalized, node.fontSize, node.fontWeight, node.width, true, node.fontFamily);
+        if (normalized !== node.text || auto.width !== node.width || auto.height !== node.height) {
+          onEditNode(node, { ...node, text: normalized, width: auto.width, height: auto.height, updatedAt: Date.now() });
+        }
+        setEditingNodeId(null);
+        return;
+      }
+      if (normalized !== node.text) onEditNode(node, { ...node, text: normalized, updatedAt: Date.now() });
+      setEditingNodeId(null);
+    },
+    [onEditNode, onDeleteNode, onSelectionChange]
+  );
+
+  const flushActiveTextEdit = useCallback(() => {
+    if (!editingNodeId) return;
+    const editingNode = page.nodes.find((n) => n.id === editingNodeId);
+    if (!editingNode) {
+      activeEditingIdRef.current = null;
+      setEditingNodeId(null);
+      return;
+    }
+    const draftText = editorRef.current ? editorRef.current.innerText : editingNode.text;
+    commitTextEdit(editingNode, draftText);
+  }, [editingNodeId, page.nodes, commitTextEdit]);
+
+  useEffect(() => {
+    activeEditingIdRef.current = editingNodeId;
+    if (!editingNodeId) return;
+    const editingNode = page.nodes.find((n) => n.id === editingNodeId);
+    if (editorRef.current && editingNode) {
+      editorRef.current.innerText = editingNode.text;
+    }
+    // Deferred one frame: entering edit mode straight from the text tool (armedShapeType ===
+    // "text") lands in the SAME commit as WhiteboardStylePanel mounting its own fresh DOM (it was
+    // rendering nothing before this node existed to select) - focusing synchronously here can lose
+    // a race with the browser's own post-commit focus handling for that newly-mounted subtree.
+    // Double-click-to-edit on an already-selected node never hits this (the style panel is already
+    // mounted), which is why only the create-and-immediately-type path needs the extra frame.
+    const raf = requestAnimationFrame(() => {
+      const el = editorRef.current;
+      if (!el) return;
+      el.focus();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    });
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingNodeId]);
+
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
   const handleContainerPointerDown = useCallback(
     (e: React.PointerEvent) => {
+      if (editingNodeId) flushActiveTextEdit();
       if (e.button === 1 || spaceHeld || handArmed || (e.button === 0 && e.altKey) || (studyMode && e.button === 0)) {
         interactionRef.current = { mode: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
         return;
@@ -2577,7 +2655,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // nothing (no marquee, no placement, no selection change). Space-panning above still works so
       // the view can be repositioned while pointing.
       if (laserArmed) return;
-      if (editingNodeId) setEditingNodeId(null);
 
       if (armedShapeType === "freehand") {
         const point = clientToDoc(e.clientX, e.clientY);
@@ -2623,54 +2700,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       interactionRef.current = { mode: "marquee", startDocX: point.x, startDocY: point.y };
       setMarqueeRect({ x: point.x, y: point.y, width: 0, height: 0 });
     },
-    [spaceHeld, pan, editingNodeId, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds, snapToGrid]
+    [spaceHeld, handArmed, studyMode, pan, editingNodeId, flushActiveTextEdit, armedShapeType, connectorArmed, laserArmed, clientToDoc, onAddNode, onSelectionChange, onShapePlaced, beginConnectorFromPoint, selectedNodeIds, selectedEdgeIds, snapToGrid]
   );
-
-  // ---- Text editing ------------------------------------------------------------------------------
-  const commitTextEdit = useCallback(
-    (node: WhiteboardNode, text: string) => {
-      const normalized = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
-      if (node.shapeType === "text") {
-        if (normalized.trim().length === 0) {
-          // Auto-clean empty ghost text boxes dropped accidentally without typing.
-          onDeleteNode(node);
-          onSelectionChange(new Set(), new Set());
-          setEditingNodeId(null);
-          return;
-        }
-        const auto = computeAutoTextBoxSize(normalized, node.fontSize, node.fontWeight, node.width, true, node.fontFamily);
-        if (normalized !== node.text || auto.width !== node.width || auto.height !== node.height) {
-          onEditNode(node, { ...node, text: normalized, width: auto.width, height: auto.height, updatedAt: Date.now() });
-        }
-        setEditingNodeId(null);
-        return;
-      }
-      if (normalized !== node.text) onEditNode(node, { ...node, text: normalized, updatedAt: Date.now() });
-      setEditingNodeId(null);
-    },
-    [onEditNode, onDeleteNode, onSelectionChange]
-  );
-
-  useEffect(() => {
-    if (!editingNodeId) return;
-    // Deferred one frame: entering edit mode straight from the text tool (armedShapeType ===
-    // "text") lands in the SAME commit as WhiteboardStylePanel mounting its own fresh DOM (it was
-    // rendering nothing before this node existed to select) - focusing synchronously here can lose
-    // a race with the browser's own post-commit focus handling for that newly-mounted subtree.
-    // Double-click-to-edit on an already-selected node never hits this (the style panel is already
-    // mounted), which is why only the create-and-immediately-type path needs the extra frame.
-    const raf = requestAnimationFrame(() => {
-      const el = editorRef.current;
-      if (!el) return;
-      el.focus();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      const sel = window.getSelection();
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [editingNodeId]);
 
   // What the connector-drag preview looks like - mirrors the Arrows tool's own armed preset
   // (color/dash/routing/arrowhead) while it's armed, so the live drag matches what actually gets
@@ -2757,16 +2788,33 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // and it's gated on the drag actually carrying files so dragging something else over the
       // canvas doesn't advertise a drop target that would do nothing.
       onDragOver={(e) => {
-        if (!onImageDrop || !e.dataTransfer.types.includes("Files")) return;
+        if ((!onImageDrop && !onSlidesFileDrop) || !e.dataTransfer.types.includes("Files")) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = "copy";
       }}
       onDrop={(e) => {
+        const allFiles = Array.from(e.dataTransfer.files);
+        if (allFiles.length === 0) return;
+        const docPt = clientToDoc(e.clientX, e.clientY);
+        const slideFile = allFiles.find((f) => {
+          const lower = f.name.toLowerCase();
+          return (
+            lower.endsWith(".pptx") ||
+            lower.endsWith(".pdf") ||
+            f.type === "application/pdf" ||
+            f.type === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          );
+        });
+        if (slideFile && onSlidesFileDrop) {
+          e.preventDefault();
+          onSlidesFileDrop(slideFile, docPt);
+          return;
+        }
         if (!onImageDrop) return;
-        const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
-        if (files.length === 0) return;
+        const imageFiles = allFiles.filter((f) => f.type.startsWith("image/"));
+        if (imageFiles.length === 0) return;
         e.preventDefault();
-        onImageDrop(files, clientToDoc(e.clientX, e.clientY));
+        onImageDrop(imageFiles, docPt);
       }}
     >
       <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
@@ -2828,6 +2876,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 // doesn't select/move THIS node while the laser tool is meant to be purely
                 // non-interactive.
                 if (armedShapeType || connectorArmed || laserArmed || handArmed) return;
+                if (editingNodeId && editingNodeId !== node.id) flushActiveTextEdit();
                 beginMoveNode(node, e, e.shiftKey);
               }}
               onDoubleClick={(e) => {
@@ -2953,6 +3002,72 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   node.shapeType === "mindmapChecklist" ||
                   node.shapeType === "mindmapLinksGroup" ? (
                   <BoxShapeBody node={node} paint={paint} />
+                ) : node.shapeType === "folder" ? (
+                  (() => {
+                    const baseFill = resolveNodeFill(node) ?? "#3b82f6";
+                    const backFill = shadeHexColor(baseFill, -0.22);
+                    const topFill = shadeHexColor(baseFill, 0.14);
+                    const botFill = shadeHexColor(baseFill, -0.08);
+                    const geo = buildFolderGeometry(node.width, node.height, node.cornerRadius ?? 12);
+                    const gradId = `wb-folder-${node.id}`;
+                    return (
+                      <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} style={{ overflow: "visible" }}>
+                        <defs>
+                          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={topFill} />
+                            <stop offset="100%" stopColor={botFill} />
+                          </linearGradient>
+                        </defs>
+                        {/* Back folder tab plate */}
+                        <path d={geo.backD} fill={backFill} stroke={node.strokeWidth > 0 ? node.strokeColor : "none"} strokeWidth={Math.max(0, node.strokeWidth * 0.75)} strokeOpacity={0.65} />
+                        {/* Peeking crisp white document sheet */}
+                        <rect
+                          x={geo.paperRect.x}
+                          y={geo.paperRect.y}
+                          width={geo.paperRect.w}
+                          height={geo.paperRect.h}
+                          rx={geo.paperRect.r}
+                          fill="#ffffff"
+                          stroke="rgba(0,0,0,0.1)"
+                          strokeWidth={1}
+                        />
+                        {/* Front folder pocket */}
+                        <path
+                          d={geo.frontD}
+                          fill={`url(#${gradId})`}
+                          stroke={node.strokeWidth > 0 ? node.strokeColor : "none"}
+                          strokeWidth={node.strokeWidth}
+                          strokeDasharray={nodeStrokeDash}
+                          strokeOpacity={nodeStrokeOpacity}
+                        />
+                        {/* Subtle top-edge highlight bevel */}
+                        <line
+                          x1={Math.max(6, geo.radius)}
+                          y1={geo.pocketY + 1.2}
+                          x2={Math.max(6, node.width - Math.max(6, geo.radius))}
+                          y2={geo.pocketY + 1.2}
+                          stroke="rgba(255,255,255,0.42)"
+                          strokeWidth={1.25}
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                    );
+                  })()
+                ) : node.shapeType === "icon" ? (
+                  <div
+                    className="w-full h-full flex items-center justify-center"
+                    style={{
+                      backgroundColor: node.fillColor ?? undefined,
+                      borderRadius: node.fillColor ? node.cornerRadius || 12 : undefined,
+                      padding: node.fillColor ? "16%" : "4%",
+                    }}
+                  >
+                    <WhiteboardIconGlyph
+                      icon={node.iconName ?? "star"}
+                      color={node.strokeColor}
+                      strokeWidth={Math.max(1, Math.min(4, node.strokeWidth || 2.1))}
+                    />
+                  </div>
                 ) : node.shapeType === "text" ? (
                   node.fillColor || node.strokeWidth > 0 ? (
                     <BoxShapeBody node={node} paint={paint} />
@@ -3501,9 +3616,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       (e.currentTarget as HTMLDivElement).blur();
                     }
                   }}
-                >
-                  {node.text}
-                </div>
+                />
               )}
 
               {isConnectorTarget && <div className="absolute inset-0 rounded-md ring-2 ring-blue-400 ring-offset-1 pointer-events-none" />}

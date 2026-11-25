@@ -54,7 +54,8 @@
         "height": 600,
         "minWidth": 850,
         "minHeight": 600,
-        "visible": false
+        "visible": false,
+        "zoomHotkeysEnabled": true
       },
       {
         "label": "recording-overlay",

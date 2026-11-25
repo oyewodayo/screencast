@@ -248,20 +248,263 @@ export function buildTemplatePageContent(
       connectNodes(execute, done)
     );
   } else if (templateId === "kanban") {
-    const colW = 240;
-    const colH = 380;
-    const gap = 36;
-    const todo = makeArtboard("To Do", 0, 0, colW, colH, "#f8fafc", "#cbd5e1");
-    const doing = makeArtboard("In Progress", colW + gap, 0, colW, colH, "#eff6ff", "#93c5fd");
-    const done = makeArtboard("Done", (colW + gap) * 2, 0, colW, colH, "#f0fdf4", "#86efac");
-    nodes.push(todo, doing, done);
+    const colW = 280;
+    const colH = 520;
+    const gap = 28;
+    const boardW = colW * 4 + gap * 3;
+    const colTop = 128;
 
+    // 1. Top Sprint Summary Banner
+    const banner: WhiteboardNode = {
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "rectangle", 0, 0),
+      x: 0,
+      y: 0,
+      width: boardW,
+      height: 100,
+      fillColor: "#0f172a",
+      strokeColor: "#1e293b",
+      strokeWidth: 1.5,
+      cornerRadius: 16,
+      shadowEnabled: true,
+      shadowBlur: 18,
+      shadowOffsetY: 6,
+      shadowOpacity: 0.14,
+      text: "",
+    };
+    const rocketIcon: WhiteboardNode = {
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "icon", 0, 0, { iconName: "rocket" }),
+      x: 24,
+      y: 26,
+      width: 48,
+      height: 48,
+      fillColor: "#1e3a8a",
+      strokeColor: "#93c5fd",
+      strokeWidth: 2,
+      cornerRadius: 12,
+    };
+    const sprintTitle: WhiteboardNode = {
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "text", 0, 0),
+      x: 86,
+      y: 18,
+      width: 520,
+      height: 36,
+      text: "Sprint 14 · Q4 Product Launch",
+      fontSize: 22,
+      fontFamily: "'Poppins', system-ui, sans-serif",
+      fontWeight: "bold",
+      fontColor: "#f8fafc",
+      textAlign: "left",
+      verticalAlign: "middle",
+    };
+    const sprintGoal: WhiteboardNode = {
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "text", 0, 0),
+      x: 86,
+      y: 54,
+      width: 600,
+      height: 28,
+      text: "Goal: Ship unified Pro Whiteboard, Slide Importer & 60fps Studio Engine",
+      fontSize: 13,
+      fontColor: "#94a3b8",
+      textAlign: "left",
+      verticalAlign: "middle",
+    };
+    const makeKpiPill = (label: string, x: number, bg: string, stroke: string, color: string): WhiteboardNode => ({
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "rectangle", 0, 0),
+      x,
+      y: 30,
+      width: 132,
+      height: 38,
+      fillColor: bg,
+      strokeColor: stroke,
+      strokeWidth: 1,
+      cornerRadius: 19,
+      text: label,
+      fontSize: 12,
+      fontWeight: "bold",
+      fontColor: color,
+    });
     nodes.push(
-      makeSticky("Define acceptance criteria", 22, 28, "#fef08a", "#eab308"),
-      makeSticky("Draft user walkthrough", 22, 130, "#fef08a", "#eab308"),
-      makeSticky("Optimize render pipeline", colW + gap + 22, 28, "#bfdbfe", "#3b82f6"),
-      makeSticky("Ship release notes v0.1.7", (colW + gap) * 2 + 22, 28, "#bbf7d0", "#16a34a")
+      banner,
+      rocketIcon,
+      sprintTitle,
+      sprintGoal,
+      makeKpiPill("Velocity: 34 pts", boardW - 432, "#1e293b", "#334155", "#e2e8f0"),
+      makeKpiPill("75% Complete", boardW - 288, "#064e3b", "#059669", "#6ee7b7"),
+      makeKpiPill("Status: On Track", boardW - 144, "#1e3a8a", "#2563eb", "#bfdbfe")
     );
+
+    // 2. Four Color-Coded Sprint Columns (Containment Frames)
+    const columns: {
+      title: string;
+      badge: string;
+      bg: string;
+      border: string;
+      headerBg: string;
+      headerColor: string;
+    }[] = [
+      { title: "Backlog", badge: "Backlog · 3", bg: "#f8fafc", border: "#cbd5e1", headerBg: "#e2e8f0", headerColor: "#334155" },
+      { title: "To Do", badge: "To Do · 3", bg: "#fffbeb", border: "#fcd34d", headerBg: "#fef3c7", headerColor: "#92400e" },
+      { title: "In Progress", badge: "In Progress · 2", bg: "#eff6ff", border: "#93c5fd", headerBg: "#dbeafe", headerColor: "#1e40af" },
+      { title: "Done", badge: "Done · 3", bg: "#f0fdf4", border: "#86efac", headerBg: "#dcfce7", headerColor: "#166534" },
+    ];
+
+    columns.forEach((col, i) => {
+      const cx = i * (colW + gap);
+      nodes.push(makeArtboard(col.title, cx, colTop, colW, colH, col.bg, col.border));
+      nodes.push({
+        ...createDefaultWhiteboardNode(crypto.randomUUID(), "rectangle", 0, 0),
+        x: cx + 14,
+        y: colTop + 14,
+        width: colW - 28,
+        height: 32,
+        fillColor: col.headerBg,
+        strokeColor: col.border,
+        strokeWidth: 1,
+        cornerRadius: 8,
+        text: col.badge,
+        fontSize: 12,
+        fontWeight: "bold",
+        fontColor: col.headerColor,
+        textAlign: "left",
+      });
+    });
+
+    // Helper for elevated designer Sprint Task Cards
+    const makeTaskCard = (
+      colIndex: number,
+      yOffset: number,
+      tag: string,
+      tagBg: string,
+      tagColor: string,
+      title: string,
+      meta: string,
+      accentBorder = "#e2e8f0"
+    ) => {
+      const x = colIndex * (colW + gap) + 14;
+      const y = colTop + yOffset;
+      const w = colW - 28;
+      const h = 112;
+      const card: WhiteboardNode = {
+        ...createDefaultWhiteboardNode(crypto.randomUUID(), "rectangle", 0, 0),
+        x,
+        y,
+        width: w,
+        height: h,
+        fillColor: "#ffffff",
+        strokeColor: accentBorder,
+        strokeWidth: 1.25,
+        cornerRadius: 12,
+        shadowEnabled: true,
+        shadowBlur: 12,
+        shadowOffsetY: 3,
+        shadowOpacity: 0.08,
+        text: "",
+      };
+      const pill: WhiteboardNode = {
+        ...createDefaultWhiteboardNode(crypto.randomUUID(), "rectangle", 0, 0),
+        x: x + 12,
+        y: y + 11,
+        width: Math.min(130, Math.max(76, tag.length * 7 + 16)),
+        height: 20,
+        fillColor: tagBg,
+        strokeColor: tagBg,
+        strokeWidth: 0,
+        cornerRadius: 10,
+        text: tag,
+        fontSize: 10,
+        fontWeight: "bold",
+        fontColor: tagColor,
+      };
+      const titleNode: WhiteboardNode = {
+        ...createDefaultWhiteboardNode(crypto.randomUUID(), "text", 0, 0),
+        x: x + 8,
+        y: y + 34,
+        width: w - 16,
+        height: 44,
+        text: title,
+        fontSize: 13,
+        fontWeight: "bold",
+        fontColor: "#0f172a",
+        textAlign: "left",
+        verticalAlign: "top",
+      };
+      const metaNode: WhiteboardNode = {
+        ...createDefaultWhiteboardNode(crypto.randomUUID(), "text", 0, 0),
+        x: x + 8,
+        y: y + 80,
+        width: w - 16,
+        height: 24,
+        text: meta,
+        fontSize: 11,
+        fontColor: "#64748b",
+        textAlign: "left",
+        verticalAlign: "middle",
+      };
+      nodes.push(card, pill, titleNode, metaNode);
+    };
+
+    // Backlog cards + Sprint Assets Folder
+    makeTaskCard(0, 58, "RESEARCH", "#f1f5f9", "#475569", "Benchmark 4K WebGL canvas zoom", "3 pts · @alex");
+    makeTaskCard(0, 184, "DESIGN", "#f3e8ff", "#7e22ce", "Dark Studio theme icon polish", "2 pts · @maya");
+    nodes.push({
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "folder", 0, 0),
+      x: 42,
+      y: colTop + 322,
+      width: 196,
+      height: 144,
+      fillColor: "#3b82f6",
+      strokeColor: "#1d4ed8",
+      strokeWidth: 1.25,
+      cornerRadius: 12,
+      shadowEnabled: true,
+      shadowBlur: 12,
+      shadowOffsetY: 4,
+      shadowOpacity: 0.16,
+      text: "Sprint Assets",
+      fontSize: 14,
+      fontWeight: "bold",
+      fontColor: "#ffffff",
+    });
+
+    // To Do cards + Rounded Sticky Note
+    makeTaskCard(1, 58, "HIGH · CORE", "#fee2e2", "#b91c1c", "Add multi-page PDF deck export", "5 pts · @sam", "#fca5a5");
+    makeTaskCard(1, 184, "UX POLISH", "#fef3c7", "#b45309", "Draft interactive user walkthrough", "3 pts · @maya", "#fcd34d");
+    nodes.push({
+      ...makeSticky("Remember: test dark canvas contrast before Friday demo!", colW + gap + 22, colTop + 320, "#fef08a", "#eab308"),
+      width: colW - 44,
+      height: 118,
+      cornerRadius: 10,
+      fontSize: 13,
+      textAlign: "left",
+      verticalAlign: "top",
+    });
+
+    // In Progress cards + Interactive Definition of Done Checklist
+    makeTaskCard(2, 58, "IN FLIGHT", "#dbeafe", "#1d4ed8", "Optimize tapered ink & render loop", "8 pts · @dev", "#93c5fd");
+    makeTaskCard(2, 184, "INTEGRATION", "#e0e7ff", "#4338ca", "PowerPoint & Google Slides parser", "5 pts · @alex", "#a5b4fc");
+    nodes.push({
+      ...createDefaultWhiteboardNode(crypto.randomUUID(), "mindmapChecklist", 0, 0, {
+        mindmapItems: [
+          { id: crypto.randomUUID(), text: "TypeScript 0 errors", checked: true },
+          { id: crypto.randomUUID(), text: "Unit tests passing", checked: true },
+          { id: crypto.randomUUID(), text: "Cross-platform QA", checked: false },
+          { id: crypto.randomUUID(), text: "Record demo clip", checked: false },
+        ],
+      }),
+      x: (colW + gap) * 2 + 14,
+      y: colTop + 314,
+      width: colW - 28,
+      height: 146,
+      text: "Definition of Done",
+      fillColor: "#ffffff",
+      strokeColor: "#93c5fd",
+      cornerRadius: 12,
+    });
+
+    // Done cards
+    makeTaskCard(3, 58, "SHIPPED", "#dcfce7", "#15803d", "Floating Studio tool rail & themes", "5 pts · @maya", "#86efac");
+    makeTaskCard(3, 184, "SHIPPED", "#dcfce7", "#15803d", "Realtime LaTeX Maths & Vector Icons", "5 pts · @dev", "#86efac");
+    makeTaskCard(3, 310, "SHIPPED", "#dcfce7", "#15803d", "Release notes v0.1.7 published", "2 pts · @sam", "#86efac");
   } else if (templateId === "swot") {
     const qW = 340;
     const qH = 240;

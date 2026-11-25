@@ -34,10 +34,12 @@ const SECTIONS: { title: string; items: [string, string][] }[] = [
     title: "Navigate & View",
     items: [
       ["Ctrl+K", "Command Palette"],
+      ["Ctrl+\\", "Hide / Show tools rail"],
       ["Ctrl+F", "Search text across all pages"],
+      ["Pinch / Ctrl+Scroll", "Zoom canvas"],
       ["0 / 1", "Fit to content / Reset zoom 100%"],
       ["Shift+2", "Zoom to selection"],
-      ["Space + Drag", "Pan canvas"],
+      ["Space + Drag / H", "Pan canvas"],
     ],
   },
   {

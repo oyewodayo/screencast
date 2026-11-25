@@ -4,12 +4,13 @@
 // moment the user drops any shape, sticky note, or template.
 
 import React, { memo } from "react";
-import { IoCodeSlashOutline } from "react-icons/io5";
+import { IoCodeSlashOutline, IoEaselOutline } from "react-icons/io5";
 import { WhiteboardTemplateId } from "../../utils/whiteboardTemplates";
 
 interface WhiteboardEmptyStateProps {
   onInsertTemplate: (id: WhiteboardTemplateId) => void;
   onOpenImport: () => void;
+  onOpenSlidesImport?: () => void;
   isDarkCanvas?: boolean;
 }
 
@@ -23,7 +24,7 @@ const QUICK_STARTS: { id: WhiteboardTemplateId; label: string; dot: string }[] =
 ];
 
 const WhiteboardEmptyState: React.FC<WhiteboardEmptyStateProps> = memo(
-  ({ onInsertTemplate, onOpenImport, isDarkCanvas = false }) => (
+  ({ onInsertTemplate, onOpenImport, onOpenSlidesImport, isDarkCanvas = false }) => (
     <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-6">
       <div
         onPointerDown={(e) => e.stopPropagation()}
@@ -55,6 +56,20 @@ const WhiteboardEmptyState: React.FC<WhiteboardEmptyStateProps> = memo(
               {item.label}
             </button>
           ))}
+          {onOpenSlidesImport && (
+            <button
+              type="button"
+              onClick={onOpenSlidesImport}
+              className={`flex items-center gap-1.5 h-7 px-2.5 rounded-full text-xs font-medium border transition-colors ${
+                isDarkCanvas
+                  ? "border-indigo-400/40 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-100"
+                  : "border-indigo-200 dark:border-indigo-500/40 bg-indigo-50 dark:bg-indigo-500/15 text-indigo-700 dark:text-indigo-300 hover:border-indigo-400"
+              }`}
+            >
+              <IoEaselOutline size={13} />
+              PowerPoint / Google Slides / PDF
+            </button>
+          )}
           <button
             type="button"
             onClick={onOpenImport}

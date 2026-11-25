@@ -13,6 +13,7 @@
 // doc comment for why undo is per-page rather than a single global stack).
 
 import { ColormapName, colormapPalette, DEFAULT_COLORMAP } from "./colormaps";
+import type { StickerIcon } from "./stickerIcons";
 import type {
   MindmapCheckStyle,
   MindmapColorKey,
@@ -174,7 +175,9 @@ export type WhiteboardShapeType =
   | "mindmapTopic"
   | "mindmapSubtopic"
   | "mindmapChecklist"
-  | "mindmapLinksGroup";
+  | "mindmapLinksGroup"
+  | "icon"
+  | "folder";
 
 export const MINDMAP_TOPIC_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
   "mindmapTopic",
@@ -662,6 +665,8 @@ export function resolveSeriesData(node: SeriesSource): ResolvedSeries {
 
 interface WhiteboardItemBase {
   id: string;
+  // Vector icon identifier from `utils/stickerIcons.ts` when `shapeType === "icon"`.
+  iconName?: StickerIcon;
   createdAt: number;
   updatedAt: number;
   // Explicit layer rank across both nodes and edges on a page (higher = further in front). Absent -
@@ -1516,6 +1521,8 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   mindmapSubtopic: { width: 160, height: 40 },
   mindmapChecklist: { width: 230, height: 132 },
   mindmapLinksGroup: { width: 230, height: 118 },
+  icon: { width: 72, height: 72 },
+  folder: { width: 176, height: 136 },
 };
 
 // The longest edge a freshly imported image's box starts at, in document units. A modern camera or
@@ -1581,13 +1588,14 @@ export function createDefaultWhiteboardNode(
       | "mindmapItems"
       | "mindmapCheckStyle"
       | "mindmapCheckColor"
+      | "iconName"
     >
   >
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
   const defaultFillColor =
-    shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType)
+    shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || shapeType === "icon" || LINE_ONLY_SHAPES.has(shapeType)
       ? null
       : shapeType === "mindmapTopic"
       ? "#fbe25c"
@@ -1595,6 +1603,8 @@ export function createDefaultWhiteboardNode(
       ? "#fcdfa5"
       : shapeType === "artboard"
       ? "#ffffff"
+      : shapeType === "folder"
+      ? "#3b82f6"
       : "#ffffff";
   const defaultStrokeColor =
     shapeType === "freehand"
@@ -1607,6 +1617,8 @@ export function createDefaultWhiteboardNode(
       ? "#d1d5db"
       : shapeType === "artboard"
       ? "#cbd5e1"
+      : shapeType === "folder"
+      ? "#1d4ed8"
       : "#000000";
   const defaultText =
     shapeType === "equation"
@@ -1642,6 +1654,8 @@ export function createDefaultWhiteboardNode(
         : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup"
         ? 10
         : shapeType === "artboard"
+        ? 12
+        : shapeType === "folder"
         ? 12
         : 0,
     // "bondLine" reuses `sides` for its own one number (how many zigzag bonds/segments) - same
@@ -1711,8 +1725,8 @@ export function createDefaultWhiteboardNode(
     tableHeaderRow: shapeType === "table" ? true : undefined,
     fontFamily: "system-ui, sans-serif",
     fontSize: shapeType === "waterfallChart" ? 11 : shapeType === "mindmapSubtopic" ? 14 : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" ? 13 : shapeType === "mindmapTopic" ? 15 : 16,
-    fontColor: shapeType === "mindmapTopic" || shapeType === "mindmapSubtopic" ? "#20211f" : "#111111",
-    fontWeight: shapeType === "mindmapTopic" ? "bold" : "normal",
+    fontColor: shapeType === "mindmapTopic" || shapeType === "mindmapSubtopic" ? "#20211f" : shapeType === "folder" ? "#ffffff" : "#111111",
+    fontWeight: shapeType === "mindmapTopic" || shapeType === "folder" ? "bold" : "normal",
     fontStyle: "normal",
     textDecoration: "none",
     textAlign: shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" || shapeType === "text" ? "left" : "center",
@@ -1741,6 +1755,7 @@ export function createDefaultWhiteboardNode(
         : undefined),
     mindmapCheckStyle: overrides?.mindmapCheckStyle,
     mindmapCheckColor: overrides?.mindmapCheckColor,
+    iconName: shapeType === "icon" ? overrides?.iconName ?? "star" : undefined,
     createdAt: now,
     updatedAt: now,
   };

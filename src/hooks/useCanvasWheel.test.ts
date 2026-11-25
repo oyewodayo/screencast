@@ -3,7 +3,7 @@
 // The wheel/pinch math only. The listener wiring itself is verified by driving the real app (a
 // jsdom wheel event can't tell you whether WebView2 would have zoomed itself instead).
 import { describe, expect, it } from "vitest";
-import { pixelDelta, wheelZoomFactor } from "./useCanvasWheel";
+import { pinchZoomFactor, pixelDelta, wheelZoomFactor } from "./useCanvasWheel";
 
 describe("pixelDelta", () => {
   it("passes pixel deltas (DOM_DELTA_PIXEL) through untouched", () => {
@@ -51,5 +51,14 @@ describe("wheelZoomFactor", () => {
   it("compounds geometrically, so a burst of pinch events adds up", () => {
     const twenty = Math.pow(wheelZoomFactor(-4), 20);
     expect(twenty).toBeCloseTo(1.294, 2);
+  });
+});
+
+describe("pinchZoomFactor", () => {
+  it("provides responsive, reciprocal zooming for small trackpad pinch deltas", () => {
+    expect(pinchZoomFactor(-4)).toBeGreaterThan(wheelZoomFactor(-4));
+    expect(pinchZoomFactor(-4)).toBeLessThan(1.06);
+    expect(pinchZoomFactor(-5) * pinchZoomFactor(5)).toBeCloseTo(1, 12);
+    expect(Math.pow(pinchZoomFactor(-4), 20)).toBeGreaterThan(2);
   });
 });

@@ -24,6 +24,7 @@ import {
 } from "../utils/whiteboardTypes";
 import {
   buildEdgePath,
+  buildFolderGeometry,
   computeContentBounds,
   CYLINDER_CAP_RATIO,
   dashArrayFor,
@@ -33,6 +34,7 @@ import {
   resolveEdgeEndpoints,
   resolvePageLayerOrder,
   SERIES_FILL_OPACITY,
+  shadeHexColor,
   shapeOutlineFor,
 } from "./whiteboardHandlers";
 import {
@@ -42,6 +44,7 @@ import {
   MindmapLayoutMode,
 } from "./whiteboardMindmapHandlers";
 import { buildTaperedFreehandPathD } from "./whiteboardFreehand";
+import { getStickerIconDef } from "../utils/stickerIcons";
 
 // ---- XML / SVG helpers -------------------------------------------------------------------------
 
@@ -152,6 +155,36 @@ function renderNodeSvg(node: WhiteboardNode): string {
       const mEnd = node.endArrowType && node.endArrowType !== "none" ? ` marker-end="url(#${svgMarkerId(node.endArrowType, node.strokeColor)})"` : "";
       const mStart = node.startArrowType && node.startArrowType !== "none" ? ` marker-start="url(#${svgMarkerId(node.startArrowType, node.strokeColor)})"` : "";
       parts.push(`<path d="${d}" fill="none" stroke="${escXml(node.strokeColor)}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round"${dashAttr}${strokeOpacityAttr}${mStart}${mEnd}/>`);
+    }
+  } else if (node.shapeType === "folder") {
+    const baseFill = resolveNodeFill(node) ?? "#3b82f6";
+    const backFill = shadeHexColor(baseFill, -0.22);
+    const geo = buildFolderGeometry(node.width, node.height, node.cornerRadius ?? 12);
+    parts.push(`<path d="${geo.backD}" fill="${escXml(backFill)}"/>`);
+    parts.push(`<rect x="${geo.paperRect.x}" y="${geo.paperRect.y}" width="${geo.paperRect.w}" height="${geo.paperRect.h}" rx="${geo.paperRect.r}" fill="#ffffff" stroke="rgba(0,0,0,0.08)" stroke-width="1"/>`);
+    parts.push(`<path d="${geo.frontD}" fill="${escXml(baseFill)}" stroke="${escXml(stroke)}" stroke-width="${sw}"${dashAttr}${strokeOpacityAttr}/>`);
+  } else if (node.shapeType === "icon") {
+    if (node.fillColor) {
+      const rx = node.cornerRadius || 12;
+      parts.push(`<rect x="0" y="0" width="${node.width}" height="${node.height}" rx="${rx}" ry="${rx}" fill="${escXml(node.fillColor)}"/>`);
+    }
+    const def = getStickerIconDef(node.iconName ?? "star");
+    if (def) {
+      const padFrac = node.fillColor ? 0.68 : 0.92;
+      const iconSize = Math.min(node.width, node.height) * padFrac;
+      const ox = (node.width - iconSize) / 2;
+      const oy = (node.height - iconSize) / 2;
+      const scale = iconSize / 24;
+      const iconSw = Math.max(1, Math.min(4, sw || 2.1));
+      parts.push(`<g transform="translate(${ox.toFixed(2)},${oy.toFixed(2)}) scale(${scale.toFixed(4)})">`);
+      for (const d of def.paths) {
+        if (def.solid) {
+          parts.push(`<path d="${d}" fill="${escXml(node.strokeColor)}"/>`);
+        } else {
+          parts.push(`<path d="${d}" fill="none" stroke="${escXml(node.strokeColor)}" stroke-width="${iconSw}" stroke-linecap="round" stroke-linejoin="round"/>`);
+        }
+      }
+      parts.push(`</g>`);
     }
   } else if (node.shapeType === "vector") {
     const midY = node.height / 2;

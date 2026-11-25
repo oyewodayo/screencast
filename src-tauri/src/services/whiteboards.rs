@@ -340,3 +340,95 @@ pub fn export_whiteboard_to_path(dest_path: String, bytes: Vec<u8>) -> Result<()
     fs::rename(&tmp, &dest).map_err(|e| format!("Failed to save export: {}", e))?;
     Ok(())
 }
+
+/// Downloads a shared Google Slides deck directly as `.pptx` (editable) or `.pdf` (pixel-perfect)
+/// via Google's built-in export endpoint and streams raw bytes back to the frontend without JSON
+/// encoding overhead.
+#[command]
+pub async fn fetch_google_slides_export(
+    presentation_id: String,
+    format: String,
+) -> Result<tauri::ipc::Response, String> {
+    let trimmed_id = presentation_id.trim();
+    if trimmed_id.len() < 10
+        || trimmed_id.len() > 128
+        || !trimmed_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid Google Slides presentation ID.".to_string());
+    }
+    let fmt = format.to_ascii_lowercase();
+    if fmt != "pptx" && fmt != "pdf" {
+        return Err(format!("Unsupported Google Slides export format: {}", fmt));
+    }
+
+    let url = format!(
+        "https://docs.google.com/presentation/d/{}/export/{}",
+        trimmed_id, fmt
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent("Briefcast/0.1.7")
+        .build()
+        .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Google Slides: {}", e))?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || content_type.contains("text/html")
+    {
+        return Err(
+            "This Google Slides deck is private or requires sign-in. Set sharing to \"Anyone with the link can view\", or download it in Google Slides (File → Download → .pptx or .pdf) and import the file directly."
+                .to_string(),
+        );
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Google Slides returned HTTP {} — check that the link is valid and publicly accessible.",
+            status.as_u16()
+        ));
+    }
+
+    const MAX_SLIDES_BYTES: usize = 120 * 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_SLIDES_BYTES {
+            return Err("Presentation exceeds the 120 MB direct import limit.".to_string());
+        }
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed while downloading Google Slides deck: {}", e))?;
+    if bytes.len() > MAX_SLIDES_BYTES {
+        return Err("Presentation exceeds the 120 MB direct import limit.".to_string());
+    }
+
+    let valid_magic = if fmt == "pptx" {
+        bytes.len() >= 4 && &bytes[0..4] == b"PK\x03\x04"
+    } else {
+        bytes.len() >= 4 && &bytes[0..4] == b"%PDF"
+    };
+    if !valid_magic {
+        return Err(
+            "Google Slides did not return a valid presentation file. Make sure sharing is set to \"Anyone with the link can view\", or download as .pptx / .pdf and import directly."
+                .to_string(),
+        );
+    }
+
+    Ok(tauri::ipc::Response::new(bytes.to_vec()))
+}

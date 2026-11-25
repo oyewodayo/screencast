@@ -45,6 +45,9 @@ import {
 } from "react-icons/tb";
 import { ColormapName, COLORMAP_NAMES, colormapPalette, DEFAULT_COLORMAP } from "../../utils/colormaps";
 import { NODE_STYLE_PRESETS } from "../../utils/whiteboardThemes";
+import { searchIcons, StickerIcon } from "../../utils/stickerIcons";
+import WhiteboardIconGlyph from "./WhiteboardIconGlyph";
+import WhiteboardMathEditor from "./WhiteboardMathEditor";
 import {
   ArrowheadType,
   ChartAnnotation,
@@ -637,7 +640,9 @@ const SHAPE_DISPLAY_NAME: Partial<Record<WhiteboardNode["shapeType"], string>> =
   lessThanSign: "Less than",
   greaterEqualSign: "Greater or equal",
   lessEqualSign: "Less or equal",
-  equation: "Equation",
+  equation: "Maths (LaTeX)",
+  icon: "Icon",
+  folder: "Folder",
   freehand: "Ink stroke",
   image: "Image",
 };
@@ -2743,18 +2748,26 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   const previewEdgeField = (key: keyof WhiteboardEdge) => (n: number | null) =>
     onPreviewEdges?.(n === null ? null : ({ [key]: n } as Partial<WhiteboardEdge>));
 
+  const singleIcon = selectedNodes.length === 1 && selectedNodes[0].shapeType === "icon";
+  const [iconQuery, setIconQuery] = React.useState("");
+  const matchingIcons = React.useMemo(
+    () => (singleIcon ? searchIcons(iconQuery).filter((i) => i.value !== "none") : []),
+    [singleIcon, iconQuery]
+  );
+
   if (selectedNodes.length === 0 && selectedEdges.length === 0) return null;
 
   // Freehand ink and the lattice widget carry no text, so the Text group only shows when some
   // selected shape can show text.
-  const hasText = selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge");
+  const hasText = selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge" && n.shapeType !== "icon");
   const allText = selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType === "text");
+  const singleEquation = selectedNodes.length === 1 && selectedNodes[0].shapeType === "equation";
 
   // Shapes whose interior takes the full fill paint (gradient/image/pattern). Charts, tables and
   // images keep the plain color well: their "fill" is bar color / cell background / letterbox matte,
   // where a gradient or a photo has no sensible meaning.
   const canPaintFill = (n: WhiteboardNode) =>
-    !["text", "freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
+    !["text", "freehand", "image", "table", "latticeGauge", "icon"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
   const hasFill = selectedNodes.some((n) => n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
   const ids = selectedNodes.map((n) => n.id).join(",");
   const allLocked =
@@ -2765,6 +2778,8 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   const canShowStylePresets =
     selectedNodes.length > 0 &&
     !allText &&
+    !singleEquation &&
+    !singleIcon &&
     selectedNodes.every(canPaintFill) &&
     selectedNodes.every((n) => n.shapeType !== "artboard");
 
@@ -2797,6 +2812,90 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain flex flex-col [scrollbar-width:thin]">
+      {/* Realtime LaTeX Maths editor at the top of the panel when an Equation is selected */}
+      {singleEquation && (
+        <Section title="Equation (LaTeX)" dense>
+          <WhiteboardMathEditor
+            node={selectedNodes[0]}
+            onCommit={updateNodes}
+            onPreview={onPreviewNodes}
+          />
+          <div className="flex items-center gap-1.5 pt-1 border-t border-black/[0.05] dark:border-white/[0.06]">
+            <div className="flex-1">
+              <ColorField label="Ink" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor })} />
+            </div>
+            <div className="w-[78px] shrink-0">
+              <PrefixedNumber
+                prefix={<TbTextSize size={12} />}
+                title="Equation size - drag the icon to scrub"
+                resetKey={`${ids}-eqfs`}
+                value={selectedNodes[0].fontSize}
+                min={10}
+                max={240}
+                onCommit={(fontSize) => updateNodes({ fontSize })}
+              />
+            </div>
+          </div>
+        </Section>
+      )}
+      {/* Searchable Icon switcher at the top of the panel when a vector Icon node is selected */}
+      {singleIcon && (
+        <Section title="Icon" dense>
+          <input
+            type="text"
+            value={iconQuery}
+            onChange={(e) => setIconQuery(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter" && matchingIcons.length > 0) {
+                updateNodes({ iconName: matchingIcons[0].value as StickerIcon });
+              }
+            }}
+            placeholder="Find an icon…"
+            className={`w-full h-7 px-2 ${INPUT_SURFACE_CLASS} text-[12px]`}
+          />
+          <div className="grid grid-cols-6 gap-1 max-h-36 overflow-y-auto [scrollbar-width:thin] pr-0.5">
+            {matchingIcons.map((ic) => {
+              const active = selectedNodes[0].iconName === ic.value;
+              return (
+                <button
+                  key={ic.value}
+                  type="button"
+                  title={ic.label}
+                  onClick={() => updateNodes({ iconName: ic.value as StickerIcon })}
+                  className={`h-8 rounded-md flex items-center justify-center p-1.5 transition-colors ${
+                    active
+                      ? "bg-blue-600 text-white"
+                      : "bg-black/[0.04] dark:bg-white/[0.06] text-neutral-700 dark:text-neutral-200 hover:bg-blue-500/15 hover:text-blue-600"
+                  }`}
+                >
+                  <WhiteboardIconGlyph icon={ic.value} size={16} />
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-between gap-2 pt-1">
+            <span className="text-[11px] text-neutral-500 dark:text-neutral-400">Badge background</span>
+            {selectedNodes[0].fillColor ? (
+              <button
+                type="button"
+                onClick={() => updateNodes({ fillColor: null })}
+                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Clear
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => updateNodes({ fillColor: "#eff6ff", strokeColor: "#2563eb", cornerRadius: 16 })}
+                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Add badge
+              </button>
+            )}
+          </div>
+        </Section>
+      )}
       {/* Visual-first top section: 1-click designer Style Presets for fillable shapes */}
       {canShowStylePresets && (
         <Section title="Presets" dense>
@@ -4098,7 +4197,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         </Section>
       )}
 
-      {selectedNodes.length > 0 && hasText && !allText && (
+      {selectedNodes.length > 0 && hasText && !allText && !singleEquation && (
         <Section title="Text" dense>
           {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets with its
               own math font regardless, so these controls would sit there doing nothing visible if
