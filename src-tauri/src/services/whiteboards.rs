@@ -286,7 +286,7 @@ pub fn export_whiteboard_file(
     bytes: Vec<u8>,
 ) -> Result<String, String> {
     let _serial = crate::services::responsiveness::serial();
-    const ALLOWED: [&str; 2] = ["png", "pdf"];
+    const ALLOWED: [&str; 3] = ["png", "pdf", "svg"];
     let ext = extension.to_ascii_lowercase();
     if !ALLOWED.contains(&ext.as_str()) {
         return Err(format!("Unsupported export type: {}", ext));

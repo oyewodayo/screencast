@@ -191,6 +191,7 @@ import { buildHomeItems, homeItemKey, relativeTime, type HomeItem } from "../uti
 import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
 import type { WhiteboardSummary } from "../utils/whiteboardTypes";
 import type { MindmapSummary } from "../utils/mindmapTypes";
+import { openOrMigrateLegacyMindmap } from "../utils/mindmapMigration";
 import {
   getResumeTime,
   recordPlaybackPosition,
@@ -3727,8 +3728,17 @@ const setScreen = () => {
 			handleOpenWhiteboard();
 			setWhiteboardScreen({ mode: "editor", whiteboardId: item.id });
 		} else {
-			handleOpenMindmap();
-			setMindmapScreen({ mode: "editor", mindmapId: item.id });
+			// Legacy standalone mindmaps open seamlessly inside Whiteboard via idempotent migration.
+			void openOrMigrateLegacyMindmap(item.id)
+				.then((whiteboardId) => {
+					handleOpenWhiteboard();
+					setWhiteboardScreen({ mode: "editor", whiteboardId });
+				})
+				.catch((err) => {
+					console.error("Failed to open mindmap in Whiteboard, falling back to legacy view:", err);
+					handleOpenMindmap();
+					setMindmapScreen({ mode: "editor", mindmapId: item.id });
+				});
 		}
 	};
 	// Cross-links (contexts/ItemLinksContext): every viewer's "Linked" control lands here to switch
@@ -6027,7 +6037,6 @@ const setScreen = () => {
                     { label: "Edit a video", icon: <IoCutOutline size={22} />, onClick: handleOpenVideoEditor },
                     { label: "Write a document", icon: <IoDocumentTextOutline size={22} />, onClick: handleOpenDocs },
                     { label: "Whiteboard", icon: <IoGitNetworkOutline size={22} />, onClick: handleOpenWhiteboard },
-                    { label: "Mind map", icon: <IoMapOutline size={22} />, onClick: handleOpenMindmap },
                     { label: "Board", icon: <IoImagesOutline size={22} />, onClick: handleOpenBoard },
                     { label: "Open a file", icon: <IoFolderOpenOutline size={22} />, onClick: handleOpenExternalFile },
                   ].map((action) => (

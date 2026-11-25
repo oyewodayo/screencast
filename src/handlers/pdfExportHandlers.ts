@@ -40,11 +40,21 @@ export function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array>
 // to fit A4: a wide roadmap letterboxed onto portrait A4 wastes most of the page, and a diagram has
 // no inherent reason to match a paper size the way a text document does.
 export async function canvasToPdfBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
-  const pngBytes = await canvasToPngBytes(canvas);
+  return canvasesToMultiPagePdfBytes([canvas]);
+}
+
+/**
+ * Bundles multiple rendered canvases into a single multi-page PDF (1px = 1pt per page).
+ * Used by Whiteboard's "All Pages -> PDF" and "All Frames (Slide Deck) -> PDF" exports.
+ */
+export async function canvasesToMultiPagePdfBytes(canvases: HTMLCanvasElement[]): Promise<Uint8Array> {
   const pdf = await PDFDocument.create();
-  const image = await pdf.embedPng(pngBytes);
-  const page = pdf.addPage([image.width, image.height]);
-  page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+  for (const canvas of canvases) {
+    const pngBytes = await canvasToPngBytes(canvas);
+    const image = await pdf.embedPng(pngBytes);
+    const page = pdf.addPage([image.width, image.height]);
+    page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+  }
   return pdf.save();
 }
 

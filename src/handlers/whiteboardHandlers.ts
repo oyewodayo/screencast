@@ -11,6 +11,9 @@
 // draw.io-style pages are independent canvases, not one shared coordinate space.
 
 import { wrapTextToWidth } from "../utils/canvasText";
+import { preloadWhiteboardFontsForNodes } from "../utils/whiteboardFonts";
+import { buildTaperedFreehandPathD } from "./whiteboardFreehand";
+import { getCollapsedState } from "./whiteboardMindmapHandlers";
 import katex from "katex";
 import {
   ArrowheadType,
@@ -4623,6 +4626,9 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
   if (node.opacity !== undefined && node.opacity < 1) {
     ctx.globalAlpha = Math.max(0, Math.min(1, node.opacity));
   }
+  if (node.blendMode && node.blendMode !== "normal") {
+    ctx.globalCompositeOperation = node.blendMode as GlobalCompositeOperation;
+  }
   if (node.shadowEnabled) {
     const shadowColor = node.shadowColor ?? DEFAULT_SHADOW_COLOR;
     const shadowOpacity = Math.max(0, Math.min(1, node.shadowOpacity ?? DEFAULT_SHADOW_OPACITY));
@@ -4632,28 +4638,36 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     ctx.shadowOffsetY = node.shadowOffsetY ?? DEFAULT_SHADOW_OFFSET_Y;
   }
   if (node.shapeType === "freehand") {
-    const path = freehandPath2D(node);
-    ctx.lineWidth = node.strokeWidth;
+    const pts = (node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height }));
+    const hasArrows =
+      (node.endArrowType !== undefined && node.endArrowType !== "none") ||
+      (node.startArrowType !== undefined && node.startArrowType !== "none");
+    const useTapered = !hasArrows && node.strokeStyle !== "dashed" && node.strokeStyle !== "dotted" && pts.length >= 2;
     const strokeColor = node.strokeOpacity !== undefined && node.strokeOpacity < 1
       ? hexToRgba(node.strokeColor, node.strokeOpacity)
       : node.strokeColor;
-    ctx.strokeStyle = strokeColor;
-    if (node.strokeStyle === "dashed") {
-      ctx.setLineDash([8, 6]);
-    } else if (node.strokeStyle === "dotted") {
-      ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+    if (useTapered) {
+      const taperedD = buildTaperedFreehandPathD(pts, node.strokeWidth, Boolean(node.freehandHighlighter));
+      if (taperedD) {
+        ctx.fillStyle = strokeColor;
+        ctx.fill(new Path2D(taperedD));
+      }
     } else {
+      const path = freehandPath2D(node);
+      ctx.lineWidth = node.strokeWidth;
+      ctx.strokeStyle = strokeColor;
+      if (node.strokeStyle === "dashed") {
+        ctx.setLineDash([8, 6]);
+      } else if (node.strokeStyle === "dotted") {
+        ctx.setLineDash([Math.max(1, node.strokeWidth * 0.4), Math.max(3, node.strokeWidth * 1.6 + 3)]);
+      } else {
+        ctx.setLineDash([]);
+      }
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.stroke(path);
       ctx.setLineDash([]);
     }
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
-    ctx.stroke(path);
-    ctx.setLineDash([]);
-    // A "Freehand Arrow" (see whiteboardTypes.ts's WhiteboardNode.endArrowType doc comment) caps
-    // one or both ends with a marker, angled off the stroke's own final two points (a close-enough
-    // stand-in for the smoothed curve's true end tangent - freehandPath2D's own last segment is a
-    // plain line to that final point anyway, so this matches exactly).
-    const pts = (node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height }));
     if (pts.length >= 2) {
       const last = pts[pts.length - 1];
       const beforeLast = pts[pts.length - 2];
@@ -4716,8 +4730,80 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
     const src = imageSrcFor?.(node) ?? null;
     const decoded = src ? getCachedWhiteboardImage(src) : null;
     paintImageNode(ctx, node, decoded, decoded?.naturalWidth ?? 0, decoded?.naturalHeight ?? 0);
+  } else if (node.shapeType === "artboard") {
+    paintShapeBody(ctx, node, imageSrcFor);
+    if (node.text) {
+      ctx.save();
+      ctx.font = "600 12px system-ui, sans-serif";
+      ctx.fillStyle = "#4b5563";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(node.text, 4, -6);
+      ctx.restore();
+    }
+  } else if (node.shapeType === "mindmapChecklist" || node.shapeType === "mindmapLinksGroup") {
+    paintShapeBody(ctx, node, imageSrcFor);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, node.width, node.height);
+    ctx.clip();
+    const pad = 10;
+    const titleText = node.text || (node.shapeType === "mindmapChecklist" ? "Checklist" : "Resources");
+    ctx.font = `600 12px ${node.fontFamily || "system-ui, sans-serif"}`;
+    ctx.fillStyle = node.fontColor;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(titleText, pad, pad);
+    let y = pad + 20;
+    ctx.strokeStyle = "rgba(0,0,0,0.1)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad, y - 4);
+    ctx.lineTo(node.width - pad, y - 4);
+    ctx.stroke();
+    ctx.font = `12px ${node.fontFamily || "system-ui, sans-serif"}`;
+    for (const item of node.mindmapItems ?? []) {
+      if (y > node.height - 10) break;
+      if (node.shapeType === "mindmapChecklist") {
+        ctx.strokeStyle = item.checked ? "#16a34a" : "#9ca3af";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(pad, y + 1, 10, 10);
+        if (item.checked) {
+          ctx.fillStyle = "#16a34a";
+          ctx.fillText("✓", pad + 1.5, y - 1);
+        }
+        ctx.fillStyle = item.checked ? "#9ca3af" : node.fontColor;
+        ctx.fillText(item.text, pad + 16, y);
+      } else {
+        ctx.fillStyle = "#2563eb";
+        ctx.fillText(`› ${item.text}`, pad, y);
+      }
+      y += 18;
+    }
+    ctx.restore();
   } else {
-    if (node.shapeType !== "text") paintShapeBody(ctx, node, imageSrcFor);
+    if (node.shapeType !== "text" || node.fillColor || node.strokeWidth > 0) paintShapeBody(ctx, node, imageSrcFor);
+    if ((node.shapeType === "mindmapTopic" || node.shapeType === "mindmapSubtopic") && node.mindmapProgress && node.mindmapProgress !== "pending") {
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(0, 0, node.width, node.height, node.cornerRadius || 6);
+      ctx.fillStyle =
+        node.mindmapProgress === "done"
+          ? "rgba(22, 163, 74, 0.16)"
+          : node.mindmapProgress === "in-progress"
+          ? "rgba(234, 179, 8, 0.18)"
+          : "rgba(156, 163, 175, 0.22)";
+      ctx.fill();
+      ctx.strokeStyle =
+        node.mindmapProgress === "done"
+          ? "#16a34a"
+          : node.mindmapProgress === "in-progress"
+          ? "#eab308"
+          : "#9ca3af";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
     paintNodeText(ctx, node);
   }
   ctx.restore();
@@ -4869,11 +4955,19 @@ function renderEdge(ctx: CanvasRenderingContext2D, edge: WhiteboardEdge, nodesBy
 // node as its missing-asset placeholder.
 export type ImageSrcResolver = (node: WhiteboardNode) => string | null;
 
-export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimension?: number, imageSrcFor?: ImageSrcResolver): Promise<HTMLCanvasElement> {
-  const bounds = computeContentBounds(page);
+export async function renderWhiteboardToCanvas(
+  page: WhiteboardPage,
+  maxDimension?: number,
+  imageSrcFor?: ImageSrcResolver,
+  explicitBounds?: BoundsBox,
+  exportScale = 1,
+  bgColor = "#ffffff"
+): Promise<HTMLCanvasElement> {
+  const bounds = explicitBounds ?? computeContentBounds(page);
   const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
   const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
-  const scale = maxDimension ? Math.min(1, maxDimension / Math.max(contentWidth, contentHeight)) : 1;
+  const baseScale = maxDimension ? Math.min(1, maxDimension / Math.max(contentWidth, contentHeight)) : exportScale;
+  const scale = Math.max(0.1, baseScale);
   const width = Math.max(1, Math.round(contentWidth * scale));
   const height = Math.max(1, Math.round(contentHeight * scale));
   const canvas = document.createElement("canvas");
@@ -4882,10 +4976,12 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
   const ctx = canvas.getContext("2d");
   if (!ctx) return canvas;
 
-  ctx.fillStyle = "#ffffff";
+  ctx.fillStyle = bgColor;
   ctx.fillRect(0, 0, width, height);
   ctx.scale(scale, scale);
   ctx.translate(-bounds.minX, -bounds.minY);
+
+  await preloadWhiteboardFontsForNodes(page.nodes);
 
   // Decode every image asset BEFORE painting anything. renderNode is synchronous once it reaches a
   // given node's draw call, so an undecoded bitmap there would export as a placeholder - doing it
@@ -4905,13 +5001,20 @@ export async function renderWhiteboardToCanvas(page: WhiteboardPage, maxDimensio
     await Promise.all([...srcs].map((src) => preloadWhiteboardImage(src).catch(() => null)));
   }
 
-  const nodesById = new Map(page.nodes.map((n) => [n.id, n]));
-  const layerOrder = resolvePageLayerOrder(page);
+  const collapsed = getCollapsedState(page.nodes, page.edges);
+  const exportNodes = collapsed.hiddenNodeIds.size === 0 ? page.nodes : page.nodes.filter((n) => !collapsed.hiddenNodeIds.has(n.id));
+  const exportEdges = collapsed.hiddenEdgeIds.size === 0 ? page.edges : page.edges.filter((e) => !collapsed.hiddenEdgeIds.has(e.id));
+  const nodesById = new Map(exportNodes.map((n) => [n.id, n]));
+  const layerOrder = resolvePageLayerOrder({ nodes: exportNodes, edges: exportEdges });
   type RenderableItem = { kind: "node"; item: WhiteboardNode } | { kind: "edge"; item: WhiteboardEdge };
   const orderedItems: RenderableItem[] = [
-    ...page.nodes.map((item): RenderableItem => ({ kind: "node", item })),
-    ...page.edges.map((item): RenderableItem => ({ kind: "edge", item })),
-  ].sort((a, b) => (layerOrder.get(a.item.id) ?? 0) - (layerOrder.get(b.item.id) ?? 0));
+    ...exportNodes.map((item): RenderableItem => ({ kind: "node", item })),
+    ...exportEdges.map((item): RenderableItem => ({ kind: "edge", item })),
+  ].sort((a, b) => {
+    const aIsArtboard = a.kind === "node" && a.item.shapeType === "artboard" ? -10000 : 0;
+    const bIsArtboard = b.kind === "node" && b.item.shapeType === "artboard" ? -10000 : 0;
+    return aIsArtboard + (layerOrder.get(a.item.id) ?? 0) - (bIsArtboard + (layerOrder.get(b.item.id) ?? 0));
+  });
 
   // Sequential awaits, not Promise.all - every item shares this one ctx (save/translate/restore),
   // so two renderNode calls running concurrently would interleave their transform stacks.

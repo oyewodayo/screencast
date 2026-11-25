@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { PhonesDockButton } from './PhonesHub';
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
+import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoCutOutline } from 'react-icons/io5'
 import RecentHistoryDropup from './RecentHistoryDropup';
 import type { HomeItem } from '../utils/homeLibraryItems';
 import type { FileEntry } from '../utils/libraryEntries';
@@ -94,7 +94,7 @@ interface Props {
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
         historyItems,onOpenHistoryItem,libraryFilesByPath,arrivals,libraryPreviewDurations
 
     }:Props) => {
@@ -192,19 +192,11 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={iconButtonClass(isWhiteboard)}
+                    className={iconButtonClass(isWhiteboard || isMindmap)}
                     onClick={() => handleOpenWhiteboard()}
-                    title="Whiteboard"
+                    title="Whiteboard & Mind maps"
                     >
                       <IoGitNetworkOutline />
-                    </button>
-                    <button
-                    type="button"
-                    className={iconButtonClass(isMindmap)}
-                    onClick={() => handleOpenMindmap()}
-                    title="Mindmap"
-                    >
-                      <IoMapOutline />
                     </button>
                     <button
                     type="button"

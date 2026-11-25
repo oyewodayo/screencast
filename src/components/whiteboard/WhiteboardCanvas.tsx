@@ -37,16 +37,29 @@ import {
   createDefaultWhiteboardEdge,
   createDefaultWhiteboardNode,
   createFreehandWhiteboardNode,
+  isArtboardNode,
+  isMindmapNode,
+  isMindmapTopicNode,
   resolveImageCrop,
   DEFAULT_CHART_DATA,
   WhiteboardAnchorSide,
+  WhiteboardCanvasTheme,
   WhiteboardEdge,
   WhiteboardEndpoint,
+  WhiteboardGridStyle,
   WhiteboardNode,
   WhiteboardPage,
   WhiteboardShapeType,
   resolveNodeFill,
 } from "../../utils/whiteboardTypes";
+import { resolveCanvasTheme } from "../../utils/whiteboardThemes";
+import { buildTaperedFreehandPathD } from "../../handlers/whiteboardFreehand";
+import {
+  buildMindmapBranch,
+  buildMindmapSibling,
+  getCollapsedState,
+} from "../../handlers/whiteboardMindmapHandlers";
+import { computeAutoTextBoxSize, cullVisibleItems, findContainedFrameItems } from "../../handlers/whiteboardProHandlers";
 import {
   AMP_MINUS_Y_FRAC,
   AMP_PLUS_Y_FRAC,
@@ -714,6 +727,8 @@ export interface WhiteboardCanvasHandle {
   zoomBy: (factor: number) => void;
   resetView: () => void;
   fitToContent: (bounds: BoundsBox) => void;
+  animateFitToBounds: (bounds: BoundsBox, paddingPx?: number, durationMs?: number) => void;
+  focusPoint: (docX: number, docY: number, minZoom?: number) => void;
   // Called by WhiteboardEditor.tsx once the user picks a shape from the quick-connect popover that
   // opens after clicking one of a node's hover arrows (see onQuickConnectArrowClick below) - builds
   // and places that shape, connected to the source node, in one step.
@@ -723,6 +738,9 @@ export interface WhiteboardCanvasHandle {
 interface WhiteboardCanvasProps {
   page: WhiteboardPage;
   showGrid: boolean;
+  canvasTheme?: WhiteboardCanvasTheme;
+  gridStyle?: WhiteboardGridStyle;
+  handArmed?: boolean;
   // See WhiteboardDocument.snapToGrid's own doc comment - independent of showGrid, consulted by
   // isSnapEnabled for move/resize drags and free-floating connector endpoint/waypoint drags.
   snapToGrid: boolean;
@@ -752,6 +770,7 @@ interface WhiteboardCanvasProps {
   // Ink color/width the pen tool draws new strokes with (the toolbar's pen popover owns them).
   penColor?: string;
   penWidth?: number;
+  penHighlighter?: boolean;
   onShapePlaced: () => void;
   // The edge-drawing tool's own armed state, kept separate from armedShapeType so a shape and the
   // connector tool can never both be "in progress" at once - see WhiteboardEditor's toolbar. Unlike
@@ -821,6 +840,10 @@ interface WhiteboardCanvasProps {
   previewNodes?: WhiteboardNode[] | null;
   previewEdges?: WhiteboardEdge[] | null;
   removingBackgroundNodeId?: string | null;
+  studyMode?: boolean;
+  onOpenTopicDrawer?: (nodeId: string) => void;
+  formatPainterActive?: boolean;
+  onApplyFormatPainter?: (targetNodeId: string) => void;
 }
 
 function clampZoom(z: number): number {
@@ -914,6 +937,9 @@ function EquationDisplay({ source, fontSize, color }: { source: string; fontSize
 const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProps>(({
   page,
   showGrid,
+  canvasTheme = "light",
+  gridStyle,
+  handArmed = false,
   snapToGrid,
   zoom,
   onZoomChange,
@@ -934,6 +960,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   armedShapeType,
   penColor = "#111111",
   penWidth = 2.5,
+  penHighlighter = false,
   onShapePlaced,
   connectorArmed,
   armedConnectorOverrides,
@@ -950,8 +977,26 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   previewNodes,
   previewEdges,
   removingBackgroundNodeId,
+  studyMode = false,
+  onOpenTopicDrawer,
+  formatPainterActive = false,
+  onApplyFormatPainter,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const cameraAnimRef = useRef<number | null>(null);
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const update = () => setContainerSize({ width: el.clientWidth, height: el.clientHeight });
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (cameraAnimRef.current !== null) cancelAnimationFrame(cameraAnimRef.current);
+    };
+  }, []);
   const interactionRef = useRef<Interaction | null>(null);
   const [liveNodes, setLiveNodes] = useState<WhiteboardNode[] | null>(null);
   // Mirrors liveNodes out to the parent throttled during drag to prevent style panel DOM layout thrashing
@@ -972,8 +1017,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // far - keeps the drag preview showing the SAME direction the committed edge will actually get,
   // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
   const [connectorPreviewBow, setConnectorPreviewBow] = useState<number>(DEFAULT_CURVE_BOW);
-  const penStyleRef = useRef({ color: penColor, width: penWidth });
-  penStyleRef.current = { color: penColor, width: penWidth };
+  const penStyleRef = useRef({ color: penColor, width: penWidth, highlighter: penHighlighter });
+  penStyleRef.current = { color: penColor, width: penWidth, highlighter: penHighlighter };
   const [freehandPreview, setFreehandPreview] = useState<{ x: number; y: number }[] | null>(null);
   // The laser pointer's trail - each point stamped with when it was recorded (performance.now(),
   // ms) so rendering can age it out smoothly. Never touches the document/undo stack - see
@@ -1037,6 +1082,37 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   const nodes = liveNodes ?? previewedNodes ?? page.nodes;
   const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edges = liveEdges ?? previewedEdges ?? page.edges;
+  const collapsedState = useMemo(() => getCollapsedState(nodes, edges), [nodes, edges]);
+  const visibleNodes = useMemo(
+    () => (collapsedState.hiddenNodeIds.size === 0 ? nodes : nodes.filter((n) => !collapsedState.hiddenNodeIds.has(n.id))),
+    [nodes, collapsedState.hiddenNodeIds]
+  );
+  const visibleEdges = useMemo(
+    () => (collapsedState.hiddenEdgeIds.size === 0 ? edges : edges.filter((ed) => !collapsedState.hiddenEdgeIds.has(ed.id))),
+    [edges, collapsedState.hiddenEdgeIds]
+  );
+  // Phase 4 Viewport Frustum Culling: skips off-screen DOM nodes/SVGs on large boards (>40 nodes)
+  // while guaranteeing selected, hovered, editing, and connector-target items always stay mounted.
+  const culled = useMemo(() => {
+    if (containerSize.width <= 0 || containerSize.height <= 0) {
+      return { nodes: visibleNodes, edges: visibleEdges, culledCount: 0 };
+    }
+    const safeZoom = Math.max(0.05, zoom);
+    const viewport = {
+      minX: -pan.x / safeZoom,
+      minY: -pan.y / safeZoom,
+      maxX: (containerSize.width - pan.x) / safeZoom,
+      maxY: (containerSize.height - pan.y) / safeZoom,
+    };
+    const alwaysKeepNodes = new Set<string>(selectedNodeIds);
+    if (hoveredNodeId) alwaysKeepNodes.add(hoveredNodeId);
+    if (editingNodeId) alwaysKeepNodes.add(editingNodeId);
+    if (connectorHoverNodeId) alwaysKeepNodes.add(connectorHoverNodeId);
+    if (croppingNodeId) alwaysKeepNodes.add(croppingNodeId);
+    return cullVisibleItems(visibleNodes, visibleEdges, viewport, alwaysKeepNodes, selectedEdgeIds);
+  }, [visibleNodes, visibleEdges, containerSize, zoom, pan, selectedNodeIds, selectedEdgeIds, hoveredNodeId, editingNodeId, connectorHoverNodeId, croppingNodeId]);
+  const renderedNodes = culled.nodes;
+  const renderedEdges = culled.edges;
   const layerOrder = useMemo(() => resolvePageLayerOrder({ nodes, edges }), [nodes, edges]);
 
   const [, setFillImageTick] = useState(0);
@@ -1141,10 +1217,35 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       const active = document.activeElement;
       const isTyping = active instanceof HTMLElement && (active.isContentEditable || active.tagName === "INPUT" || active.tagName === "TEXTAREA");
       if (isTyping) return;
+      if (studyMode) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
         e.preventDefault();
         onSelectionChange(new Set(page.nodes.map((n) => n.id)), new Set(page.edges.map((ed) => ed.id)));
         return;
+      }
+      // 1-keystroke Mind Map branching: Tab = add child branch, Enter = add sibling branch.
+      if ((e.key === "Tab" || e.key === "Enter") && !e.ctrlKey && !e.metaKey && !e.altKey && selectedNodeIds.size === 1 && selectedEdgeIds.size === 0 && !editingNodeId) {
+        const [selId] = Array.from(selectedNodeIds);
+        const selNode = page.nodes.find((n) => n.id === selId);
+        if (selNode && isMindmapTopicNode(selNode)) {
+          e.preventDefault();
+          const built =
+            e.key === "Tab"
+              ? buildMindmapBranch(selNode, "right", page.nodes, crypto.randomUUID(), crypto.randomUUID())
+              : buildMindmapSibling(selNode, page, crypto.randomUUID(), crypto.randomUUID());
+          if (selNode.mindmapCollapsed && e.key === "Tab") {
+            onEditNode(selNode, { ...selNode, mindmapCollapsed: false });
+          }
+          onAddNodeWithEdge(built.node, built.edge);
+          onSelectionChange(new Set([built.node.id]), new Set());
+          setEditingNodeId(built.node.id);
+          return;
+        }
+        if (e.key === "Enter" && selNode && !selNode.locked && (selNode.shapeType === "text" || selNode.shapeType === "equation")) {
+          e.preventDefault();
+          setEditingNodeId(selNode.id);
+          return;
+        }
       }
       if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
@@ -1193,12 +1294,20 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedNodeIds, selectedEdgeIds, page.nodes, page.edges, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onBatchEditNodes, onBatchEditItems, onEditEdge]);
+  }, [studyMode, editingNodeId, selectedNodeIds, selectedEdgeIds, page, onDeleteEdge, onDeleteNode, onSelectionChange, onEditNode, onAddNodeWithEdge, onBatchEditNodes, onBatchEditItems, onEditEdge]);
 
   // ---- Node move / resize ----------------------------------------------------------------------
   const beginMoveNode = useCallback(
     (node: WhiteboardNode, e: React.PointerEvent, additive: boolean) => {
       e.stopPropagation();
+      if (studyMode) {
+        if (isMindmapNode(node)) onOpenTopicDrawer?.(node.id);
+        return;
+      }
+      if (formatPainterActive) {
+        onApplyFormatPainter?.(node.id);
+        return;
+      }
       // A grouped node toggles/selects its WHOLE group as one unit, same "acts as one thing" idea
       // moving it below already relies on - clicking (or shift-clicking) just one member would
       // otherwise leave the group only partly selected, which then only partly drags.
@@ -1228,20 +1337,30 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
       // even though clicking-and-dragging its body no longer does anything.
       if (node.locked) return;
       const inSelection = nextSelected.has(node.id);
-      const ids = inSelection ? Array.from(nextSelected) : [node.id];
+      const baseIds = inSelection ? Array.from(nextSelected) : [node.id];
+      const baseNodes = page.nodes.filter((n) => baseIds.includes(n.id) && !n.locked);
+      // True containment frames ("artboard"): dragging a frame automatically carries every unlocked
+      // node and free-floating edge whose center/endpoint sits inside the frame's bounds.
+      const contained = findContainedFrameItems(baseNodes, page.nodes, page.edges);
+      const moveNodeIdSet = new Set<string>([...baseNodes.map((n) => n.id), ...contained.nodeIds]);
+      const moveEdgeIdSet = new Set<string>([
+        ...(inSelection ? Array.from(nextEdges) : []),
+        ...contained.edgeIds,
+      ]);
+      const ids = Array.from(moveNodeIdSet);
       lastDragClientRef.current = null;
       interactionRef.current = {
         mode: "move",
         ids,
         startClientX: e.clientX,
         startClientY: e.clientY,
-        startNodes: page.nodes.filter((n) => ids.includes(n.id)),
-        startEdges: inSelection ? page.edges.filter((ed) => nextEdges.has(ed.id) && !ed.locked) : [],
+        startNodes: page.nodes.filter((n) => moveNodeIdSet.has(n.id)),
+        startEdges: page.edges.filter((ed) => moveEdgeIdSet.has(ed.id) && !ed.locked),
         anchorId: node.id,
       };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
-    [selectedNodeIds, selectedEdgeIds, onSelectionChange, page.nodes, page.edges]
+    [studyMode, formatPainterActive, onOpenTopicDrawer, onApplyFormatPainter, selectedNodeIds, selectedEdgeIds, onSelectionChange, page.nodes, page.edges]
   );
 
   const beginResizeNode = useCallback(
@@ -1626,6 +1745,10 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         onPanChange({ x: 0, y: 0 });
       },
       fitToContent: (bounds: BoundsBox) => {
+        if (cameraAnimRef.current !== null) {
+          cancelAnimationFrame(cameraAnimRef.current);
+          cameraAnimRef.current = null;
+        }
         const rect = containerRef.current?.getBoundingClientRect();
         if (!rect || rect.width === 0 || rect.height === 0) return;
         const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
@@ -1635,6 +1758,52 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         onPanChange({
           x: (rect.width - contentWidth * nextZoom) / 2 - bounds.minX * nextZoom,
           y: (rect.height - contentHeight * nextZoom) / 2 - bounds.minY * nextZoom,
+        });
+      },
+      animateFitToBounds: (bounds: BoundsBox, paddingPx = 48, durationMs = 360) => {
+        if (cameraAnimRef.current !== null) {
+          cancelAnimationFrame(cameraAnimRef.current);
+          cameraAnimRef.current = null;
+        }
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+        const availW = Math.max(80, rect.width - paddingPx * 2);
+        const availH = Math.max(80, rect.height - paddingPx * 2);
+        const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
+        const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
+        const targetZoom = clampZoom(Math.min(availW / contentWidth, availH / contentHeight));
+        const targetPanX = (rect.width - contentWidth * targetZoom) / 2 - bounds.minX * targetZoom;
+        const targetPanY = (rect.height - contentHeight * targetZoom) / 2 - bounds.minY * targetZoom;
+
+        const startZoom = zoom;
+        const startPanX = pan.x;
+        const startPanY = pan.y;
+        const startTime = performance.now();
+
+        const step = (now: number) => {
+          const t = Math.min(1, (now - startTime) / Math.max(1, durationMs));
+          const ease = 1 - Math.pow(1 - t, 3); // cubic ease-out
+          onZoomChange(startZoom + (targetZoom - startZoom) * ease);
+          onPanChange({
+            x: startPanX + (targetPanX - startPanX) * ease,
+            y: startPanY + (targetPanY - startPanY) * ease,
+          });
+          if (t < 1) {
+            cameraAnimRef.current = requestAnimationFrame(step);
+          } else {
+            cameraAnimRef.current = null;
+          }
+        };
+        cameraAnimRef.current = requestAnimationFrame(step);
+      },
+      focusPoint: (docX: number, docY: number, minZoom?: number) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+        const nextZoom = minZoom ? clampZoom(Math.max(zoom, minZoom)) : zoom;
+        if (nextZoom !== zoom) onZoomChange(nextZoom);
+        onPanChange({
+          x: rect.width / 2 - docX * nextZoom,
+          y: rect.height / 2 - docY * nextZoom,
         });
       },
       placeConnectedShape,
@@ -1867,7 +2036,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const worldAnchorOffset = localToWorldVector(anchorOffset, start);
         const x = interaction.anchorWorld.x - worldAnchorOffset.x - width / 2;
         const y = interaction.anchorWorld.y - worldAnchorOffset.y - height / 2;
-        const resized: WhiteboardNode = { ...start, x, y, width, height };
+        let finalHeight = height;
+        if (start.shapeType === "text" && start.text.trim()) {
+          const auto = computeAutoTextBoxSize(start.text, start.fontSize, start.fontWeight, width, false, start.fontFamily);
+          finalHeight = Math.max(height, auto.height);
+        }
+        const resized: WhiteboardNode = { ...start, x, y, width, height: finalHeight };
         setLiveNodes(page.nodes.map((n) => (n.id === start.id ? resized : n)));
         return;
       }
@@ -2248,7 +2422,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // A tap with (almost) no movement isn't a meaningful stroke - drop it rather than saving a
         // near-invisible dot, same "don't save a no-op gesture" spirit as marquee's width>2 check.
         if (points.length >= 2) {
-          const node = createFreehandWhiteboardNode(crypto.randomUUID(), points, { color: penStyleRef.current.color, width: penStyleRef.current.width });
+          const node = createFreehandWhiteboardNode(crypto.randomUUID(), points, {
+            color: penStyleRef.current.color,
+            width: penStyleRef.current.width,
+            highlighter: penStyleRef.current.highlighter,
+          });
           onAddNode(node);
           onSelectionChange(new Set([node.id]), new Set());
         }
@@ -2274,12 +2452,6 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         const draggedEndpoint: WhiteboardEndpoint = droppedOnNode ? { nodeId: droppedOnNode.id, anchor: "auto" } : { x: freePoint.x, y: freePoint.y };
 
         if (interaction.edgeId === null) {
-          // Landing on a real node always creates a connection; landing on empty canvas only does
-          // when this gesture came from the Arrows toolbar tool being deliberately armed (a
-          // free-floating arrow is exactly what that tool is for) - an ad-hoc drag off a hovered
-          // node's connection dot in plain select mode still treats empty space as "changed my
-          // mind" and discards it, same as before. Either way, a drag too short to be a real
-          // gesture (a stray click) is dropped rather than creating a zero-length arrow.
           if (droppedOnNode || interaction.deliberate) {
             const fixedScreenPoint = interaction.fixed.nodeId ? null : interaction.fixed;
             const longEnough = fixedScreenPoint ? Math.hypot(cur.x - (fixedScreenPoint.x ?? 0), cur.y - (fixedScreenPoint.y ?? 0)) * zoom >= MIN_CONNECTOR_DRAG_DISTANCE : true;
@@ -2289,6 +2461,62 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               const edge = { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
               onAddEdge(edge);
               onSelectionChange(new Set(), new Set([edge.id]));
+            }
+          } else if (interaction.fixed.nodeId) {
+            // Drag-from-port Quick-Spawn: dragging from any shape's 4 blue connection ports into
+            // empty canvas spawns a connected matching node at the drop point and focuses text edit!
+            const srcNode = nodesById.get(interaction.fixed.nodeId);
+            if (srcNode) {
+              const srcAnchor = resolveAnchorPoint(srcNode, interaction.fixed.anchor ?? "auto", freePoint);
+              const dragDistScreen = Math.hypot(freePoint.x - srcAnchor.x, freePoint.y - srcAnchor.y) * zoom;
+              if (dragDistScreen >= 28) {
+                const isSourceMindmap = isMindmapTopicNode(srcNode);
+                const spawnType: WhiteboardShapeType = isSourceMindmap
+                  ? "mindmapSubtopic"
+                  : srcNode.shapeType === "table" ||
+                    srcNode.shapeType === "image" ||
+                    srcNode.shapeType === "latticeGauge" ||
+                    srcNode.shapeType === "freehand" ||
+                    srcNode.shapeType === "artboard" ||
+                    srcNode.shapeType === "text" ||
+                    srcNode.shapeType === "equation"
+                  ? "rectangle"
+                  : srcNode.shapeType;
+                const spawned = createDefaultWhiteboardNode(crypto.randomUUID(), spawnType, freePoint.x, freePoint.y);
+                const finalNode: WhiteboardNode = isSourceMindmap
+                  ? { ...spawned, text: "New subtopic" }
+                  : {
+                      ...spawned,
+                      fillColor: srcNode.fillColor,
+                      strokeColor: srcNode.strokeColor,
+                      strokeWidth: srcNode.strokeWidth,
+                      cornerRadius: srcNode.cornerRadius,
+                    };
+                const edge: WhiteboardEdge = isSourceMindmap
+                  ? {
+                      ...createDefaultWhiteboardEdge(
+                        crypto.randomUUID(),
+                        { nodeId: srcNode.id, anchor: interaction.fixed.anchor ?? "auto" },
+                        { nodeId: finalNode.id, anchor: "auto" }
+                      ),
+                      routing: "curved",
+                      strokeColor: "#2b7fff",
+                      strokeStyle: "dashed",
+                      startArrowType: "none",
+                      endArrowType: "none",
+                    }
+                  : {
+                      ...createDefaultWhiteboardEdge(
+                        crypto.randomUUID(),
+                        { nodeId: srcNode.id, anchor: interaction.fixed.anchor ?? "auto" },
+                        { nodeId: finalNode.id, anchor: "auto" }
+                      ),
+                      ...armedConnectorOverrides,
+                    };
+                onAddNodeWithEdge(finalNode, edge);
+                onSelectionChange(new Set([finalNode.id]), new Set());
+                setEditingNodeId(finalNode.id);
+              }
             }
           }
         } else {
@@ -2334,17 +2562,17 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         setLiveEdges(null);
       }
     },
-    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onBatchEditItems, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
+    [liveNodes, liveWaypoints, liveEdges, marqueeRect, page.nodes, page.edges, onEditNode, onBatchEditNodes, onBatchEditItems, onSelectionChange, clientToDoc, nodes, nodesById, onAddNode, onAddNodeWithEdge, onAddEdge, onEditEdge, zoom, armedConnectorOverrides, snapToGrid]
   );
 
   // ---- Background click: place armed shape, start a freehand stroke, start marquee, or pan --------
   const handleContainerPointerDown = useCallback(
     (e: React.PointerEvent) => {
-      if (e.button === 1 || spaceHeld || (e.button === 0 && e.altKey)) {
+      if (e.button === 1 || spaceHeld || handArmed || (e.button === 0 && e.altKey) || (studyMode && e.button === 0)) {
         interactionRef.current = { mode: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
         return;
       }
-      if (e.button !== 0) return;
+      if (e.button !== 0 || studyMode) return;
       // The laser pointer is purely for pointing, not interacting - a click while it's armed does
       // nothing (no marquee, no placement, no selection change). Space-panning above still works so
       // the view can be repositioned while pointing.
@@ -2401,11 +2629,26 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // ---- Text editing ------------------------------------------------------------------------------
   const commitTextEdit = useCallback(
     (node: WhiteboardNode, text: string) => {
-      const trimmed = text;
-      if (trimmed !== node.text) onEditNode(node, { ...node, text: trimmed });
+      const normalized = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+      if (node.shapeType === "text") {
+        if (normalized.trim().length === 0) {
+          // Auto-clean empty ghost text boxes dropped accidentally without typing.
+          onDeleteNode(node);
+          onSelectionChange(new Set(), new Set());
+          setEditingNodeId(null);
+          return;
+        }
+        const auto = computeAutoTextBoxSize(normalized, node.fontSize, node.fontWeight, node.width, true, node.fontFamily);
+        if (normalized !== node.text || auto.width !== node.width || auto.height !== node.height) {
+          onEditNode(node, { ...node, text: normalized, width: auto.width, height: auto.height, updatedAt: Date.now() });
+        }
+        setEditingNodeId(null);
+        return;
+      }
+      if (normalized !== node.text) onEditNode(node, { ...node, text: normalized, updatedAt: Date.now() });
       setEditingNodeId(null);
     },
-    [onEditNode]
+    [onEditNode, onDeleteNode, onSelectionChange]
   );
 
   useEffect(() => {
@@ -2475,16 +2718,25 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // notion of zoom at all) always draws it. A temporary drag preview (connector/freehand) is the
   // one exception that stays zoom-constant on purpose - see previewEdgeStyle's own reasoning.
 
+  const themeCfg = resolveCanvasTheme(canvasTheme);
+  const resolvedGridStyle: WhiteboardGridStyle = gridStyle ?? (showGrid ? "dots" : "none");
+  const gridBgImage =
+    resolvedGridStyle === "dots"
+      ? `radial-gradient(circle, ${themeCfg.dotColor} 1px, transparent 1px)`
+      : resolvedGridStyle === "lines"
+      ? `linear-gradient(to right, ${themeCfg.lineColor} 1px, transparent 1px), linear-gradient(to bottom, ${themeCfg.lineColor} 1px, transparent 1px)`
+      : undefined;
+
   return (
     <div
       ref={containerRef}
       className="relative w-full h-full overflow-hidden select-none"
       style={{
-        backgroundColor: "var(--wb-bg, #f7f7f8)",
-        backgroundImage: showGrid ? "radial-gradient(circle, rgba(120,120,130,0.35) 1px, transparent 1px)" : undefined,
-        backgroundSize: showGrid ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
-        backgroundPosition: showGrid ? `${pan.x}px ${pan.y}px` : undefined,
-        cursor: laserArmed ? "none" : spaceHeld ? "grab" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
+        backgroundColor: themeCfg.bg,
+        backgroundImage: gridBgImage,
+        backgroundSize: resolvedGridStyle !== "none" ? `${GRID_SIZE * zoom}px ${GRID_SIZE * zoom}px` : undefined,
+        backgroundPosition: resolvedGridStyle !== "none" ? `${pan.x}px ${pan.y}px` : undefined,
+        cursor: laserArmed ? "none" : formatPainterActive ? "copy" : spaceHeld || handArmed || studyMode ? "grab" : armedShapeType === "text" ? "text" : armedShapeType === "freehand" || connectorArmed ? "crosshair" : "default",
         // Without this, a touch-drag is up for grabs between this canvas's own pointer handlers and
         // the browser's native touch gestures (panning/scrolling) - on most touchscreens the browser
         // wins that race, so a finger stroke either scrolls the page or gets cut short by a
@@ -2519,30 +2771,28 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
     >
       <div className="absolute top-0 left-0 w-0 h-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0" }}>
         {/* Nodes layer */}
-        {nodes.map((node) => {
-          const selected = selectedNodeIds.has(node.id);
+        {renderedNodes.map((node) => {
+          const selected = !studyMode && selectedNodeIds.has(node.id);
           const isHovered = hoveredNodeId === node.id;
           const isConnectorTarget = connectorHoverNodeId === node.id;
-          const isEditing = editingNodeId === node.id;
-          const isConnectable = isConnectableShape(node.shapeType);
-          const showConnectionDots = isConnectable && (isHovered || selected || connectorArmed);
-          // Hover-arrow "pick a connected shape" (see onQuickConnectArrowClick/placeConnectedShape)
-          // - hidden while any tool is armed or a connector drag is underway so it doesn't compete
-          // with that other intent, and (like the connection dots) only on shapes an edge can
-          // actually anchor to. Also hidden for "table" - it sits at the exact same top/left/right/
-          // bottom-center positions as WhiteboardTable.tsx's own row/column selector handles and
-          // insert/delete affordances (both are "small chrome just outside a selected shape's own
-          // edges"), so showing both here would just overlap; a table can still be connected TO via
-          // the explicit connector tool (it's not in NON_CONNECTABLE_SHAPES), this only suppresses
-          // the automatic hover shortcut.
+          const isEditing = !studyMode && editingNodeId === node.id;
+          const isConnectable = isConnectableShape(node.shapeType) && !isArtboardNode(node);
+          const showConnectionDots = !studyMode && !formatPainterActive && isConnectable && (isHovered || selected || connectorArmed);
           const showQuickConnectArrows =
-            isConnectable && node.shapeType !== "table" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
+            !studyMode && !formatPainterActive && isConnectable && node.shapeType !== "table" && node.shapeType !== "mindmapChecklist" && node.shapeType !== "mindmapLinksGroup" && (isHovered || selected) && selectedNodeIds.size <= 1 && !connectorArmed && !armedShapeType && !interactionRef.current;
           const outline = cachedShapeOutline(node);
           const paint = nodeFillPaint(node, fillImageSrc(node, imageSrcFor));
           const nodeStrokeDash = dashArrayFor(node.strokeStyle, node.strokeWidth);
           const nodeStrokeOpacity = node.strokeOpacity ?? 1;
           const shadowFilter = nodeDropShadowCSS(node);
           const nodeOpacity = node.opacity ?? 1;
+          const isTopic = isMindmapTopicNode(node);
+          const isArtboard = isArtboardNode(node);
+          const topicProgress = node.mindmapProgress ?? "pending";
+          const topicResourceCount = node.mindmapResources?.length ?? 0;
+          const directChildren = collapsedState.childrenByParent.get(node.id) ?? [];
+          const collapsedCount = collapsedState.collapsedCountByNodeId.get(node.id) ?? 0;
+          const showCollapseToggle = isTopic && directChildren.length > 0 && (Boolean(node.mindmapCollapsed) || isHovered || selected);
           return (
             <div
               key={node.id}
@@ -2552,7 +2802,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 top: node.y,
                 width: node.width,
                 height: node.height,
-                zIndex: layerOrder.get(node.id) ?? 0,
+                zIndex: isArtboard ? -1000 + (layerOrder.get(node.id) ?? 0) : layerOrder.get(node.id) ?? 0,
+                mixBlendMode: node.blendMode && node.blendMode !== "normal" ? node.blendMode : undefined,
+                cursor: studyMode && isMindmapNode(node) ? "pointer" : formatPainterActive ? "copy" : undefined,
                 // Rotate listed FIRST, flip SECOND - CSS composes a `transform` list right-to-left
                 // (the last-listed function applies to the element's own local points first), so
                 // this ordering flips in local space BEFORE rotating the already-flipped result,
@@ -2575,16 +2827,24 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 // content. laserArmed also returns here (not just from the container) so a click
                 // doesn't select/move THIS node while the laser tool is meant to be purely
                 // non-interactive.
-                if (armedShapeType || connectorArmed || laserArmed) return;
+                if (armedShapeType || connectorArmed || laserArmed || handArmed) return;
                 beginMoveNode(node, e, e.shiftKey);
               }}
               onDoubleClick={(e) => {
                 e.stopPropagation();
+                if (studyMode) {
+                  if (isMindmapNode(node)) onOpenTopicDrawer?.(node.id);
+                  return;
+                }
                 // "image" has no text either, so the gesture is free to mean something else here -
                 // it toggles crop mode, matching what double-clicking a photo does in every editor
                 // that has a crop tool at all.
                 if (node.shapeType === "image") {
                   if (!node.locked) setCroppingNodeId(croppingNodeId === node.id ? null : node.id);
+                  return;
+                }
+                if (node.shapeType === "mindmapChecklist" || node.shapeType === "mindmapLinksGroup") {
+                  onOpenTopicDrawer?.(node.id);
                   return;
                 }
                 // "latticeGauge" has no text concept at all (see its own shapeType doc comment) -
@@ -2610,21 +2870,37 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 }}
               >
                 {node.shapeType === "freehand" ? (
-                  <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
-                    <path
-                      d={smoothedPathD((node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height })))}
-                      fill="none"
-                      stroke={node.strokeColor}
-                      strokeWidth={node.strokeWidth}
-                      strokeDasharray={nodeStrokeDash}
-                      strokeOpacity={nodeStrokeOpacity}
-                      markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
-                      markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      vectorEffect="non-scaling-stroke"
-                    />
-                  </svg>
+                  (() => {
+                    const localPts = (node.points ?? []).map((p) => ({ x: p.x * node.width, y: p.y * node.height }));
+                    const hasArrows = (node.startArrowType && node.startArrowType !== "none") || (node.endArrowType && node.endArrowType !== "none");
+                    const isDashed = node.strokeStyle === "dashed" || node.strokeStyle === "dotted";
+                    const useTapered = !hasArrows && !isDashed && localPts.length >= 2;
+                    return (
+                      <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
+                        {useTapered ? (
+                          <path
+                            d={buildTaperedFreehandPathD(localPts, node.strokeWidth, Boolean(node.freehandHighlighter))}
+                            fill={node.strokeColor}
+                            fillOpacity={nodeStrokeOpacity}
+                          />
+                        ) : (
+                          <path
+                            d={smoothedPathD(localPts)}
+                            fill="none"
+                            stroke={node.strokeColor}
+                            strokeWidth={node.strokeWidth}
+                            strokeDasharray={nodeStrokeDash}
+                            strokeOpacity={nodeStrokeOpacity}
+                            markerEnd={node.endArrowType && node.endArrowType !== "none" ? `url(#${markerId(node.endArrowType, node.strokeColor)})` : undefined}
+                            markerStart={node.startArrowType && node.startArrowType !== "none" ? `url(#${markerId(node.startArrowType, node.strokeColor)})` : undefined}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        )}
+                      </svg>
+                    );
+                  })()
                 ) : node.shapeType === "vector" ? (
                   <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                     <line
@@ -2668,15 +2944,21 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       onRangeChange={(range) => onTableRangeChange?.(node.id, range)}
                     />
                   </div>
-                ) : node.shapeType === "ellipse" || node.shapeType === "rectangle" || node.shapeType === "equation" ? (
-                  // "equation" reuses the plain rectangle body (background/border/corner-radius) so a
-                  // formula can sit on a card/badge instead of bare on the canvas - purely optional,
-                  // still transparent/borderless by default (same fillColor: null start every other
-                  // "starts blank" shape gets) until the style panel's Fill/Stroke/Corner radius
-                  // fields are actually used.
+                ) : node.shapeType === "ellipse" ||
+                  node.shapeType === "rectangle" ||
+                  node.shapeType === "equation" ||
+                  node.shapeType === "artboard" ||
+                  node.shapeType === "mindmapTopic" ||
+                  node.shapeType === "mindmapSubtopic" ||
+                  node.shapeType === "mindmapChecklist" ||
+                  node.shapeType === "mindmapLinksGroup" ? (
                   <BoxShapeBody node={node} paint={paint} />
                 ) : node.shapeType === "text" ? (
-                  isHovered || selected ? <div style={{ position: "absolute", inset: 0, border: "1px dashed #9ca3af" }} /> : null
+                  node.fillColor || node.strokeWidth > 0 ? (
+                    <BoxShapeBody node={node} paint={paint} />
+                  ) : isHovered && !selected ? (
+                    <div style={{ position: "absolute", inset: 0, border: `${1 / zoom}px dashed #9ca3af`, borderRadius: 4 }} />
+                  ) : null
                 ) : outline.kind === "cylinder" ? (
                   <svg width="100%" height="100%" viewBox={`0 0 ${node.width} ${node.height}`} preserveAspectRatio="none" style={{ overflow: "visible" }}>
                     {paint.defs}
@@ -3001,6 +3283,109 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     );
                   })()}
 
+                {/* Progress status overlay + resource badge for Mind Map topics */}
+                {isTopic && topicProgress !== "pending" && (
+                  <div
+                    className="absolute inset-0 pointer-events-none"
+                    style={{
+                      borderRadius: node.cornerRadius,
+                      backgroundColor:
+                        topicProgress === "done"
+                          ? "rgba(22, 163, 74, 0.16)"
+                          : topicProgress === "in-progress"
+                          ? "rgba(234, 179, 8, 0.18)"
+                          : "rgba(156, 163, 175, 0.22)",
+                      boxShadow: `inset 0 0 0 2px ${
+                        topicProgress === "done"
+                          ? "#16a34a"
+                          : topicProgress === "in-progress"
+                          ? "#eab308"
+                          : "#9ca3af"
+                      }`,
+                    }}
+                  />
+                )}
+                {isTopic && topicResourceCount > 0 && (
+                  <button
+                    type="button"
+                    title={`${topicResourceCount} linked resource${topicResourceCount > 1 ? "s" : ""} — click to open`}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onOpenTopicDrawer?.(node.id);
+                    }}
+                    className="absolute -top-2 -right-2 flex items-center justify-center rounded-full bg-blue-600 text-white font-semibold shadow-sm hover:bg-blue-700"
+                    style={{
+                      pointerEvents: "auto",
+                      minWidth: 16 / zoom,
+                      height: 16 / zoom,
+                      padding: `0 ${4 / zoom}px`,
+                      fontSize: 9 / zoom,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {topicResourceCount}
+                  </button>
+                )}
+
+                {/* Mind Map interactive Checklist & Links Group cards */}
+                {(node.shapeType === "mindmapChecklist" || node.shapeType === "mindmapLinksGroup") && (
+                  <div
+                    className="absolute inset-0 p-2.5 flex flex-col gap-1 overflow-hidden"
+                    style={{
+                      color: node.fontColor,
+                      fontFamily: node.fontFamily,
+                      fontSize: node.fontSize,
+                      pointerEvents: "auto",
+                    }}
+                  >
+                    <div className="font-semibold truncate text-xs pb-0.5 border-b border-black/10">
+                      {node.text || (node.shapeType === "mindmapChecklist" ? "Checklist" : "Resources")}
+                    </div>
+                    <div className="flex flex-col gap-1 overflow-y-auto flex-1 min-h-0">
+                      {(node.mindmapItems ?? []).map((item) =>
+                        node.shapeType === "mindmapChecklist" ? (
+                          <label
+                            key={item.id}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            className="flex items-start gap-1.5 text-[12px] leading-snug cursor-pointer select-none"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={Boolean(item.checked)}
+                              onChange={() => {
+                                const nextItems = (node.mindmapItems ?? []).map((it) =>
+                                  it.id === item.id ? { ...it, checked: !it.checked } : it
+                                );
+                                onEditNode(node, { ...node, mindmapItems: nextItems, updatedAt: Date.now() });
+                              }}
+                              className="mt-0.5 rounded accent-emerald-600 cursor-pointer shrink-0"
+                            />
+                            <span className={item.checked ? "line-through opacity-55" : ""}>{item.text}</span>
+                          </label>
+                        ) : (
+                          <div key={item.id} className="flex items-center gap-1 text-[12px] leading-snug truncate">
+                            <span className="text-blue-500 shrink-0">›</span>
+                            {item.url ? (
+                              <a
+                                href={item.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                className="text-blue-600 hover:underline truncate"
+                              >
+                                {item.text || item.url}
+                              </a>
+                            ) : (
+                              <span className="text-blue-600/80 truncate">{item.text}</span>
+                            )}
+                          </div>
+                        )
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {!isEditing && node.text && node.shapeType === "equation" && (
                   <div
                     className="absolute inset-0 flex px-2 overflow-visible pointer-events-none"
@@ -3012,9 +3397,9 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     <EquationDisplay source={node.text} fontSize={node.fontSize} color={node.fontColor} />
                   </div>
                 )}
-                {!isEditing && node.text && node.shapeType !== "equation" && (
+                {!isEditing && node.text && node.shapeType !== "equation" && node.shapeType !== "artboard" && node.shapeType !== "mindmapChecklist" && node.shapeType !== "mindmapLinksGroup" && (
                   <div
-                    className="absolute inset-0 flex px-2 overflow-hidden whitespace-pre-wrap break-words"
+                    className={`absolute inset-0 flex whitespace-pre-wrap break-words ${node.shapeType === "text" ? "px-2 py-1.5 overflow-visible" : "px-2 overflow-hidden"}`}
                     style={{
                       alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
                       justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
@@ -3022,13 +3407,14 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       color: node.fontColor,
                       fontFamily: node.fontFamily,
                       fontSize: node.fontSize,
+                      lineHeight: node.shapeType === "text" ? 1.38 : 1.28,
                       fontWeight: node.fontWeight,
                       fontStyle: node.fontStyle,
                       textDecoration: node.textDecoration,
                       pointerEvents: "none",
                     }}
                   >
-                    <span>{node.text}</span>
+                    <span className="w-full">{node.text}</span>
                   </div>
                 )}
                 {!isEditing && !node.text && (node.shapeType === "text" || node.shapeType === "equation") && (isHovered || selected) && (
@@ -3043,10 +3429,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   ref={editorRef}
                   contentEditable
                   suppressContentEditableWarning
-                  className="absolute inset-0 px-2 outline-none whitespace-pre-wrap break-words overflow-hidden flex"
+                  className={`absolute outline-none whitespace-pre-wrap break-words ${
+                    node.shapeType === "text"
+                      ? "top-0 left-0 px-2 py-1.5 overflow-visible rounded bg-white/75 dark:bg-neutral-900/75 ring-2 ring-blue-500/40"
+                      : "inset-0 px-2 overflow-hidden flex"
+                  }`}
                   style={{
-                    alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
-                    justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                    ...(node.shapeType === "text"
+                      ? { minWidth: node.width, maxWidth: Math.max(520, node.width), minHeight: node.height, height: "auto", lineHeight: 1.38 }
+                      : {
+                          alignItems: node.verticalAlign === "top" ? "flex-start" : node.verticalAlign === "bottom" ? "flex-end" : "center",
+                          justifyContent: node.textAlign === "left" ? "flex-start" : node.textAlign === "right" ? "flex-end" : "center",
+                          lineHeight: 1.28,
+                        }),
                     textAlign: node.textAlign,
                     color: node.fontColor,
                     // Editing shows the raw LaTeX SOURCE, not typeset math - a monospace font here
@@ -3063,7 +3458,42 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                   onBlur={(e) => commitTextEdit(node, e.currentTarget.innerText)}
                   onKeyDown={(e) => {
                     e.stopPropagation();
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    const mod = e.ctrlKey || e.metaKey;
+                    if (mod && node.shapeType !== "equation") {
+                      const k = e.key.toLowerCase();
+                      if (k === "b") {
+                        e.preventDefault();
+                        onEditNode(node, { ...node, fontWeight: node.fontWeight === "bold" ? "normal" : "bold", updatedAt: Date.now() });
+                        return;
+                      }
+                      if (k === "i") {
+                        e.preventDefault();
+                        onEditNode(node, { ...node, fontStyle: node.fontStyle === "italic" ? "normal" : "italic", updatedAt: Date.now() });
+                        return;
+                      }
+                      if (k === "u") {
+                        e.preventDefault();
+                        onEditNode(node, { ...node, textDecoration: node.textDecoration === "underline" ? "none" : "underline", updatedAt: Date.now() });
+                        return;
+                      }
+                      if (e.shiftKey && (e.key === ">" || e.key === ".")) {
+                        e.preventDefault();
+                        onEditNode(node, { ...node, fontSize: Math.min(200, node.fontSize + 2), updatedAt: Date.now() });
+                        return;
+                      }
+                      if (e.shiftKey && (e.key === "<" || e.key === ",")) {
+                        e.preventDefault();
+                        onEditNode(node, { ...node, fontSize: Math.max(8, node.fontSize - 2), updatedAt: Date.now() });
+                        return;
+                      }
+                    }
+                    if (node.shapeType === "text") {
+                      // In dedicated Text nodes, Enter inserts a natural newline; Ctrl+Enter or Escape commits!
+                      if ((e.key === "Enter" && mod) || e.key === "Escape") {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLDivElement).blur();
+                      }
+                    } else if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       (e.currentTarget as HTMLDivElement).blur();
                     } else if (e.key === "Escape") {
@@ -3252,6 +3682,59 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                 );
               })()}
 
+              {/* Artboard / Containment Frame floating title label above top-left corner */}
+              {isArtboard && !isEditing && (
+                <div
+                  onPointerDown={(e) => {
+                    if (armedShapeType || connectorArmed || laserArmed) return;
+                    beginMoveNode(node, e, e.shiftKey);
+                  }}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    if (!studyMode && !node.locked) setEditingNodeId(node.id);
+                  }}
+                  className="absolute left-0 flex items-center gap-1 rounded px-1.5 py-0.5 font-medium text-neutral-600 dark:text-neutral-300 bg-white/90 dark:bg-neutral-800/90 border border-gray-200 dark:border-neutral-700 shadow-sm truncate max-w-full"
+                  style={{
+                    top: -24 / zoom,
+                    fontSize: 11 / zoom,
+                    lineHeight: 1.2,
+                    cursor: studyMode ? "default" : "grab",
+                  }}
+                  title="Drag header to move frame & all contained items · Double-click to rename"
+                >
+                  <span className="truncate">{node.text || "Frame"}</span>
+                </div>
+              )}
+
+              {/* Mind Map branch collapse/expand pill (- / +N) */}
+              {showCollapseToggle && (
+                <button
+                  type="button"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEditNode(node, { ...node, mindmapCollapsed: !node.mindmapCollapsed, updatedAt: Date.now() });
+                  }}
+                  title={node.mindmapCollapsed ? `Expand ${collapsedCount} hidden branch item(s)` : "Collapse child branches"}
+                  className={`absolute flex items-center justify-center rounded-full font-semibold shadow-sm border transition-colors ${
+                    node.mindmapCollapsed
+                      ? "bg-blue-600 text-white border-blue-700 hover:bg-blue-700"
+                      : "bg-white text-neutral-600 border-gray-300 hover:bg-gray-100"
+                  }`}
+                  style={{
+                    right: -10 / zoom,
+                    bottom: -10 / zoom,
+                    minWidth: 20 / zoom,
+                    height: 20 / zoom,
+                    padding: `0 ${5 / zoom}px`,
+                    fontSize: 10 / zoom,
+                    lineHeight: 1,
+                  }}
+                >
+                  {node.mindmapCollapsed ? `+${collapsedCount}` : "−"}
+                </button>
+              )}
+
               {showQuickConnectArrows &&
                 ANCHOR_SIDES.map((side) => {
                   const size = 22 / zoom;
@@ -3270,18 +3753,26 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     style.top = node.height / 2 - size / 2;
                     style.left = node.width + margin;
                   }
-                  const glyph = side === "top" ? "↑" : side === "bottom" ? "↓" : side === "left" ? "←" : "→";
+                  const glyph = isTopic ? "+" : side === "top" ? "↑" : side === "bottom" ? "↓" : side === "left" ? "←" : "→";
                   return (
                     <button
                       key={side}
                       type="button"
                       style={style}
                       className="rounded-full bg-blue-50 border border-blue-300 text-blue-500 hover:bg-blue-500 hover:text-white hover:border-blue-500 flex items-center justify-center leading-none"
-                      title="Click to pick a connected shape"
+                      title={isTopic ? `Add connected branch (${side})` : "Click to pick a connected shape"}
                       onPointerDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onQuickConnectArrowClick(node.id, side, { x: e.clientX, y: e.clientY });
+                        if (isTopic) {
+                          if (node.mindmapCollapsed) onEditNode(node, { ...node, mindmapCollapsed: false });
+                          const built = buildMindmapBranch(node, side, page.nodes, crypto.randomUUID(), crypto.randomUUID());
+                          onAddNodeWithEdge(built.node, built.edge);
+                          onSelectionChange(new Set([built.node.id]), new Set());
+                          setEditingNodeId(built.node.id);
+                        } else {
+                          onQuickConnectArrowClick(node.id, side, { x: e.clientX, y: e.clientY });
+                        }
                       }}
                     >
                       <span style={{ fontSize: 13 / zoom }}>{glyph}</span>
@@ -3306,7 +3797,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         {/* Edges layer - each edge is rendered in its own positioned <svg> carrying its unified
             layerOrder zIndex, so edges and shapes can be freely interleaved via Bring to front /
             Send to back while defaulting to rendering above shapes when zIndex is unset. */}
-        {edges.map((edge) => {
+        {renderedEdges.map((edge) => {
           const { source, target } = resolveEdgeEndpoints(edge, nodesById);
           const waypoints = liveWaypointsEdgeId === edge.id && liveWaypoints ? liveWaypoints : edge.waypoints ?? [];
           const cornerRadius = edge.cornerRadius ?? 0;
@@ -3461,7 +3952,12 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
               />
             )}
             {freehandPreview && freehandPreview.length > 1 && (
-              <path d={smoothedPathD(freehandPreview)} fill="none" stroke={penColor} strokeWidth={penWidth / zoom} strokeLinecap="round" strokeLinejoin="round" style={{ pointerEvents: "none" }} />
+              <path
+                d={buildTaperedFreehandPathD(freehandPreview, penWidth, penHighlighter)}
+                fill={penColor}
+                fillOpacity={penHighlighter ? 0.42 : 1}
+                style={{ pointerEvents: "none", mixBlendMode: penHighlighter ? "multiply" : undefined }}
+              />
             )}
           </svg>
         )}

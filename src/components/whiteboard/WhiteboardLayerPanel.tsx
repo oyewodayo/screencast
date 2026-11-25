@@ -57,7 +57,13 @@ function getNodeIcon(node: WhiteboardNode): React.ReactNode {
     case "freehand":
       return <TbPencil size={14} className="text-purple-500 shrink-0" />;
     case "frame":
+    case "artboard":
       return <TbFrame size={14} className="text-indigo-500 shrink-0" />;
+    case "mindmapTopic":
+    case "mindmapSubtopic":
+    case "mindmapChecklist":
+    case "mindmapLinksGroup":
+      return <TbNote size={14} className="text-teal-500 shrink-0" />;
     default:
       return <IoShapesOutline size={14} className="text-neutral-500 dark:text-neutral-400 shrink-0" />;
   }
@@ -67,6 +73,21 @@ function getNodeLabel(node: WhiteboardNode): string {
   const text = (node.text ?? "").trim();
   if (node.shapeType === "text") {
     return text || "Text";
+  }
+  if (node.shapeType === "artboard") {
+    return text ? `Frame: "${text}"` : "Containment Frame";
+  }
+  if (node.shapeType === "mindmapTopic") {
+    return text ? `Topic: "${text}"` : "Mind Map Topic";
+  }
+  if (node.shapeType === "mindmapSubtopic") {
+    return text ? `Subtopic: "${text}"` : "Subtopic";
+  }
+  if (node.shapeType === "mindmapChecklist") {
+    return text ? `Checklist: "${text}"` : "Checklist";
+  }
+  if (node.shapeType === "mindmapLinksGroup") {
+    return text ? `Links: "${text}"` : "Links Group";
   }
   if (node.shapeType === "image") {
     if (text) return `Image: ${text}`;

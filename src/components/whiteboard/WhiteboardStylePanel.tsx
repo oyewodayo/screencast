@@ -44,6 +44,7 @@ import {
   TbUnderline,
 } from "react-icons/tb";
 import { ColormapName, COLORMAP_NAMES, colormapPalette, DEFAULT_COLORMAP } from "../../utils/colormaps";
+import { NODE_STYLE_PRESETS } from "../../utils/whiteboardThemes";
 import {
   ArrowheadType,
   ChartAnnotation,
@@ -83,6 +84,8 @@ import {
   MIN_TABLE_COLS,
   MIN_TABLE_ROWS,
   TableBorderStyle,
+  WhiteboardBlendMode,
+  WHITEBOARD_BLEND_MODES,
   WhiteboardEdge,
   AxisPlacement,
   WhiteboardFillPattern,
@@ -162,14 +165,7 @@ import {
 import { preloadWhiteboardImage } from "../../utils/whiteboardImageCache";
 import { exportLatticeLoop } from "../../handlers/latticeLoopExport";
 import ColorInput from "../common/ColorInput";
-
-const FONT_FAMILY_OPTIONS: { label: string; value: string }[] = [
-  { label: "Sans", value: "system-ui, sans-serif" },
-  { label: "Serif", value: "Georgia, 'Times New Roman', serif" },
-  { label: "Monospace", value: "'Courier New', monospace" },
-  { label: "Rounded", value: "'Trebuchet MS', sans-serif" },
-  { label: "Casual", value: "'Comic Sans MS', cursive" },
-];
+import WhiteboardFontPicker from "./WhiteboardFontPicker";
 
 const ARROWHEAD_OPTIONS: { value: ArrowheadType; label: string }[] = [
   { value: "none", label: "None" },
@@ -1577,12 +1573,15 @@ function TransformBlock({
           title="Rotation in degrees - drag the icon to scrub"
           suffix="°"
           resetKey={`${ids}-r`}
-          value={node.rotation ?? 0}
+          value={((Math.round(node.rotation ?? 0) % 360) + 360) % 360}
           min={0}
           max={360}
           // 360 is visually identical to 0 (no rotation) - normalize both to "unset" rather than
           // clamping a typed 360 down to 359, which read as an arbitrary, unexplained cap.
-          onCommit={(n) => onCommit({ rotation: n === 0 || n === 360 ? undefined : n })}
+          onCommit={(n) => {
+            const norm = ((Math.round(n) % 360) + 360) % 360;
+            onCommit({ rotation: norm === 0 ? undefined : norm });
+          }}
         />
         <Segmented stretch>
           <SegmentButton active={false} onClick={() => onFlip("horizontal")} title="Flip horizontal (mirror left to right)">
@@ -2749,21 +2748,28 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
   // Freehand ink and the lattice widget carry no text, so the Text group only shows when some
   // selected shape can show text.
   const hasText = selectedNodes.some((n) => n.shapeType !== "freehand" && n.shapeType !== "latticeGauge");
+  const allText = selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType === "text");
 
   // Shapes whose interior takes the full fill paint (gradient/image/pattern). Charts, tables and
   // images keep the plain color well: their "fill" is bar color / cell background / letterbox matte,
   // where a gradient or a photo has no sensible meaning.
   const canPaintFill = (n: WhiteboardNode) =>
     !["text", "freehand", "image", "table", "latticeGauge"].includes(n.shapeType) && !LINE_ONLY_SHAPES.has(n.shapeType) && !CHART_DATA_SHAPES.has(n.shapeType);
-  const hasFill = selectedNodes.some((n) => n.shapeType !== "text" && n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
+  const hasFill = selectedNodes.some((n) => n.shapeType !== "freehand" && !LINE_ONLY_SHAPES.has(n.shapeType));
   const ids = selectedNodes.map((n) => n.id).join(",");
   const allLocked =
     selectedNodes.length > 0
       ? selectedNodes.every((n) => n.locked ?? false)
       : selectedEdges.length > 0 && selectedEdges.every((e) => e.locked ?? false);
 
+  const canShowStylePresets =
+    selectedNodes.length > 0 &&
+    !allText &&
+    selectedNodes.every(canPaintFill) &&
+    selectedNodes.every((n) => n.shapeType !== "artboard");
+
   return (
-    <div className={`absolute top-3 ${offsetRight ? "right-[278px]" : "right-3"} bottom-3 w-[300px] bg-white/95 dark:bg-neutral-900/95 backdrop-blur-xl ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 transition-all duration-200 animate-[wbPanelIn_180ms_ease-out]`}>
+    <div className={`absolute top-3 ${offsetRight ? "right-[278px]" : "right-3"} bottom-3 w-[300px] bg-white dark:bg-neutral-900 ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 transition-all duration-200 animate-[wbPanelIn_180ms_ease-out]`}>
       <style>{"@keyframes wbPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
       {/* Sticky header - a long panel scrolls well past its own top, and without this there's no
           persistent indication of WHAT the controls below are acting on. */}
@@ -2791,60 +2797,109 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain flex flex-col [scrollbar-width:thin]">
-      {selectedNodes.length > 0 && (
-        <>
-          <Section title="Arrange" dense>
-            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} onFlip={flipSelected} />
-            <SliderField
-              label="Opacity"
-              resetKey={`lyo-${ids}`}
-              value={Math.round((selectedNodes[0].opacity ?? 1) * 100)}
-              min={0}
-              max={100}
-              step={1}
-              onCommit={(n) => updateNodes({ opacity: n >= 100 ? undefined : n / 100 })}
-              onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
-              title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
-            />
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <NudgeBar onNudge={nudgeSelected} />
-              <Segmented>
-                <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
-                  <TbStackFront size={14} />
-                </SegmentButton>
-                {onBringForward && (
-                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward">
-                    <TbArrowUp size={13} />
-                  </SegmentButton>
-                )}
-                {onSendBackward && (
-                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward">
-                    <TbArrowDown size={13} />
-                  </SegmentButton>
-                )}
-                <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
-                  <TbStackBack size={14} />
-                </SegmentButton>
-                {selectedNodes.length + selectedEdges.length >= 2 && (
-                  <SegmentButton active={false} onClick={onGroup} title="Group (Ctrl+G)">
-                    <TbComponents size={14} />
-                  </SegmentButton>
-                )}
-                {(selectedNodes.some((n) => n.groupId) || selectedEdges.some((e) => e.groupId)) && (
-                  <SegmentButton active={false} onClick={onUngroup} title="Ungroup (Ctrl+Shift+G)">
-                    <TbComponentsOff size={14} />
-                  </SegmentButton>
-                )}
-              </Segmented>
+      {/* Visual-first top section: 1-click designer Style Presets for fillable shapes */}
+      {canShowStylePresets && (
+        <Section title="Presets" dense>
+          <div className="grid grid-cols-6 gap-1.5">
+            {NODE_STYLE_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                title={`Apply ${preset.label} style`}
+                onClick={() => updateNodes(preset.patch)}
+                className="h-7 rounded-md text-[10px] font-semibold flex items-center justify-center transition-transform hover:scale-105 active:scale-95 shadow-sm"
+                style={{
+                  backgroundColor: preset.patch.fillColor ?? "#ffffff",
+                  border: `1.5px solid ${preset.patch.strokeColor ?? "#cbd5e1"}`,
+                  color: preset.patch.fontColor ?? "#0f172a",
+                }}
+              >
+                Aa
+              </button>
+            ))}
+          </div>
+        </Section>
+      )}
+      {/* When editing pure Text nodes, put Typography FIRST at the top of the panel instead of
+          burying it below Arrange/Stroke/Shadow. */}
+      {allText && (
+        <Section title="Text" dense>
+          <div className="flex items-center gap-1.5">
+            <div className="flex-1 min-w-0">
+              <WhiteboardFontPicker value={selectedNodes[0].fontFamily} onChange={(fontFamily) => updateNodes({ fontFamily })} />
             </div>
-          </Section>
-
-          {selectedNodes.length > 1 && (
-            <Section title="Align & distribute" dense>
-              <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />
-            </Section>
-          )}
-        </>
+            <div className="w-[76px] shrink-0 ml-auto">
+              <PrefixedNumber
+                prefix={<TbTextSize size={12} />}
+                title="Font size - drag the icon to scrub"
+                resetKey={`${ids}-fs-top`}
+                value={selectedNodes[0].fontSize}
+                min={6}
+                max={400}
+                onCommit={(fontSize) => updateNodes({ fontSize })}
+              />
+            </div>
+          </div>
+          <ColorField label="Color" value={selectedNodes[0].fontColor} onChange={(fontColor) => updateNodes({ fontColor })} />
+          <div className="flex items-center justify-between gap-1.5">
+            <Segmented>
+              <SegmentButton
+                active={selectedNodes[0].fontWeight === "bold"}
+                onClick={() => updateNodes({ fontWeight: selectedNodes[0].fontWeight === "bold" ? "normal" : "bold" })}
+                title="Bold (Ctrl+B)"
+              >
+                <TbBold size={13} />
+              </SegmentButton>
+              <SegmentButton
+                active={selectedNodes[0].fontStyle === "italic"}
+                onClick={() => updateNodes({ fontStyle: selectedNodes[0].fontStyle === "italic" ? "normal" : "italic" })}
+                title="Italic (Ctrl+I)"
+              >
+                <TbItalic size={13} />
+              </SegmentButton>
+              <SegmentButton
+                active={selectedNodes[0].textDecoration === "underline"}
+                onClick={() => updateNodes({ textDecoration: selectedNodes[0].textDecoration === "underline" ? "none" : "underline" })}
+                title="Underline (Ctrl+U)"
+              >
+                <TbUnderline size={13} />
+              </SegmentButton>
+            </Segmented>
+            <Segmented>
+              {(["left", "center", "right"] as const).map((align) => (
+                <SegmentButton key={align} active={selectedNodes[0].textAlign === align} onClick={() => updateNodes({ textAlign: align })} title={`Align ${align}`}>
+                  {align === "left" ? <TbAlignLeft size={13} /> : align === "center" ? <TbAlignCenter size={13} /> : <TbAlignRight size={13} />}
+                </SegmentButton>
+              ))}
+            </Segmented>
+          </div>
+          <Field label="Vertical">
+            <Segmented>
+              {(["top", "middle", "bottom"] as const).map((align) => (
+                <SegmentButton key={align} active={selectedNodes[0].verticalAlign === align} onClick={() => updateNodes({ verticalAlign: align })} title={`Align ${align}`}>
+                  {align === "top" ? <TbLayoutAlignTop size={13} /> : align === "middle" ? <TbLayoutAlignMiddle size={13} /> : <TbLayoutAlignBottom size={13} />}
+                </SegmentButton>
+              ))}
+            </Segmented>
+          </Field>
+          <Field label="Blend">
+            <select
+              value={selectedNodes[0].blendMode ?? "normal"}
+              onChange={(e) => {
+                const v = e.target.value as WhiteboardBlendMode;
+                updateNodes({ blendMode: v === "normal" ? undefined : v });
+              }}
+              className={`w-[144px] shrink-0 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
+              title="How this text blends with layers underneath it (e.g. Multiply, Screen, Overlay, Difference)"
+            >
+              {WHITEBOARD_BLEND_MODES.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </Section>
       )}
 
       {selectedNodes.length === 1 && selectedNodes[0].shapeType === "image" && (
@@ -2864,8 +2919,47 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
       )}
 
       {selectedNodes.length > 0 && hasFill && (
-        <Section title="Fill" dense>
-          {selectedNodes.every(canPaintFill) ? (
+        <Section title={allText ? "Background" : "Fill"} dense>
+          {allText ? (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-neutral-500 dark:text-neutral-400">Highlight pill</span>
+                {selectedNodes[0].fillColor ? (
+                  <button
+                    type="button"
+                    onClick={() => updateNodes({ fillColor: null })}
+                    className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+                  >
+                    Clear
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => updateNodes({ fillColor: "#fef08a", cornerRadius: selectedNodes[0].cornerRadius || 6 })}
+                    className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+                  >
+                    Add background
+                  </button>
+                )}
+              </div>
+              {selectedNodes[0].fillColor && (
+                <ColorField label="Color" value={selectedNodes[0].fillColor} onChange={(fillColor) => updateNodes({ fillColor })} />
+              )}
+              {(selectedNodes[0].fillColor || selectedNodes[0].strokeWidth > 0) && (
+                <SliderField
+                  label="Radius"
+                  resetKey={`tr-${ids}`}
+                  value={selectedNodes[0].cornerRadius ?? 6}
+                  min={0}
+                  max={32}
+                  step={1}
+                  onCommit={(cornerRadius) => updateNodes({ cornerRadius })}
+                  onPreview={previewField("cornerRadius")}
+                  title="Corner radius for text background / outline box"
+                />
+              )}
+            </>
+          ) : selectedNodes.every(canPaintFill) ? (
             <FillControls nodes={selectedNodes} updateNodes={updateNodes} onPreviewNodes={onPreviewNodes} onPickFillImage={onPickFillImage} assetUrlFor={assetUrlFor} />
           ) : (
             <>
@@ -2887,7 +2981,29 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
       )}
 
       {selectedNodes.length > 0 && selectedNodes.every((n) => n.shapeType !== "latticeGauge") && (
-        <Section title={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink" : "Stroke"} dense>
+        <Section
+          title={selectedNodes.every((n) => n.shapeType === "freehand") ? "Ink" : allText ? "Stroke / Outline" : "Stroke"}
+          dense
+          action={
+            allText && selectedNodes[0].strokeWidth > 0 ? (
+              <button
+                type="button"
+                onClick={() => updateNodes({ strokeWidth: 0 })}
+                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                None
+              </button>
+            ) : allText ? (
+              <button
+                type="button"
+                onClick={() => updateNodes({ strokeWidth: 1.5, cornerRadius: selectedNodes[0].cornerRadius || 6 })}
+                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Add outline
+              </button>
+            ) : undefined
+          }
+        >
           <ColorField label="Color" value={selectedNodes[0].strokeColor} onChange={(strokeColor) => updateNodes({ strokeColor })} />
           {/* The slider's top end scales with the shape itself. A fixed max of 12 is right for a
               flowchart box, but meaningless on a 3000px-wide imported screenshot, where a 12px
@@ -3982,7 +4098,7 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         </Section>
       )}
 
-      {selectedNodes.length > 0 && hasText && (
+      {selectedNodes.length > 0 && hasText && !allText && (
         <Section title="Text" dense>
           {/* Font family/Bold/Italic/Underline are meaningless for "equation" - KaTeX typesets with its
               own math font regardless, so these controls would sit there doing nothing visible if
@@ -3990,18 +4106,9 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               only those stay visible for it. */}
           <div className="flex items-center gap-1.5">
             {selectedNodes.every((n) => n.shapeType !== "equation") && (
-              <select
-                value={selectedNodes[0].fontFamily}
-                onChange={(e) => updateNodes({ fontFamily: e.target.value })}
-                className={`flex-1 min-w-0 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
-                title="Font"
-              >
-                {FONT_FAMILY_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
+              <div className="flex-1 min-w-0">
+                <WhiteboardFontPicker value={selectedNodes[0].fontFamily} onChange={(fontFamily) => updateNodes({ fontFamily })} />
+              </div>
             )}
             <div className="w-[76px] shrink-0 ml-auto">
               <PrefixedNumber
@@ -4059,7 +4166,99 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
               ))}
             </Segmented>
           </Field>
+          <Field label="Blend">
+            <select
+              value={selectedNodes[0].blendMode ?? "normal"}
+              onChange={(e) => {
+                const v = e.target.value as WhiteboardBlendMode;
+                updateNodes({ blendMode: v === "normal" ? undefined : v });
+              }}
+              className={`w-[144px] shrink-0 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
+              title="How this text blends with layers underneath it (e.g. Multiply, Screen, Overlay, Difference)"
+            >
+              {WHITEBOARD_BLEND_MODES.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </Field>
         </Section>
+      )}
+
+      {selectedNodes.length > 0 && (
+        <>
+          <Section title="Arrange" dense>
+            <TransformBlock nodes={selectedNodes} onCommit={updateNodes} onFlip={flipSelected} />
+            <SliderField
+              label="Opacity"
+              resetKey={`lyo-${ids}`}
+              value={Math.round((selectedNodes[0].opacity ?? 1) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              onCommit={(n) => updateNodes({ opacity: n >= 100 ? undefined : n / 100 })}
+              onPreview={(n) => onPreviewNodes?.(n === null ? null : { opacity: n / 100 })}
+              title="Overall layer opacity - fades the entire shape including fill, stroke and shadow"
+            />
+            {!allText && !hasText && (
+              <Field label="Blend">
+                <select
+                  value={selectedNodes[0].blendMode ?? "normal"}
+                  onChange={(e) => {
+                    const v = e.target.value as WhiteboardBlendMode;
+                    updateNodes({ blendMode: v === "normal" ? undefined : v });
+                  }}
+                  className={`w-[144px] shrink-0 h-7 pl-2 pr-1 ${INPUT_SURFACE_CLASS} text-[12px] cursor-pointer`}
+                  title="Layer blend mode against elements underneath"
+                >
+                  {WHITEBOARD_BLEND_MODES.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <NudgeBar onNudge={nudgeSelected} />
+              <Segmented>
+                <SegmentButton active={false} onClick={onBringToFront} title="Bring to front">
+                  <TbStackFront size={14} />
+                </SegmentButton>
+                {onBringForward && (
+                  <SegmentButton active={false} onClick={onBringForward} title="Bring forward">
+                    <TbArrowUp size={13} />
+                  </SegmentButton>
+                )}
+                {onSendBackward && (
+                  <SegmentButton active={false} onClick={onSendBackward} title="Send backward">
+                    <TbArrowDown size={13} />
+                  </SegmentButton>
+                )}
+                <SegmentButton active={false} onClick={onSendToBack} title="Send to back">
+                  <TbStackBack size={14} />
+                </SegmentButton>
+                {selectedNodes.length + selectedEdges.length >= 2 && (
+                  <SegmentButton active={false} onClick={onGroup} title="Group (Ctrl+G)">
+                    <TbComponents size={14} />
+                  </SegmentButton>
+                )}
+                {(selectedNodes.some((n) => n.groupId) || selectedEdges.some((e) => e.groupId)) && (
+                  <SegmentButton active={false} onClick={onUngroup} title="Ungroup (Ctrl+Shift+G)">
+                    <TbComponentsOff size={14} />
+                  </SegmentButton>
+                )}
+              </Segmented>
+            </div>
+          </Section>
+
+          {selectedNodes.length > 1 && (
+            <Section title="Align & distribute" dense>
+              <FigureLayoutFields nodes={selectedNodes} onBatchEditNodes={onBatchEditNodes} />
+            </Section>
+          )}
+        </>
       )}
 
       {selectedNodes.length === 0 && firstEdge && (
