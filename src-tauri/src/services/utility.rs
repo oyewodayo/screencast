@@ -92,11 +92,11 @@ fn resolve_ffmpeg_tool(app_handle: &AppHandle, tool: &str) -> Result<PathBuf, St
     }
 
     Err(format!(
-        "{tool} was not found. Briefcast ships it on Windows; on {} install it with {} and make \
+        "{tool} was not found. On {} install it with {} and make \
          sure it is on your PATH.",
         std::env::consts::OS,
         if cfg!(target_os = "macos") {
-            "`brew install ffmpeg`"
+            "`brew install ffmpeg` (or reinstall Briefcast to restore its bundled copy)"
         } else {
             "your package manager (e.g. `sudo apt install ffmpeg`)"
         }

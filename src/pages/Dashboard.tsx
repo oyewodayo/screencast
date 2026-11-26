@@ -24,6 +24,8 @@ import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { useAnnotationController } from '../hooks/useAnnotationController';
 import { useMediaAssetResolvers } from '../hooks/useMediaAssetResolvers';
+import { useDashboardSystemListeners } from '../hooks/useDashboardSystemListeners';
+import { useHomeCreationIndexes } from '../hooks/useHomeCreationIndexes';
 import { describeShortcutFailures, onGlobalShortcut, onShortcutFailures, type ShortcutAction } from '../services/globalShortcuts';
 import { formatFileName, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
@@ -72,7 +74,7 @@ import PdfFolderGallery from "../components/PdfFolderGallery";
 import DocumentFolderGallery from "../components/DocumentFolderGallery";
 import BoardWorkspace, { BoardScreen } from "../components/board/BoardWorkspace";
 import { BoardEditorHandle } from "../components/board/BoardEditor";
-import { createEmptyBoardDocument, createDefaultBoardImage, type BoardSummary } from "../utils/boardTypes";
+import { createEmptyBoardDocument, createDefaultBoardImage } from "../utils/boardTypes";
 import DocsWorkspace, { DocsScreen } from "../components/docs/DocsWorkspace";
 import { ItemLinksProvider } from "../contexts/ItemLinksContext";
 import LinksControl from "../components/links/LinksControl";
@@ -103,8 +105,7 @@ import TrackTargetPicker from "../components/video/TrackTargetPicker";
 import ExportQueueChip from "../components/docker/ExportQueueChip";
 import { type Box as TrackBox, cancelTracking, trackOverlay } from "../utils/motionTracking";
 import { type ExportJob, installGlobalCloseGuard, onJobFinished } from "../utils/exportQueue";
-import { addCloseGuard, addReleaseBlocker, HIDDEN_TO_TRAY_EVENT, installCloseGuards, quitApp } from "../utils/closeGuards";
-import { stopAllPlayback } from "../utils/previewHead";
+import { addCloseGuard, addReleaseBlocker, installCloseGuards, quitApp } from "../utils/closeGuards";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
@@ -124,7 +125,6 @@ import { useClipRecordings } from "../hooks/useClipRecordings";
 import { pointerStyleOf } from "../utils/pointerTrack";
 import { buildKeyChips, keystrokeStyleOf } from "../utils/keystrokes";
 import { screenContentRect } from "../utils/screenStyle";
-import { DocSummary } from "../utils/docTypes";
 import ErrorBoundary from "../components/ErrorBoundary";
 import SettingsModal, { SettingsInitialTarget } from "../components/Modals/SettingsModal";
 import PhoneCameraModal from "../components/Modals/PhoneCameraModal";
@@ -133,7 +133,6 @@ import {
   broadcastToPhones,
   IncomingStatus,
   onPhoneClip,
-  onPhoneFileArrived,
   onPhoneRemote,
   onPhoneTimelineFile,
   PhoneRemoteCommand,
@@ -165,28 +164,18 @@ import FfmpegSetupBanner from "../components/custom/FfmpegSetupBanner";
 import TelemetryNotice from "../components/custom/TelemetryNotice";
 import type { RecordingStatus } from "../utils/recordingStatus";
 import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../utils/recordingCountdown";
-import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
-import type { Update } from "@tauri-apps/plugin-updater";
 import { AppSettings, loadSettings, saveSettings, updateSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
-  getPinnedPaths,
-  getRecentPaths,
   togglePin,
   recordFileOpened,
   repathFile,
   forgetFile,
-  getExternalFiles,
   recordExternalFile,
-  type ExternalFileMetadata,
 } from "../utils/homeScreenFiles";
-import { getArrivals, getOpenedAt, recordFileArrived, recordItemOpened } from "../utils/homeScreenFiles";
-import { onUsbImported } from "../services/usbPhone";
-import { buildHomeItems, homeItemKey, type HomeItem } from "../utils/homeLibraryItems";
+import { type HomeItem } from "../utils/homeLibraryItems";
 import { isOpenableDocument, openDocumentFile } from "../utils/docFileImport";
-import type { WhiteboardSummary } from "../utils/whiteboardTypes";
-import type { MindmapSummary } from "../utils/mindmapTypes";
 import { openOrMigrateLegacyMindmap } from "../utils/mindmapMigration";
 import {
   getResumeTime,
@@ -214,8 +203,6 @@ import {
 } from "react-icons/io5";
 import { MdOutlineDescription } from "react-icons/md";
 const appWindow = getCurrentWebviewWindow()
-
-type RAMInfo = [number, number];
 
 
 // The sidebar's active tab is either a real file category or the Trash view — the latter isn't
@@ -288,7 +275,6 @@ const Dashboard = () => {
   const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
   const [pausedAccumulatedMs, setPausedAccumulatedMs] = useState<number>(0);
   const [error, setError] = useState<string>("");
-  const [ramInfo, setRamInfo] = useState<RAMInfo | null>(null);
   const [fileName, setFileName] = useState(
     () => loadSettings().defaultFileNamePrefix + "_" + new Date().toLocaleDateString().replace(/\//g, "_")
   );
@@ -432,31 +418,6 @@ const Dashboard = () => {
   // per-tab state, same as a normal file explorer's search box.
   const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
-  // Pinned + recently-opened file paths behind the home screen's "From your library" preview —
-  // see utils/homeScreenFiles.ts. Mirrored into React state (rather than read fresh from
-  // localStorage on every render) so toggling a pin or opening a file re-renders that preview.
-  const [pinnedPaths, setPinnedPaths] = useState<string[]>(() => getPinnedPaths());
-  const [recentPaths, setRecentPaths] = useState<string[]>(() => getRecentPaths());
-  const [externalFiles, setExternalFiles] = useState<Record<string, ExternalFileMetadata>>(() => getExternalFiles());
-  const [homeLibraryView, setHomeLibraryView] = useState<"list" | "grid">(() => {
-    try {
-      return localStorage.getItem("briefcast.homeLibraryViewMode") === "grid" ? "grid" : "list";
-    } catch {
-      return "list";
-    }
-  });
-  const [homeLibrarySearch, setHomeLibrarySearch] = useState("");
-  const handleHomeLibraryViewChange = useCallback((mode: "list" | "grid") => {
-    setHomeLibraryView(mode);
-    try {
-      localStorage.setItem("briefcast.homeLibraryViewMode", mode);
-    } catch {
-      // ignore storage quota / private-mode errors
-    }
-  }, []);
-  const handleTogglePinHomeKey = useCallback((key: string) => {
-    setPinnedPaths(togglePin(key));
-  }, []);
   // Which Board screen (if any) is showing in the main content pane - null means Board mode is
   // off entirely (showing the normal selectedFile/home content instead). See handleOpenBoard.
   const [boardScreen, setBoardScreen] = useState<BoardScreen | null>(null);
@@ -473,30 +434,6 @@ const Dashboard = () => {
   // pattern as boardScreen/docsScreen. See handleOpenWhiteboard.
   const [whiteboardScreen, setWhiteboardScreen] = useState<WhiteboardScreen | null>(null);
   const [mindmapScreen, setMindmapScreen] = useState<MindmapScreen | null>(null);
-  // Whiteboards and mind maps for the home screen's "From your library" list (documents come from
-  // docsIndex below), and when each library item was last opened - see utils/homeLibraryItems.ts.
-  const [whiteboardIndex, setWhiteboardIndex] = useState<WhiteboardSummary[]>([]);
-  const [mindmapIndex, setMindmapIndex] = useState<MindmapSummary[]>([]);
-  const [boardIndex, setBoardIndex] = useState<BoardSummary[]>([]);
-  const [openedAt, setOpenedAt] = useState<Record<string, number>>(() => getOpenedAt());
-  // Files that came in from a phone - tagged on the home screen with where from (homeScreenFiles.ts).
-  const [arrivals, setArrivals] = useState(() => getArrivals());
-  useEffect(() => {
-    const arrive = (paths: string[], from: string, batch: string) => {
-      if (!paths.length) return;
-      let recent: string[] = [];
-      for (const path of paths) ({ recent } = recordFileArrived(path, from, batch));
-      setRecentPaths(recent);
-      setArrivals(getArrivals());
-      setOpenedAt(getOpenedAt());
-    };
-    const stopWifi = onPhoneFileArrived((file) => arrive(file.path ? [file.path] : [], file.device_name, file.batch ?? file.id));
-    const stopUsb = onUsbImported((t) => arrive(t.paths, t.device_name || "Phone", `usb:${t.id}`));
-    return () => {
-      stopWifi();
-      stopUsb();
-    };
-  }, []);
   // Which Video Editor screen (if any) is active - same null-means-off pattern as the tool
   // screens above, but with one deliberate difference: "editing" renders nothing of its own. The
   // video editor has always been "an open video in VideoPlayer + FileToolsDocker's video tools",
@@ -512,10 +449,6 @@ const Dashboard = () => {
   videoEditorHomeRef.current = videoEditorScreen?.mode === "home";
   const [editorHomeDrag, setEditorHomeDrag] = useState(false);
   const [editorHomeDrop, setEditorHomeDrop] = useState<{ paths: string[]; at: number } | null>(null);
-  // Every doc's summary (id/title/linked_to/etc.), refreshed via refreshDocsIndex - backs both the
-  // "Link to recording" picker's libraryFiles-independent state and the per-file "has linked
-  // notes" badge/menu below, from one list_docs call rather than one find_docs_linked_to per row.
-  const [docsIndex, setDocsIndex] = useState<DocSummary[]>([]);
   // "Link notes" flyout inside a file's 3-dot menu when 2+ docs are already linked to it - same
   // expand-in-place pattern the old "Move to" flyout used.
   const [linkDocsMenuOpenFor, setLinkDocsMenuOpenFor] = useState<string | null>(null);
@@ -678,6 +611,37 @@ const Dashboard = () => {
   // The one "Move or copy to..." menu (MoveCopyMenu.tsx) every sidebar/gallery Move-to opens.
   const [transferMenu, setTransferMenu] = useState<{ files: { name: string; path: string }[]; anchor: PopoverAnchor } | null>(null);
   const [selectedFile, setSelectedFile] = useState<{ path: string; name: string; sourcePath: string } | null>(null);
+  // Memoized flat list of all library files + home/history/creation indexes.
+  const allLibraryFiles = useMemo(() => Object.values(files).flat(), [files]);
+  const {
+    pinnedPaths,
+    setPinnedPaths,
+    recentPaths,
+    setRecentPaths,
+    setExternalFiles,
+    homeLibraryView,
+    handleHomeLibraryViewChange,
+    homeLibrarySearch,
+    setHomeLibrarySearch,
+    handleTogglePinHomeKey,
+    arrivals,
+    refreshDocsIndex,
+    linkedDocsByPath,
+    libraryFilesByPath,
+    boardThumbById,
+    homeItems,
+    hasAnyHomeItems,
+    historyItems,
+    homeFiles,
+  } = useHomeCreationIndexes({
+    allLibraryFiles,
+    hasSelectedFile: Boolean(selectedFile),
+    isVideoEditorHome: videoEditorScreen?.mode === "home",
+    boardScreen,
+    docsScreen,
+    whiteboardScreen,
+    mindmapScreen,
+  });
   // Folder relative-path whose images are shown as a thumbnail grid in the main board - set by
   // clicking an Image-tab folder header in the sidebar (see the folder header onClick below), and
   // cleared whenever the active category tab changes so a stale gallery can't linger into another
@@ -1676,66 +1640,13 @@ useEffect(() => {
     };
   }, []);
 
-  // Get RAM info
-  useEffect(() => {
-    invoke<RAMInfo>('get_ram_info')
-      .then(setRamInfo)
-      .catch(console.error);
-  }, []);
-
-  // The "Convert format" button in the recording-completed popup (a separate Tauri window)
-  // can't render ConversionDialog itself, so it asks this window to open it instead.
-  useEffect(() => {
-    const setupListener = async () => {
-      const unlisten = await listen<string>('open-conversion-dialog', (event) => {
-        const path = event.payload;
-        const name = path.split(/[\\/]/).pop() || path;
-        setConversionFile({ path, name });
-      });
-      return unlisten;
-    };
-
-    let unlistenFn: (() => void) | undefined;
-    setupListener().then(fn => {
-      unlistenFn = fn;
-    });
-
-    return () => {
-      if (unlistenFn) {
-        unlistenFn();
-      }
-    };
-  }, []);
-
-  // The "Play" button in the same recording-completed popup. That window has no player of its
-  // own, so it hands the path over here and closes itself - the same arrangement
-  // 'open-conversion-dialog' above uses.
-  //
-  // setFocus matters: this window is behind the popup, so without it the file would load out of
-  // sight and clicking Play would look like it did nothing.
-  useEffect(() => {
-    const setupListener = async () => {
-      return await listen<string>('open-recording-playback', async (event) => {
-        const path = event.payload;
-        const name = path.split(/[\\/]/).pop() || path;
-        try {
-          await getCurrentWebviewWindow().setFocus();
-        } catch {
-          /* focus is a nicety - never let it stop the file from loading */
-        }
-        await loadFileForPlayback(path, name);
-      });
-    };
-
-    let unlistenFn: (() => void) | undefined;
-    setupListener().then((fn) => {
-      unlistenFn = fn;
-    });
-
-    return () => {
-      if (unlistenFn) unlistenFn();
-    };
-  }, []);
+  // System-level app integrations (RAM readout, delayed update check, hidden-to-tray media pause,
+  // and Convert / Play requests from the recording-completed popup window).
+  const { ramInfo, pendingUpdate, setPendingUpdate } = useDashboardSystemListeners({
+    videoPlayerRef,
+    onOpenConversionFile: setConversionFile,
+    onOpenRecordingPlayback: (path, name) => loadFileForPlayback(path, name),
+  });
 
   // ScreenshotOverlayWindow does the actual capture itself (it's the one holding the formData
   // by then) and reports the outcome back here purely for the toast — the sidebar refresh
@@ -2324,36 +2235,6 @@ const setScreen = () => {
 		});
 	}, [isRecording]);
 
-	// Closing to the tray only hides the window - the page keeps running - so a video playing in it
-	// carried on, heard but not seen. Whatever plays stops as the window goes, as it would if the window
-	// really closed; it stays paused when Briefcast is opened again. The player is paused through its
-	// own controls so the editor's other layers stop with it. Live camera previews are left alone:
-	// they're streams rather than playback, and a paused one would come back frozen.
-	useEffect(() => {
-		const stopPlayback = () => {
-			if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
-			// The timeline, the mixer's audition and the panels' previews.
-			stopAllPlayback();
-			document.querySelectorAll<HTMLMediaElement>("video, audio").forEach((el) => {
-				if (!el.paused && !el.srcObject) el.pause();
-			});
-		};
-		window.addEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
-		return () => window.removeEventListener(HIDDEN_TO_TRAY_EVENT, stopPlayback);
-	}, []);
-
-	// One update check per launch, delayed so it never competes with startup work (device probes,
-	// file list, thumbnails). Shown as a dismissible card - see UpdateBanner.
-	const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
-	useEffect(() => {
-		const timer = setTimeout(() => {
-			void checkForUpdate().then((update) => {
-				if (update) setPendingUpdate(update);
-			});
-		}, 15_000);
-		return () => clearTimeout(timer);
-	}, []);
-
 	const loadTrash = async () => {
 		setIsLoadingTrash(true);
 		try {
@@ -2366,75 +2247,6 @@ const setScreen = () => {
 			setIsLoadingTrash(false);
 		}
 	};
-
-	// Backs the sidebar's per-file "has linked notes" badge/menu (see linkedDocsByPath below) from
-	// one list_docs call rather than a find_docs_linked_to round trip per visible row.
-	const refreshDocsIndex = useCallback(async () => {
-		try {
-			setDocsIndex(await invoke<DocSummary[]>("list_docs"));
-		} catch (error) {
-			console.error("Failed to load docs index:", error);
-		}
-	}, []);
-
-	useEffect(() => {
-		refreshDocsIndex();
-	}, [refreshDocsIndex]);
-
-	// Opening a document, whiteboard or mind map counts as "recent" for the home screen even if
-	// nothing in it changes.
-	const openedDocId = docsScreen?.mode === "editor" ? docsScreen.docId : null;
-	const openedWhiteboardId = whiteboardScreen?.mode === "editor" ? whiteboardScreen.whiteboardId : null;
-	const openedMindmapId = mindmapScreen?.mode === "editor" ? mindmapScreen.mindmapId : null;
-	const openedBoardId = boardScreen?.mode === "editor" ? boardScreen.boardId : null;
-	useEffect(() => {
-		if (openedDocId) setOpenedAt(recordItemOpened(homeItemKey("doc", openedDocId)));
-	}, [openedDocId]);
-	useEffect(() => {
-		if (openedWhiteboardId) setOpenedAt(recordItemOpened(homeItemKey("whiteboard", openedWhiteboardId)));
-	}, [openedWhiteboardId]);
-	useEffect(() => {
-		if (openedMindmapId) setOpenedAt(recordItemOpened(homeItemKey("mindmap", openedMindmapId)));
-	}, [openedMindmapId]);
-	useEffect(() => {
-		if (openedBoardId) setOpenedAt(recordItemOpened(homeItemKey("board", openedBoardId)));
-	}, [openedBoardId]);
-
-	// The home screen is whatever shows when no tool and no file is open. Its library list is
-	// refreshed every time it comes back into view, so a document just written, a design just
-	// composed, or a whiteboard just drawn is there straight away.
-	const onHomeScreen = videoEditorScreen?.mode !== "home" && !mindmapScreen && !whiteboardScreen && !boardScreen && !docsScreen && !selectedFile;
-	useEffect(() => {
-		if (!onHomeScreen) return;
-		let live = true;
-		void refreshDocsIndex();
-		setOpenedAt(getOpenedAt());
-		invoke<WhiteboardSummary[]>("list_whiteboards")
-			.then((list) => live && setWhiteboardIndex(list))
-			.catch((error) => console.error("Failed to load whiteboards for the home screen:", error));
-		invoke<MindmapSummary[]>("list_mindmaps")
-			.then((list) => live && setMindmapIndex(list))
-			.catch((error) => console.error("Failed to load mind maps for the home screen:", error));
-		invoke<BoardSummary[]>("list_boards")
-			.then((list) => live && setBoardIndex(list))
-			.catch((error) => console.error("Failed to load designs for the home screen:", error));
-		return () => {
-			live = false;
-		};
-	}, [onHomeScreen, refreshDocsIndex]);
-
-	// file.path -> every doc linked to it, derived once per docsIndex change rather than filtered
-	// per row on every render.
-	const linkedDocsByPath = useMemo(() => {
-		const map = new Map<string, DocSummary[]>();
-		for (const doc of docsIndex) {
-			if (!doc.linked_to) continue;
-			const existing = map.get(doc.linked_to);
-			if (existing) existing.push(doc);
-			else map.set(doc.linked_to, [doc]);
-		}
-		return map;
-	}, [docsIndex]);
 
 	// One-step "notes for this file" action from a file's 3-dot menu: create-and-link if nothing's
 	// linked yet, jump straight in if exactly one doc is, or open the flyout (linkDocsMenuOpenFor)
@@ -3462,14 +3274,6 @@ const setScreen = () => {
 	const categoryIconColorClassName = (category: FileCategory | null): string =>
 		category ? CATEGORY_ICON_COLOR[category] : "text-neutral-400 dark:text-neutral-500";
 
-	// What to surface on the empty home screen so it isn't just a blank void: library files and
-	// Briefcast's own documents, whiteboards and mind maps in one most-recent-first list, with
-	// pinned files (in pin order - see utils/homeScreenFiles.ts) always on top. See
-	// utils/homeLibraryItems.ts for the ranking.
-	// Memoized (with the per-tool lists below) so the Video Editor home and Create dialog get the
-	// same arrays back on every unrelated Dashboard render - a new array re-ran their thumbnail
-	// effects and re-rendered every tile.
-	const allLibraryFiles = useMemo(() => Object.values(files).flat(), [files]);
 	// Each library file's folder, looked up at once (findFileFolder walks every folder).
 	const folderByPath = useMemo(() => new Map(Object.entries(files).flatMap(([folder, list]) => list.map((f) => [f.path, folder] as const))), [files]);
 	const folderOfPath = useCallback((path: string) => folderByPath.get(path) ?? null, [folderByPath]);
@@ -3478,71 +3282,6 @@ const setScreen = () => {
 	const libraryVideoFiles = useMemo(() => allLibraryFiles.filter((file) => getFileCategory(file.name) === "video"), [allLibraryFiles]);
 	const libraryImageClipFiles = useMemo(() => allLibraryFiles.filter((file) => isImageClipPath(file.path)), [allLibraryFiles]);
 	const libraryClipVideoFiles = useMemo(() => libraryVideoFiles.filter((file) => !isVideoProjectPath(file.path)), [libraryVideoFiles]);
-	// The home screen's items - rebuilt only when the library, pins, history or indexes change,
-	// not on every render of the page (playback ticks re-render it several times a second).
-	const libraryFilesByPath = useMemo(() => {
-		const map = new Map<string, FileEntry>(allLibraryFiles.map((file) => [file.path, file]));
-		for (const [path, ext] of Object.entries(externalFiles)) {
-			if (!map.has(path)) {
-				map.set(path, {
-					path: ext.path,
-					name: ext.name,
-					size: ext.size ?? 0,
-					modified: ext.modified,
-				});
-			}
-		}
-		return map;
-	}, [allLibraryFiles, externalFiles]);
-	const boardThumbById = useMemo(
-		() => new Map(boardIndex.filter((b) => b.thumbnail_path).map((b) => [b.id, b.thumbnail_path!] as const)),
-		[boardIndex]
-	);
-	const homeItems = useMemo(
-		() =>
-			buildHomeItems({
-				files: allLibraryFiles,
-				pinnedPaths,
-				recentPaths,
-				openedAt,
-				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
-				whiteboards: whiteboardIndex,
-				mindmaps: mindmapIndex,
-				boards: boardIndex,
-				externalFiles,
-				query: homeLibrarySearch,
-			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, boardIndex, externalFiles, homeLibrarySearch]
-	);
-	const hasAnyHomeItems =
-		allLibraryFiles.length > 0 ||
-		pinnedPaths.length > 0 ||
-		docsIndex.some((d) => !d.deleted_at) ||
-		whiteboardIndex.length > 0 ||
-		mindmapIndex.length > 0 ||
-		boardIndex.length > 0 ||
-		Object.keys(externalFiles).length > 0;
-	// Extended history list for the quick-switcher dropup in the dock when navigating outside home
-	const historyItems = useMemo(
-		() =>
-			buildHomeItems({
-				files: allLibraryFiles,
-				pinnedPaths,
-				recentPaths,
-				openedAt,
-				docs: docsIndex.filter((d) => !d.deleted_at).map((d) => ({ id: d.id, name: d.title, updated_at: d.updated_at })),
-				whiteboards: whiteboardIndex,
-				mindmaps: mindmapIndex,
-				boards: boardIndex,
-				externalFiles,
-				limit: 30,
-			}),
-		[allLibraryFiles, pinnedPaths, recentPaths, openedAt, docsIndex, whiteboardIndex, mindmapIndex, boardIndex, externalFiles]
-	);
-	const homeFiles = useMemo(
-		() => homeItems.flatMap((item) => (item.kind === "file" && libraryFilesByPath.has(item.id) ? [libraryFilesByPath.get(item.id)!] : [])),
-		[homeItems, libraryFilesByPath]
-	);
 	const openHomeItem = (item: HomeItem) => {
 		if (item.kind === "file") {
 			const file = libraryFilesByPath.get(item.id);
