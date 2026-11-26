@@ -32,13 +32,14 @@
 // within the global coordinate space (obtainable via NSScreen, itself another osascript/JXA call)
 // - deferred until real multi-monitor Mac hardware exists to verify the fix against.
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::AppHandle;
 
 use super::{MonitorInfo, WindowInfo, WindowTitles};
 use crate::commands::recording::macos::list_avfoundation_devices;
 
-const NOT_IMPLEMENTED: &str = "Window focus monitoring isn't implemented on macOS yet";
 const WINDOW_FIELD_SEP: &str = "|||";
 
 #[repr(C)]
@@ -344,19 +345,103 @@ pub fn get_window_global_rect_by_title(title: &str) -> Result<(i32, i32, i32, i3
         .ok_or_else(|| format!("Window '{}' not found", title))
 }
 
-// Live focus-change tracking (which window is active/was last active) is a separate feature from
-// "enumerate windows to pick one to record" above, and would need an Accessibility API observer
-// (AXObserver) or a polling loop neither of which this pass attempts - left as a clear error
-// rather than a best-guess implementation with no way to verify it actually fires on real focus
-// changes.
+struct MonitorHandle {
+    running: Arc<AtomicBool>,
+    join_handle: std::thread::JoinHandle<()>,
+}
+
+fn monitor_thread_slot() -> &'static Mutex<Option<MonitorHandle>> {
+    static SLOT: OnceLock<Mutex<Option<MonitorHandle>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn last_two_windows() -> &'static Mutex<[String; 2]> {
+    static TITLES: OnceLock<Mutex<[String; 2]>> = OnceLock::new();
+    TITLES.get_or_init(|| Mutex::new([String::new(), String::new()]))
+}
+
+/// Queries the frontmost application's active window title (falling back to the app name when the
+/// frontmost app has no titled window, e.g. Finder desktop).
+fn query_frontmost_window_title() -> Option<String> {
+    let script = r#"
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    set appName to name of frontApp
+    try
+        set winTitle to name of front window of frontApp
+        if winTitle is not "" then
+            return winTitle
+        end if
+    end try
+    return appName
+end tell
+"#;
+    let output = Command::new("osascript").args(["-e", script]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!title.is_empty()).then_some(title)
+}
+
 pub async fn start_monitoring_windows() -> Result<(), String> {
-    Err(NOT_IMPLEMENTED.to_string())
+    let mut slot = monitor_thread_slot().lock().map_err(|e| e.to_string())?;
+    if slot.is_some() {
+        return Err("Monitoring is already active".to_string());
+    }
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
+    let join_handle = std::thread::spawn(move || {
+        while flag.load(Ordering::Relaxed) {
+            if let Some(title) = query_frontmost_window_title() {
+                if let Ok(mut last_two) = last_two_windows().lock() {
+                    if last_two[1] != title {
+                        last_two[0] = last_two[1].clone();
+                        last_two[1] = title;
+                    }
+                }
+            }
+            // Poll at 400ms in small sleep slices so stop_monitoring_windows exits promptly.
+            for _ in 0..4 {
+                if !flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    });
+    *slot = Some(MonitorHandle { running, join_handle });
+    log::info!("macOS window focus monitoring started");
+    Ok(())
 }
 
 pub async fn stop_monitoring_windows() -> Result<(), String> {
-    Err(NOT_IMPLEMENTED.to_string())
+    let handle = {
+        let mut slot = monitor_thread_slot().lock().map_err(|e| e.to_string())?;
+        slot.take()
+    };
+    match handle {
+        Some(h) => {
+            h.running.store(false, Ordering::Relaxed);
+            let _ = h.join_handle.join();
+            log::info!("macOS window focus monitoring stopped");
+            Ok(())
+        }
+        None => Err("Monitoring is not active".to_string()),
+    }
 }
 
 pub async fn get_window_titles() -> Result<WindowTitles, String> {
-    Err(NOT_IMPLEMENTED.to_string())
+    let is_active = monitor_thread_slot()
+        .lock()
+        .map(|s| s.is_some())
+        .unwrap_or(false);
+    if !is_active {
+        return Err("Monitoring is not active".to_string());
+    }
+    let titles = last_two_windows().lock().map_err(|e| e.to_string())?;
+    Ok(WindowTitles {
+        active: titles[1].clone(),
+        last_active: titles[0].clone(),
+    })
 }

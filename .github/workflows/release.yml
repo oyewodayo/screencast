@@ -85,7 +85,7 @@ jobs:
             echo "**To install**"
             echo
             echo "- **Windows** - download the file ending in **x64-setup.exe**."
-            echo "- **macOS** - download the **.dmg** (Apple Silicon and Intel) and drag Briefcast into **Applications**. Briefcast uses the ffmpeg on your Mac: \`brew install ffmpeg\`. Because the app isn't Apple-notarized yet, macOS may show *\"Apple could not verify Briefcast\"* on first launch — to open it once:"
+            echo "- **macOS** - download the **.dmg** (Apple Silicon and Intel) and drag Briefcast into **Applications**. Because the app isn't Apple-notarized yet, macOS may show *\"Apple could not verify Briefcast\"* on first launch — to open it once:"
             echo "  1. **System Settings (recommended):** Click **Done**, open **System Settings → Privacy & Security**, scroll to **Security**, click **Open Anyway** next to Briefcast, and confirm."
             echo "  2. **Terminal:** Run \`xattr -cr /Applications/Briefcast.app\` and then open Briefcast normally."
             echo "- **Linux** - download the **.AppImage** (make it executable and run it) or the **.deb** (\`sudo apt install ./Briefcast_*.deb\`). Briefcast uses the ffmpeg on your system, version 5.1 or newer."
@@ -288,6 +288,13 @@ jobs:
             echo "APPLE_PASSWORD=$APPLE_PASSWORD"
             echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
           } >> "$GITHUB_ENV"
+      # Universal static ffmpeg + ffprobe (arm64 + x86_64 via lipo) so macOS users can record and
+      # export immediately without installing Homebrew. If the download fails the installer still
+      # builds and falls back to any ffmpeg on the user's Mac (services/utility.rs).
+      - name: Bundle macOS ffmpeg
+        id: ffmpeg
+        continue-on-error: true
+        run: bash scripts/bundle-macos-ffmpeg.sh src-tauri/binaries/ffmpeg "$RUNNER_TEMP/ffmpeg-macos"
       # The speech engine (whisper.cpp), built for this system by scripts/build-whisper-engine.sh -
       # whisper.cpp publishes no macOS or Linux binaries. If it fails the installer is still built,
       # just without it: captions and transcript editing then need a whisper-cli on the user's PATH.
@@ -295,17 +302,24 @@ jobs:
         id: whisper
         continue-on-error: true
         run: bash scripts/build-whisper-engine.sh src-tauri/binaries/whisper "$RUNNER_TEMP/whisper-build"
-      # Bundled through a config overlay rather than the committed config: tauri-build refuses a
-      # resource pattern that matches no file, and binaries/whisper only exists once it is built.
-      - name: Bundle the speech engine
-        id: speech
+      # Bundled through one config overlay rather than the committed config: tauri-build refuses a
+      # resource pattern that matches no file, and binaries/{ffmpeg,whisper} only exist when built.
+      - name: Configure bundled macOS resources
+        id: macos_resources
         run: |
+          resources='"licenses/*","models/rnnoise/*"'
+          if [ "${{ steps.ffmpeg.outcome }}" = "success" ]; then
+            resources="${resources},\"binaries/ffmpeg/*\""
+          else
+            echo "::warning::Bundled macOS ffmpeg failed - this installer will fall back to system ffmpeg (brew install ffmpeg)."
+          fi
           if [ "${{ steps.whisper.outcome }}" = "success" ]; then
-            printf '%s' '{"bundle":{"resources":["licenses/*","models/rnnoise/*","binaries/whisper/*"]}}' > src-tauri/tauri.speech.conf.json
-            echo "args=--config src-tauri/tauri.speech.conf.json" >> "$GITHUB_OUTPUT"
+            resources="${resources},\"binaries/whisper/*\""
           else
             echo "::warning::The speech engine failed to build - this installer has no captions or transcript editing."
           fi
+          printf '{"bundle":{"resources":[%s]}}' "$resources" > src-tauri/tauri.macos-bundle.conf.json
+          echo "args=--config src-tauri/tauri.macos-bundle.conf.json" >> "$GITHUB_OUTPUT"
       # One universal app (Apple Silicon and Intel in a single .dmg).
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -329,4 +343,4 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target universal-apple-darwin ${{ steps.speech.outputs.args }}
+          args: --target universal-apple-darwin ${{ steps.macos_resources.outputs.args }}

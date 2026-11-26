@@ -21,6 +21,8 @@ import type { FileEntry } from "../utils/libraryEntries";
 
 // Dispatched (on window) to bring the dock back up when it was minimized.
 export const SHOW_DOCKER_EVENT = "briefcast:show-docker";
+// Dispatched (on window) to open the Recording Studio setup modal from outside BottomDocker.
+export const OPEN_RECORD_MODAL_EVENT = "briefcast:open-record-modal";
 
 const FEEDBACK_EMAIL = "withbriefs@gmail.com";
 
@@ -392,11 +394,16 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
-  // Something asked for the dock (the player's "Edit video") - bring it back if minimized.
+  // Something asked for the dock (the player's "Edit video") or the Recording Studio setup modal.
   useEffect(() => {
-    const open = () => setShowDocker(true);
-    window.addEventListener(SHOW_DOCKER_EVENT, open);
-    return () => window.removeEventListener(SHOW_DOCKER_EVENT, open);
+    const openDock = () => setShowDocker(true);
+    const openRecordModal = () => setModalOpenScreen(true);
+    window.addEventListener(SHOW_DOCKER_EVENT, openDock);
+    window.addEventListener(OPEN_RECORD_MODAL_EVENT, openRecordModal);
+    return () => {
+      window.removeEventListener(SHOW_DOCKER_EVENT, openDock);
+      window.removeEventListener(OPEN_RECORD_MODAL_EVENT, openRecordModal);
+    };
   }, []);
   // Click tracking (services/click_tracker.rs, a Win32 mouse hook) is still Windows-only with no
   // equivalent elsewhere, unlike system audio ("what you hear"), which is now attempted on every

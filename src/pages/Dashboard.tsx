@@ -18,12 +18,12 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ask, open as openFileDialog, message as showMessageDialog } from "@tauri-apps/plugin-dialog";
 import MoveCopyMenu, { FileTransferOptions, FileTransferRequest } from "../components/docker/MoveCopyMenu";
 import type { PopoverAnchor } from "../hooks/useClampedPopoverPosition";
-import BottomDocker, { SHOW_DOCKER_EVENT } from "../components/BottomDocker";
+import BottomDocker, { OPEN_RECORD_MODAL_EVENT, SHOW_DOCKER_EVENT } from "../components/BottomDocker";
 import { listen, emit } from '@tauri-apps/api/event';
 import { CaptureCapabilities, WindowInfo } from "../Types";
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
-import { PhysicalPosition, PhysicalSize, availableMonitors } from '@tauri-apps/api/window';
-import { fadeTotalMs } from '../utils/annotationStyles';
+import { useAnnotationController } from '../hooks/useAnnotationController';
+import { useMediaAssetResolvers } from '../hooks/useMediaAssetResolvers';
 import { describeShortcutFailures, onGlobalShortcut, onShortcutFailures, type ShortcutAction } from '../services/globalShortcuts';
 import { formatFileName, truncateFileName } from "../utils/Formater";
 import { useMediaDurations } from "../hooks/useMediaDurations";
@@ -80,7 +80,7 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
-import HomeLibrarySection from "../components/HomeLibrarySection";
+import HomeWorkspace from "../components/HomeWorkspace";
 import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
 import SidebarHeader from "../components/sidebar/SidebarHeader";
 import { FILE_CATEGORY_TABS } from "../components/sidebar/categoryTabs";
@@ -92,7 +92,7 @@ import { setEditorIntent, type EditorIntent } from "../utils/editorIntent";
 import NewVideoProjectDialog, { NewVideoProjectRequest } from "../components/video/NewVideoProjectDialog";
 import ProjectPrepOverlay from "../components/video/ProjectPrepOverlay";
 import { endPrep, getPrep, setWarm, startPrep, updatePrep } from "../utils/projectPrep";
-import { Clip, OverlayTrackInfo, VideoProjectFrame, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
+import { Clip, OverlayTrackInfo, createProjectState, isImageClipPath, isVideoProjectPath } from "../utils/videoEditTypes";
 import PhonePreviewLayer from "../components/video/PhonePreviewLayer";
 import SplitArrangeBar from "../components/video/SplitArrangeBar";
 import { usePhonePreview } from "../hooks/usePhonePreview";
@@ -107,7 +107,6 @@ import { addCloseGuard, addReleaseBlocker, HIDDEN_TO_TRAY_EVENT, installCloseGua
 import { stopAllPlayback } from "../utils/previewHead";
 import { heldItemsFor, isTimelineMarker } from "../utils/timelineClipboard";
 import SharePanel from "../components/video/SharePanel";
-import { resolveClipPreviewUrl } from "../utils/clipPreviewSource";
 import { loadWorkspace, saveWorkspace } from "../utils/sessionRestore";
 import { useGradeLut } from "../utils/gradeLuts";
 import { clipOutputDuration, outputOffsetToSource, sourceToOutputOffset } from "../utils/clipTiming";
@@ -146,14 +145,9 @@ import PhoneIncomingTray from "../components/PhoneIncomingTray";
 import UsbPhoneTray from "../components/UsbPhoneTray";
 import { UsbImportHost } from "../components/Modals/UsbImportModal";
 import FileInfoModal from "../components/Modals/FileInfoModal";
-import LiveCameraRecordingView from "../components/LiveCameraRecordingView";
 import { PresentationLiveBar } from "../components/PresentationControls";
 import { getPresentationState, visibleCameras } from "../services/presentation";
 import { SnipResult, startSnip } from "../services/snip";
-
-// Record types that capture cameras and no screen (win.rs recording_with_output_va/_v). Mirrors
-// CAMERA_ONLY_TYPES in EnhancedScreenOptions.tsx.
-const CAMERA_ONLY_RECORD_TYPES = ["va", "v"];
 import {
   getPhoneCameraState,
   listenForPhoneCamera,
@@ -167,14 +161,14 @@ import { copyImageUrlToClipboard } from "../utils/imageClipboard";
 import PhoneShelf, { dropOnPhone, phoneDropAt, phonesPaired } from "../components/PhoneShelf";
 import { PhonesHubHost } from "../components/PhonesHub";
 import UpdateBanner from "../components/custom/UpdateBanner";
+import FfmpegSetupBanner from "../components/custom/FfmpegSetupBanner";
 import TelemetryNotice from "../components/custom/TelemetryNotice";
 import type { RecordingStatus } from "../utils/recordingStatus";
 import { cancelCountdown, isCountdownRunning, runRecordingCountdown } from "../utils/recordingCountdown";
 import { checkForUpdate } from "../utils/updater";
 import { trackEvent } from "../utils/telemetry";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { AppSettings, loadSettings, saveSettings, SETTINGS_CHANGED_DOM_EVENT, updateSettings } from "../utils/appSettings";
-import { isPrivacyShieldActiveNow, syncScreenBlurConfig } from "../utils/privacyShield";
+import { AppSettings, loadSettings, saveSettings, updateSettings } from "../utils/appSettings";
 import { FileCategory, FILE_CATEGORY_EXTENSIONS, getFileCategory, getFileExtension } from "../utils/fileCategory";
 import {
   getPinnedPaths,
@@ -212,7 +206,6 @@ import {
   IoFolderOutline,
   IoOptionsOutline,
   IoLocateOutline,
-  IoCutOutline,
   IoDocumentTextOutline,
   IoGitNetworkOutline,
   IoMapOutline,
@@ -265,15 +258,6 @@ const toggleOverlayVisibility = async () => {
 // "mic only" (mp3) must not be handed to a screen recording started from the tray.
 const formatSuitsRecordType = (ext: string, recordType: string): boolean =>
 	recordType === 'a' ? ['mp3', 'wav', 'aac', 'wma'].includes(ext) : ['mp4', 'mkv', 'mov', 'webm', 'avi'].includes(ext);
-// How long to keep the overlay window shown (but click-through) after draw mode turns off, so a
-// stroke that's still fading gets to finish instead of vanishing instantly - the longest fade the
-// current Settings > Annotation fade can produce (the overlay's toolbar can switch style, never
-// fade), plus margin. "Until I exit" strokes are dropped by the overlay itself on exit; laser trails
-// still fade, which is what the laser term covers there.
-const annotationFadeGraceMs = (): number => {
-	const { annotationFade } = loadSettings();
-	return Math.max(fadeTotalMs('pen', annotationFade), fadeTotalMs('laser', annotationFade)) + 400;
-};
 
 
 interface FileMap {
@@ -1036,11 +1020,6 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     return flushPlaybackPositions;
   }, [selectedFile?.path]);
 
-  // Asset URLs for files referenced by a timeline clip other than the one currently open -
-  // resolved on demand (same convert_file_path_to_url + convertFileSrc round-trip
-  // loadFileForPlayback already does for the primary file) and cached forever per path, since a
-  // given file's asset URL never changes for the life of the app.
-  const previewAssetUrlCacheRef = useRef<Map<string, string>>(new Map());
   // Which source file's content is actually loaded into the player right now - starts matching
   // selectedFile.sourcePath, but a cross-clip preview seek (see handleSeekActiveFile below) can
   // point it at a different file entirely without touching selectedFile itself.
@@ -1054,73 +1033,17 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // Gapless clip changes (ClipHandoffLayer): a warmed standby of the next clip that covers the switch.
   const handoffRef = useRef<ClipHandoffApi | null>(null);
 
-  // useCallback'd (stable identity across renders, not just a stable cache Map) because these
-  // three resolvers are passed as props into ImageFolderGallery, whose own thumbnail-resolving
-  // effect depends on resolveThumbnailUrl's identity (see that file). Without this, every
-  // Dashboard re-render - including one triggered by nothing more than a gallery selection click,
-  // since selectedFilePaths lives here - handed the gallery a brand-new function reference, which
-  // re-triggered that effect and re-resolved every already-cached thumbnail on every click. That
-  // was the actual "selection is lagging/hanging" bug: not the selection logic itself, but a full
-  // thumbnail-resolution storm firing on every click as a side effect of it.
-  // bypassCache is for exactly one case: a video's poster was just overwritten in place
-  // (set_video_thumbnail, conversion.rs) at the SAME cache path it always had, so neither this
-  // Map nor the browser's own HTTP cache has any way to notice the bytes underneath changed - see
-  // the video-thumbnail-updated listener below. The `?t=` it appends only matters for that path;
-  // every normal (non-bypassed) resolve keeps returning the plain, cacheable URL.
-  const resolvePreviewAssetUrl = useCallback(async (sourcePath: string, bypassCache = false): Promise<string> => {
-    if (!bypassCache) {
-      const cached = previewAssetUrlCacheRef.current.get(sourcePath);
-      if (cached) return cached;
-    }
-    const absolutePath = await invoke<string>("convert_file_path_to_url", { filepath: sourcePath });
-    const url = convertFileSrc(absolutePath) + (bypassCache ? `?t=${Date.now()}` : "");
-    previewAssetUrlCacheRef.current.set(sourcePath, url);
-    return url;
-  }, []);
-
-  // The open timeline's frame size - a project's own (its file's header), or the open video's
-  // native resolution. Image clips preview letterboxed into exactly this frame (see
-  // get_image_clip_proxy), which is what keeps their crop/Ken Burns/overlay positions identical in
-  // preview and export. null if it couldn't be read; cached per primary file for the session.
-  const timelineFrameCacheRef = useRef<Map<string, Promise<VideoProjectFrame | null>>>(new Map());
-  // A canvas chosen for the edit (canvasFormats.ts) is the timeline's frame instead.
-  const canvasRef = useRef(editStore.canvas);
-  canvasRef.current = editStore.canvas;
   // A canvas's Blur background (canvasFormats.ts) - not under a Screen Style, which draws its own.
   const canvasBlur = editStore.canvas?.background === "blur" && !editStore.screenStyle;
-  const canvasBlurRef = useRef(canvasBlur);
-  canvasBlurRef.current = canvasBlur;
-  const resolveTimelineFrame = useCallback((primaryPath: string): Promise<VideoProjectFrame | null> => {
-    const canvas = canvasRef.current;
-    if (canvas) return Promise.resolve({ width: canvas.width, height: canvas.height });
-    let pending = timelineFrameCacheRef.current.get(primaryPath);
-    if (!pending) {
-      pending = (
-        isVideoProjectPath(primaryPath)
-          ? invoke<VideoProjectFrame>("read_video_project", { projectPath: primaryPath })
-          : invoke<Record<string, string>>("get_conversion_info", { inputPath: primaryPath }).then((info) => {
-              const match = info.resolution?.match(/^(\d+)x(\d+)$/);
-              return match ? { width: Number(match[1]), height: Number(match[2]) } : null;
-            })
-      ).catch((error) => {
-        console.error("Failed to read timeline frame size for", primaryPath, error);
-        timelineFrameCacheRef.current.delete(primaryPath);
-        return null;
-      });
-      timelineFrameCacheRef.current.set(primaryPath, pending);
-    }
-    return pending;
-  }, []);
-
-  // An image clip's preview source - a cached still-video proxy of that image, fitted to the
-  // timeline's frame (see clipPreviewSource.ts, shared with the transition preview and the clip
-  // viewer so all three show the same picture). The prefetch effect below and an actual seek share
-  // one encode through that module's cache.
-  const resolveImageClipProxyUrl = useCallback(
-    async (imagePath: string, primaryPath: string): Promise<string> =>
-      resolveClipPreviewUrl(imagePath, await resolveTimelineFrame(primaryPath), canvasBlurRef.current ? "blur" : null),
-    [resolveTimelineFrame]
-  );
+  const {
+    resolvePreviewAssetUrl,
+    resolveTimelineFrame,
+    resolveImageClipProxyUrl,
+    resolveProjectCanvasUrl,
+    resolveImageDisplayUrl,
+    resolveImageThumbnailUrl,
+    resolveVideoThumbnailUrl,
+  } = useMediaAssetResolvers({ canvas: editStore.canvas, canvasBlur });
   // Stable (TransitionPreviewLayer's animation loop restarts whenever it changes).
   // During a clip handoff, the standby stands in for the player; mid-switch without one, the player's
   // own report still belongs to the clip it's leaving, so it reads as "not there yet".
@@ -1561,82 +1484,6 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
     [resolveImageClipProxyUrl, resolvePreviewAssetUrl]
   );
 
-  // What a video project plays as its primary file - a black canvas at the project's frame size
-  // (see get_video_canvas_proxy) - since the project file itself is only a small JSON header.
-  const resolveProjectCanvasUrl = useCallback(async (projectPath: string): Promise<string> => {
-    const frame = await resolveTimelineFrame(projectPath);
-    if (!frame) throw new Error("This video project couldn't be read");
-    const canvasPath = await invoke<string>("get_video_canvas_proxy", { width: frame.width, height: frame.height });
-    return resolvePreviewAssetUrl(canvasPath);
-  }, [resolveTimelineFrame, resolvePreviewAssetUrl]);
-
-  // Full-resolution display URL for an image file - the single-image viewer's resolver (also used
-  // by the gallery's "Copy image" action, which should copy full quality, not a thumbnail). Same
-  // as resolvePreviewAssetUrl above except HEIC/HEIF (WebView2 has no decoder for it at all) first
-  // gets silently decoded to a cached PNG on the backend (get_heic_preview, content-addressed by
-  // path+mtime - see conversion.rs) so it just displays with no "Convert" step and nothing added
-  // to the library. get_heic_preview itself is nearly free on a cache hit (a single file-exists
-  // check), so it's fine to call on every resolve rather than adding a second JS-side cache here.
-  //
-  // Deliberately NOT what the gallery grid (ImageFolderGallery.tsx) uses for its tiles - see
-  // resolveImageThumbnailUrl below for why a full decode per grid tile turned out to be a real
-  // problem, not just a slower one.
-  const resolveImageDisplayUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
-    if (!["heic", "heif"].includes(getFileExtension(file.name))) return resolvePreviewAssetUrl(file.path);
-    const previewPath = await invoke<string>("get_heic_preview", { inputPath: file.path });
-    return resolvePreviewAssetUrl(previewPath);
-  }, [resolvePreviewAssetUrl]);
-
-  // Small (~480px) display URL for an image gallery grid tile - get_image_thumbnail generates and
-  // caches a properly downscaled preview on the backend (HEIC/HEIF via the bundled
-  // heif-thumbnailer, everything else via the `image` crate) instead of handing the tile a
-  // full-resolution decode. The grid used to just call resolveImageDisplayUrl above for every
-  // tile: fine for one image, but a folder of 100+ multi-megapixel photos meant the browser's
-  // image cache couldn't hold every decoded bitmap at once, so scrolling away and back forced a
-  // re-decode of whatever got evicted - visible as thumbnails "reloading" while scrolling, on top
-  // of the initial load already being far slower than a grid of small tiles should be.
-  const resolveImageThumbnailUrl = useCallback(async (file: { name: string; path: string }): Promise<string> => {
-    const thumbPath = await invoke<string>("get_image_thumbnail", { inputPath: file.path });
-    return resolvePreviewAssetUrl(thumbPath);
-  }, [resolvePreviewAssetUrl]);
-
-  // Poster-frame thumbnail for a video gallery grid tile (VideoFolderGallery.tsx) - the video
-  // counterpart to resolveImageThumbnailUrl above, backed by get_video_thumbnail's own
-  // content-addressed cache on the Rust side (a single ffmpeg frame extraction, ~1s into the
-  // clip). Routed through the same shared thumbnailLimiter as every other gallery/sidebar
-  // thumbnail request by the callers of this function, not here - this just resolves one URL.
-  // A video project has no frames of its own, so its tile shows its first clip instead.
-  const resolveVideoThumbnailUrl = useCallback(async (file: { name: string; path: string }, bypassCache = false): Promise<string> => {
-    let videoPath = file.path;
-    if (isVideoProjectPath(file.path)) {
-      const json = await invoke<string | null>("load_video_edit_state", { videoPath: file.path });
-      const firstClipPath: unknown = json ? JSON.parse(json)?.clips?.[0]?.sourcePath : undefined;
-      if (typeof firstClipPath !== "string") throw new Error("Empty video project - nothing to thumbnail");
-      if (isImageClipPath(firstClipPath)) return resolveImageThumbnailUrl({ name: firstClipPath, path: firstClipPath });
-      videoPath = firstClipPath;
-    }
-    const thumbPath = await invoke<string>("get_video_thumbnail", { inputPath: videoPath });
-    return resolvePreviewAssetUrl(thumbPath, bypassCache);
-  }, [resolvePreviewAssetUrl, resolveImageThumbnailUrl]);
-
-  // VideoPlayer.tsx's "set current frame as thumbnail" overwrites get_video_thumbnail's cached jpg
-  // in place, at the SAME path it always had - so this listens for its completion and clears the
-  // stale cached URL for that video, keyed by re-deriving the same thumbPath (a cache hit, and
-  // thus effectively free) rather than trying to track path->thumbPath mappings separately.
-  // VideoFolderGallery.tsx has its own listener alongside this one, to actually refresh whatever
-  // it's already rendered - this one only clears Dashboard's own cache so that gallery's re-fetch
-  // doesn't just receive the identical stale URL back.
-  useEffect(() => {
-    const unlistenPromise = listen<string>("video-thumbnail-updated", (event) => {
-      invoke<string>("get_video_thumbnail", { inputPath: event.payload })
-        .then((thumbPath) => previewAssetUrlCacheRef.current.delete(thumbPath))
-        .catch((err) => console.error("Failed to invalidate thumbnail cache:", err));
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, []);
-
   // The video-tools timeline's own seek, extended to know *which file* it's seeking within -
   // once a clip can be dragged in from a different file than the one currently open, "seek to
   // this time" is ambiguous without also saying which file's timeline that time belongs to. Swaps
@@ -1728,26 +1575,9 @@ const [bulkConversionFiles, setBulkConversionFiles] = useState<FileEntry[] | nul
   // so it's just the one flag. Driven by VideoPlayer's own Autoplay button/settings row (it can't
   // hold this itself since it fully remounts on every file change via `key={selectedFile.path}`).
   const [videoAutoplayNext, setVideoAutoplayNext] = useState<boolean>(true);
-  // Whether the system-wide annotation overlay is allowed to exist at all this session — see
-  // handleSettingsSaved and the effect below that hides the overlay window when this turns off.
-  // (Its shortcuts follow the same setting from the Rust side - services/shortcuts.rs.)
-  const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(() => loadSettings().enableAnnotationTool);
   // The "Nothing playing yet" home screen's backdrop (Settings > Appearance > "Home screen
-  // background") - see the decorative block a few hundred lines down in this file's JSX.
+  // background") - see HomeWorkspace.
   const [homeBackgroundStyle, setHomeBackgroundStyle] = useState<AppSettings["homeBackgroundStyle"]>(() => loadSettings().homeBackgroundStyle);
-  // Mirrors whether the overlay is currently in "draw mode" (capturing input) vs click-through.
-  // A ref, not state — read inside the global-shortcut callback and the turn-off-request
-  // listener, both registered once and needing the *current* value, not whatever was in scope
-  // when they were set up. State mirrors it for dock highlight.
-  const annotationDrawModeRef = useRef<boolean>(false);
-  const [annotationDrawMode, setAnnotationDrawMode] = useState<boolean>(false);
-  const annotationToolRef = useRef<'ink' | 'blur'>('ink');
-  const [activeBlurCount, setActiveBlurCount] = useState<number>(0);
-  const [privacyShieldActiveNow, setPrivacyShieldActiveNow] = useState<boolean>(() => isPrivacyShieldActiveNow(loadSettings(), false));
-  // Pending "hide the overlay" timeout scheduled when draw mode turns off (see
-  // toggleAnnotationDrawMode) — tracked so a quick off-then-on re-toggle can cancel it instead of
-  // hiding a window the user just turned drawing back on for.
-  const annotationHideTimeoutRef = useRef<number | null>(null);
 
   // Playback positions used to live here as an audio-only ref; they're now in
   // utils/playbackResume.ts, which covers video too and survives an app restart. See
@@ -2494,37 +2324,6 @@ const setScreen = () => {
 		});
 	}, [isRecording]);
 
-	// macOS and Linux use the system ffmpeg, which can be too old or built without the encoders
-	// recordings need (services/ffmpeg_check.rs). Say what to do - and check again each time this
-	// window comes back after a failed check, which is when someone has just installed a newer one in
-	// a terminal, so there is no button to find.
-	useEffect(() => {
-		let disposed = false;
-		let shown: string | null = null;
-		const check = async (recheck: boolean) => {
-			const status = await invoke<{ ok: boolean; version: string | null; problems: string[]; fix: string | null }>("ffmpeg_status", { recheck }).catch(() => null);
-			if (disposed || !status) return;
-			if (!status.ok) {
-				shown = [...status.problems, status.fix].filter(Boolean).join(" ");
-				setError(shown);
-			} else if (shown) {
-				// Fixed while Briefcast was open: take back only our own message.
-				const ours = shown;
-				shown = null;
-				setError((current) => (current === ours ? "" : current));
-				setMessage(`ffmpeg ${status.version ?? ""} found - recording and export are ready.`);
-			}
-		};
-		void check(false);
-		const unlisten = appWindow.onFocusChanged(({ payload: focused }) => {
-			if (focused && shown) void check(true);
-		});
-		return () => {
-			disposed = true;
-			void unlisten.then((fn) => fn());
-		};
-	}, []);
-
 	// Closing to the tray only hides the window - the page keeps running - so a video playing in it
 	// carried on, heard but not seen. Whatever plays stops as the window goes, as it would if the window
 	// really closed; it stays paused when Briefcast is opened again. The player is paused through its
@@ -2837,175 +2636,20 @@ const setScreen = () => {
 		setSelectedFile(null);
 	};
 
-	// Shows/hides the annotation overlay and flips its click-through state, and tells its own page
-	// to show/hide the floating toolbar. Called both by the global hotkey (toggles) and by the
-	// turn-off-request listener below (forces off, e.g. from the overlay's Esc/close button).
-	//
-	// The overlay stays hidden except for this deliberately brief, user-initiated window: a
-	// click-through style that silently fails to apply is nearly harmless on a window that's about
-	// to be hidden anyway, but catastrophic on one left permanently visible in the background (an
-	// invisible, always-on-top, all-monitors window eating every click on the desktop).
-	// show()/setIgnoreCursorEvents are also always sequenced show-before-ignore when turning draw
-	// mode on, since setting that style before a window has ever been shown is what didn't reliably
-	// stick on Windows.
-	//
-	// The window itself is pre-declared in tauri.conf.json (like the snip overlay) and placed from
-	// here, over the union of every monitor, each time it's shown - so a monitor plugged in or
-	// rearranged since last time is covered too. Building and placing it from a Rust command instead
-	// deadlocked the whole app on a 4K/250% display (what kept this feature switched off).
-	const toggleAnnotationDrawMode = useCallback(async (forceOff = false, requestedTool?: 'ink' | 'blur') => {
-		const overlay = await WebviewWindow.getByLabel('annotation-overlay');
-		if (!overlay) return;
-
-		// Already drawing and asked for the *other* tool (e.g. clicking Privacy Shield on the
-		// floating recording pill while Draw is open): switch tools in place instead of closing.
-		if (!forceOff && annotationDrawModeRef.current && requestedTool && annotationToolRef.current !== requestedTool) {
-			annotationToolRef.current = requestedTool;
-			try {
-				await overlay.setFocus();
-				await emit('annotation-mode-changed', { active: true, tool: requestedTool });
-			} catch (err) {
-				console.error('Failed to switch annotation tool:', err);
-			}
-			return;
-		}
-
-		const next = forceOff ? false : !annotationDrawModeRef.current;
-		annotationDrawModeRef.current = next;
-		setAnnotationDrawMode(next);
-		if (next) {
-			annotationToolRef.current = requestedTool ?? 'ink';
-		} else {
-			annotationToolRef.current = 'ink';
-		}
-
-		if (annotationHideTimeoutRef.current !== null) {
-			window.clearTimeout(annotationHideTimeoutRef.current);
-			annotationHideTimeoutRef.current = null;
-		}
-
-		try {
-			if (next) {
-				const monitors = await availableMonitors();
-				if (monitors.length > 0) {
-					const left = Math.min(...monitors.map((m) => m.position.x));
-					const top = Math.min(...monitors.map((m) => m.position.y));
-					const right = Math.max(...monitors.map((m) => m.position.x + m.size.width));
-					const bottom = Math.max(...monitors.map((m) => m.position.y + m.size.height));
-					await overlay.setPosition(new PhysicalPosition(left, top));
-					await overlay.setSize(new PhysicalSize(right - left, bottom - top));
-				}
-				await overlay.show();
-				await overlay.setIgnoreCursorEvents(false);
-				// Focused so Esc reaches the overlay's own keydown listener; hiding it hands focus
-				// back to whatever was underneath (the slides, the browser...).
-				await overlay.setFocus();
-				await emit('annotation-mode-changed', { active: true, tool: annotationToolRef.current });
-			} else {
-				await emit('annotation-mode-changed', { active: false });
-				await overlay.setIgnoreCursorEvents(true);
-				// Not hidden immediately - a still-fading stroke should keep fading, not vanish the
-				// instant draw mode turns off. annotationFadeGraceMs covers the overlay's own fade
-				// (utils/annotationStyles.ts) with margin. Click-through
-				// is already applied above, so even if this timer never fires (e.g. the app closes
-				// first), the overlay can't block input in the meantime.
-				annotationHideTimeoutRef.current = window.setTimeout(() => {
-					annotationHideTimeoutRef.current = null;
-					if (!annotationDrawModeRef.current) void overlay.hide();
-				}, annotationFadeGraceMs());
-			}
-		} catch (err) {
-			console.error('Failed to toggle annotation draw mode:', err);
-		}
-	}, []);
-
-	// Clicking an explicit Annotate / Privacy Shield button in the dock or recording pill should
-	// always work even if the user previously turned the hotkey toggle off in Settings.
-	const handleToggleAnnotationFromUI = useCallback(async (requestedTool?: 'ink' | 'blur') => {
-		if (!loadSettings().enableAnnotationTool) {
-			updateSettings({ enableAnnotationTool: true });
-			setAnnotationEnabled(true);
-		}
-		await toggleAnnotationDrawMode(false, requestedTool);
-	}, [toggleAnnotationDrawMode]);
-
-	// Turning the annotation tool off ends draw mode and hides its overlay. Its shortcuts are
-	// registered and dropped by Rust from the same setting (services/shortcuts.rs), and the
-	// dispatcher below ignores a press while the tool is off.
-	useEffect(() => {
-		if (annotationEnabled) return;
-		void (async () => {
-			if (annotationDrawModeRef.current) {
-				await toggleAnnotationDrawMode(true);
-			}
-			const overlay = await WebviewWindow.getByLabel('annotation-overlay');
-			if (overlay) await overlay.hide();
-		})();
-	}, [annotationEnabled, toggleAnnotationDrawMode]);
-
-	// Privacy Shield strength and auto-blur rules (services/screen_blur.rs). Re-sent when recording
-	// starts/stops (the rules default to "while recording"), whenever Settings closes, and whenever
-	// any window updates Privacy Shield settings live (Recording Setup modal or Annotation overlay).
-	useEffect(() => {
-		if (showSettings) return;
-		const applyFrom = (st: AppSettings) => {
-			setAnnotationEnabled(st.enableAnnotationTool);
-			setPrivacyShieldActiveNow(isPrivacyShieldActiveNow(st, isRecording));
-			void syncScreenBlurConfig(st, isRecording);
-		};
-		applyFrom(loadSettings());
-		const onSettings = (e: Event) => {
-			const detail = (e as CustomEvent<AppSettings>).detail;
-			applyFrom(detail ?? loadSettings());
-		};
-		window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
-		return () => window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
-	}, [isRecording, showSettings]);
-
-	// Track live blur region count so the dock indicator reflects active Privacy Shield regions.
-	useEffect(() => {
-		const unlisten = listen<unknown[]>('screen-blur-changed', (e) => {
-			setActiveBlurCount(Array.isArray(e.payload) ? e.payload.length : 0);
-		});
-		invoke<unknown[]>('screen_blur_list').then((list) => setActiveBlurCount(list.length)).catch(() => {});
-		return () => {
-			unlisten.then((fn) => fn());
-		};
-	}, []);
-
-	// Cross-window annotation & settings requests (overlay Esc/close, recording pill buttons,
-	// overlay Options popover "All settings...").
-	useEffect(() => {
-		const unlistenTurnOff = listen('annotation-turn-off-request', () => {
-			if (annotationDrawModeRef.current) {
-				void toggleAnnotationDrawMode(true);
-			}
-		});
-		const unlistenToggle = listen<{ tool?: 'ink' | 'blur' }>('annotation-toggle-request', (e) => {
-			void handleToggleAnnotationFromUI(e.payload?.tool);
-		});
-		const unlistenTool = listen<{ tool: 'ink' | 'blur' }>('annotation-tool-changed', (e) => {
-			annotationToolRef.current = e.payload.tool;
-		});
-		const unlistenOpenSettings = listen<{ section?: SettingsInitialTarget }>('open-settings-request', (e) => {
-			void (async () => {
-				if (annotationDrawModeRef.current) {
-					await toggleAnnotationDrawMode(true);
-				}
-				const mainWin = getCurrentWebviewWindow();
-				await mainWin.show().catch(() => {});
-				await mainWin.unminimize().catch(() => {});
-				await mainWin.setFocus().catch(() => {});
-				handleOpenSettings(e.payload?.section ?? 'annotation');
-			})();
-		});
-		return () => {
-			unlistenTurnOff.then((fn) => fn());
-			unlistenToggle.then((fn) => fn());
-			unlistenTool.then((fn) => fn());
-			unlistenOpenSettings.then((fn) => fn());
-		};
-	}, [toggleAnnotationDrawMode, handleToggleAnnotationFromUI]);
+	// System-wide screen annotation & Privacy Shield orchestration (overlay window lifecycle,
+	// live blur rule syncing, and cross-window events).
+	const {
+		annotationEnabled,
+		setAnnotationEnabled,
+		annotationDrawMode,
+		hasActiveBlur,
+		toggleAnnotationDrawMode,
+		handleToggleAnnotationFromUI,
+	} = useAnnotationController({
+		isRecording,
+		showSettings,
+		onOpenSettings: handleOpenSettings,
+	});
 
 	// Flips the panel-buttons visibility and persists it directly - bypassing the Settings modal's
 	// "must click Save" flow is the whole point here, so the next time Settings is opened it should
@@ -6171,95 +5815,38 @@ const setScreen = () => {
               onBulkDelete={handleBulkDeleteFiles}
             />
           ) : (
-            <div className="relative flex flex-col items-center justify-[safe_center] h-full w-full gap-6 px-8 pt-8 pb-24 overflow-y-auto overflow-x-hidden">
-              {/* Purely decorative - a soft color glow plus a faint graph-paper line grid, sat
-                  behind everything else in this empty state via z-index/pointer-events:none. Only
-                  rendered on this "nothing open yet" screen, not the shared bg-neutral-950
-                  container real video/PDF content plays inside a few lines up - a colorful
-                  backdrop behind actual footage would fight with it instead of the empty state,
-                  where there's nothing else competing for attention. Gated on Settings >
-                  Appearance > "Home screen background" (homeBackgroundStyle) - "plain" skips this
-                  whole block and falls back to the container's own flat themed background. */}
-              {homeBackgroundStyle === "graph" && (
-                <div className="absolute inset-0 pointer-events-none overflow-hidden">
-                  {/* Deliberately faint and static (no drift/animation - motion is what actually
-                      catches the eye, more than raw opacity does) - meant to read as a barely-
-                      there warmth in the corner, not a "glow" anyone would consciously notice. */}
-                  <div className="absolute -top-1/4 -left-1/4 w-[35%] h-[35%] rounded-full blur-2xl opacity-[0.07] dark:opacity-[0.05] bg-[radial-gradient(circle,theme(colors.blue.400),transparent_45%)]" />
-                  <svg className="absolute inset-0 w-full h-full text-gray-400/40 dark:text-neutral-500/30" xmlns="http://www.w3.org/2000/svg">
-                    <defs>
-                      <pattern id="home-empty-grid" width="36" height="36" patternUnits="userSpaceOnUse">
-                        <path d="M 36 0 L 0 0 0 36" fill="none" stroke="currentColor" strokeWidth="1" />
-                      </pattern>
-                      {/* Fades the grid out toward the edges so it reads as a subtle texture behind
-                          the centered content rather than a hard-edged tiled pattern. */}
-                      <radialGradient id="home-empty-grid-fade" cx="50%" cy="45%" r="65%">
-                        <stop offset="0%" stopColor="white" stopOpacity="1" />
-                        <stop offset="100%" stopColor="white" stopOpacity="0" />
-                      </radialGradient>
-                      <mask id="home-empty-grid-mask">
-                        <rect width="100%" height="100%" fill="url(#home-empty-grid-fade)" />
-                      </mask>
-                    </defs>
-                    <rect width="100%" height="100%" fill="url(#home-empty-grid)" mask="url(#home-empty-grid-mask)" />
-                  </svg>
-                </div>
-              )}
-
-              {/* A camera-only recording captures no screen, so this otherwise-idle home area is
-                  the natural place to show what the cameras are actually sending - see
-                  LiveCameraRecordingView for why it's polled frames rather than a MediaStream. */}
-              {isRecording && CAMERA_ONLY_RECORD_TYPES.includes(recordType) ? (
-                <LiveCameraRecordingView videoDevices={videoDevices} isPaused={isPaused} />
-              ) : (
-              <div className="relative flex flex-col items-center gap-4 text-center w-full max-w-3xl">
-                <p className="text-xl text-gray-800 dark:text-neutral-100 font-semibold tracking-tight">
-                  What would you like to create?
-                </p>
-                {/* Same tools (and icons) as the bottom dock's tool row, aligned cleanly to the
-                    same max-w-3xl width as the library grid below. */}
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 w-full">
-                  {[
-                    { label: "Video", icon: <IoCutOutline size={20} />, onClick: handleOpenVideoEditor },
-                    { label: "Document", icon: <IoDocumentTextOutline size={20} />, onClick: handleOpenDocs },
-                    { label: "Whiteboard", icon: <IoGitNetworkOutline size={20} />, onClick: handleOpenWhiteboard },
-                    { label: "Design", icon: <IoImagesOutline size={20} />, onClick: handleOpenBoard },
-                    { label: "Open file", icon: <IoFolderOpenOutline size={20} />, onClick: handleOpenExternalFile },
-                  ].map((action) => (
-                    <button
-                      key={action.label}
-                      type="button"
-                      onClick={action.onClick}
-                      className="flex flex-col items-center justify-center gap-2 h-[84px] rounded-xl bg-white/90 dark:bg-neutral-900/90 backdrop-blur-sm border border-gray-200/80 dark:border-neutral-800 text-gray-600 dark:text-neutral-300 hover:border-blue-400/80 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 hover:shadow-sm transition-all"
-                    >
-                      {action.icon}
-                      <span className="text-xs font-medium">{action.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              )}
-
-              <HomeLibrarySection
-                items={homeItems}
-                hasAnyItems={hasAnyHomeItems}
-                viewMode={homeLibraryView}
-                onViewModeChange={handleHomeLibraryViewChange}
-                searchQuery={homeLibrarySearch}
-                onSearchQueryChange={setHomeLibrarySearch}
-                libraryFilesByPath={libraryFilesByPath}
-                boardThumbById={boardThumbById}
-                arrivals={arrivals}
-                durations={libraryPreviewDurations}
-                homeKinds={HOME_KIND}
-                categoryIcon={categoryIcon}
-                categoryIconColorClassName={categoryIconColorClassName}
-                resolveImageThumbnailUrl={resolveImageThumbnailUrl}
-                resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
-                onOpenItem={openHomeItem}
-                onTogglePinKey={handleTogglePinHomeKey}
-              />
-            </div>
+            <HomeWorkspace
+              homeBackgroundStyle={homeBackgroundStyle}
+              isRecording={isRecording}
+              recordType={recordType}
+              videoDevices={videoDevices}
+              isPaused={isPaused}
+              homeItems={homeItems}
+              hasAnyHomeItems={hasAnyHomeItems}
+              homeLibraryView={homeLibraryView}
+              onHomeLibraryViewChange={handleHomeLibraryViewChange}
+              homeLibrarySearch={homeLibrarySearch}
+              onHomeLibrarySearchChange={setHomeLibrarySearch}
+              libraryFilesByPath={libraryFilesByPath}
+              boardThumbById={boardThumbById}
+              arrivals={arrivals}
+              durations={libraryPreviewDurations}
+              homeKinds={HOME_KIND}
+              categoryIcon={categoryIcon}
+              categoryIconColorClassName={categoryIconColorClassName}
+              resolveImageThumbnailUrl={resolveImageThumbnailUrl}
+              resolveVideoThumbnailUrl={resolveVideoThumbnailUrl}
+              onOpenItem={openHomeItem}
+              onTogglePinKey={handleTogglePinHomeKey}
+              onOpenVideoEditor={handleOpenVideoEditor}
+              onOpenDocs={handleOpenDocs}
+              onOpenWhiteboard={handleOpenWhiteboard}
+              onOpenBoard={handleOpenBoard}
+              onOpenExternalFile={handleOpenExternalFile}
+              onStartRecordingSetup={() => window.dispatchEvent(new Event(OPEN_RECORD_MODAL_EVENT))}
+              onTryAnnotation={() => void handleToggleAnnotationFromUI()}
+              onOpenPhoneCamera={() => setShowPhoneCamera(true)}
+            />
           )}
           </div>
         </div>
@@ -6406,7 +5993,7 @@ const setScreen = () => {
         arrivals={arrivals}
         libraryPreviewDurations={libraryPreviewDurations}
         isAnnotating={annotationDrawMode}
-        hasActiveBlur={activeBlurCount > 0 || privacyShieldActiveNow}
+        hasActiveBlur={hasActiveBlur}
         onToggleAnnotation={() => void handleToggleAnnotationFromUI()}
         onOpenAnnotationSettings={() => handleOpenSettings("annotation")}
       />
@@ -6472,6 +6059,7 @@ const setScreen = () => {
         {pendingUpdate && (
           <UpdateBanner update={pendingUpdate} isRecording={isRecording} onDismiss={() => setPendingUpdate(null)} />
         )}
+        <FfmpegSetupBanner onReady={(v) => setMessage(`ffmpeg ${v ?? ""} found — recording and export are ready.`)} />
         <TelemetryNotice /> 
       </div>
     </div>
