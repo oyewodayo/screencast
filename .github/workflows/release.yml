@@ -85,7 +85,9 @@ jobs:
             echo "**To install**"
             echo
             echo "- **Windows** - download the file ending in **x64-setup.exe**."
-            echo "- **macOS** - download the **.dmg** (Apple Silicon and Intel). The first time, right-click Briefcast and choose Open, because the app isn't notarized yet. Briefcast uses the ffmpeg on your Mac: \`brew install ffmpeg\`."
+            echo "- **macOS** - download the **.dmg** (Apple Silicon and Intel) and drag Briefcast into **Applications**. Briefcast uses the ffmpeg on your Mac: \`brew install ffmpeg\`. Because the app isn't Apple-notarized yet, macOS may show *\"Apple could not verify Briefcast\"* on first launch — to open it once:"
+            echo "  1. **System Settings (recommended):** Click **Done**, open **System Settings → Privacy & Security**, scroll to **Security**, click **Open Anyway** next to Briefcast, and confirm."
+            echo "  2. **Terminal:** Run \`xattr -cr /Applications/Briefcast.app\` and then open Briefcast normally."
             echo "- **Linux** - download the **.AppImage** (make it executable and run it) or the **.deb** (\`sudo apt install ./Briefcast_*.deb\`). Briefcast uses the ffmpeg on your system, version 5.1 or newer."
             echo
             echo "Already installed? Briefcast will offer this update on its next launch."
