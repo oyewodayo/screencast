@@ -57,6 +57,7 @@ interface StudioPolishPopoverProps {
   shortcutCount: number;
   onPointerStyle: (patch: Partial<PointerStyle>) => void;
   onKeystrokeStyle: (patch: Partial<KeystrokeStyle>) => void;
+  onOpenScreenStyle?: () => void;
   onTurnIntoDoc?: () => Promise<void> | void;
   onClose: () => void;
 }
@@ -76,6 +77,7 @@ const StudioPolishPopover: React.FC<StudioPolishPopoverProps> = ({
   shortcutCount,
   onPointerStyle,
   onKeystrokeStyle,
+  onOpenScreenStyle,
   onTurnIntoDoc,
   onClose,
 }) => {
@@ -438,6 +440,17 @@ const StudioPolishPopover: React.FC<StudioPolishPopoverProps> = ({
                       <IoImageOutline size={12} />
                       {activeImagePath ? "Change image…" : "Image…"}
                     </button>
+                    {screenStyle && onOpenScreenStyle && (
+                      <button
+                        type="button"
+                        disabled={running}
+                        title="Adjust padding, corner radius & shadow strength"
+                        onClick={onOpenScreenStyle}
+                        className="px-2 py-1 rounded-md text-[10.5px] text-amber-200/85 hover:text-amber-200 hover:bg-amber-500/10 disabled:opacity-40 transition-colors"
+                      >
+                        Fine-tune…
+                      </button>
+                    )}
                     {screenStyle && (
                       <button
                         type="button"

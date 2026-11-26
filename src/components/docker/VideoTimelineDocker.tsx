@@ -6,8 +6,7 @@ import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { IoLayersOutline } from "react-icons/io5";
-import { beatStarts as stageBeatStarts, sceneDuration, setBeatHold, setSceneDuration } from "../../utils/stage/stageEditing";
-import type { StageScene } from "../../utils/stage/stageTypes";
+import { beatStarts as stageBeatStarts, sceneDuration } from "../../utils/stage/stageEditing";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
@@ -54,9 +53,9 @@ import {
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, ClipTransitionIn, IMAGE_CLIP_EXTENSIONS, TransitionEdge, edgeTransitionWindows, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
+import { AudioOverlay, Clip, ClipTransitionIn, IMAGE_CLIP_EXTENSIONS, TransitionEdge, edgeTransitionWindows, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
-import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
 import { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
 import ElementsGallery from "../video/ElementsGallery";
@@ -129,9 +128,11 @@ import { CutSoundPlayer } from "../../utils/cutSoundPlayer";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
 import StudioPolishPopover from "./StudioPolishPopover";
+import { useTimelineOverlayDrags } from "./useTimelineOverlayDrags";
+import { useTimelinePlaybackSync } from "./useTimelinePlaybackSync";
 import VideoToDocModal from "../video/VideoToDocModal";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
-import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
+import { isTrackHidden, pipTrack, videoTrackLabel } from "../../utils/videoTracks";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
 
 import {
@@ -142,14 +143,11 @@ import {
   AUTOMATION_HEADER_PX,
   AUTOMATION_ROW_HEIGHT,
   BADGE_TONES,
-  bootstrappedClipIdByFile,
-  CLIP_END_EPSILON_SEC,
   CLIP_GAP,
   DEFAULT_PX_PER_SEC,
   forgetTimelineBootstrap,
   formatClipLength,
   formatTimestamp,
-  FRAME_BOUNDARY_SEC,
   FRAME_CACHE_STEP_SEC,
   HANDLE_GRAB_PX,
   isFullFrameLayer,
@@ -1310,323 +1308,81 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [drawWindow, pxPerSec, filmstripClipsKey, nativePixelSize, duration, isProject, file.path]);
   const totalWidth = Math.max(1, totalOutputDuration * pxPerSec);
 
-  // Live drag state for the text-overlay lane below - same delta-based/live-preview shape as
-  // resizeDrag/clipDrag above, just retiming a TextOverlay instead of a Clip. Kept as separate
-  // state (rather than reusing resizeDrag/clipDrag) since the clamping rules differ (against
-  // totalOutputDuration, not a source file's own duration) and an overlay id could otherwise be
-  // mistaken for a clip id sharing the same drag state shape.
-  const [overlayResizeDrag, setOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [overlayDrag, setOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const renderOverlays: TextOverlay[] = editStore.textOverlays.map((o) => {
-    if (overlayResizeDrag && o.id === overlayResizeDrag.id) {
-      return overlayResizeDrag.edge === "start" ? { ...o, startTime: overlayResizeDrag.liveValue } : { ...o, endTime: overlayResizeDrag.liveValue };
-    }
-    if (overlayDrag && o.id === overlayDrag.id) {
-      return { ...o, startTime: overlayDrag.liveStartTime, endTime: overlayDrag.liveStartTime + overlayDrag.duration };
-    }
-    return o;
+  // Overlay drag/resize state, split-screen live following, and quick-add helpers extracted to
+  // useTimelineOverlayDrags.ts. Getters/wrappers avoid touching below-the-fold playhead/snap consts
+  // until an interaction actually fires.
+  const {
+    renderOverlays,
+    beginOverlayResizeDrag,
+    handleOverlayResizeDragMove,
+    endOverlayResizeDrag,
+    beginOverlayDrag,
+    handleOverlayDragMove,
+    endOverlayDrag,
+    renderImageOverlays,
+    beginImageOverlayResizeDrag,
+    handleImageOverlayResizeDragMove,
+    endImageOverlayResizeDrag,
+    beginImageOverlayDrag,
+    handleImageOverlayDragMove,
+    endImageOverlayDrag,
+    renderBlurOverlays,
+    beginBlurOverlayResizeDrag,
+    handleBlurOverlayResizeDragMove,
+    endBlurOverlayResizeDrag,
+    beginBlurOverlayDrag,
+    handleBlurOverlayDragMove,
+    endBlurOverlayDrag,
+    renderAdjustmentLayers,
+    beginAdjustResizeDrag,
+    handleAdjustResizeDragMove,
+    endAdjustResizeDrag,
+    beginAdjustDrag,
+    handleAdjustDragMove,
+    endAdjustDrag,
+    sceneDrag,
+    sceneEdgeDrag,
+    renderScenes,
+    beginSceneDrag,
+    handleSceneDragMove,
+    endSceneDrag,
+    beginSceneEdgeDrag,
+    handleSceneEdgeDragMove,
+    endSceneEdgeDrag,
+    addScene,
+    addAdjustmentLayer,
+    pipOverlayDrag,
+    renderPipOverlays,
+    videoTrackLanes,
+    handleAddBroll,
+    beginPipOverlayResizeDrag,
+    handlePipOverlayResizeDragMove,
+    endPipOverlayResizeDrag,
+    beginPipOverlayDrag,
+    handlePipOverlayDragMove,
+    endPipOverlayDrag,
+  } = useTimelineOverlayDrags({
+    filePath: file.path,
+    isProject,
+    editStore,
+    pxPerSec,
+    totalOutputDuration,
+    getCurrentOutputTime: () => currentOutputTime,
+    getOverlaySnapTargets: () => overlaySnapTargets,
+    isPlaying,
+    toolMode,
+    videoPixelSize,
+    rootRef,
+    outputTimeFromClientX: (clientX) => outputTimeFromClientX(clientX),
+    seekToOutputTime: (outputTime) => seekToOutputTime(outputTime),
+    setSelectedClipId,
+    onSelectOverlay,
+    onSelectImageOverlay,
+    onSelectBlurOverlay,
+    onSelectAdjustment,
+    onSelectScene,
+    onSelectPipOverlay,
   });
-
-  const beginOverlayResizeDrag = (overlay: TextOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!overlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - overlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(overlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      overlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, overlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, overlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endOverlayResizeDrag = () => {
-    if (!overlayResizeDrag) return;
-    const { id, edge, liveValue } = overlayResizeDrag;
-    setOverlayResizeDrag(null);
-    editStore.resizeTextOverlayTime(id, edge, liveValue);
-  };
-
-  const beginOverlayDrag = (overlay: TextOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleOverlayDragMove = (e: React.PointerEvent) => {
-    if (!overlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - overlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - overlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(overlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - overlayDrag.duration));
-    setOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endOverlayDrag = () => {
-    if (!overlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = overlayDrag;
-    setOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveTextOverlayTime(id, liveStartTime);
-    }
-    onSelectOverlay?.(id);
-    // Selecting a text overlay only actually opens it for editing in the main preview once the
-    // playhead sits inside its own time range - VideoOverlayLayer's editingSession is gated on
-    // "active at currentOutputTime" (so text off-screen at the current moment doesn't render an
-    // editor for it). Without this, clicking a chip whose range the playhead wasn't already inside
-    // updated selectedOverlayId but visibly did nothing in the preview, which read as "selecting
-    // from the timeline doesn't work" even though the click itself was registering correctly.
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
-
-  // Same shape as the text-overlay lane's drag state just above, retiming an ImageOverlay instead
-  // - kept as its own state for the same reason overlayResizeDrag/overlayDrag are kept separate
-  // from resizeDrag/clipDrag (a shared id namespace between drag kinds would be a real hazard).
-  const [imageOverlayResizeDrag, setImageOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [imageOverlayDrag, setImageOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const [pipOverlayResizeDrag, setPipOverlayResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; liveValue: number }>(null);
-  const [pipOverlayDrag, setPipOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-    // The video track it started on, and the one under the pointer now (dragging up or down moves
-    // it between tracks; the drop zone above the top one makes a new track).
-    startTrack: number;
-    liveTrack: number;
-  }>(null);
-
-  // A split screen moves and trims as one (alignSplitTiming does it on drop): while one of its
-  // layers is dragged, the rest follow along live.
-  const splitFollow = (() => {
-    const live: { id: string; start: number; end: number } | null = pipOverlayDrag
-      ? { id: pipOverlayDrag.id, start: pipOverlayDrag.liveStartTime, end: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration }
-      : imageOverlayDrag
-        ? { id: imageOverlayDrag.id, start: imageOverlayDrag.liveStartTime, end: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration }
-        : null;
-    const edge: { id: string; edge: "start" | "end"; value: number } | null = pipOverlayResizeDrag
-      ? { id: pipOverlayResizeDrag.id, edge: pipOverlayResizeDrag.edge, value: pipOverlayResizeDrag.liveValue }
-      : imageOverlayResizeDrag
-        ? { id: imageOverlayResizeDrag.id, edge: imageOverlayResizeDrag.edge, value: imageOverlayResizeDrag.liveValue }
-        : null;
-    const id = live?.id ?? edge?.id;
-    const dragged = id ? editStore.pipOverlays.find((o) => o.id === id) ?? editStore.imageOverlays.find((o) => o.id === id) : undefined;
-    if (!dragged?.split || dragged.split.cell < 0) return null;
-    const ds = live ? live.start - dragged.startTime : edge!.edge === "start" ? edge!.value - dragged.startTime : 0;
-    const de = live ? live.end - dragged.endTime : edge!.edge === "end" ? edge!.value - dragged.endTime : 0;
-    return { group: dragged.split.group, id: dragged.id, ds, de };
-  })();
-  const followSplit = <T extends { id: string; startTime: number; endTime: number; split?: { group: string } }>(o: T): T =>
-    splitFollow && o.id !== splitFollow.id && o.split?.group === splitFollow.group ? { ...o, startTime: o.startTime + splitFollow.ds, endTime: o.endTime + splitFollow.de } : o;
-
-  const renderImageOverlays: ImageOverlay[] = editStore.imageOverlays.map((o) => {
-    if (imageOverlayResizeDrag && o.id === imageOverlayResizeDrag.id) {
-      return imageOverlayResizeDrag.edge === "start" ? { ...o, startTime: imageOverlayResizeDrag.liveValue } : { ...o, endTime: imageOverlayResizeDrag.liveValue };
-    }
-    if (imageOverlayDrag && o.id === imageOverlayDrag.id) {
-      return { ...o, startTime: imageOverlayDrag.liveStartTime, endTime: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration };
-    }
-    return followSplit(o);
-  });
-
-  const beginImageOverlayResizeDrag = (overlay: ImageOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectImageOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setImageOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleImageOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!imageOverlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - imageOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(imageOverlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      imageOverlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, imageOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, imageOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setImageOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endImageOverlayResizeDrag = () => {
-    if (!imageOverlayResizeDrag) return;
-    const { id, edge, liveValue } = imageOverlayResizeDrag;
-    setImageOverlayResizeDrag(null);
-    editStore.resizeImageOverlayTime(id, edge, liveValue);
-  };
-
-  const beginImageOverlayDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setImageOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleImageOverlayDragMove = (e: React.PointerEvent) => {
-    if (!imageOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - imageOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - imageOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(imageOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - imageOverlayDrag.duration));
-    setImageOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endImageOverlayDrag = () => {
-    if (!imageOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = imageOverlayDrag;
-    setImageOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveImageOverlayTime(id, liveStartTime);
-    }
-    onSelectImageOverlay?.(id);
-    // Same reasoning as endOverlayDrag's own comment: image overlays are also only rendered (and
-    // so only visibly show selection handles) while the playhead is inside their own time range
-    // (see activeImageOverlays' overlaysActiveAt filter in VideoOverlayLayer.tsx), so selecting one
-    // from the timeline while the playhead is elsewhere needs to bring the playhead along with it.
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
-
-  // ---- Blur-overlay lane drag (move) / resize (retime) - same shape as the image-overlay block
-  // above, just against editStore's blur methods and onSelectBlurOverlay instead. ----------------
-  const [blurOverlayResizeDrag, setBlurOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [blurOverlayDrag, setBlurOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const renderBlurOverlays: BlurOverlay[] = editStore.blurOverlays.map((o) => {
-    if (blurOverlayResizeDrag && o.id === blurOverlayResizeDrag.id) {
-      return blurOverlayResizeDrag.edge === "start" ? { ...o, startTime: blurOverlayResizeDrag.liveValue } : { ...o, endTime: blurOverlayResizeDrag.liveValue };
-    }
-    if (blurOverlayDrag && o.id === blurOverlayDrag.id) {
-      return { ...o, startTime: blurOverlayDrag.liveStartTime, endTime: blurOverlayDrag.liveStartTime + blurOverlayDrag.duration };
-    }
-    return o;
-  });
-
-  const beginBlurOverlayResizeDrag = (overlay: BlurOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectBlurOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setBlurOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleBlurOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!blurOverlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - blurOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(blurOverlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      blurOverlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, blurOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, blurOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setBlurOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endBlurOverlayResizeDrag = () => {
-    if (!blurOverlayResizeDrag) return;
-    const { id, edge, liveValue } = blurOverlayResizeDrag;
-    setBlurOverlayResizeDrag(null);
-    editStore.resizeBlurOverlayTime(id, edge, liveValue);
-  };
-
-  const beginBlurOverlayDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setBlurOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleBlurOverlayDragMove = (e: React.PointerEvent) => {
-    if (!blurOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - blurOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - blurOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(blurOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - blurOverlayDrag.duration));
-    setBlurOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endBlurOverlayDrag = () => {
-    if (!blurOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = blurOverlayDrag;
-    setBlurOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveBlurOverlayTime(id, liveStartTime);
-    }
-    onSelectBlurOverlay?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
 
   // Which kind of thing was selected most recently - what Ctrl+C copies when there are several.
   const lastSelectedRef = useRef<"clips" | "overlay">("overlay");
@@ -1636,259 +1392,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   useEffect(() => {
     if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedAdjustmentId || selectedAudioOverlayId || selectedPipOverlayId) lastSelectedRef.current = "overlay";
   }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId]);
-
-  // ---- Adjustment-layer lane: move / retime, the blur lane's shape. ----------------------------
-  const [adjustResizeDrag, setAdjustResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; startValue: number; oppositeBound: number; liveValue: number }>(null);
-  const [adjustDrag, setAdjustDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
-  const renderAdjustmentLayers: AdjustmentLayer[] = editStore.adjustmentLayers.map((l) => {
-    if (adjustResizeDrag && l.id === adjustResizeDrag.id) return adjustResizeDrag.edge === "start" ? { ...l, startTime: adjustResizeDrag.liveValue } : { ...l, endTime: adjustResizeDrag.liveValue };
-    if (adjustDrag && l.id === adjustDrag.id) return { ...l, startTime: adjustDrag.liveStartTime, endTime: adjustDrag.liveStartTime + adjustDrag.duration };
-    return l;
-  });
-  const beginAdjustResizeDrag = (layer: AdjustmentLayer, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectAdjustment?.(layer.id);
-    const startValue = edge === "start" ? layer.startTime : layer.endTime;
-    setAdjustResizeDrag({ id: layer.id, edge, startClientX: e.clientX, startValue, oppositeBound: edge === "start" ? layer.endTime : layer.startTime, liveValue: startValue });
-  };
-  const handleAdjustResizeDragMove = (e: React.PointerEvent) => {
-    if (!adjustResizeDrag) return;
-    e.stopPropagation();
-    const raw = snapToTargets(adjustResizeDrag.startValue + (e.clientX - adjustResizeDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
-    const liveValue =
-      adjustResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, adjustResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, adjustResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setAdjustResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endAdjustResizeDrag = () => {
-    if (!adjustResizeDrag) return;
-    const { id, edge, liveValue } = adjustResizeDrag;
-    setAdjustResizeDrag(null);
-    editStore.resizeAdjustmentLayerTime(id, edge, liveValue);
-  };
-  const beginAdjustDrag = (layer: AdjustmentLayer) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setAdjustDrag({ id: layer.id, startClientX: e.clientX, startTime: layer.startTime, duration: layer.endTime - layer.startTime, isDragging: false, liveStartTime: layer.startTime });
-  };
-  const handleAdjustDragMove = (e: React.PointerEvent) => {
-    if (!adjustDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - adjustDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const raw = snapToTargets(adjustDrag.startTime + (e.clientX - adjustDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - adjustDrag.duration));
-    setAdjustDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endAdjustDrag = () => {
-    if (!adjustDrag) return;
-    const { id, isDragging, liveStartTime, duration } = adjustDrag;
-    setAdjustDrag(null);
-    if (isDragging) editStore.moveAdjustmentLayerTime(id, liveStartTime);
-    onSelectAdjustment?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
-  };
-  // ---- Stage scene lane: move a scene, stretch its last beat, drag a beat's boundary. -------------
-  // A scenes-only project's canvas grows with its scenes, so they move freely there; over clips a
-  // scene stays inside the video, as overlays do.
-  const scenesFree = editStore.clips.length === 0;
-  const [sceneDrag, setSceneDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
-  const [sceneEdgeDrag, setSceneEdgeDrag] = useState<null | { id: string; beat: number | "end"; startClientX: number; startValue: number; liveValue: number }>(null);
-  const renderScenes: StageScene[] = editStore.scenes.map((sc) => {
-    if (sceneDrag && sc.id === sceneDrag.id) return { ...sc, startTime: sceneDrag.liveStartTime };
-    if (sceneEdgeDrag && sc.id === sceneEdgeDrag.id)
-      return sceneEdgeDrag.beat === "end" ? setSceneDuration(sc, sceneEdgeDrag.liveValue) : setBeatHold(sc, sceneEdgeDrag.beat, sceneEdgeDrag.liveValue);
-    return sc;
-  });
-  const beginSceneDrag = (sc: StageScene) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setSceneDrag({ id: sc.id, startClientX: e.clientX, startTime: sc.startTime, duration: sceneDuration(sc), isDragging: false, liveStartTime: sc.startTime });
-  };
-  const handleSceneDragMove = (e: React.PointerEvent) => {
-    if (!sceneDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - sceneDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    // Its start or its end snaps - to the other scenes' edges too, so scenes butt end to end exactly.
-    const edges = editStore.scenes.filter((x) => x.id !== sceneDrag.id).flatMap((x) => [x.startTime, x.startTime + sceneDuration(x)]);
-    const targets = [...overlaySnapTargets, ...edges];
-    const free = sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec;
-    const startTo = snapToTargets(free, targets, pxPerSec);
-    const endTo = snapToTargets(free + sceneDrag.duration, targets, pxPerSec);
-    const startPull = startTo !== free ? Math.abs(startTo - free) : Infinity;
-    const endPull = endTo !== free + sceneDrag.duration ? Math.abs(endTo - (free + sceneDrag.duration)) : Infinity;
-    const raw = startPull === Infinity && endPull === Infinity ? free : startPull <= endPull ? startTo : endTo - sceneDrag.duration;
-    const liveStartTime = Math.max(0, scenesFree ? raw : Math.min(raw, totalOutputDuration - sceneDrag.duration));
-    setSceneDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endSceneDrag = () => {
-    if (!sceneDrag) return;
-    const { id, isDragging, liveStartTime, duration } = sceneDrag;
-    setSceneDrag(null);
-    if (isDragging) editStore.moveSceneTime(id, liveStartTime);
-    onSelectScene?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime + Math.min(duration, 1.5) * 0.9);
-  };
-  // A beat boundary (`beat` = the beat whose end it is) or the scene's end, dragged: that beat holds
-  // longer or shorter; everything after it moves with it.
-  const beginSceneEdgeDrag = (sc: StageScene, beat: number | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectScene?.(sc.id);
-    const startValue = beat === "end" ? sceneDuration(sc) : sc.beats[beat].hold;
-    setSceneEdgeDrag({ id: sc.id, beat, startClientX: e.clientX, startValue, liveValue: startValue });
-  };
-  const handleSceneEdgeDragMove = (e: React.PointerEvent) => {
-    if (!sceneEdgeDrag) return;
-    e.stopPropagation();
-    const liveValue = Math.max(0.1, sceneEdgeDrag.startValue + (e.clientX - sceneEdgeDrag.startClientX) / pxPerSec);
-    setSceneEdgeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endSceneEdgeDrag = () => {
-    if (!sceneEdgeDrag) return;
-    const { id, beat, liveValue } = sceneEdgeDrag;
-    setSceneEdgeDrag(null);
-    editStore.updateScene(id, (sc) => (beat === "end" ? setSceneDuration(sc, liveValue) : setBeatHold(sc, beat, liveValue)));
-  };
-  const addScene = async () => {
-    // Laid out for the frame it will be seen in: the video's, or a fresh project's own.
-    let frame = videoPixelSize;
-    if (!frame && isProject) frame = await invoke<{ width: number; height: number }>("read_video_project", { projectPath: file.path }).catch(() => null);
-    const total = totalOutputDuration;
-    const startTime = editStore.clips.length > 0 ? Math.max(0, Math.min(currentOutputTime, total - 1)) : Math.max(0, currentOutputTime);
-    const id = editStore.addScene(startTime, frame ?? { width: 1920, height: 1080 });
-    onSelectScene?.(id);
-    seekToOutputTime(startTime + 1.4);
-  };
-
-  const addAdjustmentLayer = () => {
-    const total = totalOutputDuration;
-    if (total <= 0) return;
-    const length = Math.min(5, total);
-    const startTime = Math.max(0, Math.min(currentOutputTime, total - length));
-    // Strong enough to see at once - the grade alone at 0.7 barely shows on a bright screen
-    // recording, which read as "does nothing". The panel opens with it to dial it back.
-    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 1 }, vignette: 0.35 });
-    onSelectAdjustment?.(id);
-  };
-
-  // ---- PiP-overlay lane drag (move) / resize (trim into source) - move is shaped like the blur
-  // block above (a PipOverlay has no popover of its own to manage here, unlike audio - clicking its
-  // actual video bubble in the preview, PipOverlayLayer.tsx, is what opens PipOverlayPopover), but
-  // resize reuses the pure resizePipOverlayTime handler the same way audio's own resize does below,
-  // since a PipOverlay trims into a real source file too (trimStart/sourceDuration), unlike blur's
-  // free-stretch box. ------------------------------------------------------------------------------
-
-  const renderPipOverlays: PipOverlay[] = editStore.pipOverlays.map((o) => {
-    if (pipOverlayResizeDrag && o.id === pipOverlayResizeDrag.id) {
-      return pipOverlayResizeDrag.edge === "start" ? { ...o, startTime: pipOverlayResizeDrag.liveValue } : { ...o, endTime: pipOverlayResizeDrag.liveValue };
-    }
-    if (pipOverlayDrag && o.id === pipOverlayDrag.id) {
-      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration, track: pipOverlayDrag.liveTrack };
-    }
-    return followSplit(o);
-  });
-  // One lane per video track in use, top track first (it draws over the ones below it).
-  const videoTrackLanes = tracksInUse(renderPipOverlays).reverse();
-
-  // B-roll: pick videos; they go full frame over the main video from the playhead, back to back,
-  // on the lowest free video track.
-  const handleAddBroll = async () => {
-    const selected = await openFileDialog({ multiple: true, filters: [{ name: "Video", extensions: [...MEDIA_VIDEO_EXTENSIONS] }] });
-    const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
-    if (paths.length === 0) return;
-    const at = currentOutputTime < totalOutputDuration - 1 ? currentOutputTime : 0;
-    const ids = await editStore.addVideoLayers(paths, at);
-    if (ids[0]) onSelectPipOverlay?.(ids[0]);
-  };
-
-  const beginPipOverlayResizeDrag = (overlay: PipOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectPipOverlay?.(overlay.id);
-    setPipOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, liveValue: edge === "start" ? overlay.startTime : overlay.endTime });
-  };
-  const handlePipOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!pipOverlayResizeDrag) return;
-    e.stopPropagation();
-    const overlay = editStore.pipOverlays.find((o) => o.id === pipOverlayResizeDrag.id);
-    if (!overlay) return;
-    const deltaSec = (e.clientX - pipOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets((pipOverlayResizeDrag.edge === "start" ? overlay.startTime : overlay.endTime) + deltaSec, overlaySnapTargets, pxPerSec);
-    const preview = resizePipOverlayTimeHandler([overlay], overlay.id, pipOverlayResizeDrag.edge, totalOutputDuration, raw)[0];
-    const liveValue = pipOverlayResizeDrag.edge === "start" ? preview.startTime : preview.endTime;
-    setPipOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endPipOverlayResizeDrag = () => {
-    if (!pipOverlayResizeDrag) return;
-    const { id, edge, liveValue } = pipOverlayResizeDrag;
-    setPipOverlayResizeDrag(null);
-    editStore.resizePipOverlayTime(id, edge, liveValue);
-  };
-
-  const beginPipOverlayDrag = (overlay: PipOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    if (toolMode === "razor") {
-      // Razor mode cuts the PiP right where the click landed, same as it does for clip blocks.
-      editStore.splitPipOverlay(overlay.id, outputTimeFromClientX(e.clientX));
-      onSelectPipOverlay?.(overlay.id);
-      setSelectedClipId(null);
-      return;
-    }
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setPipOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-      startTrack: pipTrack(overlay),
-      liveTrack: pipTrack(overlay),
-    });
-  };
-  const handlePipOverlayDragMove = (e: React.PointerEvent) => {
-    if (!pipOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - pipOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - pipOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(pipOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - pipOverlayDrag.duration));
-    // The video-track lane under the pointer - or, above the top one, a new track over every other
-    // layer. (Lanes are in the DOM top track first.)
-    const lanes = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-video-track]") ?? []);
-    let overTrack: number | null = null;
-    for (const lane of lanes) {
-      const r = lane.getBoundingClientRect();
-      if (e.clientY >= r.top && e.clientY < r.bottom) overTrack = Number(lane.dataset.videoTrack);
-    }
-    if (overTrack === null && lanes.length > 0 && e.clientY < lanes[0].getBoundingClientRect().top) {
-      overTrack = Math.max(0, ...editStore.pipOverlays.filter((o) => o.id !== pipOverlayDrag.id).map(pipTrack)) + 1;
-    }
-    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved || (overTrack !== null && overTrack !== prev.liveTrack), liveStartTime, liveTrack: overTrack ?? prev.liveTrack } : prev));
-  };
-  const endPipOverlayDrag = () => {
-    if (!pipOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration, startTrack, liveTrack } = pipOverlayDrag;
-    setPipOverlayDrag(null);
-    if (isDragging) {
-      editStore.movePipOverlayTime(id, liveStartTime, liveTrack !== startTrack ? liveTrack : undefined);
-    }
-    onSelectPipOverlay?.(id);
-    setSelectedClipId(null);
-    // Same reasoning as endBlurOverlayDrag's own comment: bring the playhead into the overlay's
-    // own range on select, so choosing (or just placing) one from the timeline immediately shows
-    // its actual video bubble in the preview instead of leaving it invisible off-screen in time -
-    // the gap that made a freshly-added PiP look like it silently failed. Skipped while actively
-    // playing, though (unlike the other overlay lanes this was copied from) - a PiP chip is often
-    // placed right at/near 0:00 (wherever the playhead happened to sit when it was added), so a
-    // plain click to just glance at/select it while mid-playback would otherwise yank playback
-    // straight back to the start, which reads as "clicking the timeline restarts the video".
-    if (!isPlaying && (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration)) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
 
   // ---- Audio overlay placement / drag (move) / resize (trim into source) ---------------------
   //
@@ -3038,138 +2541,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTimelineInsert]);
 
-  // Bootstrap: whenever a different clip becomes first in playback order - initial load, or a
-  // reorder that puts something else at index 0 - force playback to actually start there, rather
-  // than trusting wherever the native <video> defaults to (source time 0, or wherever the user
-  // last happened to be). Keyed on the first clip's *id* rather than its start/end, so resizing
-  // that same clip's own edges mid-edit doesn't yank playback back to the start every time.
-  // Tracked in bootstrappedClipIdByFile (module-level, keyed by file.path) rather than a useRef -
-  // see that declaration's own comment for why a ref here previously reset on every reopen of
-  // this panel and force-seeked an already-playing video back to the start each time.
-  useEffect(() => {
-    const first = baseClips[0];
-    // A project emptied of every clip goes back to its blank canvas (its primary file) rather
-    // than leaving the deleted clip's picture on screen - and forgets the old first clip, so
-    // bringing it back (undo) plays from it again.
-    if (!first && isProject && !editStore.loading) {
-      bootstrappedClipIdByFile.delete(file.path);
-      setActiveClipIndex(0);
-      onSeek(file.path, 0);
-      return;
-    }
-    if (!first || first.id === "__pending__") return;
-    if (bootstrappedClipIdByFile.get(file.path) === first.id) {
-      if (activeClipIndexRef.current < 0 || activeClipIndexRef.current >= baseClips.length) {
-        const idx = baseClips.findIndex((c) => c.sourcePath === file.path && currentTime >= c.start - SEEK_TOLERANCE_SEC && currentTime <= c.end + SEEK_TOLERANCE_SEC);
-        setActiveClipIndex(idx >= 0 ? idx : 0);
-      }
-      return;
-    }
-    bootstrappedClipIdByFile.set(file.path, first.id);
-    const leftAt = leftAtByFile.get(file.path);
-    leftAtByFile.delete(file.path);
-    const playerAt = getResumeTime(file.path);
-    const unchanged = leftAt && (leftAt.playerAt === undefined ? playerAt === undefined : playerAt !== undefined && Math.abs(playerAt - leftAt.playerAt) < 1.5);
-    if (leftAt && unchanged && leftAt.outputTime > 0 && renderClips.length > 0) {
-      seekToOutputTime(leftAt.outputTime);
-      return;
-    }
-    setActiveClipIndex(0);
-    lastAppliedTimeRef.current = first.start;
-    onSeek(first.sourcePath, first.start);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseClips[0]?.id]);
-
-  // Live-preview: keeps playback following the clips in their *playback* (array) order rather
-  // than raw source order. `activeClipIndexRef` is only ever *advanced* here, never re-derived
-  // from "whichever clip this source time happens to belong to" (see the ref's own comment above
-  // for why that broke reordering) - every tick just checks whether currentTime is still inside
-  // the clip already being tracked, and if not, jumps straight to the start of the next clip in
-  // array order, which may be earlier *or* later in the source file than where it just was. This
-  // is what makes a reordered timeline actually preview in the new order using nothing but seeks
-  // on the same raw <video> element - no re-encoding needed for preview, only at Save. Only
-  // active while this timeline panel is mounted, since onSeek is the only way to reach the real
-  // player from here - closing the panel mid-edit just means preview following pauses, edits
-  // themselves are unaffected either way.
-  useEffect(() => {
-    if (baseClips.length === 0 || currentTime === lastAppliedTimeRef.current) return;
-    const activeIdx = activeClipIndexRef.current;
-    if (activeIdx < 0 || activeIdx >= baseClips.length) return; // not bootstrapped yet
-    const active = baseClips[activeIdx];
-    // Leaving forward is judged against the clip's end itself (less a frame's worth), not end +
-    // tolerance: a clip that runs to the end of its file - any freshly added or duplicated whole
-    // video - stops dead at `end` when the <video> hits "ended", so it never got past end +
-    // tolerance and playback stalled there instead of moving on to the next clip. The tolerance
-    // stays on the start side, where a seek can land a hair early (see SEEK_TOLERANCE_SEC).
-    if (currentTime >= active.start - SEEK_TOLERANCE_SEC && currentTime < active.end - CLIP_END_EPSILON_SEC) return; // still inside it
-
-    const nextIndex = activeIdx + 1;
-    if (nextIndex < baseClips.length) {
-      // Playback running out of one clip carries on into the next - even if the <video> paused
-      // itself on reaching the end of its file. A scrub past the end while paused stays paused.
-      advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
-    } else if (isPlaying && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
-      // Finished the last clip in playback order - stop there rather than playing on into the
-      // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
-      // cut for a reason). Play again restarts from clip 0 (the isPlaying effect below).
-      stopAtEnd();
-    }
-  }, [currentTime, editStore.clips]);
-  function advanceToClip(index: number, resume: boolean) {
-    const clip = baseClips[index];
-    setActiveClipIndex(index);
-    lastAppliedTimeRef.current = clip.start;
-    onSeek(clip.sourcePath, clip.start, resume);
-  }
-  // The effect above only hears the player's position a few times a second (timeupdate), so on its
-  // own a clip ran up to a quarter second past its cut before the next one was asked for. While
-  // playing, this checks every frame and crosses over on the frame the clip ends - the next clip's
-  // standby (ClipHandoffLayer) takes over in the same tick.
-  const boundaryCheckRef = useRef<() => void>(() => {});
-  const stopRequestedRef = useRef(false);
-  boundaryCheckRef.current = () => {
-    const t = getPlayerTime?.();
-    const index = activeClipIndexRef.current;
-    const clip = baseClips[index];
-    if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
-    if (t < clip.end - FRAME_BOUNDARY_SEC) return;
-    if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
-    else stopAtEnd(); // the end of the last clip - stop there (see the effect above)
-  };
-  // A definite pause, safe to repeat every frame until it lands. Without onPausePlayer it falls back
-  // to a toggle - once, since isPlaying only turns false a render later and a second toggle would
-  // start it again.
-  function stopAtEnd() {
-    if (onPausePlayer) return onPausePlayer();
-    if (stopRequestedRef.current) return;
-    stopRequestedRef.current = true;
-    onTogglePlay();
-  }
-  useEffect(() => {
-    if (isPlaying) stopRequestedRef.current = false;
-    if (!isPlaying) return;
-    // Play pressed while sitting at the end of the last clip - from the player's own button, k, or
-    // anywhere else that isn't handleTransportPlayClick - starts over from clip 0 instead of being
-    // stopped again on the very next frame.
-    const lastIndex = baseClips.length - 1;
-    const last = baseClips[lastIndex];
-    const t = getPlayerTime?.() ?? currentTime;
-    if (last && activeClipIndexRef.current >= lastIndex && t >= last.end - SEEK_TOLERANCE_SEC) advanceToClip(0, true);
-    if (!getPlayerTime) return;
-    let raf = 0;
-    const tick = () => {
-      boundaryCheckRef.current();
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [isPlaying, getPlayerTime]);
-  // isPlaying as of the previous commit, for the effect above: on reaching the end of its file the
-  // <video> reports its final time and its pause together, so that effect can see the clip end
-  // with isPlaying already false. Declared after it so it still holds the previous value there.
-  const wasPlayingRef = useRef(false);
-  useEffect(() => {
-    wasPlayingRef.current = isPlaying;
+  // Keeps main-player playback synchronized with the timeline's edited clip sequence (bootstrap,
+  // clip-to-clip advancement, 60fps boundary rAF, stop-at-end, and play-from-end restart).
+  useTimelinePlaybackSync({
+    filePath: file.path,
+    isProject,
+    editLoading: editStore.loading,
+    baseClips,
+    editClips: editStore.clips,
+    renderClipsCount: renderClips.length,
+    currentTime,
+    isPlaying,
+    activeClipIndexRef,
+    lastAppliedTimeRef,
+    setActiveClipIndex,
+    onSeek,
+    onTogglePlay,
+    onPausePlayer,
+    getPlayerTime,
+    seekToOutputTime,
   });
 
   const commitRename = async () => {
@@ -6049,6 +5439,11 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           shortcutCount={shortcutCount}
           onPointerStyle={editStore.updatePointerStyle}
           onKeystrokeStyle={editStore.updateKeystrokeStyle}
+          onOpenScreenStyle={() => {
+            const anchor = studioPolishAnchor;
+            setStudioPolishAnchor(null);
+            setScreenStyleAnchor(anchor ?? { left: window.innerWidth / 2 - 160, top: 120 });
+          }}
           onTurnIntoDoc={() => {
             setStudioPolishAnchor(null);
             setVideoToDocOpen(true);

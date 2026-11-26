@@ -348,6 +348,7 @@ fn on_run_event(app: &AppHandle, event: RunEvent) {
             api.prevent_exit();
         }
         RunEvent::Exit => {
+            let _ = commands::conversion::cancel_transcription();
             commands::window_capture::cleanup_stale_window_screenshots();
             commands::native_playback::cleanup_all_sessions(
                 &app.state::<commands::native_playback::NativePlaybackState>(),

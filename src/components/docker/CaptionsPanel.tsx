@@ -71,7 +71,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
 
   const missingSources = sourcePaths.filter((p) => !captions?.transcripts[p]);
 
-  const { generate, generating, error, setError, resumable } = useTranscriptGeneration({
+  const { generate, cancel, generating, error, setError, resumable } = useTranscriptGeneration({
     sourcePaths,
     language,
     hasTranscripts: !!captions,
@@ -149,7 +149,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
     </div>
   );
 
-  const progressBlock = generating && <GenerationProgressBar generating={generating} />;
+  const progressBlock = generating && <GenerationProgressBar generating={generating} onCancel={cancel} />;
 
   const showTranscriptOnly = transcriptOnly && !!settings && lines.length > 0;
 

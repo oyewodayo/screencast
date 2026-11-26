@@ -42,6 +42,7 @@ import GradeCanvas from './video/GradeCanvas';
 import BlurBackdrop from './video/BlurBackdrop';
 import { speedAtSource } from '../utils/clipTiming';
 import ThumbnailPicker, { ScrubSpriteMeta, ThumbnailChoice } from './video/ThumbnailPicker';
+import VideoToDocModal from './video/VideoToDocModal';
 import { getPlayableUrl, isPictureless } from '../utils/playableVideo';
 import type { Lut3D } from '../utils/colorGrade';
 import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
@@ -685,6 +686,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // While the timeline editor drives playback, the chapters are the edit's (editTimeline).
   const chapters = editTimeline?.chapters ?? fileChapters;
   const [showChaptersMenu, setShowChaptersMenu] = useState<boolean>(false);
+  const [showVideoToDocModal, setShowVideoToDocModal] = useState<boolean>(false);
   const [isDetectingChapters, setIsDetectingChapters] = useState<boolean>(false);
   // Which chapter (if any) the cursor is currently near while hovering the timeline - drives the
   // small tooltip in handleTimelineHover below. Plain state (not a ref written directly to the
@@ -3036,6 +3038,18 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							)}
 						</div>
 
+						{!isEditingVideo && mediaType === 'video' && filePath && (
+							<button
+								type="button"
+								onClick={() => setShowVideoToDocModal(true)}
+								title="Turn this video into a structured Briefcast Doc (transcript, chapters & screenshots)"
+								className="h-7 px-2 rounded-md flex items-center gap-1 text-[11px] font-medium bg-white/10 hover:bg-white/20 text-white/90 hover:text-white transition-colors whitespace-nowrap shrink-0"
+							>
+								<IoDocumentTextOutline size={13} />
+								<span className="@max-[640px]/player:hidden">Doc</span>
+							</button>
+						)}
+
 						{onEditVideo && mediaType === 'video' && (
 							<button
 								type="button"
@@ -3307,6 +3321,21 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					</>
 			}
     	</div>
+
+      {showVideoToDocModal && filePath && (
+        <VideoToDocModal
+          sourceVideoPath={filePath}
+          fileName={filePath.split(/[\\/]/).pop() || filePath}
+          durationSec={videoRef.current?.duration && Number.isFinite(videoRef.current.duration) ? videoRef.current.duration : 0}
+          chapters={chapters.map((c) => ({ time: c.time, label: c.label }))}
+          lines={playerCaptionLines.map((l) => ({
+            start: l.start,
+            end: l.end,
+            text: l.words.map((w) => w.text).join(" "),
+          }))}
+          onClose={() => setShowVideoToDocModal(false)}
+        />
+      )}
 
     </div>
 
