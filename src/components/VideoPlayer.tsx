@@ -5,7 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { createPortal } from 'react-dom';
-import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoCutOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -3035,6 +3035,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								</div>
 							)}
 						</div>
+
+						{onEditVideo && mediaType === 'video' && (
+							<button
+								type="button"
+								onClick={onEditVideo}
+								title={isEditingVideo ? 'Exit editor & return to Watch mode (E)' : 'Open Video Editor (E)'}
+								className={`h-7 px-2 rounded-md flex items-center gap-1 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+									isEditingVideo
+										? 'bg-blue-600 hover:bg-blue-500 text-white'
+										: 'bg-white/10 hover:bg-white/20 text-white/90 hover:text-white'
+								}`}
+							>
+								<IoCutOutline size={13} />
+								<span className="@max-[540px]/player:hidden">{isEditingVideo ? 'Editing' : 'Edit'}</span>
+							</button>
+						)}
 
 						<button ref={settingsBtnRef} className="settings-btn w-7" onClick={toggleSettings} title="Settings">
 							<FaCog className='w-[100%] text-2xl' />

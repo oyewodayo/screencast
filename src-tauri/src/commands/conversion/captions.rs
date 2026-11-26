@@ -1,5 +1,63 @@
 // Offline Whisper caption generation, word-level timing, and audio transcription.
 use super::*;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+static WHISPER_CANCELLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_WHISPER_PIDS: OnceLock<std::sync::Mutex<Vec<u32>>> = OnceLock::new();
+static WHISPER_JOB_LOCK: OnceLock<tauri::async_runtime::Mutex<()>> = OnceLock::new();
+
+fn active_whisper_pids() -> &'static std::sync::Mutex<Vec<u32>> {
+    ACTIVE_WHISPER_PIDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn whisper_job_lock() -> &'static tauri::async_runtime::Mutex<()> {
+    WHISPER_JOB_LOCK.get_or_init(|| tauri::async_runtime::Mutex::new(()))
+}
+
+fn kill_whisper_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        hide_console_window(&mut cmd);
+        let _ = cmd.args(["/F", "/PID", &pid.to_string()]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
+fn register_whisper_pid(pid: u32) {
+    if let Ok(mut pids) = active_whisper_pids().lock() {
+        pids.push(pid);
+    }
+}
+
+fn unregister_whisper_pid(pid: u32) {
+    if let Ok(mut pids) = active_whisper_pids().lock() {
+        pids.retain(|&p| p != pid);
+    }
+}
+
+fn kill_all_active_whisper() {
+    let pids: Vec<u32> = active_whisper_pids()
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default();
+    for pid in pids {
+        kill_whisper_pid(pid);
+    }
+}
+
+/// Immediately cancels any in-flight offline Whisper transcription job and terminates its worker.
+#[tauri::command]
+pub fn cancel_transcription() -> Result<(), String> {
+    WHISPER_CANCELLED.store(true, Ordering::SeqCst);
+    kill_all_active_whisper();
+    Ok(())
+}
 
 // Offline speech-to-text fallback for VideoPlayer's CC button, used only when the user explicitly
 // asks for it (no sibling .vtt/.srt file exists, and they choose "Generate from audio" rather than
@@ -24,7 +82,7 @@ pub async fn generate_captions(
 ) -> Result<String, String> {
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
-    let cache_path = preview_cache_path(&input, &format!("captions_generated_v1_{}", lang), "vtt")?;
+    let cache_path = preview_cache_path(&input, &format!("captions_generated_v2_{}", lang), "vtt")?;
 
     if cache_path.exists() {
         return std::fs::read_to_string(&cache_path)
@@ -57,12 +115,9 @@ pub async fn generate_captions(
     Ok(vtt)
 }
 
-// One whisper run's worth of audio. Long recordings are transcribed in pieces this size so the
-// work survives the app closing: each finished piece is kept, and a later run (same file, same
-// language) only transcribes what's still missing - see transcribe_in_chunks. Short enough that
-// little is lost to an interruption, long enough that whisper's per-run model load stays a small
-// share of the time.
-pub(super) const CAPTION_CHUNK_SECS: f64 = 300.0;
+// One whisper run's worth of audio (90s chunks give frequent resumable checkpoints and fast
+// feedback on long recordings without letting whisper's model-load overhead dominate).
+pub(super) const CAPTION_CHUNK_SECS: f64 = 90.0;
 
 // Bytes per second of the 16kHz mono s16le WAV extract_audio_for_whisper writes.
 pub(super) const WHISPER_WAV_BYTES_PER_SEC: f64 = 32_000.0;
@@ -83,6 +138,13 @@ pub(super) async fn transcribe_in_chunks(
     lang: &str,
     words: bool,
 ) -> Result<Vec<(f64, PathBuf)>, String> {
+    // Cancel any orphaned prior transcription so multiple whisper-cli processes never pile up and
+    // fight over CPU or overwrite each other's chunk files, then serialize via WHISPER_JOB_LOCK.
+    WHISPER_CANCELLED.store(true, Ordering::SeqCst);
+    kill_all_active_whisper();
+    let _job_guard = whisper_job_lock().lock().await;
+    WHISPER_CANCELLED.store(false, Ordering::SeqCst);
+
     let parts = chunk_parts_dir(cache_path);
     std::fs::create_dir_all(&parts).map_err(|e| format!("Failed to create captions work folder: {}", e))?;
 
@@ -134,8 +196,13 @@ pub(super) async fn transcribe_in_chunks(
 
     let ext = if words { "json" } else { "vtt" };
     let mut outputs = Vec::with_capacity(total);
+    let _ = app_handle.emit("captions-progress", 1.0_f64);
     for i in 0..total {
+        if WHISPER_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Transcription cancelled".to_string());
+        }
         let offset = i as f64 * CAPTION_CHUNK_SECS;
+        let chunk_secs = (duration - offset).clamp(1.0, CAPTION_CHUNK_SECS);
         let stem = parts.join(format!("chunk_{:04}", i));
         let out_file = stem.with_extension(ext);
         let ok_marker = stem.with_extension("ok");
@@ -149,11 +216,6 @@ pub(super) async fn transcribe_in_chunks(
 
         let chunk_wav = stem.with_extension("wav");
         cut_wav_chunk(&ffmpeg_path, &wav, &chunk_wav, offset, CAPTION_CHUNK_SECS).await?;
-        // Word mode feeds edit-by-transcript as well as captions, and there the hesitations are the
-        // point: Whisper normally tidies speech up, silently dropping "um"/"uh" and stutters, so
-        // "remove filler words" would have nothing to find. A disfluent prompt (the known trick
-        // for keeping them) makes it transcribe what was actually said. English-only text, so
-        // it's only given when the speech is English or being auto-detected.
         let keep_disfluencies = words && (lang == "en" || lang == "auto");
         let mut format_args: Vec<&str> = if words { vec!["-oj", "-ml", "1", "-sow"] } else { vec!["-ovtt"] };
         if keep_disfluencies {
@@ -162,9 +224,12 @@ pub(super) async fn transcribe_in_chunks(
         if let Some(vad) = vad_model.as_deref() {
             format_args.extend(["--vad", "-vm", vad]);
         }
-        let result = run_whisper_cli(app_handle, &whisper_path, &model_path, &chunk_wav, &stem, lang, &format_args, span).await;
+        let result = run_whisper_cli(app_handle, &whisper_path, &model_path, &chunk_wav, &stem, lang, &format_args, span, chunk_secs).await;
         let _ = std::fs::remove_file(&chunk_wav);
         result?;
+        if WHISPER_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Transcription cancelled".to_string());
+        }
         std::fs::write(&ok_marker, b"").map_err(|e| format!("Failed to record transcription progress: {}", e))?;
         outputs.push((offset, out_file));
     }
@@ -255,9 +320,9 @@ pub async fn caption_job_progress(input_path: String, language: Option<String>, 
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
     let (namespace, ext) = if words {
-        (format!("captions_words_v3_{}", lang), "json")
+        (format!("captions_words_v4_{}", lang), "json")
     } else {
-        (format!("captions_generated_v1_{}", lang), "vtt")
+        (format!("captions_generated_v2_{}", lang), "vtt")
     };
     let cache_path = preview_cache_path(&input, &namespace, ext)?;
     if cache_path.exists() {
@@ -298,9 +363,8 @@ pub async fn generate_caption_words(
 ) -> Result<Vec<CaptionWordOut>, String> {
     let input = PathBuf::from(&input_path);
     let lang = language.filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".to_string());
-    // v3: fillers and stutters kept (WHISPER_DISFLUENCY_PROMPT) and words timed with voice
-    // detection (ensure_vad_model) - the bump retires older transcripts that had neither.
-    let cache_path = preview_cache_path(&input, &format!("captions_words_v3_{}", lang), "json")?;
+    // v4: 90s chunks + greedy decoding (-bs 1 -bo 1) + live stdout/stderr progress.
+    let cache_path = preview_cache_path(&input, &format!("captions_words_v4_{}", lang), "json")?;
 
     if cache_path.exists() {
         let cached = std::fs::read_to_string(&cache_path)
@@ -689,33 +753,33 @@ pub(super) async fn run_whisper_cli(
     format_args: &[&str],
     // This run's share of the overall job's 0-100 progress (transcribe_in_chunks runs one per piece).
     progress_span: (f64, f64),
+    chunk_secs: f64,
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
     let (span_start, span_end) = progress_span;
-    let _ = app_handle.emit("captions-progress", span_start);
+    let _ = app_handle.emit("captions-progress", span_start.max(1.0));
     let format_args: Vec<String> = format_args.iter().map(|a| a.to_string()).collect();
     let whisper_path = whisper_path.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.clone();
     let output_stem = output_stem.clone();
     let language = language.to_string();
-    // Leaves one logical core free rather than claiming every one of them - using all of them
-    // starves everything else on the machine of CPU for the whole transcription (measured: a
-    // couple of minutes even for under a minute of audio), including the UI thread rendering the
-    // very progress this is meant to report and, in dev builds, the separate Vite dev-server
-    // process - a real, reproduced symptom (window frame responsive, content area just never
-    // repainting) that this one-core margin is meant to prevent.
+    // Leave headroom for the UI and OS (cap at 6 threads) and use greedy decoding (-bs 1 -bo 1),
+    // which is 3-5x faster on CPU than default beam search (5) with negligible quality difference.
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1).max(1))
+        .map(|n| n.get().saturating_sub(2).clamp(1, 6))
         .unwrap_or(4);
     tauri::async_runtime::spawn_blocking(move || {
+        if WHISPER_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Transcription cancelled".to_string());
+        }
         let mut cmd = Command::new(&whisper_path);
         #[cfg(windows)]
         hide_console_window(&mut cmd);
         cmd.arg("-m").arg(path_to_str(&model_path)?);
         cmd.arg("-f").arg(path_to_str(&wav_path)?);
         cmd.args(&format_args);
-        cmd.args(["-np", "-pp", "-t", &threads.to_string(), "-l", &language]);
+        cmd.args(["-bs", "1", "-bo", "1", "-pp", "-t", &threads.to_string(), "-l", &language]);
         cmd.arg("-of").arg(path_to_str(&output_stem)?);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -724,47 +788,93 @@ pub(super) async fn run_whisper_cli(
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start whisper-cli: {}", e))?;
+        let pid = child.id();
+        register_whisper_pid(pid);
 
-        // Drained but discarded - whisper-cli writes each transcribed segment here as it goes
-        // (not currently surfaced anywhere), but the pipe still has to be read continuously or a
-        // long transcription fills the OS pipe buffer and the child blocks trying to write to it,
-        // silently hanging the whole command.
+        let highest_pct = Arc::new(std::sync::Mutex::new(span_start));
+        let emit_progress = {
+            let app = app_handle.clone();
+            let highest = highest_pct.clone();
+            move |pct: f64| {
+                let clamped = pct.clamp(span_start, span_end);
+                if let Ok(mut guard) = highest.lock() {
+                    if clamped > *guard + 0.15 {
+                        *guard = clamped;
+                        let _ = app.emit("captions-progress", clamped);
+                    }
+                }
+            }
+        };
+
+        // Read stdout continuously (prevents pipe deadlock) AND parse segment end timestamps
+        // (`[00:00:12.340 --> 00:00:15.800] ...`) for smooth, second-by-second progress updates.
         let stdout = child.stdout.take().ok_or("Failed to capture whisper-cli stdout")?;
-        std::thread::spawn(move || {
+        let emit_stdout = emit_progress.clone();
+        let safe_chunk_secs = chunk_secs.max(1.0);
+        let stdout_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            let ts_re = regex::Regex::new(r"-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})").unwrap();
             for line in reader.lines() {
-                if line.is_err() {
-                    break;
+                let Ok(line) = line else { break };
+                if let Some(caps) = ts_re.captures(&line) {
+                    if let Some(sec) = parse_vtt_time(&caps[1]) {
+                        let frac = (sec / safe_chunk_secs).clamp(0.0, 1.0);
+                        emit_stdout(span_start + frac * (span_end - span_start));
+                    }
                 }
             }
         });
 
-        let stderr = child.stderr.take().ok_or("Failed to capture whisper-cli stderr")?;
-        let app_handle_for_stderr = app_handle.clone();
+        // Read stderr splitting on BOTH '\r' and '\n' so whisper.cpp's progress lines flush
+        // immediately instead of buffering until the chunk finishes.
+        let mut stderr = child.stderr.take().ok_or("Failed to capture whisper-cli stderr")?;
+        let emit_stderr = emit_progress.clone();
         let stderr_thread = std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
             let mut full_output = String::new();
             let progress_re = regex::Regex::new(r"progress\s*=\s*(\d+)%").unwrap();
-
-            for line in reader.lines() {
-                let Ok(line) = line else { continue };
-                full_output.push_str(&line);
-                full_output.push('\n');
-
-                if let Some(caps) = progress_re.captures(&line) {
-                    if let Ok(pct) = caps[1].parse::<f64>() {
-                        let _ = app_handle_for_stderr.emit("captions-progress", span_start + pct / 100.0 * (span_end - span_start));
+            let mut buf = [0u8; 1024];
+            let mut line_buf = String::new();
+            let process_segment = |seg: &str, out: &mut String| {
+                if !seg.is_empty() {
+                    out.push_str(seg);
+                    out.push('\n');
+                    if let Some(caps) = progress_re.captures(seg) {
+                        if let Ok(pct) = caps[1].parse::<f64>() {
+                            emit_stderr(span_start + (pct / 100.0).clamp(0.0, 1.0) * (span_end - span_start));
+                        }
+                    }
+                }
+            };
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&buf[..n]);
+                for ch in text.chars() {
+                    if ch == '\n' || ch == '\r' {
+                        process_segment(line_buf.trim(), &mut full_output);
+                        line_buf.clear();
+                    } else {
+                        line_buf.push(ch);
                     }
                 }
             }
-
+            if !line_buf.trim().is_empty() {
+                process_segment(line_buf.trim(), &mut full_output);
+            }
             full_output
         });
 
         let status = child
             .wait()
             .map_err(|e| format!("Failed to wait for whisper-cli: {}", e))?;
+        unregister_whisper_pid(pid);
+        let _ = stdout_thread.join();
         let stderr_output = stderr_thread.join().unwrap_or_default();
+
+        if WHISPER_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Transcription cancelled".to_string());
+        }
 
         if !status.success() {
             let tail: Vec<&str> = stderr_output

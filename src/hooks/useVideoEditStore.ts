@@ -118,6 +118,7 @@ export interface SplitScreenGroup {
 }
 import { renderAssetFrames } from "../utils/videoAssets";
 import { keystrokesForExport, loadClipRecordings, screenStyleExport, withPointerLayers } from "../utils/screenPolish";
+import { invalidateEditSummary } from "../utils/videoLibraryMeta";
 import { screenContentRect, type ScreenStyle } from "../utils/screenStyle";
 import type { PointerStyle } from "../utils/pointerTrack";
 import type { KeystrokeStyle } from "../utils/keystrokes";
@@ -700,16 +701,24 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // any more, or the switch-files flush below would recreate a stale .edits.json at the old path
   // right after the real one travelled with the file.
   const movedAwayFromRef = useRef<string | null>(null);
+  // True only after an actual edit mutation (scheduleAutosave) - never from setDuration seeding a
+  // pristine 1-clip state while someone is simply watching a video. Prevents watching a video from
+  // writing a fake .edits.json sidecar that makes VideoEditorHome label it "Continue editing".
+  const dirtyRef = useRef<boolean>(false);
   const flushSave = useCallback((): Promise<void> => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
     const current = stateRef.current;
-    if (!sourcePath || !current || movedAwayFromRef.current === sourcePath) return Promise.resolve();
+    if (!dirtyRef.current || !sourcePath || !current || movedAwayFromRef.current === sourcePath) return Promise.resolve();
+    dirtyRef.current = false;
     return invoke("save_video_edit_state", { videoPath: sourcePath, json: JSON.stringify(current) })
-      .then(() => undefined)
+      .then(() => {
+        invalidateEditSummary(sourcePath);
+      })
       .catch((err) => {
+        dirtyRef.current = true;
         console.error("Failed to save video edit state:", err);
       });
   }, [sourcePath]);
@@ -727,6 +736,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   }, [flushSave, sourcePath]);
 
   const scheduleAutosave = useCallback(() => {
+    dirtyRef.current = true;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(flushSave, AUTOSAVE_DEBOUNCE_MS);
   }, [flushSave]);
@@ -741,6 +751,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // - a different file later taking the old name saves normally.
   useEffect(() => {
     movedAwayFromRef.current = null;
+    dirtyRef.current = false;
   }, [sourcePath]);
 
   // Guards the whole app window closing while this file's editor is open - mirrors

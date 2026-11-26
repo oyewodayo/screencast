@@ -74,6 +74,8 @@ interface VideoEditorHomeProps {
   resolveThumbnailUrl: (file: { name: string; path: string }, bypassCache?: boolean) => Promise<string>;
   // Opens a video in the editor - set up for `intent` when it came from a starter.
   onOpenVideo: (file: VideoEditorFile, intent?: EditorIntent) => void;
+  // Opens a video in clean Watch mode (no editor timeline/chrome) when the user just wants to play it.
+  onWatchVideo?: (file: VideoEditorFile) => void;
   // Opens the OS file picker filtered to video extensions and edits whatever comes back, from
   // anywhere on disk - the reason this screen exists as a standalone tool rather than only being
   // reachable from a file that's already open in the library.
@@ -140,12 +142,13 @@ interface TileProps {
   // Its exports, newest first - shown on it rather than as tiles of their own.
   exports: VideoEditorFile[] | undefined;
   onOpen: (video: VideoEditorFile) => void;
+  onWatch?: (video: VideoEditorFile) => void;
   onVisible: (path: string) => void;
   onSendToPhone: (video: VideoEditorFile) => void;
 }
 
 // Memoized so a thumbnail or a probe arriving re-renders its own tile, not the whole grid.
-const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, picking, exports, onOpen, onVisible, onSendToPhone }: TileProps) {
+const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, picking, exports, onOpen, onWatch, onVisible, onSendToPhone }: TileProps) {
   const ref = useRef<HTMLDivElement>(null);
   const previewing = useIsVideoPreviewActive("editor-home", video.path);
   // Asks for its poster, length and edit only once it scrolls into view.
@@ -197,8 +200,13 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, pickin
             onFailed={() => cancelVideoPreview("editor-home", video.path)}
           />
         )}
-        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/10 transition-colors pointer-events-none">
-          {!previewing && <IoPlay size={26} className="text-white opacity-0 group-hover:opacity-90 transition-opacity drop-shadow" />}
+        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/15 transition-colors pointer-events-none">
+          {!previewing && (
+            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/70 text-white text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity shadow">
+              <IoCutOutline size={13} />
+              {picking ? "Use video" : "Edit"}
+            </span>
+          )}
         </div>
         <div className="absolute left-2 top-2 flex gap-1 pointer-events-none">
           {edit && <span className="px-1.5 py-0.5 rounded bg-blue-600/90 text-white text-[10px] font-medium">Edited</span>}
@@ -206,19 +214,38 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, pickin
           {edit?.canvasLabel && edit.canvasAspect && <span className="px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-medium">{edit.canvasAspect < 1 ? "Vertical" : edit.canvasLabel}</span>}
         </div>
         {duration && <span className="absolute right-2 bottom-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-medium tabular-nums pointer-events-none">{formatMediaDuration(duration)}</span>}
-        {!picking && (!project || !!exports?.length) && (
-          <button
-            type="button"
-            // What gets shared is the finished video, when there is one.
-            title={exports?.length ? `Send the latest export (${exportLabel(exports[0].path)}) to your phone` : "Send to your phone"}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSendToPhone(exports?.[0] ?? video);
-            }}
-            className="absolute right-2 top-2 p-1.5 rounded-full bg-black/55 text-white opacity-0 group-hover:opacity-100 hover:bg-black/75 transition-opacity"
-          >
-            <IoPhonePortraitOutline size={14} />
-          </button>
+        {!picking && (
+          <div className="absolute right-2 top-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {onWatch && !project && (
+              <button
+                type="button"
+                title="Watch in player without opening the editor"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelVideoPreview("editor-home", video.path);
+                  onWatch(video);
+                }}
+                className="flex items-center gap-1 px-2 py-1 rounded-full bg-black/65 text-white text-[10.5px] font-medium hover:bg-black/85 transition-colors"
+              >
+                <IoPlay size={11} />
+                Watch
+              </button>
+            )}
+            {(!project || !!exports?.length) && (
+              <button
+                type="button"
+                // What gets shared is the finished video, when there is one.
+                title={exports?.length ? `Send the latest export (${exportLabel(exports[0].path)}) to your phone` : "Send to your phone"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSendToPhone(exports?.[0] ?? video);
+                }}
+                className="p-1.5 rounded-full bg-black/65 text-white hover:bg-black/85 transition-colors"
+              >
+                <IoPhonePortraitOutline size={14} />
+              </button>
+            )}
+          </div>
         )}
       </div>
       <div className="px-3 py-2.5">
@@ -378,7 +405,7 @@ const ContinueCard: React.FC<{
 
 // ---- The screen -------------------------------------------------------------------------------
 
-const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, resolveThumbnailUrl, onOpenVideo, onOpenExternalVideo, onCreateVideo, onSendToPhone, externalDrag = false, droppedPaths = null, onTidyUp }) => {
+const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, resolveThumbnailUrl, onOpenVideo, onWatchVideo, onOpenExternalVideo, onCreateVideo, onSendToPhone, externalDrag = false, droppedPaths = null, onTidyUp }) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<Sort>("recent");
@@ -400,6 +427,12 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
     setPicking(null);
     onOpenVideoRef.current(video, starter?.intent);
   }, []);
+  const onWatchVideoRef = useRef(onWatchVideo);
+  onWatchVideoRef.current = onWatchVideo;
+  const watchVideo = useCallback((video: VideoEditorFile) => {
+    setPicking(null);
+    onWatchVideoRef.current?.(video);
+  }, []);
   const onSendRef = useRef(onSendToPhone);
   onSendRef.current = onSendToPhone;
   const sendToPhone = useCallback((video: VideoEditorFile) => onSendRef.current([{ path: video.path, name: video.name }]), []);
@@ -419,7 +452,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
         .then((url) => putThumbUrl(path, url))
         .catch((err) => console.error(`Failed to resolve thumbnail for ${path}:`, err));
       if (!isVideoProjectPath(path)) probeVideo(video).then((p) => putProbe(path, p)).catch(() => {});
-      readEditSummary(path)
+      readEditSummary(path, true)
         .then((s) => setEdits((prev) => ({ ...prev, [path]: s })))
         .catch(() => setEdits((prev) => ({ ...prev, [path]: null })));
     },
@@ -570,6 +603,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
       picking={!!picking}
       exports={filter === "exports" || isExportName(video.path) ? undefined : exportsByBase.get(exportBase(video.path))}
       onOpen={openVideo}
+      onWatch={onWatchVideo ? watchVideo : undefined}
       onVisible={loadMeta}
       onSendToPhone={sendToPhone}
     />

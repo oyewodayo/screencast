@@ -125,6 +125,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::conversion::generate_captions,
         commands::conversion::generate_caption_words,
         commands::conversion::caption_job_progress,
+        commands::conversion::cancel_transcription,
         commands::conversion::audio_cleanup_waveform,
         commands::conversion::decode_audio_range,
         commands::conversion::transcribe_doc_audio,

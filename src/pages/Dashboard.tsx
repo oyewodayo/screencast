@@ -1641,11 +1641,23 @@ useEffect(() => {
   }, []);
 
   // System-level app integrations (RAM readout, delayed update check, hidden-to-tray media pause,
-  // and Convert / Play requests from the recording-completed popup window).
+  // post-recording popup actions, and opening docs generated from video tools).
   const { ramInfo, pendingUpdate, setPendingUpdate } = useDashboardSystemListeners({
     videoPlayerRef,
     onOpenConversionFile: setConversionFile,
     onOpenRecordingPlayback: (path, name) => loadFileForPlayback(path, name),
+    onOpenRecordingEditor: (file, intent) => handleOpenVideoInEditor(file, intent),
+    onOpenRecordingNotes: (file) => handleLinkNotes({ path: file.path, name: file.name, size: 0 }),
+    onOpenBriefcastDoc: async (docId) => {
+      await refreshDocsIndex();
+      setShareJob(null);
+      setSelectedFile(null);
+      setBoardScreen(null);
+      setWhiteboardScreen(null);
+      setMindmapScreen(null);
+      setVideoEditorScreen(null);
+      setDocsScreen({ mode: "editor", docId });
+    },
   });
 
   // ScreenshotOverlayWindow does the actual capture itself (it's the one holding the formData
@@ -4992,6 +5004,11 @@ const setScreen = () => {
               recentPaths={recentPaths}
               resolveThumbnailUrl={resolveVideoThumbnailUrl}
               onOpenVideo={(file, intent) => void handleOpenVideoInEditor(file, intent)}
+              onWatchVideo={(file) => {
+                setVideoEditorScreen(null);
+                setDockerMode("record");
+                void loadFileForPlayback(file.path, file.name);
+              }}
               onOpenExternalVideo={(intent) => void handleOpenExternalVideoForEditing(intent)}
               onCreateVideo={() => setIsNewVideoProjectOpen(true)}
               onSendToPhone={openPhoneTransfer}
@@ -5101,9 +5118,14 @@ const setScreen = () => {
                     onOpenFrameInDesign={() => void handleOpenVideoFrameInDesign(selectedFile)}
                     onShowInFolder={() => void invoke("open_file_from_directory", { filepath: selectedFile.sourcePath })}
                     onExport={() => window.dispatchEvent(new CustomEvent("briefcast:video-tool-trigger", { detail: { tool: "save" } }))}
+                    onSwitchToWatch={() => {
+                      setDockerMode("record");
+                      setVideoEditorScreen(null);
+                    }}
                     onClose={() => {
                       setSelectedFile(null);
                       setDockerMode("record");
+                      setVideoEditorScreen(null);
                     }}
                     onUndo={() => editStore.undo()}
                     onRedo={() => editStore.redo()}
@@ -5155,8 +5177,13 @@ const setScreen = () => {
                 onEditVideo={
                   getFileCategory(selectedFile.name) === "video"
                     ? () => {
-                        if (dockerMode === "file-tools") return setDockerMode("record");
+                        if (dockerMode === "file-tools") {
+                          setDockerMode("record");
+                          setVideoEditorScreen(null);
+                          return;
+                        }
                         setDockerMode("file-tools");
+                        setVideoEditorScreen({ mode: "editing" });
                         window.dispatchEvent(new Event(SHOW_DOCKER_EVENT));
                       }
                     : undefined

@@ -12,8 +12,12 @@ import {
   IoPlay,
   IoAlertCircle,
   IoPencil,
+  IoSparkles,
+  IoSwapHorizontalOutline,
 } from 'react-icons/io5';
+import { MdClosedCaptionOff } from 'react-icons/md';
 import { open } from '@tauri-apps/plugin-shell';
+import type { EditorIntent } from '../../utils/editorIntent';
 const appWindow = getCurrentWebviewWindow()
 
 // "processing": Stop was pressed and the window is shown straight away, while the backend is still
@@ -140,9 +144,21 @@ const FileModal = ({ filePath: initialPath, status = "done", error }: FileModalP
     await appWindow.close();
   };
 
+  const handleOpenInEditor = async (intent?: EditorIntent) => {
+    await emit('open-recording-editor', { path: filePath, intent });
+    await appWindow.close();
+  };
+
+  const handleCreateNotesDoc = async () => {
+    await emit('open-recording-notes', filePath);
+    await appWindow.close();
+  };
+
   const handleClose = async () => {
     await appWindow.close();
   };
+
+  const isVideoFile = ['MP4', 'MKV', 'MOV', 'WEBM', 'AVI'].includes(fileType);
 
   if (status !== "done") {
     const processing = status === "processing";
@@ -178,14 +194,18 @@ const FileModal = ({ filePath: initialPath, status = "done", error }: FileModalP
 
   return (
     <div className="fixed inset-0 flex flex-col bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100" data-tauri-drag-region>
-      <div className="flex-1 flex flex-col items-center px-6 pt-8 pb-4 overflow-hidden">
-        <div className="w-16 h-16 rounded-full bg-green-50 dark:bg-green-500/10 flex items-center justify-center mb-3">
-          <IoCheckmarkCircle className="text-green-500 text-4xl" />
+      <div className="flex-1 flex flex-col items-center px-5 pt-5 pb-3 overflow-y-auto">
+        <div className="flex items-center gap-3 w-full mb-3.5">
+          <div className="w-11 h-11 rounded-full bg-green-50 dark:bg-green-500/10 flex items-center justify-center shrink-0">
+            <IoCheckmarkCircle className="text-green-500 text-3xl" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-sm font-semibold text-gray-900 dark:text-neutral-100">Recording completed</h1>
+            <p className="text-xs text-gray-400 dark:text-neutral-500">Saved to your Briefcast library</p>
+          </div>
         </div>
-        <h1 className="text-base font-semibold text-gray-900 dark:text-neutral-100 mb-1">Recording completed</h1>
-        <p className="text-xs text-gray-400 dark:text-neutral-500 mb-5">Your recording has been saved</p>
 
-        <div className="w-full bg-gray-50 dark:bg-neutral-800 rounded-xl mb-4">
+        <div className="w-full bg-gray-50 dark:bg-neutral-800 rounded-xl mb-3">
           {renaming ? (
             <div className="py-2 px-3 border-b border-gray-100 dark:border-neutral-800">
               <div className="flex items-center gap-2">
@@ -213,7 +233,7 @@ const FileModal = ({ filePath: initialPath, status = "done", error }: FileModalP
             </div>
           ) : (
             <button
-              className="group w-full flex items-center justify-between gap-3 py-2.5 px-3 border-b border-gray-100 dark:border-neutral-800 text-left hover:bg-gray-100/70 dark:hover:bg-neutral-700/40 rounded-t-xl transition-colors"
+              className="group w-full flex items-center justify-between gap-3 py-2 px-3 border-b border-gray-100 dark:border-neutral-800 text-left hover:bg-gray-100/70 dark:hover:bg-neutral-700/40 rounded-t-xl transition-colors"
               onClick={startRename}
               title="Rename"
             >
@@ -238,35 +258,86 @@ const FileModal = ({ filePath: initialPath, status = "done", error }: FileModalP
           )}
         </div>
 
+        {/* Post-Recording Quick Action Strip */}
+        <div className="w-full mb-2.5">
+          <div className="text-[10px] font-medium uppercase tracking-wider text-gray-400 dark:text-neutral-500 mb-1.5 px-0.5">
+            Next steps
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {isVideoFile && (
+              <button
+                type="button"
+                onClick={() => void handleOpenInEditor({ studioPolish: true })}
+                className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-amber-50 dark:bg-amber-500/10 border border-amber-200/80 dark:border-amber-400/25 text-left hover:bg-amber-100/80 dark:hover:bg-amber-500/20 transition-colors"
+              >
+                <IoSparkles className="text-amber-500 dark:text-amber-300 text-base shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold text-gray-900 dark:text-neutral-100 leading-tight">Studio Polish</span>
+                  <span className="block text-[10px] text-gray-500 dark:text-neutral-400 truncate">Frame, audio & cuts</span>
+                </span>
+              </button>
+            )}
+            {isVideoFile && (
+              <button
+                type="button"
+                onClick={() => void handleOpenInEditor({ openCaptions: true })}
+                className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-gray-50 dark:bg-neutral-800 border border-gray-200/80 dark:border-neutral-700 text-left hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+              >
+                <MdClosedCaptionOff className="text-blue-500 dark:text-blue-400 text-base shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold text-gray-900 dark:text-neutral-100 leading-tight">Add Captions</span>
+                  <span className="block text-[10px] text-gray-500 dark:text-neutral-400 truncate">Offline transcript</span>
+                </span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void handleCreateNotesDoc()}
+              className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-gray-50 dark:bg-neutral-800 border border-gray-200/80 dark:border-neutral-700 text-left hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+            >
+              <IoDocumentTextOutline className="text-emerald-500 dark:text-emerald-400 text-base shrink-0" />
+              <span className="min-w-0">
+                <span className="block text-xs font-semibold text-gray-900 dark:text-neutral-100 leading-tight">Create Doc</span>
+                <span className="block text-[10px] text-gray-500 dark:text-neutral-400 truncate">Linked notes</span>
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={handleConvertFormat}
+              className="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-gray-50 dark:bg-neutral-800 border border-gray-200/80 dark:border-neutral-700 text-left hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+            >
+              <IoSwapHorizontalOutline className="text-violet-500 dark:text-violet-400 text-base shrink-0" />
+              <span className="min-w-0">
+                <span className="block text-xs font-semibold text-gray-900 dark:text-neutral-100 leading-tight">Convert</span>
+                <span className="block text-[10px] text-gray-500 dark:text-neutral-400 truncate">MP4, GIF, MP3…</span>
+              </span>
+            </button>
+          </div>
+        </div>
+
         <button
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-200 dark:border-neutral-700 hover:border-gray-300 dark:hover:border-neutral-600 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors text-left"
+          className="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-200 dark:border-neutral-700 hover:border-gray-300 dark:hover:border-neutral-600 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors text-left"
           onClick={handleOpenFile}
           title={filePath}
         >
-          <IoFolderOpenOutline className="text-gray-400 dark:text-neutral-500 text-base shrink-0" />
-          <span className="text-xs text-gray-500 dark:text-neutral-400 truncate">{filePath}</span>
+          <IoFolderOpenOutline className="text-gray-400 dark:text-neutral-500 text-sm shrink-0" />
+          <span className="text-[11px] text-gray-500 dark:text-neutral-400 truncate">{filePath}</span>
         </button>
       </div>
 
       <div className="flex border-t border-gray-100 dark:border-neutral-800">
         <button
-          className="flex-1 py-3.5 text-sm font-medium text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+          className="flex-1 py-3 text-sm font-medium text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
           onClick={handleClose}
         >
           Close
         </button>
         <button
-          className="flex-1 flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-700 dark:text-neutral-200 border-l border-gray-100 dark:border-neutral-800 hover:bg-gray-50 dark:hover:bg-neutral-800 transition-colors"
+          className="flex-1 flex items-center justify-center gap-1.5 py-3 text-sm font-medium bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white transition-colors"
           onClick={handlePlay}
         >
           <IoPlay className="text-base" />
           Play
-        </button>
-        <button
-          className="flex-1 py-3.5 text-sm font-medium bg-black dark:bg-neutral-100 text-white dark:text-neutral-900 hover:bg-gray-800 dark:hover:bg-white transition-colors"
-          onClick={handleConvertFormat}
-        >
-          Convert format
         </button>
       </div>
     </div>

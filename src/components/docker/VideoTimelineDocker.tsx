@@ -128,6 +128,8 @@ import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues,
 import { CutSoundPlayer } from "../../utils/cutSoundPlayer";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
+import StudioPolishPopover from "./StudioPolishPopover";
+import VideoToDocModal from "../video/VideoToDocModal";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
 import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
@@ -1036,10 +1038,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // After the canvas has taken (the panel lays its cells out for it).
     if (intent.split) window.setTimeout(() => openSplitPanel(null), 60);
     if (intent.shorts) setShortsOpen(true);
+    if (intent.studioPolish) {
+      window.setTimeout(() => {
+        const rect = studioPolishButtonRef.current?.getBoundingClientRect();
+        setStudioPolishAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+      }, 80);
+    }
+    if (intent.openCaptions) {
+      window.setTimeout(() => {
+        setCaptionsAnchor({ left: window.innerWidth / 2 - 160, top: 120 });
+      }, 80);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intentReady, file.path]);
   // Highlight intro builder (HighlightIntroPanel).
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
+  // 1-Click Studio Polish (StudioPolishPopover) and Turn into Doc modal.
+  const [studioPolishAnchor, setStudioPolishAnchor] = useState<{ left: number; top: number } | null>(null);
+  const studioPolishButtonRef = useRef<HTMLButtonElement>(null);
+  const [videoToDocOpen, setVideoToDocOpen] = useState(false);
   // The music & sound-effects library (MusicLibraryPanel).
   const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
   // The mixer (MixerPanel), and the strip it opens with its effects showing.
@@ -1099,6 +1116,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     transcript: transcriptAnchor !== null,
     music: musicAnchor !== null,
     mixer: mixerAnchor !== null,
+    studioPolish: studioPolishAnchor !== null,
   };
   const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
   useEffect(() => {
@@ -1115,8 +1133,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (opened !== "transcript") setTranscriptAnchor(null);
     if (opened !== "music") setMusicAnchor(null);
     if (opened !== "mixer") setMixerAnchor(null);
+    if (opened !== "studioPolish") setStudioPolishAnchor(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer]);
+  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer, dockedPanelsOpen.studioPolish]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
   const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
@@ -4463,6 +4482,24 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
 
         <div className="flex items-center gap-2 shrink-0">
           <button
+            ref={studioPolishButtonRef}
+            type="button"
+            data-studio-polish-button
+            title="1-Click Studio Polish - screen frame, pro voice audio, trim dead air & click auto-zoom"
+            disabled={!editStore.editState || editStore.clips.length === 0}
+            onClick={(e) => {
+              if (studioPolishAnchor) return setStudioPolishAnchor(null);
+              const rect = e.currentTarget.getBoundingClientRect();
+              setStudioPolishAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-default ${
+              studioPolishAnchor ? "text-neutral-950 bg-amber-400" : "text-amber-200 bg-amber-500/15 hover:bg-amber-500/25"
+            }`}
+          >
+            <IoSparkles size={13} />
+            Polish
+          </button>
+          <button
             type="button"
             title="Add a scene - motion graphics that animate from beat to beat: titles, lists, live numbers, diagrams"
             onClick={() => void addScene()}
@@ -5996,6 +6033,45 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           );
         })()}
 
+      {studioPolishAnchor && editStore.editState && (
+        <StudioPolishPopover
+          anchor={studioPolishAnchor}
+          clips={editStore.clips}
+          primarySourcePath={file.path}
+          screenStyle={editStore.screenStyle}
+          onScreenStyle={editStore.setScreenStyle}
+          soundProInput={soundProInput}
+          applySoundPro={editStore.applySoundPro}
+          onLoudnessChange={setExportLoudness}
+          onTrimSilence={editStore.trimSilenceForClip}
+          onApplyAutoZoom={editStore.applyAutoZoomAtClicks}
+          hasEditablePointer={hasEditablePointer}
+          shortcutCount={shortcutCount}
+          onPointerStyle={editStore.updatePointerStyle}
+          onKeystrokeStyle={editStore.updateKeystrokeStyle}
+          onTurnIntoDoc={() => {
+            setStudioPolishAnchor(null);
+            setVideoToDocOpen(true);
+          }}
+          onClose={() => setStudioPolishAnchor(null)}
+        />
+      )}
+
+      {videoToDocOpen && (
+        <VideoToDocModal
+          sourceVideoPath={file.path}
+          fileName={file.name}
+          durationSec={totalOutputDuration}
+          clips={editStore.clips}
+          captions={editStore.captions}
+          sourcePaths={captionSourcePaths}
+          chapters={outputChapters(editStore.clips, editStore.chapters).map((c) => ({ time: c.time, label: c.label }))}
+          lines={captionLines.map((l) => ({ start: l.start, end: l.end, text: l.words.map((w) => w.text).join(" ") }))}
+          onTranscriptGenerated={(language, transcripts) => editStore.setCaptionTranscripts(language, transcripts, { captionsEnabled: false })}
+          onClose={() => setVideoToDocOpen(false)}
+        />
+      )}
+
       {soundProAnchor && editStore.editState && (
         <SoundProPopover
           anchor={soundProAnchor}
@@ -6234,6 +6310,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           primarySourcePath={file.path}
           onChange={editStore.setChapters}
           onSeek={seekToOutputTime}
+          onTurnIntoDoc={() => {
+            setChaptersAnchor(null);
+            setVideoToDocOpen(true);
+          }}
           onClose={() => setChaptersAnchor(null)}
         />
       )}
@@ -6266,6 +6346,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onEditLine={editStore.editCaptionLine}
           onClear={editStore.clearCaptions}
           onSeekLine={(line) => onSeek(line.sourcePath, line.sourceStart)}
+          onTurnIntoDoc={() => {
+            setCaptionsAnchor(null);
+            setVideoToDocOpen(true);
+          }}
           onClose={() => setCaptionsAnchor(null)}
         />
       )}

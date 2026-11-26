@@ -28,6 +28,7 @@ import {
   IoPencilOutline,
   IoFilmOutline,
   IoCheckmark,
+  IoPlayOutline,
 } from "react-icons/io5";
 import { MdFlip, MdOutlineClosedCaption } from "react-icons/md";
 
@@ -49,6 +50,7 @@ export interface EditorMenuBarProps {
   onOpenFrameInDesign?: () => void;
   onShowInFolder?: () => void;
   onExport?: () => void;
+  onSwitchToWatch?: () => void;
   onClose?: () => void;
   onUndo?: () => void;
   onRedo?: () => void;
@@ -105,6 +107,7 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
   onOpenFrameInDesign,
   onShowInFolder,
   onExport,
+  onSwitchToWatch,
   onClose,
   onUndo,
   onRedo,
@@ -359,6 +362,18 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
                 </button>
               )}
               <div className="border-t border-white/10 my-1" />
+              {onSwitchToWatch && (
+                <button
+                  type="button"
+                  className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-blue-600 hover:text-white"
+                  onClick={() => triggerAction(onSwitchToWatch)}
+                >
+                  <span className="flex items-center gap-2">
+                    <IoPlayOutline size={14} /> Switch to Watch Mode
+                  </span>
+                  <span className="text-[10px] text-white/40">E</span>
+                </button>
+              )}
               {onExport && (
                 <button
                   type="button"
@@ -763,6 +778,10 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
 
       {/* File Name & Duration in front of the menu */}
       <div className="flex items-center gap-2 min-w-0 flex-1">
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
+          <IoCutOutline size={10} />
+          Editor
+        </span>
         <IoFilmOutline size={14} className="text-blue-400 shrink-0" />
         {isRenaming ? (
           <div className="flex items-center gap-1">
@@ -843,6 +862,18 @@ export const EditorMenuBar: React.FC<EditorMenuBarProps> = ({
         >
           <IoArrowRedo size={14} />
         </button>
+
+        {onSwitchToWatch && (
+          <button
+            type="button"
+            onClick={onSwitchToWatch}
+            title="Exit editor and return to Watch mode (E)"
+            className="ml-1 px-2 py-1 rounded bg-white/[0.08] hover:bg-white/[0.15] text-white/85 hover:text-white text-xs font-medium flex items-center gap-1 transition-colors"
+          >
+            <IoPlayOutline size={13} />
+            <span>Watch</span>
+          </button>
+        )}
 
         {onExport && (
           <button

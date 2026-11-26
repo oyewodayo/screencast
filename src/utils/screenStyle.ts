@@ -58,6 +58,12 @@ export const SCREEN_GRADIENTS: GradientSpec[] = [
   { id: "forest", label: "Forest", angle: 150, stops: ["#052e16", "#166534", "#65a30d"], glows: [{ x: 0.85, y: 0.15, r: 0.45, color: "#bef264", alpha: 0.3 }] },
   { id: "graphite", label: "Graphite", angle: 145, stops: ["#0b0f19", "#1f2937", "#374151"], glows: [{ x: 0.5, y: 0.0, r: 0.7, color: "#64748b", alpha: 0.35 }] },
   { id: "midnight", label: "Midnight", angle: 135, stops: ["#020617", "#1e293b", "#312e81"], glows: [{ x: 0.85, y: 0.15, r: 0.5, color: "#6366f1", alpha: 0.4 }] },
+  { id: "cobalt", label: "Cobalt", angle: 135, stops: ["#0f172a", "#1d4ed8", "#06b6d4"], glows: [{ x: 0.2, y: 0.85, r: 0.55, color: "#38bdf8", alpha: 0.45 }] },
+  { id: "rose", label: "Velvet", angle: 140, stops: ["#4c0519", "#be123c", "#f43f5e"], glows: [{ x: 0.85, y: 0.15, r: 0.5, color: "#fda4af", alpha: 0.45 }] },
+  { id: "obsidian", label: "Obsidian", angle: 155, stops: ["#09090b", "#18181b", "#27272a"], glows: [{ x: 0.8, y: 0.15, r: 0.6, color: "#818cf8", alpha: 0.25 }] },
+  { id: "ember", label: "Ember", angle: 135, stops: ["#431407", "#9a3412", "#ea580c"], glows: [{ x: 0.15, y: 0.2, r: 0.55, color: "#fdba74", alpha: 0.4 }] },
+  { id: "glacial", label: "Glacial", angle: 150, stops: ["#e2e8f0", "#cbd5e1", "#93c5fd"], glows: [{ x: 0.2, y: 0.15, r: 0.55, color: "#ffffff", alpha: 0.6 }] },
+  { id: "sage", label: "Sage", angle: 145, stops: ["#14532d", "#3f6212", "#84cc16"], glows: [{ x: 0.85, y: 0.85, r: 0.55, color: "#ecfccb", alpha: 0.35 }] },
 ];
 
 export const SCREEN_COLOR_SWATCHES = ["#0f172a", "#f8fafc", "#e5e7eb", "#111827", "#1e3a8a", "#7c3aed", "#db2777", "#f59e0b", "#059669", "#0ea5e9"];

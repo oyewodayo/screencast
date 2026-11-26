@@ -10,7 +10,7 @@ import React, { useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { IoClose, IoDocumentAttachOutline, IoRefresh, IoTrashOutline } from "react-icons/io5";
+import { IoClose, IoDocumentAttachOutline, IoDocumentTextOutline, IoRefresh, IoTrashOutline } from "react-icons/io5";
 import { MdClosedCaptionOff } from "react-icons/md";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
 import { DOCKED_PANEL_CLASS, useToolPanelHost, useDockSnap, useFloatingDismiss } from "./ToolPanelHost";
@@ -36,6 +36,7 @@ interface CaptionsPanelProps {
   onEditLine: (line: CaptionLine, text: string) => void;
   onClear: () => void;
   onSeekLine: (line: CaptionLine) => void;
+  onTurnIntoDoc?: () => Promise<void> | void;
   onClose: () => void;
 }
 
@@ -53,6 +54,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
   onEditLine,
   onClear,
   onSeekLine,
+  onTurnIntoDoc,
   onClose,
 }) => {
   const { ref: popoverRef, position } = useClampedPopoverPosition(anchor);
@@ -60,6 +62,7 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
   const dockHost = useToolPanelHost();
   const [language, setLanguage] = useState<string>(captions?.language ?? "auto");
   const [transcriptOnly, setTranscriptOnly] = useTranscriptOnly();
+  const [creatingDoc, setCreatingDoc] = useState(false);
 
   // A click elsewhere closes it - unless that click opened the sidebar, which docks it instead,
   // gliding into place. Docked, it stays open until its X / toolbar button closes it.
@@ -241,6 +244,28 @@ const CaptionsPanel: React.FC<CaptionsPanelProps> = ({
                   exportBaseName={fileName(primarySourcePath).replace(/\.[^.]+$/, "")}
                   onError={setError}
                 />
+              )}
+
+              {onTurnIntoDoc && lines.length > 0 && (
+                <button
+                  type="button"
+                  disabled={creatingDoc || !!generating}
+                  onClick={async () => {
+                    setCreatingDoc(true);
+                    setError(null);
+                    try {
+                      await onTurnIntoDoc();
+                    } catch (err) {
+                      setError(`Couldn't create doc: ${err}`);
+                    } finally {
+                      setCreatingDoc(false);
+                    }
+                  }}
+                  className="flex items-center justify-center gap-1.5 w-full px-2.5 py-1.5 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 ring-1 ring-emerald-400/25 text-[11px] font-medium text-emerald-200 disabled:opacity-40 transition-colors"
+                >
+                  <IoDocumentTextOutline size={13} />
+                  {creatingDoc ? "Creating Briefcast Doc…" : "Turn transcript into Briefcast Doc"}
+                </button>
               )}
 
               <div className="pt-2 border-t border-white/10">{importRow}</div>
