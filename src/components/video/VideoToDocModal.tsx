@@ -2,21 +2,28 @@
 //
 // Interactive modal for "Turn into Briefcast Doc": lets the user name the doc, choose whether to
 // transcribe offline automatically (if no captions exist yet), capture keyframe chapter
-// screenshots, and include the full cleaned transcript — with live step-by-step progress.
-import React, { useEffect, useRef, useState } from "react";
+// screenshots, and include the full cleaned transcript — with live step-by-step progress AND
+// Minimize-to-background support via videoToDocJob.ts so long videos never block your workflow.
+import React, { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
-import { IoCheckmarkCircle, IoClose, IoDocumentTextOutline, IoImagesOutline, IoSparkles } from "react-icons/io5";
+import { IoCheckmarkCircle, IoClose, IoDocumentTextOutline, IoImagesOutline, IoRemove, IoSparkles } from "react-icons/io5";
 import { CAPTIONS_LANGUAGE_OPTIONS } from "../../utils/videoUtils";
 import {
-  createDocFromVideo,
   humanizeVideoTitle,
-  openBriefcastDoc,
   type VideoDocChapter,
-  type VideoToDocProgress,
   type VideoTranscriptLine,
 } from "../../utils/videoToDoc";
+import {
+  cancelVideoToDocJob,
+  dismissVideoToDocJob,
+  expandVideoToDocJob,
+  minimizeVideoToDocJob,
+  skipVideoToDocTranscription,
+  startVideoToDocJob,
+  useVideoToDocJob,
+} from "../../utils/videoToDocJob";
 import type { CaptionTrack, CaptionWord, Clip } from "../../utils/videoEditTypes";
+import { loadStudyNotes, type StudyNote } from "../../utils/videoStudyNotes";
 
 interface VideoToDocModalProps {
   sourceVideoPath: string;
@@ -27,6 +34,7 @@ interface VideoToDocModalProps {
   sourcePaths?: string[];
   chapters?: VideoDocChapter[];
   lines?: VideoTranscriptLine[];
+  studyNotes?: StudyNote[];
   watchUrl?: string | null;
   onTranscriptGenerated?: (language: string, transcripts: Record<string, CaptionWord[]>) => void;
   onClose: () => void;
@@ -41,6 +49,7 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
   sourcePaths,
   chapters = [],
   lines = [],
+  studyNotes: initialStudyNotes,
   watchUrl,
   onTranscriptGenerated,
   onClose,
@@ -50,46 +59,73 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
   const [autoTranscribe, setAutoTranscribe] = useState(true);
   const [captureScreenshots, setCaptureScreenshots] = useState(true);
   const [includeTranscript, setIncludeTranscript] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState<VideoToDocProgress | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const [resolvedStudyNotes, setResolvedStudyNotes] = useState<StudyNote[]>(initialStudyNotes ?? []);
+
+  const job = useVideoToDocJob();
+  const busy = job?.status === "running";
+  const progress = busy ? job.progress : null;
+  const error = job?.status === "error" ? job.error ?? null : null;
+
+  // If the user re-opens this modal while a job is already running in the background, bring it back
+  // into expanded view so the modal owns its progress display cleanly.
+  useEffect(() => {
+    if (job?.status === "running" && job.minimized) {
+      expandVideoToDocJob();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (initialStudyNotes && initialStudyNotes.length > 0) {
+      setResolvedStudyNotes(initialStudyNotes);
+      return;
+    }
+    let cancelled = false;
+    void loadStudyNotes(sourceVideoPath).then((sidecar) => {
+      if (!cancelled) setResolvedStudyNotes(sidecar.notes);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceVideoPath, initialStudyNotes]);
 
   const hasTranscript = lines.length > 0;
   const wordCount = lines.reduce((sum, l) => sum + l.text.trim().split(/\s+/).filter(Boolean).length, 0);
+  const slideSnapCount = resolvedStudyNotes.filter((n) => !!n.snapshotDataUrl).length;
 
-  const handleCancel = () => {
+  const handleMinimize = () => {
     if (busy) {
-      abortRef.current?.abort();
-      void invoke("cancel_transcription").catch(() => {});
-      setBusy(false);
-      setProgress(null);
-      return;
+      minimizeVideoToDocJob();
     }
     onClose();
   };
 
-  const handleSkipTranscription = () => {
-    void invoke("cancel_transcription").catch(() => {});
+  const handleCancel = () => {
+    if (busy) {
+      cancelVideoToDocJob();
+      return;
+    }
+    if (job?.status === "error") dismissVideoToDocJob();
+    onClose();
   };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") handleCancel();
+      if (e.key === "Escape") {
+        if (busy) handleMinimize();
+        else handleCancel();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy, onClose]);
 
-  const handleGenerate = async () => {
+  const handleGenerate = () => {
     if (busy) return;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setBusy(true);
-    setError(null);
-    setProgress({ stage: "analyzing", label: "Starting…", percent: null });
-    try {
-      const result = await createDocFromVideo(sourceVideoPath, {
+    void startVideoToDocJob(
+      sourceVideoPath,
+      {
         fileName,
         title: title.trim() || humanizeVideoTitle(fileName),
         durationSec,
@@ -98,32 +134,26 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
         sourcePaths,
         chapters,
         lines,
+        studyNotes: resolvedStudyNotes,
         watchUrl,
         autoTranscribe: !hasTranscript && autoTranscribe,
         language,
         captureScreenshots,
         includeTranscript,
-        signal: controller.signal,
-        onProgress: setProgress,
         onTranscriptGenerated,
-      });
-      if (controller.signal.aborted) return;
-      openBriefcastDoc(result.id);
-      onClose();
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      setError(err instanceof Error ? err.message : String(err));
-      setBusy(false);
-      setProgress(null);
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-    }
+      },
+      { onFinishedWhileOpen: onClose }
+    );
   };
 
   return createPortal(
     <div
       className="fixed inset-0 z-[85] flex items-center justify-center bg-black/55 backdrop-blur-xs"
-      onPointerDown={(e) => e.target === e.currentTarget && !busy && onClose()}
+      onPointerDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (busy) handleMinimize();
+        else handleCancel();
+      }}
     >
       <div className="w-[440px] max-w-[94vw] rounded-2xl bg-neutral-900 ring-1 ring-white/10 shadow-2xl text-white/90 p-5 flex flex-col gap-4">
         <div className="flex items-center gap-2.5">
@@ -136,12 +166,21 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
               {fileName}
             </p>
           </div>
+          {busy && (
+            <button
+              type="button"
+              title="Minimize and keep running in the background"
+              onClick={handleMinimize}
+              className="p-1 rounded-md text-white/60 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              <IoRemove size={16} />
+            </button>
+          )}
           <button
             type="button"
-            title="Close"
-            disabled={busy}
-            onClick={onClose}
-            className="p-1 rounded-md text-white/55 hover:text-white hover:bg-white/10 disabled:opacity-30"
+            title={busy ? "Minimize to background" : "Close"}
+            onClick={busy ? handleMinimize : handleCancel}
+            className="p-1 rounded-md text-white/55 hover:text-white hover:bg-white/10 transition-colors"
           >
             <IoClose size={16} />
           </button>
@@ -158,6 +197,17 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
             className="w-full rounded-lg bg-white/[0.07] px-3 py-2 text-xs text-white outline-none ring-1 ring-white/10 focus:ring-emerald-400/60"
           />
         </label>
+
+        {/* Study notes readiness badge (if notes exist from Study Mode) */}
+        {resolvedStudyNotes.length > 0 && (
+          <div className="rounded-xl bg-emerald-500/10 ring-1 ring-emerald-400/25 px-3 py-2 flex items-center gap-2 text-xs text-emerald-200">
+            <IoCheckmarkCircle size={15} className="shrink-0 text-emerald-400" />
+            <span>
+              <strong>{resolvedStudyNotes.length}</strong> study {resolvedStudyNotes.length === 1 ? "note" : "notes"}
+              {slideSnapCount > 0 ? ` & ${slideSnapCount} captured ${slideSnapCount === 1 ? "slide" : "slides"}` : ""} will be embedded at the top of your Doc.
+            </span>
+          </div>
+        )}
 
         {/* Transcript readiness status */}
         <div className="rounded-xl bg-white/[0.04] p-3 flex flex-col gap-2">
@@ -249,10 +299,10 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
                 style={progress.percent !== null ? { width: `${Math.max(4, Math.min(100, progress.percent))}%` } : undefined}
               />
             </div>
-            {(progress.stage === "transcribing" || progress.stage === "downloading-model") && captureScreenshots && (
+            {(progress.stage === "transcribing" || progress.stage === "downloading-model") && (job?.captureScreenshots ?? captureScreenshots) && (
               <button
                 type="button"
-                onClick={handleSkipTranscription}
+                onClick={skipVideoToDocTranscription}
                 className="self-end text-[10.5px] text-white/55 hover:text-emerald-300 underline-offset-2 hover:underline"
               >
                 Skip transcription &amp; build visual doc now
@@ -275,15 +325,27 @@ const VideoToDocModal: React.FC<VideoToDocModalProps> = ({
           >
             {busy ? "Stop & Cancel" : "Cancel"}
           </button>
-          <button
-            type="button"
-            disabled={busy || !title.trim()}
-            onClick={() => void handleGenerate()}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-40 transition-colors"
-          >
-            <IoSparkles size={13} />
-            {busy ? "Generating…" : !hasTranscript && autoTranscribe ? "Transcribe & Create Doc" : "Create Briefcast Doc"}
-          </button>
+          {busy ? (
+            <button
+              type="button"
+              onClick={handleMinimize}
+              title="Close this popup and let the doc finish in the background"
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-xs font-semibold transition-colors"
+            >
+              <IoRemove size={14} />
+              Run in background
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={!title.trim()}
+              onClick={handleGenerate}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-40 transition-colors"
+            >
+              <IoSparkles size={13} />
+              {!hasTranscript && autoTranscribe ? "Transcribe & Create Doc" : "Create Briefcast Doc"}
+            </button>
+          )}
         </div>
       </div>
     </div>,

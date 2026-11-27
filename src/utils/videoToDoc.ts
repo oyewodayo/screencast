@@ -19,6 +19,7 @@ import { markdownToHtml } from "./docFileImport";
 import { getDocContentExtensions } from "./docSchemaExtensions";
 import { formatChapterTimestamp, stem, STOPWORDS, suggestChapters, tokenize } from "./videoChapters";
 import type { CaptionTrack, CaptionWord, Clip } from "./videoEditTypes";
+import { loadStudyNotes, studyNotesToMarkdown, type StudyNote } from "./videoStudyNotes";
 
 export const OPEN_BRIEFCAST_DOC_EVENT = "briefcast:open-doc";
 
@@ -53,6 +54,8 @@ export interface VideoToDocInput {
   watchUrl?: string | null;
   includeTranscript?: boolean;
   screenshots?: VideoDocScreenshot[];
+  studyNotes?: StudyNote[];
+  studyNoteSnapshotUrls?: Map<string, string>;
   createdAt?: Date;
 }
 
@@ -302,6 +305,18 @@ export function buildVideoDocMarkdown(input: VideoToDocInput): GeneratedVideoDoc
 
   if (input.watchUrl?.trim()) {
     parts.push(`> Watch the video: [${input.watchUrl.trim()}](${input.watchUrl.trim()})`);
+  }
+
+  // My Study Notes (if the user took notes in Study Mode, place them front and center!)
+  if (input.studyNotes && input.studyNotes.length > 0) {
+    const notesMd = studyNotesToMarkdown(input.studyNotes, {
+      includeHeader: false,
+      snapshotUrlByNoteId: input.studyNoteSnapshotUrls,
+    });
+    if (notesMd) {
+      parts.push("## My Study Notes");
+      parts.push(notesMd);
+    }
   }
 
   // Summary section (real extracted summary whenever speech exists)
@@ -590,6 +605,34 @@ export async function createDocFromVideo(
       }
     }
 
+    // Step 4b: Load Study Mode notes (from options or `.notes.json`) & persist any captured slide frames into the doc.
+    const studyNotes: StudyNote[] =
+      options.studyNotes && options.studyNotes.length > 0
+        ? options.studyNotes
+        : (await loadStudyNotes(sourceVideoPath)).notes;
+    const studyNoteSnapshotUrls = new Map<string, string>();
+    for (const note of studyNotes) {
+      if (!note.snapshotDataUrl) continue;
+      const commaIdx = note.snapshotDataUrl.indexOf(",");
+      if (commaIdx < 0) continue;
+      try {
+        const b64 = note.snapshotDataUrl.slice(commaIdx + 1);
+        const binary = atob(b64);
+        const bytes = new Array<number>(binary.length);
+        for (let k = 0; k < binary.length; k++) bytes[k] = binary.charCodeAt(k);
+        // eslint-disable-next-line no-await-in-loop
+        const savedPath = await invoke<string>("save_doc_image", {
+          id,
+          assetId: crypto.randomUUID(),
+          extension: "jpg",
+          bytes,
+        });
+        studyNoteSnapshotUrls.set(note.id, convertFileSrc(savedPath));
+      } catch (err) {
+        console.warn(`Skipping study note snapshot for ${note.id}:`, err);
+      }
+    }
+
     // Step 5: Assemble Markdown -> HTML -> ProseMirror -> Yjs & link doc to video.
     onProgress?.({ stage: "saving", label: "Formatting Briefcast Doc…", percent: 100 });
     const generated = buildVideoDocMarkdown({
@@ -599,6 +642,8 @@ export async function createDocFromVideo(
       chapters,
       lines,
       screenshots,
+      studyNotes,
+      studyNoteSnapshotUrls,
       createdAt: options.createdAt ?? new Date(),
     });
     const html = markdownToHtml(generated.markdown);

@@ -82,6 +82,7 @@ import { fileRef, normalizePath, type ItemRef } from "../utils/itemLinks";
 import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/WhiteboardWorkspace";
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
+import VideoToDocJobChip from "../components/video/VideoToDocJobChip";
 import HomeWorkspace from "../components/HomeWorkspace";
 import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
 import SidebarHeader from "../components/sidebar/SidebarHeader";
@@ -5819,6 +5820,7 @@ const setScreen = () => {
           onOpen={(job) => job.resultPath && void loadFileForPlayback(job.resultPath, job.resultPath.split(/[\\/]/).pop() ?? job.title)}
           onShare={setShareJob}
         />
+        <VideoToDocJobChip />
         {shareJob?.resultPath && <SharePanel filePath={shareJob.resultPath} meta={shareJob.share} durationSec={shareJob.durationSec} onClose={() => setShareJob(null)} />}
         {message && <Toast key={`msg-${message}`} message={message} variant="info" onDismiss={() => setMessage("")} />}
         {error && <Toast key={`err-${error}`} message={error} variant="error" onDismiss={() => setError("")} />}

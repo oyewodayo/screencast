@@ -13,7 +13,7 @@ use std::{
 };
 
 // Every companion-file suffix the app writes (see each service's own sidecar_path_for).
-pub const SIDECAR_SUFFIXES: &[&str] = &[".edits.json", ".chapters.json", ".imageedit.json", ".annotations.json", ".pointer.json"];
+pub const SIDECAR_SUFFIXES: &[&str] = &[".edits.json", ".chapters.json", ".notes.json", ".imageedit.json", ".annotations.json", ".pointer.json"];
 
 // Companions are hidden in Explorer (the Windows "hidden" attribute): the library folder shows the
 // files people made, not the app's bookkeeping beside each one - yet each companion still sits next

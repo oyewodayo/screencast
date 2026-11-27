@@ -323,6 +323,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         services::video_edits::read_video_project,
         services::video_edits::save_video_chapters,
         services::video_edits::load_video_chapters,
+        services::video_edits::save_video_notes,
+        services::video_edits::load_video_notes,
         services::trash::move_to_trash,
         services::sidecars::prepare_library_tidy,
         services::trash::list_trash,
