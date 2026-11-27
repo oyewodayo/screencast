@@ -334,6 +334,12 @@ pub(crate) enum CaptureTarget {
         width: i32,
         height: i32,
     },
+    Region {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     Window {
         // The picked window's handle ("window:<hwnd>") - what Windows captures by. None when it
         // didn't parse; the title is then the only way to find it (and the only way on Linux and
@@ -353,10 +359,24 @@ pub(crate) enum CaptureTarget {
 // reject. Falls back to FullScreen (rather than erroring the whole capture out) if a monitor id
 // can't be resolved — a screen recording that captures more than intended beats one that
 // silently doesn't start at all.
+pub(crate) fn parse_region_spec(screen_size: &str) -> Option<(i32, i32, i32, i32)> {
+    let raw = screen_size.strip_prefix("region:")?;
+    let mut parts = raw.split(',').map(|s| s.trim().parse::<i32>().ok());
+    let x = parts.next()??;
+    let y = parts.next()??;
+    let w = parts.next()?? & !1;
+    let h = parts.next()?? & !1;
+    (w >= 64 && h >= 64).then_some((x, y, w, h))
+}
+
 pub(crate) fn resolve_capture_target(
     app_handle: &AppHandle,
     form_data: &FormData,
 ) -> CaptureTarget {
+    if let Some((x, y, width, height)) = parse_region_spec(&form_data.screen_size) {
+        return CaptureTarget::Region { x, y, width, height };
+    }
+
     if let Some(monitor_id) = form_data.screen_size.strip_prefix("monitor:") {
         if let Ok(monitors) = crate::commands::window_capture::get_monitors(app_handle.clone()) {
             if let Some(m) = monitors.iter().find(|m| m.id == monitor_id) {
@@ -414,6 +434,12 @@ pub(crate) fn capture_region_bounds(target: &CaptureTarget) -> Option<(i32, i32,
             y,
             width,
             height,
+        }
+        | CaptureTarget::Region {
+            x,
+            y,
+            width,
+            height,
         } => Some((*x, *y, *width, *height)),
         CaptureTarget::Window { hwnd, title, title_bar } => {
             crate::commands::window_capture::win::get_window_rect(*hwnd, title, *title_bar).ok()
@@ -437,7 +463,8 @@ fn resolve_tracking_bounds(app_handle: &AppHandle, target: &CaptureTarget) -> Op
                 (primary.width > 0 && primary.height > 0)
                     .then_some((primary.x, primary.y, primary.width, primary.height))
             }
-            CaptureTarget::Monitor { x, y, width, height } => {
+            CaptureTarget::Monitor { x, y, width, height }
+            | CaptureTarget::Region { x, y, width, height } => {
                 (*width > 0 && *height > 0).then_some((*x, *y, *width, *height))
             }
             CaptureTarget::Window { title, .. } => {
@@ -461,7 +488,8 @@ fn resolve_tracking_bounds(app_handle: &AppHandle, target: &CaptureTarget) -> Op
                 let (w, h) = (max_x - min_x, max_y - min_y);
                 (w > 0 && h > 0).then_some((min_x, min_y, w, h))
             }
-            CaptureTarget::Monitor { x, y, width, height } => {
+            CaptureTarget::Monitor { x, y, width, height }
+            | CaptureTarget::Region { x, y, width, height } => {
                 (*width > 0 && *height > 0).then_some((*x, *y, *width, *height))
             }
             CaptureTarget::Window { title, .. } => {

@@ -83,6 +83,13 @@ import WhiteboardWorkspace, { WhiteboardScreen } from "../components/whiteboard/
 import MindmapWorkspace, { MindmapScreen } from "../components/mindmap/MindmapWorkspace";
 import VideoEditorHome from "../components/video/VideoEditorHome";
 import VideoToDocJobChip from "../components/video/VideoToDocJobChip";
+import {
+  clearActiveRecordingSession,
+  getActiveRecordingSession,
+  setActiveRecordingSession,
+  updateActiveRecordingSession,
+  useActiveRecordingSession,
+} from "../utils/activeRecordingCoordinator";
 import HomeWorkspace from "../components/HomeWorkspace";
 import SidebarFileTree, { SidebarSkeleton } from "../components/sidebar/SidebarFileTree";
 import SidebarHeader from "../components/sidebar/SidebarHeader";
@@ -348,6 +355,10 @@ const Dashboard = () => {
   // True while a stop is in flight, so repeated clicks on Stop (or the hotkey) while the backend is
   // still finalizing don't each run stop_recording and open their own completion popup.
   const isStoppingRef = useRef(false);
+  // Active recording owned by a scoped presenter (e.g. Whiteboard Presentation Mode) so the main
+  // bottom bar and global hotkeys reflect it live and delegate Stop/Pause cleanly without colliding.
+  const activeRecordingSession = useActiveRecordingSession();
+  const externalRecordingSession = activeRecordingSession && activeRecordingSession.owner !== "main" ? activeRecordingSession : null;
 
   useEffect(
     () => subscribePhoneCamera((s) => setIsPhoneCameraConnected(s.status === "live")),
@@ -1802,6 +1813,15 @@ const setScreen = () => {
       cancelCountdown();
       return;
     }
+    // If a scoped presentation recorder (e.g. Whiteboard Presentation Mode) already owns the
+    // backend ffmpeg session, delegate Stop cleanly instead of colliding with start_recording.
+    if (formData.record_type !== "c") {
+      const existing = getActiveRecordingSession();
+      if (existing && existing.owner !== "main") {
+        await existing.stop();
+        return;
+      }
+    }
     // Read at the moment of recording rather than threaded through every caller - the panel and
     // the record hotkey both land here.
     const recordingPrefs = loadSettings();
@@ -1882,6 +1902,16 @@ const setScreen = () => {
         setPauseStartedAt(null);
         setPausedAccumulatedMs(0);
         setError("");
+        setActiveRecordingSession({
+          owner: "main",
+          startedAt: startTime,
+          isPaused: false,
+          pauseStartedAt: null,
+          pausedAccumulatedMs: 0,
+          stop: () => handleStopRecording(),
+          pause: () => handlePauseRecording(),
+          resume: () => handleResumeRecording(),
+        });
 
         // Create the overlay window, but don't show it - it stays hidden until the user
         // asks for it via the toggle shortcut below, rather than popping up unasked-for
@@ -2008,11 +2038,17 @@ const setScreen = () => {
   }, []);
 
   let handleStopRecording = async () => {
+    const active = getActiveRecordingSession();
+    if (active && active.owner !== "main") {
+      await active.stop();
+      return;
+    }
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
     try {
       await stopRecordingOnce();
     } finally {
+      clearActiveRecordingSession("main");
       isStoppingRef.current = false;
     }
   };
@@ -2093,6 +2129,11 @@ const setScreen = () => {
   // capture if system audio is on) at the backend level, and freezes this window's own elapsed
   // timer at the moment of pause by recording when it happened rather than resetting it.
   const handlePauseRecording = async () => {
+    const active = getActiveRecordingSession();
+    if (active && active.owner !== "main") {
+      await active.pause?.();
+      return;
+    }
     try {
       await invoke("pause_recording");
       phoneCaptureRef.current?.pause();
@@ -2100,6 +2141,7 @@ const setScreen = () => {
       setIsPaused(true);
       setPauseStartedAt(now);
       setMessage("Recording paused");
+      updateActiveRecordingSession("main", { isPaused: true, pauseStartedAt: now, pausedAccumulatedMs });
 
       const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
@@ -2119,6 +2161,11 @@ const setScreen = () => {
   };
 
   const handleResumeRecording = async () => {
+    const active = getActiveRecordingSession();
+    if (active && active.owner !== "main") {
+      await active.resume?.();
+      return;
+    }
     try {
       await invoke("resume_recording");
       phoneCaptureRef.current?.resume();
@@ -2130,6 +2177,7 @@ const setScreen = () => {
       setPauseStartedAt(null);
       setPausedAccumulatedMs(newAccumulatedMs);
       setMessage("Recording resumed");
+      updateActiveRecordingSession("main", { isPaused: false, pauseStartedAt: null, pausedAccumulatedMs: newAccumulatedMs });
 
       const overlayWindow = await WebviewWindow.getByLabel('recording-overlay');
       overlayWindow?.emit('recording-state-update', {
@@ -2493,12 +2541,12 @@ const setScreen = () => {
 	// is refreshed after every render instead (same pattern as selectedFileRef above) so the
 	// hotkey handler, registered once, always acts on the latest values.
 	const recordingHotkeyRef = useRef({
-		isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+		isRecording: isRecording || !!externalRecordingSession, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 		fileName, fileExt,
 	});
 	useEffect(() => {
 		recordingHotkeyRef.current = {
-			isRecording, startRecording: handleStartRecording, stopRecording: handleStopRecording,
+			isRecording: isRecording || !!externalRecordingSession, startRecording: handleStartRecording, stopRecording: handleStopRecording,
 			fileName, fileExt,
 		};
 	});
@@ -2774,9 +2822,12 @@ const setScreen = () => {
 			case "record.toggle":
 				handleRecordingToggleHotkey();
 				break;
-			case "record.pause":
-				if (isRecording) void (isPaused ? handleResumeRecording() : handlePauseRecording());
+			case "record.pause": {
+				const anyRecording = isRecording || !!externalRecordingSession;
+				const anyPaused = isRecording ? isPaused : externalRecordingSession?.isPaused ?? false;
+				if (anyRecording) void (anyPaused ? handleResumeRecording() : handlePauseRecording());
 				break;
+			}
 			case "view.toggle":
 				void switchViewRef.current("toggle");
 				break;
@@ -5710,18 +5761,18 @@ const setScreen = () => {
         windowTitles={windowTitles}
         isMonitoring={isMonitoring}
         setIsMonitoring={setIsMonitoring}
-        isRecording={isRecording}
-        recordingStartTime={recordingStartTime}
+        isRecording={isRecording || !!externalRecordingSession}
+        recordingStartTime={isRecording ? recordingStartTime : externalRecordingSession?.startedAt ?? null}
         handleStartRecording={handleStartRecording}
         handleStopRecording={handleStopRecording}
         onOpenPhoneCamera={() => setShowPhoneCamera(true)}
         isPhoneCameraConnected={isPhoneCameraConnected}
-        isPaused={isPaused}
+        isPaused={isRecording ? isPaused : externalRecordingSession?.isPaused ?? false}
         canSwitchView={canSwitchView}
         viewMode={viewMode}
         onSwitchView={(mode: 'screen' | 'camera') => void switchView(mode)}
-        pauseStartedAt={pauseStartedAt}
-        pausedAccumulatedMs={pausedAccumulatedMs}
+        pauseStartedAt={isRecording ? pauseStartedAt : externalRecordingSession?.pauseStartedAt ?? null}
+        pausedAccumulatedMs={isRecording ? pausedAccumulatedMs : externalRecordingSession?.pausedAccumulatedMs ?? 0}
         handlePauseRecording={handlePauseRecording}
         handleResumeRecording={handleResumeRecording}
         ramInfo={ramInfo}

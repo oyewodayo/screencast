@@ -378,6 +378,10 @@ fn resolve_screen_target(
     video_devices: &[AvDevice],
     form_data: &FormData,
 ) -> Result<(u32, Option<(i32, i32, i32, i32)>), String> {
+    if let Some((x, y, width, height)) = super::parse_region_spec(&form_data.screen_size) {
+        let screen_idx = require_screen_index(video_devices)?;
+        return Ok((screen_idx, Some((width, height, x.max(0), y.max(0)))));
+    }
     if let Some(title) = form_data.screen_size.strip_prefix("window:") {
         let title = if form_data.window_title.is_empty() {
             title

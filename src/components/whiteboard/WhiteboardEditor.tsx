@@ -126,6 +126,8 @@ import {
   SlideImageSaver,
 } from "../../handlers/whiteboardSlidesImport";
 import LinksControl from "../links/LinksControl";
+import { useItemLinks } from "../../contexts/ItemLinksContext";
+import { useWhiteboardPresentationRecorder } from "../../hooks/useWhiteboardPresentationRecorder";
 
 const THUMBNAIL_MAX_DIMENSION = 480;
 
@@ -1188,6 +1190,17 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [presentationDeck]
   );
 
+  const whiteboardLinks = useItemLinks(
+    whiteboardId ? { kind: "whiteboard", id: whiteboardId } : null,
+    doc?.name ?? "Whiteboard"
+  );
+  const presentationRecorder = useWhiteboardPresentationRecorder({
+    whiteboardId,
+    whiteboardTitle: doc?.name ?? "Whiteboard Presentation",
+    presentMode,
+    onLinked: () => void whiteboardLinks?.refresh(),
+  });
+
   const glideToFrame = useCallback(
     (frame: WhiteboardNode) => {
       canvasRef.current?.animateFitToBounds(
@@ -1205,6 +1218,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
       const clamped = Math.max(0, Math.min(presentationDeck.length - 1, index));
       const slide = presentationDeck[clamped];
       setPresentSlideIndex(clamped);
+      presentationRecorder.recordSlideVisit(slide.label);
       if (slide.pageId !== page.id) {
         pendingPresentSlideRef.current = slide;
         store.setActivePage(slide.pageId);
@@ -1218,7 +1232,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         canvasRef.current?.resetView();
       }
     },
-    [page, presentationDeck, store, glideToFrame]
+    [page, presentationDeck, store, glideToFrame, presentationRecorder]
   );
 
   const enterPresentMode = useCallback(
@@ -1245,9 +1259,12 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
   );
 
   const exitPresentMode = useCallback(() => {
+    if (presentationRecorder.isActive) {
+      void presentationRecorder.stop();
+    }
     setPresentMode(false);
     deselectTools();
-  }, [deselectTools]);
+  }, [deselectTools, presentationRecorder]);
 
   const insertTemplateOntoPage = useCallback(
     (templateId: WhiteboardTemplateId) => {
@@ -3035,26 +3052,6 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
             onOpenShortcuts={() => setShortcutsOpen(true)}
           />
         )}
-        {presentMode && (
-          <WhiteboardPresentationBar
-            slides={presentationSlides}
-            activeIndex={presentSlideIndex}
-            laserArmed={laserArmed}
-            penArmed={armedShapeType === "freehand"}
-            onPrev={() => goToPresentSlide(presentSlideIndex - 1)}
-            onNext={() => goToPresentSlide(presentSlideIndex + 1)}
-            onJump={(idx) => goToPresentSlide(idx)}
-            onToggleLaser={() => {
-              setArmedShapeType(null);
-              setLaserArmed((v) => !v);
-            }}
-            onTogglePen={() => {
-              setLaserArmed(false);
-              setArmedShapeType((prev) => (prev === "freehand" ? null : "freehand"));
-            }}
-            onExit={exitPresentMode}
-          />
-        )}
         {commandPaletteOpen && (
           <WhiteboardCommandPalette
             commands={paletteCommands}
@@ -3640,6 +3637,47 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           </div>
         )}
       </div>
+      )}
+      {presentMode && (
+        <WhiteboardPresentationBar
+          slides={presentationSlides}
+          activeIndex={presentSlideIndex}
+          laserArmed={laserArmed}
+          penArmed={armedShapeType === "freehand"}
+          onPrev={() => goToPresentSlide(presentSlideIndex - 1)}
+          onNext={() => goToPresentSlide(presentSlideIndex + 1)}
+          onJump={(idx) => goToPresentSlide(idx)}
+          onToggleLaser={() => {
+            setArmedShapeType(null);
+            setLaserArmed((v) => !v);
+          }}
+          onTogglePen={() => {
+            setLaserArmed(false);
+            setArmedShapeType((prev) => (prev === "freehand" ? null : "freehand"));
+          }}
+          onExit={exitPresentMode}
+          recorder={{
+            status: presentationRecorder.status,
+            externalRecordingActive: presentationRecorder.externalRecordingActive,
+            onStopExternalRecording: presentationRecorder.stopExternalRecording,
+            elapsedMs: presentationRecorder.elapsedMs,
+            micDevices: presentationRecorder.micDevices,
+            selectedMic: presentationRecorder.selectedMic,
+            onSelectMic: presentationRecorder.setSelectedMic,
+            includeSystemAudio: presentationRecorder.includeSystemAudio,
+            onIncludeSystemAudioChange: presentationRecorder.setIncludeSystemAudio,
+            chapterCount: presentationRecorder.chapterCount,
+            error: presentationRecorder.error,
+            onClearError: presentationRecorder.clearError,
+            onStart: () => {
+              const currentSlide = presentationSlides[presentSlideIndex]?.label ?? doc.name;
+              void presentationRecorder.start(canvasHostRef.current, currentSlide);
+            },
+            onPause: () => void presentationRecorder.pause(),
+            onResume: () => void presentationRecorder.resume(),
+            onStop: () => void presentationRecorder.stop(),
+          }}
+        />
       )}
     </div>
   );

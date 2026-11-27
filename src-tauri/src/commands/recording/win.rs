@@ -75,7 +75,7 @@ impl ScreenSource {
         let region = capture_region_bounds(&target);
         let gpu = match region {
             Some(region) if gpu_container => {
-                let exact = !matches!(target, CaptureTarget::Window { .. });
+                let exact = !matches!(target, CaptureTarget::Window { .. } | CaptureTarget::Region { .. });
                 let ffmpeg = ffmpeg_path.to_path_buf();
                 // Normally answered from the startup probe's cache, but the first recording of a
                 // session can land while that probe is still running - never on an async worker.
@@ -273,6 +273,12 @@ fn gdigrab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
     match target {
         CaptureTarget::FullScreen => Ok(vec!["-i".to_string(), "desktop".to_string()]),
         CaptureTarget::Monitor {
+            x,
+            y,
+            width,
+            height,
+        }
+        | CaptureTarget::Region {
             x,
             y,
             width,

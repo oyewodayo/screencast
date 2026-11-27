@@ -75,6 +75,12 @@ fn x11grab_input_args(target: &CaptureTarget) -> Result<Vec<String>, String> {
             y,
             width,
             height,
+        }
+        | CaptureTarget::Region {
+            x,
+            y,
+            width,
+            height,
         } => Ok(vec![
             "-video_size".to_string(),
             format!("{}x{}", width, height),
