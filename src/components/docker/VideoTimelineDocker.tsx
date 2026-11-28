@@ -185,6 +185,7 @@ import {
   ImageClipTiles,
   nearestFrame,
   PreviewHeadLine,
+  ScrollableToolbarStrip,
   SpokeWheel,
   TrackAudioPopover,
   ViewportClampedMenu,
@@ -3448,7 +3449,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             overflow-x-auto below to ever actually kick in - a flex child's default min-width:auto
             otherwise refuses to shrink below its content's own natural width, which would silently
             defeat this and just widen the whole toolbar (or overflow the panel) instead of scrolling. */}
-        <div className="flex items-center gap-0.5 min-w-0">
+        <div className="flex items-center gap-0.5 min-w-0 flex-1">
           <button
             ref={toolModeButtonRef}
             type="button"
@@ -3470,7 +3471,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <ToolSearch toolbarRef={toolbarRef} />
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
-          <div className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 overflow-x-auto">
+          <ScrollableToolbarStrip>
           <ActionButton title="Undo" onClick={editStore.undo} disabled={!editStore.canUndo}>
             <IoArrowUndo size={15} />
           </ActionButton>
@@ -3877,7 +3878,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdOutlineSettingsVoice size={16} />
           </button>
-          </div>
+          </ScrollableToolbarStrip>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
@@ -4436,8 +4437,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       <div className="h-full w-full bg-neutral-800" />
                     )}
                     {/* What's on this clip - look, colour, effect, motion, speed, framing, sound -
-                        as small badges; clicking them opens the clip's effects. */}
+                        as small badges; clicking them opens the clip's effects. Inline Scene clips
+                        omit the blank-frame Muted badge so it never crowds the scene title. */}
                     {!isPending &&
+                      !inlineScene &&
                       (() => {
                         const badges = clipEffectBadges(baseClips[i] ?? clip, {
                           look: (name) => GRADE_LOOKS.find((l) => l.value === name)?.label,

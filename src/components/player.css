@@ -501,25 +501,16 @@ video {
     background: rgba(0, 0, 0, 0.5);
 }
 
-/* VideoTimelineDocker's toolbar tool cluster - scrolls horizontally once the panel gets too
-   narrow to fit every tool button, rather than overflowing the panel or squishing buttons down.
-   A thin bar (the global 10px one in index.css reads as bulky against this row's own 28px-tall
-   buttons) that only takes up space while actually scrollable. */
+/* VideoTimelineDocker's toolbar tool cluster - hides the native horizontal scrollbar so the
+   28px-tall buttons align on the exact vertical centerline of the static tools beside them;
+   ScrollableToolbarStrip draws crisp left/right edge fade + chevron scroll indicators instead. */
+.timeline-toolbar-scroll {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
 .timeline-toolbar-scroll::-webkit-scrollbar {
-    height: 4px;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.15);
-    border-radius: 9999px;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.3);
+    display: none;
 }
 
 /* Smooth transitions */

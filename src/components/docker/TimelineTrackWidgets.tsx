@@ -527,3 +527,83 @@ export const TrackAudioPopover: React.FC<{
   );
 };
 
+// Horizontally scrollable toolbar cluster that stays dead-center aligned with static tools on both
+// sides (no scrollbar height offset) and displays subtle fade + chevron edge indicators whenever
+// hidden tools are available to scroll left or right.
+export const ScrollableToolbarStrip: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [canLeft, setCanLeft] = useState(false);
+  const [canRight, setCanRight] = useState(false);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const sync = () => {
+      const maxScroll = el.scrollWidth - el.clientWidth;
+      setCanLeft(el.scrollLeft > 2);
+      setCanRight(maxScroll - el.scrollLeft > 2);
+    };
+    sync();
+    el.addEventListener("scroll", sync, { passive: true });
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", sync);
+      ro.disconnect();
+    };
+  }, []);
+
+  const nudge = (delta: number) => {
+    scrollerRef.current?.scrollBy({ left: delta, behavior: "smooth" });
+  };
+
+  return (
+    <div className="relative flex items-center min-w-0 flex-1 h-7">
+      <div
+        ref={scrollerRef}
+        onWheel={(e) => {
+          const el = scrollerRef.current;
+          if (!el || el.scrollWidth <= el.clientWidth) return;
+          if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+            e.preventDefault();
+            el.scrollLeft += e.deltaY;
+          }
+        }}
+        className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 w-full h-7 overflow-x-auto overflow-y-hidden"
+      >
+        {children}
+      </div>
+      {canLeft && (
+        <div className="pointer-events-none absolute left-0 inset-y-0 w-8 flex items-center justify-start bg-gradient-to-r from-neutral-900 via-neutral-900/90 to-transparent">
+          <button
+            type="button"
+            title="Scroll tools left"
+            aria-label="Scroll tools left"
+            onClick={() => nudge(-180)}
+            className="pointer-events-auto flex items-center justify-center w-5 h-6 rounded bg-neutral-800/95 hover:bg-neutral-700 text-neutral-200 ring-1 ring-white/15 shadow transition-colors"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+        </div>
+      )}
+      {canRight && (
+        <div className="pointer-events-none absolute right-0 inset-y-0 w-8 flex items-center justify-end bg-gradient-to-l from-neutral-900 via-neutral-900/90 to-transparent">
+          <button
+            type="button"
+            title="More tools — scroll right"
+            aria-label="Scroll tools right"
+            onClick={() => nudge(180)}
+            className="pointer-events-auto flex items-center justify-center w-5 h-6 rounded bg-neutral-800/95 hover:bg-neutral-700 text-neutral-200 ring-1 ring-white/15 shadow transition-colors"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+

@@ -489,7 +489,7 @@ export function useTimelineOverlayDrags({
     const created = await editStore.addScene(Math.max(0, now), frame ?? { width: 1920, height: 1080 });
     if (!created) return;
     onSelectScene?.(created.id);
-    requestAnimationFrame(() => seekToOutputTime(created.startTime + 1.4));
+    requestAnimationFrame(() => requestAnimationFrame(() => seekToOutputTime(created.startTime + 0.5)));
   };
   const addAdjustmentLayer = () => {
     const total = totalOutputDuration;
