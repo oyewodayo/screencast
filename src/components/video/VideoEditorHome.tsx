@@ -200,12 +200,45 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, pickin
             onFailed={() => cancelVideoPreview("editor-home", video.path)}
           />
         )}
-        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/15 transition-colors pointer-events-none">
+        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-colors pointer-events-none">
           {!previewing && (
-            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/70 text-white text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity shadow">
-              <IoCutOutline size={13} />
-              {picking ? "Use video" : "Edit"}
-            </span>
+            picking ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/75 text-white text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity shadow">
+                <IoCutOutline size={13} />
+                Use video
+              </span>
+            ) : (
+              <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-auto">
+                {onWatch && !project && (
+                  <button
+                    type="button"
+                    title="Play in Watch mode"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      cancelVideoPreview("editor-home", video.path);
+                      onWatch(video);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/95 text-neutral-900 hover:bg-white text-xs font-semibold shadow-md transition-colors"
+                  >
+                    <IoPlay size={12} className="text-red-600" />
+                    Play
+                  </button>
+                )}
+                <button
+                  type="button"
+                  title="Open in Video Editor"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    cancelVideoPreview("editor-home", video.path);
+                    onOpen(video);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/75 text-white hover:bg-blue-600 text-xs font-medium shadow-md transition-colors"
+                >
+                  <IoCutOutline size={12} />
+                  {edit ? "Resume" : "Edit"}
+                </button>
+              </div>
+            )
           )}
         </div>
         <div className="absolute left-2 top-2 flex gap-1 pointer-events-none">
@@ -216,19 +249,19 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, pickin
         {duration && <span className="absolute right-2 bottom-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-medium tabular-nums pointer-events-none">{formatMediaDuration(duration)}</span>}
         {!picking && (
           <div className="absolute right-2 top-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-            {onWatch && !project && (
+            {onWatch && !project && previewing && (
               <button
                 type="button"
-                title="Watch in player without opening the editor"
+                title="Play in Watch mode"
                 onClick={(e) => {
                   e.stopPropagation();
                   cancelVideoPreview("editor-home", video.path);
                   onWatch(video);
                 }}
-                className="flex items-center gap-1 px-2 py-1 rounded-full bg-black/65 text-white text-[10.5px] font-medium hover:bg-black/85 transition-colors"
+                className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/90 text-neutral-900 text-[10.5px] font-semibold hover:bg-white transition-colors shadow"
               >
-                <IoPlay size={11} />
-                Watch
+                <IoPlay size={11} className="text-red-600" />
+                Play
               </button>
             )}
             {(!project || !!exports?.length) && (
@@ -251,6 +284,38 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, pickin
       <div className="px-3 py-2.5">
         <p className="text-sm font-medium leading-snug text-gray-800 dark:text-neutral-100 line-clamp-2 break-words">{video.name}</p>
         <p className="mt-0.5 text-xs text-neutral-400 dark:text-neutral-500 truncate">{meta}</p>
+        {!picking && (
+          <div className="mt-2.5 flex items-center gap-1.5">
+            {onWatch && !project && (
+              <button
+                type="button"
+                title={`Play ${video.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelVideoPreview("editor-home", video.path);
+                  onWatch(video);
+                }}
+                className="group/play flex-1 h-7 inline-flex items-center justify-center gap-1 rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50/70 dark:bg-neutral-800/70 text-xs font-medium text-gray-700 dark:text-neutral-200 hover:bg-red-600 hover:text-white hover:border-red-600 dark:hover:bg-red-600 dark:hover:text-white dark:hover:border-red-600 transition-colors"
+              >
+                <IoPlay size={12} className="text-red-600 dark:text-red-500 group-hover/play:text-white transition-colors" />
+                Play
+              </button>
+            )}
+            <button
+              type="button"
+              title={`Edit ${video.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                cancelVideoPreview("editor-home", video.path);
+                onOpen(video);
+              }}
+              className="flex-1 h-7 inline-flex items-center justify-center gap-1 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-600 hover:text-white dark:hover:bg-blue-500 dark:hover:text-white text-xs font-medium transition-colors"
+            >
+              <IoCutOutline size={12} />
+              {edit ? "Resume" : "Edit"}
+            </button>
+          </div>
+        )}
         {!!exports?.length && (
           <div className="mt-2 flex flex-wrap items-center gap-1">
             <span className="text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mr-0.5">Exports</span>
@@ -331,8 +396,9 @@ const ContinueCard: React.FC<{
   edit: EditSummary;
   latestExport: VideoEditorFile | undefined;
   onResume: () => void;
+  onWatch?: () => void;
   onSendToPhone: (file: VideoEditorFile) => void;
-}> = ({ video, thumbUrl, probe, edit, latestExport, onResume, onSendToPhone }) => {
+}> = ({ video, thumbUrl, probe, edit, latestExport, onResume, onWatch, onSendToPhone }) => {
   const vertical = (edit.canvasAspect ?? 1) < 1;
   const parts = describeEdit(edit);
   const trimmed = edit.sourceDuration > 0 && edit.outputDuration > 0 && Math.abs(edit.sourceDuration - edit.outputDuration) > 0.5;
@@ -386,6 +452,17 @@ const ContinueCard: React.FC<{
             Resume editing
             <IoArrowForward size={15} />
           </button>
+          {onWatch && (
+            <button
+              type="button"
+              onClick={onWatch}
+              title={`Play ${video.name} in Watch mode`}
+              className="group/play flex items-center gap-2 px-3.5 py-2 rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50/70 dark:bg-neutral-800/70 text-sm font-medium text-gray-800 dark:text-neutral-100 hover:border-red-600 hover:bg-red-600 hover:text-white dark:hover:border-red-600 dark:hover:bg-red-600 dark:hover:text-white active:scale-[0.98] transition-all outline-none"
+            >
+              <IoPlay size={14} className="text-red-600 dark:text-red-500 group-hover/play:text-white transition-colors" />
+              Play
+            </button>
+          )}
           {latestExport && (
             <button
               type="button"
@@ -646,6 +723,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
             edit={continueEdit}
             latestExport={exportsByBase.get(exportBase(continueVideo.path))?.[0] ?? exportsOf(continueVideo.path, videos)[0]}
             onResume={() => openVideo(continueVideo)}
+            onWatch={onWatchVideo && !isVideoProjectPath(continueVideo.path) ? () => watchVideo(continueVideo) : undefined}
             onSendToPhone={sendToPhone}
           />
         )}
