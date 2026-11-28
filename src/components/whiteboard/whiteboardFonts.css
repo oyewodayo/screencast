@@ -1,0 +1,60 @@
+/* components/whiteboard/whiteboardFonts.css
+ *
+ * Self-hosted modern fonts for Whiteboard (all bundled locally — 100% offline-safe).
+ * Reuses boardFonts.css (Inter, Poppins, Montserrat, Space Grotesk, Playfair Display, Bebas Neue)
+ * and curated @fontsource/* Latin faces already installed in the project.
+ */
+@import "../board/boardFonts.css";
+
+/* Modern Sans */
+@import "@fontsource/ibm-plex-sans/latin-400.css";
+@import "@fontsource/ibm-plex-sans/latin-700.css";
+@import "@fontsource/fira-sans/latin-400.css";
+@import "@fontsource/fira-sans/latin-700.css";
+@import "@fontsource/source-sans-3/latin-400.css";
+@import "@fontsource/source-sans-3/latin-700.css";
+@import "@fontsource/atkinson-hyperlegible/latin-400.css";
+@import "@fontsource/atkinson-hyperlegible/latin-700.css";
+
+/* Editorial Serif */
+@import "@fontsource/instrument-serif/latin-400.css";
+@import "@fontsource/instrument-serif/latin-400-italic.css";
+@import "@fontsource/dm-serif-display/latin-400.css";
+@import "@fontsource/dm-serif-display/latin-400-italic.css";
+@import "@fontsource/eb-garamond/latin-400.css";
+@import "@fontsource/eb-garamond/latin-700.css";
+@import "@fontsource/crimson-pro/latin-400.css";
+@import "@fontsource/crimson-pro/latin-700.css";
+@import "@fontsource/literata/latin-400.css";
+@import "@fontsource/literata/latin-700.css";
+@import "@fontsource/source-serif-4/latin-400.css";
+@import "@fontsource/source-serif-4/latin-700.css";
+@import "@fontsource/cinzel/latin-400.css";
+@import "@fontsource/cinzel/latin-700.css";
+
+/* Mono & Code */
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-700.css";
+@import "@fontsource/fira-code/latin-400.css";
+@import "@fontsource/fira-code/latin-700.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-700.css";
+
+/* Display & Poster */
+@import "@fontsource/oswald/latin-400.css";
+@import "@fontsource/oswald/latin-700.css";
+@import "@fontsource/anton/latin-400.css";
+@import "@fontsource/abril-fatface/latin-400.css";
+@import "@fontsource/righteous/latin-400.css";
+@import "@fontsource/orbitron/latin-400.css";
+@import "@fontsource/orbitron/latin-700.css";
+@import "@fontsource/special-elite/latin-400.css";
+
+/* Handwriting & Sketch */
+@import "@fontsource/caveat/latin-400.css";
+@import "@fontsource/caveat/latin-700.css";
+@import "@fontsource/dancing-script/latin-400.css";
+@import "@fontsource/dancing-script/latin-700.css";
+@import "@fontsource/pacifico/latin-400.css";
+@import "@fontsource/permanent-marker/latin-400.css";
+@import "@fontsource/great-vibes/latin-400.css";

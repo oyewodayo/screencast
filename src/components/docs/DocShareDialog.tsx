@@ -14,7 +14,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { IoClose } from "react-icons/io5";
-import { MdAttachFile, MdCheckCircle, MdContentCopy, MdContentPaste, MdErrorOutline, MdFileDownload, MdIosShare, MdMailOutline } from "react-icons/md";
+import { MdAttachFile, MdCheckCircle, MdContentCopy, MdContentPaste, MdErrorOutline, MdFileDownload, MdIosShare, MdMailOutline, MdOpenInNew } from "react-icons/md";
+import { copyRichToClipboard, openBriefsComposer } from "../../utils/briefsPublish";
 import { FaDiscord, FaSlack, FaTelegramPlane, FaWhatsapp, FaYahoo } from "react-icons/fa";
 import { SiGmail, SiMicrosoftoutlook, SiMicrosoftteams } from "react-icons/si";
 import { MdAdd, MdOutlinePhoneIphone, MdOutlineTabletMac } from "react-icons/md";
@@ -515,6 +516,34 @@ const DocShareDialog: React.FC<DocShareDialogProps> = ({ title, pageCount, wordC
           </div>
         ) : (
           <div className="px-6 pt-4 space-y-4">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setStatus({ tone: "busy", text: "Preparing formatted content for Briefs…" });
+                try {
+                  const { html, text } = await getClipboardContent();
+                  await copyRichToClipboard(html, text);
+                  await openBriefsComposer();
+                  setStatus({ tone: "ok", text: "Document copied — press Ctrl+V in the Briefs composer to paste and publish." });
+                } catch (err) {
+                  setStatus({ tone: "error", text: `Couldn't open Briefs: ${err}` });
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              className="w-full flex items-center gap-3 rounded-xl border border-indigo-200 dark:border-indigo-500/35 bg-indigo-50/70 dark:bg-indigo-500/10 px-4 py-3 text-left hover:bg-indigo-100/70 dark:hover:bg-indigo-500/20 disabled:opacity-60 transition-colors"
+            >
+              <span className="h-10 w-10 shrink-0 inline-flex items-center justify-center rounded-full bg-indigo-600 text-white font-semibold text-sm">
+                B
+              </span>
+              <span className="flex-1 min-w-0">
+                <span className="block text-sm font-semibold text-neutral-900 dark:text-neutral-50">Publish to Briefs</span>
+                <span className="block text-xs text-neutral-600 dark:text-neutral-300">Copies formatted content and opens withbriefs.com/brief/create</span>
+              </span>
+              <MdOpenInNew size={18} className="shrink-0 text-indigo-600 dark:text-indigo-300" />
+            </button>
             {caps?.native_share && (
               <button
                 type="button"

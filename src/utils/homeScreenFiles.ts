@@ -5,7 +5,8 @@
 // metadata from the Rust backend, so pin state and open-history live purely on the frontend,
 // keyed by file.path (already the identity used everywhere else in Dashboard.tsx).
 
-export const MAX_HOME_SCREEN_FILES = 6;
+export const MAX_HOME_SCREEN_FILES = 12;
+export const MAX_RECENT_PATHS = 100;
 
 const PINNED_KEY = "briefcast.pinnedFiles.v1";
 const RECENT_KEY = "briefcast.recentFiles.v1";
@@ -18,6 +19,16 @@ const MAX_OPENED_AT = 200;
 // path - they join the recent list so the home screen shows what just arrived, and from where.
 const ARRIVALS_KEY = "briefcast.fileArrivals.v1";
 const MAX_ARRIVALS = 50;
+// External files opened outside the app directory, keyed by full path.
+const EXTERNAL_FILES_KEY = "briefcast.externalFiles.v1";
+const MAX_EXTERNAL_FILES = 100;
+
+export interface ExternalFileMetadata {
+  path: string;
+  name: string;
+  size?: number;
+  modified?: number;
+}
 
 export interface FileArrival {
   from: string; // the phone's name
@@ -92,12 +103,45 @@ export function recordItemOpened(key: string, at = Date.now()): Record<string, n
   return next;
 }
 
-// Most-recently-opened first, capped at MAX_HOME_SCREEN_FILES — the home screen's fallback
-// ordering whenever nothing is pinned.
-export function recordFileOpened(path: string): string[] {
-  const next = [path, ...getRecentPaths().filter((p) => p !== path)].slice(0, MAX_HOME_SCREEN_FILES);
+export function getExternalFiles(): Record<string, ExternalFileMetadata> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(EXTERNAL_FILES_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveExternalFiles(map: Record<string, ExternalFileMetadata>): void {
+  const kept = Object.entries(map)
+    .slice(-MAX_EXTERNAL_FILES);
+  try {
+    localStorage.setItem(EXTERNAL_FILES_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export function recordExternalFile(entry: ExternalFileMetadata): Record<string, ExternalFileMetadata> {
+  const current = getExternalFiles();
+  const next = { ...current, [entry.path]: { ...current[entry.path], ...entry } };
+  saveExternalFiles(next);
+  return next;
+}
+
+// Most-recently-opened first, capped at MAX_RECENT_PATHS.
+export function recordFileOpened(path: string, metadata?: { name?: string; size?: number; modified?: number }): string[] {
+  const next = [path, ...getRecentPaths().filter((p) => p !== path)].slice(0, MAX_RECENT_PATHS);
   savePaths(RECENT_KEY, next);
   recordItemOpened(path);
+  if (metadata?.name) {
+    recordExternalFile({
+      path,
+      name: metadata.name,
+      size: metadata.size,
+      modified: metadata.modified,
+    });
+  }
   return next;
 }
 
@@ -137,7 +181,7 @@ export function recordFileArrived(
   for (const p of earlier) delete arrivals[p];
   arrivals[path] = { from, at, batch, count };
   saveArrivals(arrivals);
-  const recent = [path, ...getRecentPaths().filter((p) => p !== path && !earlier.includes(p))].slice(0, MAX_HOME_SCREEN_FILES);
+  const recent = [path, ...getRecentPaths().filter((p) => p !== path && !earlier.includes(p))].slice(0, MAX_RECENT_PATHS);
   savePaths(RECENT_KEY, recent);
   recordItemOpened(path, at);
   return { recent, arrivals: getArrivals() };
@@ -163,6 +207,12 @@ export function repathFile(oldPath: string, newPath: string): { pinned: string[]
     delete arrivals[oldPath];
     saveArrivals(arrivals);
   }
+  const extFiles = getExternalFiles();
+  if (oldPath in extFiles) {
+    extFiles[newPath] = { ...extFiles[oldPath], path: newPath };
+    delete extFiles[oldPath];
+    saveExternalFiles(extFiles);
+  }
   return { pinned, recent };
 }
 
@@ -182,6 +232,11 @@ export function forgetFile(path: string): { pinned: string[]; recent: string[] }
   if (path in arrivals) {
     delete arrivals[path];
     saveArrivals(arrivals);
+  }
+  const extFiles = getExternalFiles();
+  if (path in extFiles) {
+    delete extFiles[path];
+    saveExternalFiles(extFiles);
   }
   return { pinned, recent };
 }

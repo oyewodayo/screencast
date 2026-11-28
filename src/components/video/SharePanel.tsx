@@ -12,9 +12,12 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { IoClose, IoCopyOutline, IoLinkOutline, IoLogoYoutube, IoOpenOutline, IoShareSocialOutline } from "react-icons/io5";
+import { IoClose, IoCopyOutline, IoDocumentTextOutline, IoLinkOutline, IoLogoYoutube, IoNewspaperOutline, IoOpenOutline, IoShareSocialOutline } from "react-icons/io5";
 import type { ShareMeta } from "../../utils/exportQueue";
+import { parseSubtitleFile } from "../../utils/captions";
 import { youtubeChapterLines } from "../../utils/videoChapters";
+import { buildBriefsVideoPayload, copyRichToClipboard, openBriefsComposer } from "../../utils/briefsPublish";
+import { createDocFromVideo, openBriefcastDoc } from "../../utils/videoToDoc";
 
 interface Props {
   filePath: string;
@@ -44,7 +47,7 @@ interface YouTubeResult {
   captionsError: string | null;
 }
 
-type Tab = "youtube" | "link" | "send";
+type Tab = "youtube" | "link" | "briefs" | "send";
 type Privacy = "private" | "unlisted" | "public";
 type Upload = { jobId: string; sent: number; total: number; stage: string } | null;
 
@@ -104,6 +107,31 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
   const [ytResult, setYtResult] = useState<YouTubeResult | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [sent, setSent] = useState<string | null>(null);
+  const [briefsWatchUrl, setBriefsWatchUrl] = useState("");
+  const [briefsIncludeTranscript, setBriefsIncludeTranscript] = useState(false);
+  const [briefsBusy, setBriefsBusy] = useState(false);
+  const [briefsNote, setBriefsNote] = useState<string | null>(null);
+
+  const parsedTranscriptLines = useMemo(() => {
+    if (!meta.srt) return [];
+    return parseSubtitleFile(meta.srt).map((c) => ({ start: c.start, end: c.end, text: c.text }));
+  }, [meta.srt]);
+
+  const effectiveWatchUrl = briefsWatchUrl.trim() || ytResult?.url || link || "";
+  const briefsPayload = useMemo(
+    () =>
+      buildBriefsVideoPayload({
+        title,
+        summary: body,
+        watchUrl: effectiveWatchUrl || null,
+        durationSec,
+        chapters: meta.chapters,
+        lines: parsedTranscriptLines,
+        includeChapters,
+        includeTranscript: briefsIncludeTranscript,
+      }),
+    [title, body, effectiveWatchUrl, durationSec, meta.chapters, parsedTranscriptLines, includeChapters, briefsIncludeTranscript]
+  );
 
   const description = useMemo(() => {
     const parts = [body.trim()];
@@ -250,6 +278,7 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
         <div className="flex gap-0.5 rounded-lg bg-white/[0.06] p-0.5">
           {tabBtn("youtube", <IoLogoYoutube size={14} className="text-red-400" />, "YouTube")}
           {tabBtn("link", <IoLinkOutline size={14} />, "Share link")}
+          {tabBtn("briefs", <IoNewspaperOutline size={14} className="text-indigo-300" />, "Briefs")}
           {tabBtn("send", <IoShareSocialOutline size={14} />, "Send")}
         </div>
 
@@ -418,6 +447,103 @@ const SharePanel: React.FC<Props> = ({ filePath, meta, durationSec, onClose }) =
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {tab === "briefs" && (
+          <div className="flex flex-col gap-2.5">
+            <p className="text-[12px] leading-relaxed text-white/60">
+              Turn this video into a written post for your Briefs audience — or save it as an editable Briefcast Doc first.
+            </p>
+            <label className="flex flex-col gap-1 text-[11px] text-white/55">
+              Brief title
+              <input value={title} maxLength={140} onChange={(e) => setTitle(e.target.value)} className={field} />
+            </label>
+            <label className="flex flex-col gap-1 text-[11px] text-white/55">
+              Watch link <span className="text-white/30">optional — auto-fills from YouTube or Share link</span>
+              <input
+                value={briefsWatchUrl}
+                onChange={(e) => setBriefsWatchUrl(e.target.value)}
+                placeholder={ytResult?.url ?? link ?? "https://youtu.be/… or Drive link"}
+                className={field}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-[11px] text-white/55">
+              Intro note
+              <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={2} placeholder="A quick takeaway before readers watch…" className={`${field} resize-y`} />
+            </label>
+            <div className="flex flex-wrap gap-3 text-[12px]">
+              {meta.chapters.length > 0 && (
+                <label className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={includeChapters} onChange={(e) => setIncludeChapters(e.target.checked)} />
+                  Include chapters <span className="text-white/40">({meta.chapters.length})</span>
+                </label>
+              )}
+              {parsedTranscriptLines.length > 0 && (
+                <label className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={briefsIncludeTranscript} onChange={(e) => setBriefsIncludeTranscript(e.target.checked)} />
+                  Include transcript
+                </label>
+              )}
+            </div>
+            <pre className="max-h-28 overflow-y-auto rounded-lg bg-white/[0.04] p-2.5 text-[11px] leading-relaxed text-white/70 font-sans whitespace-pre-wrap">
+              {briefsPayload.previewText}
+            </pre>
+            {briefsNote && <span className="text-[11px] text-emerald-300/90">{briefsNote}</span>}
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <button
+                type="button"
+                disabled={briefsBusy}
+                onClick={async () => {
+                  setBriefsBusy(true);
+                  setError(null);
+                  try {
+                    const doc = await createDocFromVideo(filePath, {
+                      fileName: fileName(filePath),
+                      title,
+                      durationSec,
+                      chapters: meta.chapters,
+                      lines: parsedTranscriptLines,
+                      watchUrl: effectiveWatchUrl || null,
+                      autoTranscribe: parsedTranscriptLines.length === 0,
+                      captureScreenshots: true,
+                      onProgress: (p) => setBriefsNote(p.percent !== null ? `${p.label} (${Math.round(p.percent)}%)` : p.label),
+                    });
+                    openBriefcastDoc(doc.id);
+                    onClose();
+                  } catch (err) {
+                    setError(String(err));
+                  } finally {
+                    setBriefsBusy(false);
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 disabled:opacity-40 text-white text-[12px] font-medium"
+              >
+                <IoDocumentTextOutline size={14} />
+                Create Briefcast Doc
+              </button>
+              <button
+                type="button"
+                disabled={briefsBusy || !title.trim()}
+                onClick={async () => {
+                  setBriefsBusy(true);
+                  setError(null);
+                  try {
+                    await copyRichToClipboard(briefsPayload.html, briefsPayload.text);
+                    await openBriefsComposer();
+                    setBriefsNote("Copied formatted post — press Ctrl+V in the Briefs composer.");
+                  } catch (err) {
+                    setError(String(err));
+                  } finally {
+                    setBriefsBusy(false);
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-[12px] font-medium"
+              >
+                <IoOpenOutline size={14} />
+                Publish to Briefs
+              </button>
+            </div>
           </div>
         )}
 

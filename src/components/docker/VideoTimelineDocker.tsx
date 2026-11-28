@@ -6,8 +6,7 @@ import type { ReframePreview } from "../video/ReframePreviewLayer";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { IoLayersOutline } from "react-icons/io5";
-import { beatStarts as stageBeatStarts, sceneDuration, setBeatHold, setSceneDuration } from "../../utils/stage/stageEditing";
-import type { StageScene } from "../../utils/stage/stageTypes";
+import { beatStarts as stageBeatStarts, sceneDuration } from "../../utils/stage/stageEditing";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
@@ -49,16 +48,16 @@ import {
   IoDownloadOutline,
   IoDocumentTextOutline,
   IoPhonePortraitOutline,
+  IoContractOutline,
 } from "react-icons/io5";
 import { openPhoneTransfer } from "../../services/phoneTransfer";
 import { DockerFile } from "./FileToolsDocker";
 import { ExportQuality, MIN_AUDIO_START_ROOM_SEC, UseVideoEditStoreResult } from "../../hooks/useVideoEditStore";
-import { AdjustmentLayer, AudioOverlay, BlurOverlay, Clip, ClipTransitionIn, IMAGE_CLIP_EXTENSIONS, TransitionEdge, edgeTransitionWindows, ImageOverlay, PipOverlay, TextOverlay, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
+import { AudioOverlay, Clip, ClipTransitionIn, IMAGE_CLIP_EXTENSIONS, TransitionEdge, edgeTransitionWindows, hasAudioCleanup, isImageClipPath, isVideoProjectPath } from "../../utils/videoEditTypes";
 import { FILE_CATEGORY_EXTENSIONS, MEDIA_VIDEO_EXTENSIONS } from "../../utils/fileCategory";
-import { getWaveformPeaks, sliceWaveformWindow } from "../../utils/audioWaveform";
-import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler, resizePipOverlayTime as resizePipOverlayTimeHandler } from "../../handlers/videoEditHandlers";
+import { buildViewSwitchOverlays, mergeClipsInPlace, overlaysActiveAt, packAudioRows, reorderClip as reorderClipOrder, reorderTarget, resizeAudioOverlayTime as resizeAudioOverlayTimeHandler } from "../../handlers/videoEditHandlers";
 import type { ViewSwitchEvent } from "../../handlers/videoEditHandlers";
-import { PopoverAnchor, useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
+import { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
 import ElementsGallery from "../video/ElementsGallery";
 import SplitScreenPanel, { type ExistingSplit } from "../video/SplitScreenPanel";
 import CanvasPanel from "../video/CanvasPanel";
@@ -111,715 +110,90 @@ import { copyItems, emptyClipboardItems } from "../../utils/timelineClipboard";
 import { outputChapters } from "../../utils/videoChapters";
 import { IoBookmarkOutline, IoColorFilterOutline, IoPersonCircleOutline, IoSparkles } from "react-icons/io5";
 import { buildCaptionLines } from "../../utils/captions";
-import { ActiveClipEffects, ClipEffectBadge, TRANSITION_PRESETS, clipEffectBadges } from "../../utils/videoColorFilters";
+import { ActiveClipEffects, TRANSITION_PRESETS, clipEffectBadges } from "../../utils/videoColorFilters";
 import { GRADE_LOOKS } from "../../utils/gradeLooks";
 import { CLIP_FX } from "../../utils/clipFx";
 
-// Clip effect badges (clipEffectBadges), coloured by kind.
-const BADGE_TONES: Record<ClipEffectBadge["tone"], string> = {
-  look: "bg-amber-400/90 text-black",
-  fx: "bg-fuchsia-500/90 text-white",
-  motion: "bg-sky-500/90 text-white",
-  time: "bg-orange-500/90 text-white",
-  frame: "bg-black/75 text-teal-300",
-  sound: "bg-red-600/90 text-white",
-};
 import ToolSearch from "./ToolSearch";
 import MixerPanel, { type MixerChannel } from "./MixerPanel";
 import { audioChannelKey, audioChannelName, fileStem, fxForExport, isNeutralFx } from "../../utils/audioFx";
 
-// A video-track layer covering the whole frame - B-roll rather than a picture-in-picture.
-const isFullFrameLayer = (o: PipOverlay) => o.x <= 0.001 && o.y <= 0.001 && o.width >= 0.999 && o.height >= 0.999;
 import { isTimelineMuted, resumeMixer, setElementGain, syncElementFx, unrouteElement, useTimelineMuted } from "../../utils/mixerGraph";
 import { Audition, type AuditionPiece, type AuditionState } from "../../utils/audition";
 import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
-import { fadeLevel, joinFades, NO_FADES, type FadeCurve, type PieceFades } from "../../utils/audioJoins";
-import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundLabel, type CutSounds } from "../../utils/cutSounds";
+import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
+import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundLabel, type CutCue, type CutSounds } from "../../utils/cutSounds";
+import { stageSoundCues } from "../../utils/stage/stageSounds";
 import { CutSoundPlayer } from "../../utils/cutSoundPlayer";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
+import StudioPolishPopover from "./StudioPolishPopover";
+import { useTimelineOverlayDrags } from "./useTimelineOverlayDrags";
+import { useTimelinePlaybackSync } from "./useTimelinePlaybackSync";
+import VideoToDocModal from "../video/VideoToDocModal";
 import { VIDEO_CHANNEL, getMixerSession, pipChannelKey, silencedBySolo, useMixerSession } from "../../utils/mixerState";
-import { isTrackHidden, pipTrack, tracksInUse, videoTrackLabel } from "../../utils/videoTracks";
-import { subscribeVideoFrames, wantVideoFrames, type FrameWant } from "../../utils/videoFrameCache";
+import { isTrackHidden, pipTrack, videoTrackLabel } from "../../utils/videoTracks";
 import { getPlayableUrl, isPictureless } from "../../utils/playableVideo";
-import useCanvasRestoreTick from "../../hooks/useCanvasRestoreTick";
 
-const MIN_PX_PER_SEC = 8;
-const AUDIO_ROW_HEIGHT = 32; // px - one row of the audio lane; overlapping audio stacks into more rows
-const AUTOMATION_ROW_HEIGHT = 112; // px - the row of a piece whose volume line is open
-const AUTOMATION_HEADER_PX = 16;
-const MAX_PX_PER_SEC = 200;
-const DEFAULT_PX_PER_SEC = 40;
-const THUMB_TILE_HEIGHT = 52; // px - filmstrip tile height inside the h-16 clip track
-// Filmstrip frame cache density: one captured frame every FRAME_CACHE_STEP_SEC of source time,
-// capped at MAX_CACHED_FRAMES (the step widens for long videos). Tiles pick their nearest cached
-// frame, so this is what bounds how short a shot can be and still show up on the strip.
-const FRAME_CACHE_STEP_SEC = 0.5;
-const MAX_CACHED_FRAMES = 120;
-const THUMB_CAPTURE_HEIGHT = 80; // px - frames are downscaled at capture; tiles never draw larger
-// On a long video those 120 are minutes apart, so the tiles in view also ask for their own frame
-// (a frame inside each tile's own stretch of source) - kept up to this many, oldest dropped first.
-const MAX_DETAIL_FRAMES = 240;
-
-// Nearest cached frame to `time` (frames sorted by time), or null if none captured yet.
-const nearestFrame = (frames: ThumbFrame[], time: number): ThumbFrame | null => {
-  if (frames.length === 0) return null;
-  let lo = 0;
-  let hi = frames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (frames[mid].time < time) lo = mid + 1;
-    else hi = mid;
-  }
-  if (lo > 0 && Math.abs(frames[lo - 1].time - time) <= Math.abs(frames[lo].time - time)) return frames[lo - 1];
-  return frames[lo];
-};
-const NICE_TICK_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600]; // seconds
-const MIN_TICK_SPACING_PX = 70;
-const MIN_CLIP_LENGTH = 0.05;
-const MIN_OVERLAY_DURATION = 0.1; // matches videoEditHandlers.ts's own MIN_OVERLAY_DURATION
-
-// The clip lane's look. A hairline gap between clips (half each side), and a trim handle's invisible
-// grab area - wider than what's drawn, so grabbing an edge stays easy without a thick bar on every cut.
-const CLIP_GAP = 2;
-const HANDLE_GRAB_PX = 10;
-// Handles show on the clip's hover, their own hover, or the selected clip (data-on) - and never while a
-// clip is being dragged. A grip: a slim white pill. A bracket: the selected clip's yellow edge, with
-// two notches to read as something to pull.
-const TIMELINE_LANE_CSS = `
-.tl-lane .tl-h { opacity: 0; transition: opacity 120ms ease-out; }
-.tl-lane .tl-clip:hover + .tl-h, .tl-lane .tl-clip:hover + .tl-h + .tl-h, .tl-lane .tl-h:hover, .tl-lane .tl-h[data-on="true"] { opacity: 1; }
-.tl-lane.tl-lane-dragging .tl-h { opacity: 0 !important; }
-.tl-grip { width: 3px; height: 45%; border-radius: 9999px; background: rgba(255,255,255,0.92); box-shadow: 0 0 0 1px rgba(0,0,0,0.35); }
-.tl-h:hover .tl-grip { height: 60%; }
-.tl-bracket { position: relative; width: 7px; height: 100%; background: #fbbf24; }
-.tl-bracket-start { border-radius: 6px 0 0 6px; }
-.tl-bracket-end { border-radius: 0 6px 6px 0; }
-.tl-bracket::before, .tl-bracket::after { content: ""; position: absolute; left: 50%; width: 1px; height: 22%; background: rgba(0,0,0,0.55); transform: translateX(-50%); }
-.tl-bracket::before { top: 28%; }
-.tl-bracket::after { bottom: 28%; }
-.tl-fade-knob { opacity: 0; transition: opacity 120ms ease-out, transform 120ms ease-out; }
-.tl-fade-knob:hover { transform: scale(1.25); }
-.tl-clip:hover .tl-fade-knob, .tl-fade-knob[data-on="true"] { opacity: 1; }
-.tl-lane.tl-lane-dragging .tl-fade-knob { opacity: 0 !important; }
-`;
-// "4.5s", or "1:05" from a minute up - the selected clip's length on its corner.
-const formatClipLength = (seconds: number): string => {
-  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  return `${m}:${String(Math.round(seconds - m * 60)).padStart(2, "0")}`;
-};
-// How close (in on-screen pixels, not seconds - so the snap "feels" equally sticky regardless of
-// zoom level) a dragged overlay edge/position needs to land next to a snap target before it's
-// pulled onto it exactly. Applied to the RAW (pre-clamp) candidate value in every overlay drag/
-// resize handler below, so a snap can never itself push a value out of its own valid bounds - the
-// existing min/max clamp right after always runs on the (possibly snapped) result.
-const SNAP_THRESHOLD_PX = 8;
-
-// Pulls `value` onto whichever entry in `targets` is within SNAP_THRESHOLD_PX of it, if any -
-// otherwise returns `value` unchanged. Shared by every overlay drag/resize handler (text/image/
-// blur/audio) so dragging or retiming any of them snaps to the same landmarks: the playhead and
-// every clip boundary (see overlaySnapTargets below). Ties broken by whichever target is nearest,
-// not by array order.
-function snapToTargets(value: number, targets: number[], pxPerSec: number): number {
-  const thresholdSec = SNAP_THRESHOLD_PX / pxPerSec;
-  let best = value;
-  let bestDist = thresholdSec;
-  for (const target of targets) {
-    const dist = Math.abs(value - target);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = target;
-    }
-  }
-  return best;
-}
-// Generous tolerance on the "still inside the tracked clip" check in the live-preview tracking
-// effect below - seeking to an arbitrary time doesn't always land exactly there (keyframe-
-// interval snapping, decoder rounding), so a strict [start,end) check evaluated on the very first
-// tick after a seek could look like we'd already left the clip we just jumped to, and cascade
-// straight past it to the *next* one - which is exactly what "played the first clip then skipped
-// straight to the third" was: the seek to clip 2 landed a hair outside its stored [start,end), so
-// that effect immediately advanced again before clip 2 ever got a chance to play. Also used by
-// handleTransportPlayClick to decide "are we sitting at the very end of the sequence".
-const SEEK_TOLERANCE_SEC = 0.25;
-// How close to a clip's end playback counts as having finished it - a little under a frame, so a
-// file whose real length rounds a hair short of the clip's stored end still moves on.
-const CLIP_END_EPSILON_SEC = 0.05;
-// The per-frame boundary check crosses within half a frame of the cut.
-const FRAME_BOUNDARY_SEC = 0.012;
-// How far an audio overlay may drift from the picture while playing before it's re-seeked.
-const AUDIO_DRIFT_TOLERANCE_SEC = 0.3;
-// After re-seeking an audio overlay, how long to let it rebuffer before judging its drift again -
-// and the jump (a scrub, not drift) that's corrected even inside that window.
-const AUDIO_SEEK_SETTLE_MS = 1000;
-const AUDIO_JUMP_SEC = 1;
-
-// Module-level (not a useRef) so it survives this component unmounting - which happens every time
-// the tools/timeline panel is closed (BottomDocker swaps back to the recording docker) and
-// reopened, not just when a different file is opened. A useRef here was the original bug: it
-// reset to null on every one of those remounts, so the bootstrap effect below saw "never
-// bootstrapped" and force-seeked back to clip 0 every single time the panel was reopened, even on
-// a video that was already mid-playback - the "opening the timeline restarts the video" report.
-// Keyed by file path so switching files still bootstraps normally; a small, session-lifetime
-// cache (a few bytes per file ever opened) is an acceptable tradeoff for not needing to lift this
-// state through Dashboard/BottomDocker just to keep it alive across the panel toggle.
-const bootstrappedClipIdByFile = new Map<string, string>();
-// Called whenever a file is (re)opened for playback: the player starts over on the file's own
-// picture (a project's blank canvas), so "already playing from its first clip" no longer holds and
-// the timeline must put playback on the first clip again when it next mounts. Without this, a
-// project opened a second time in a session played its black canvas under a full timeline.
-export const forgetTimelineBootstrap = (path: string): void => {
-  bootstrappedClipIdByFile.delete(path);
-};
-
-// Where the playhead was when this file's timeline last went away (the editor closed, or the video
-// left for a linked document, a folder, home), so coming back with the editor open lands there
-// rather than on the first clip. Kept with the player's saved position at that moment: if the
-// video played on afterwards with the editor closed, that newer position wins and this is dropped.
-const leftAtByFile = new Map<string, { outputTime: number; playerAt: number | undefined }>();
-
-// The track area's height, set by dragging the divider between the player and the timeline (the
-// panel's top edge) - null is automatic: as tall as its lanes, up to TRACK_AUTO_MAX_PX, then it
-// scrolls. Kept across launches.
-const TRACK_HEIGHT_KEY = "briefcast.timelineTrackHeight.v1";
-const TRACK_AUTO_MAX_PX = 236;
-// The track-button column's own height (eye, lock, sound, play, more, cover): the column is
-// pinned beside the lanes rather than in the row's flow, so the lanes alone set the row's height
-// - a measured, stretching column used to fight the divider - and never go shorter than it.
-const TRACK_MIN_PX = 168;
-// The picture keeps at least this much of the window above the timeline.
-const PLAYER_MIN_PX = 240;
-const readTrackHeight = (): number | null => {
-  try {
-    const v = Number(localStorage.getItem(TRACK_HEIGHT_KEY));
-    return Number.isFinite(v) && v >= TRACK_MIN_PX ? v : null;
-  } catch {
-    return null;
-  }
-};
-const saveTrackHeight = (h: number | null) => {
-  try {
-    if (h === null) localStorage.removeItem(TRACK_HEIGHT_KEY);
-    else localStorage.setItem(TRACK_HEIGHT_KEY, String(Math.round(h)));
-  } catch {
-    /* preference only */
-  }
-};
-
-// "4:05", or "1:04:05" past the hour - a timeline can run for a day or more.
-const formatTimestamp = (totalSeconds: number): string => {
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = Math.floor(totalSeconds % 60);
-  return hours > 0 ? `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}` : `${minutes}:${seconds.toString().padStart(2, "0")}`;
-};
-
+import {
+  AUDIO_DRIFT_TOLERANCE_SEC,
+  AUDIO_JUMP_SEC,
+  AUDIO_ROW_HEIGHT,
+  AUDIO_SEEK_SETTLE_MS,
+  AUTOMATION_HEADER_PX,
+  AUTOMATION_ROW_HEIGHT,
+  BADGE_TONES,
+  CLIP_GAP,
+  DEFAULT_PX_PER_SEC,
+  forgetTimelineBootstrap,
+  formatClipLength,
+  formatTimestamp,
+  FRAME_CACHE_STEP_SEC,
+  HANDLE_GRAB_PX,
+  isFullFrameLayer,
+  leftAtByFile,
+  MAX_CACHED_FRAMES,
+  MAX_DETAIL_FRAMES,
+  MAX_PX_PER_SEC,
+  MIN_CLIP_LENGTH,
+  MIN_OVERLAY_DURATION,
+  MIN_PX_PER_SEC,
+  MIN_TICK_SPACING_PX,
+  NICE_TICK_INTERVALS,
+  PLAYER_MIN_PX,
+  readTrackHeight,
+  saveTrackHeight,
+  SEEK_TOLERANCE_SEC,
+  snapToTargets,
+  THUMB_CAPTURE_HEIGHT,
+  THUMB_TILE_HEIGHT,
+  TIMELINE_LANE_CSS,
+  TRACK_AUTO_MAX_PX,
+  TRACK_MIN_PX,
+} from "./timelineHelpers";
+export { forgetTimelineBootstrap };
+import {
+  ActionButton,
+  ADD_BUTTON_ROOM_PX,
+  AudioChipWaveform,
+  AudioFadeKnob,
+  AudioFadeShade,
+  ClipWaveform,
+  ForeignVideoClipTiles,
+  FREEZE_FRAME_SECONDS,
+  IMAGE_CLIP_TOOL_HINT,
+  ImageClipTiles,
+  nearestFrame,
+  PreviewHeadLine,
+  ScrollableToolbarStrip,
+  SpokeWheel,
+  TrackAudioPopover,
+  ViewportClampedMenu,
+  type DetailWant,
+  type ThumbFrame,
+} from "./TimelineTrackWidgets";
 type StoreClipPatch = Parameters<UseVideoEditStoreResult["updateClipEffects"]>[1];
-
-interface ThumbFrame {
-  time: number; // source time this frame was captured at
-  src: string;
-}
-
-// A tile's ask: a frame within `tolerance` seconds of `time` (source time).
-interface DetailWant {
-  time: number;
-  tolerance: number;
-}
-
-const ActionButton: React.FC<{
-  title: string;
-  onClick: () => void;
-  disabled?: boolean;
-  children: React.ReactNode;
-}> = ({ title, onClick, disabled, children }) => (
-  <button
-    type="button"
-    title={title}
-    onClick={onClick}
-    disabled={disabled}
-    className="shrink-0 flex items-center justify-center w-7 h-7 rounded text-neutral-300 hover:bg-neutral-700 disabled:text-neutral-600 disabled:hover:bg-transparent disabled:cursor-default"
-  >
-    {children}
-  </button>
-);
-
-// The audio-overlay chip's real waveform - a genuine decode (see audioWaveform.ts), not a
-// decorative placeholder. Needs its own component (rather than being computed inline in the
-// lane's .map() below) because decoding is async and per-file: each chip tracks its own decoded
-// peaks via its own hook state, which .map() callbacks can't own directly. Re-slices (not
-// re-decodes) whenever the visible window (trimStart/duration, from drag or resize) or pixel size
-// changes, so a live trim drag updates the waveform every frame from already-decoded data.
-// `visible`: the part of the chip (its own px) to draw - a canvas can't be millions of px wide.
-// A fade's gain `x` seconds into it - the curves export gives afade (fade_curve, conversion.rs):
-// straight for a fade set in the panel, a quarter sine for an automatic equal-power crossfade.
-const fadeGain = (x: number, d: number, curve: FadeCurve): number => {
-  if (d <= 0) return 1;
-  const t = Math.max(0, Math.min(1, x / d));
-  return curve === "equalPower" ? Math.sin((t * Math.PI) / 2) : t;
-};
-const sameFades = (a: PieceFades | undefined, b: PieceFades | undefined) =>
-  a === b || (!!a && !!b && a.fadeIn === b.fadeIn && a.fadeOut === b.fadeOut && a.fadeInCurve === b.fadeInCurve && a.fadeOutCurve === b.fadeOutCurve);
-
-// An audio piece's fades as they'll be heard (joinFades - its own, plus join crossfades), drawn on
-// the chip the way editors show them: the stretch above the fade's curve shaded, the curve a line.
-const AudioFadeShade: React.FC<{ side: "in" | "out"; seconds: number; curve: FadeCurve; pxPerSec: number; widthPx: number; heightPx: number }> = ({ side, seconds, curve, pxPerSec, widthPx, heightPx }) => {
-  const w = Math.min(widthPx, seconds * pxPerSec);
-  if (w < 1.5 || heightPx <= 0) return null;
-  const steps = 16;
-  const pts: string[] = [];
-  for (let k = 0; k <= steps; k++) {
-    const x = (k / steps) * w;
-    const gain = fadeGain(side === "in" ? x : w - x, w, curve);
-    pts.push(`${x.toFixed(1)},${(heightPx * (1 - gain)).toFixed(1)}`);
-  }
-  const line = pts.join(" ");
-  const area = side === "in" ? `0,0 ${w.toFixed(1)},0 ${line}` : `${line} ${w.toFixed(1)},0 0,0`;
-  return (
-    <svg className="absolute top-0 pointer-events-none z-[3]" style={{ [side === "in" ? "left" : "right"]: 0 }} width={w} height={heightPx} viewBox={`0 0 ${w} ${heightPx}`}>
-      <polygon points={area} fill="rgba(0,0,0,0.42)" />
-      <polyline points={line} fill="none" stroke="rgba(255,255,255,0.75)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
-    </svg>
-  );
-};
-
-// A fade's knob at the chip's top corner: drag it inward to fade in (or out) over longer, double-
-// click to take the fade away. Shows the length while it moves. One undo step per drag (the store
-// merges a run of the same edit).
-const AudioFadeKnob: React.FC<{
-  side: "in" | "out";
-  seconds: number;
-  maxSeconds: number;
-  pxPerSec: number;
-  widthPx: number;
-  shown: boolean;
-  onChange: (seconds: number) => void;
-}> = ({ side, seconds, maxSeconds, pxPerSec, widthPx, shown, onChange }) => {
-  const drag = useRef<{ x: number; from: number; last: number } | null>(null);
-  const [live, setLive] = useState<number | null>(null);
-  const fadePx = Math.min(widthPx, seconds * pxPerSec);
-  const size = 10;
-  const left = side === "in" ? Math.max(2, Math.min(widthPx - size - 2, fadePx - size / 2)) : Math.max(2, Math.min(widthPx - size - 2, widthPx - fadePx - size / 2));
-  const label = (s: number) => `Fade ${side} ${s < 10 ? s.toFixed(2) : s.toFixed(1)}s`;
-  return (
-    <div
-      // Over the trim handle (z-12), which keeps the rest of the edge below this corner.
-      className="tl-fade-knob absolute z-[13] cursor-ew-resize"
-      data-on={shown || live !== null ? "true" : undefined}
-      title={`${seconds > 0 ? label(seconds) : `Fade ${side}`} - drag to change, double-click to remove`}
-      style={{ left, top: 3, width: size, height: size }}
-      onPointerDown={(e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        e.currentTarget.setPointerCapture(e.pointerId);
-        drag.current = { x: e.clientX, from: seconds, last: seconds };
-        setLive(seconds);
-      }}
-      onPointerMove={(e) => {
-        const d = drag.current;
-        if (!d) return;
-        const dx = (e.clientX - d.x) / pxPerSec;
-        const next = Math.round(Math.max(0, Math.min(maxSeconds, d.from + (side === "in" ? dx : -dx))) * 20) / 20;
-        if (next === d.last) return;
-        d.last = next;
-        setLive(next);
-        onChange(next);
-      }}
-      onPointerUp={(e) => {
-        drag.current = null;
-        setLive(null);
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }}
-      onPointerCancel={() => {
-        drag.current = null;
-        setLive(null);
-      }}
-      onDoubleClick={(e) => {
-        e.stopPropagation();
-        onChange(0);
-      }}
-    >
-      <span className="block w-full h-full rounded-full bg-white shadow-[0_1px_3px_rgba(0,0,0,0.6)] ring-1 ring-black/40" />
-      {live !== null && (
-        <span className={`absolute -top-[2px] ${side === "in" ? "left-[14px]" : "right-[14px]"} px-1 rounded-sm bg-black/80 text-[9px] leading-[13px] font-semibold tabular-nums text-white whitespace-nowrap pointer-events-none`}>
-          {label(live)}
-        </span>
-      )}
-    </div>
-  );
-};
-
-const AudioChipWaveform: React.FC<{ overlay: AudioOverlay; widthPx: number; heightPx: number; visible: [number, number]; fades?: PieceFades }> = React.memo(({ overlay, widthPx, heightPx, visible, fades }) => {
-  const [vFrom, vTo] = [Math.max(0, visible[0]), Math.min(widthPx, visible[1])];
-  const vWidth = Math.max(0, vTo - vFrom);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [peaks, setPeaks] = useState<Float32Array | null>(null);
-  const canvasRestoreTick = useCanvasRestoreTick();
-
-  useEffect(() => {
-    let cancelled = false;
-    getWaveformPeaks(overlay.src)
-      .then((p) => {
-        if (!cancelled) setPeaks(p);
-      })
-      .catch(() => {
-        /* getWaveformPeaks already logs - a failed decode just leaves the chip waveform-less */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [overlay.src]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !peaks || vWidth <= 0 || heightPx <= 0) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.round(vWidth * dpr));
-    canvas.height = Math.max(1, Math.round(heightPx * dpr));
-    ctx.scale(dpr, dpr);
-
-    const duration = overlay.endTime - overlay.startTime;
-    const secPerPx = duration / widthPx;
-    const buckets = Math.max(8, Math.floor(vWidth / 2));
-    const windowed = sliceWaveformWindow(peaks, overlay.sourceDuration, overlay.trimStart + vFrom * secPerPx, vWidth * secPerPx, buckets);
-    const barWidth = vWidth / buckets;
-    // Through a fade the bars taper exactly as the sound does (the same gain the mix applies).
-    ctx.fillStyle = overlay.muted ? "rgba(212,212,216,0.55)" : "rgba(204,251,241,0.88)";
-    windowed.forEach((amp, i) => {
-      const t = (vFrom + (i + 0.5) * barWidth) * secPerPx;
-      const gain = fades ? fadeLevel(fades, t, duration) : 1;
-      const barHeight = Math.max(1, amp * gain * heightPx);
-      ctx.fillRect(i * barWidth, (heightPx - barHeight) / 2, Math.max(1, barWidth - 1), barHeight);
-    });
-    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [peaks, widthPx, heightPx, vFrom, vWidth, overlay.trimStart, overlay.startTime, overlay.endTime, overlay.sourceDuration, overlay.muted, fades?.fadeIn, fades?.fadeOut, fades?.fadeInCurve, fades?.fadeOutCurve, canvasRestoreTick]);
-
-  return <canvas ref={canvasRef} className="absolute top-0 pointer-events-none" style={{ left: vFrom, width: vWidth, height: heightPx }} />;
-}, (prev, next) =>
-  prev.overlay === next.overlay &&
-  prev.widthPx === next.widthPx &&
-  prev.heightPx === next.heightPx &&
-  prev.visible[0] === next.visible[0] &&
-  prev.visible[1] === next.visible[1] &&
-  sameFades(prev.fades, next.fades)
-);
-
-// The audio panel's preview position on its own track (previewHead.ts) - a line with the time, moved
-// straight on the DOM every frame (the timeline itself never re-renders for it). While the preview
-// plays, the timeline scrolls to keep the line in view. The line (or its time tag) can be dragged
-// back and forth to scrub the preview - it never drags the track itself.
-const PreviewHeadLine: React.FC<{ overlayId: string; trimStart: number; pxPerSec: number; chipLeft: number; scrollRef: React.RefObject<HTMLDivElement | null> }> = ({
-  overlayId,
-  trimStart,
-  pxPerSec,
-  chipLeft,
-  scrollRef,
-}) => {
-  const lineRef = useRef<HTMLDivElement>(null);
-  const labelRef = useRef<HTMLSpanElement>(null);
-  const geometry = useRef({ trimStart, pxPerSec, chipLeft });
-  geometry.current = { trimStart, pxPerSec, chipLeft };
-  const draggingRef = useRef(false);
-  const scrubTo = (clientX: number) => {
-    const chip = lineRef.current?.parentElement;
-    const head = readPreviewHead(overlayId);
-    if (!chip || !head) return;
-    const { trimStart: from, pxPerSec: pps } = geometry.current;
-    head.seek(from + (clientX - chip.getBoundingClientRect().left) / pps);
-  };
-  const grab = {
-    onPointerDown: (e: React.PointerEvent) => {
-      if (e.button !== 0) return;
-      e.stopPropagation();
-      e.preventDefault();
-      e.currentTarget.setPointerCapture(e.pointerId);
-      draggingRef.current = true;
-    },
-    onPointerMove: (e: React.PointerEvent) => {
-      if (!draggingRef.current) return;
-      e.stopPropagation();
-      scrubTo(e.clientX);
-    },
-    onPointerUp: (e: React.PointerEvent) => {
-      if (!draggingRef.current) return;
-      e.stopPropagation();
-      draggingRef.current = false;
-      scrubTo(e.clientX);
-    },
-    onDoubleClick: (e: React.MouseEvent) => e.stopPropagation(),
-  };
-  useEffect(() => {
-    let raf = 0;
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
-      const line = lineRef.current;
-      if (!line) return;
-      const head = readPreviewHead(overlayId);
-      if (!head || !head.visible) {
-        line.style.display = "none";
-        return;
-      }
-      const { trimStart: from, pxPerSec: pps, chipLeft: left } = geometry.current;
-      const x = (head.at - from) * pps;
-      line.style.display = "block";
-      line.style.transform = `translateX(${x.toFixed(1)}px)`;
-      if (labelRef.current) {
-        const s = head.at - from;
-        labelRef.current.textContent = `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
-      }
-      const area = scrollRef.current;
-      if (head.playing && head.leads && area && !draggingRef.current) {
-        const abs = left + x;
-        if (abs < area.scrollLeft + 24 || abs > area.scrollLeft + area.clientWidth - 48) area.scrollLeft = Math.max(0, abs - area.clientWidth * 0.25);
-      }
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [overlayId, scrollRef]);
-  return (
-    <div ref={lineRef} className="absolute inset-y-0 left-0 z-20 pointer-events-none" style={{ display: "none" }}>
-      <div className="absolute inset-y-0 -left-px w-0.5 bg-amber-300 shadow-[0_0_6px_rgba(252,211,77,0.9)]" />
-      {/* The grab zone - wider than the line, so it's easy to catch. */}
-      <div {...grab} title="Drag to scrub" className="absolute inset-y-0 -left-[5px] w-[10px] pointer-events-auto cursor-ew-resize" />
-      <span
-        {...grab}
-        ref={labelRef}
-        title="Drag to scrub"
-        className="absolute top-0 left-1 px-1 rounded-b text-[9px] font-medium tabular-nums text-black bg-amber-300 pointer-events-auto cursor-ew-resize select-none"
-      />
-    </div>
-  );
-};
-
-const IMAGE_CLIP_TOOL_HINT = "Not available for image clips";
-
-// The classic spoked "wheel" activity indicator - 12 spokes fading round the circle, spun fast.
-const SpokeWheel: React.FC<{ size?: number }> = ({ size = 16 }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" className="animate-spin text-white" style={{ animationDuration: "0.5s" }} aria-hidden>
-    {Array.from({ length: 12 }, (_, i) => (
-      <line key={i} x1="12" y1="2.5" x2="12" y2="7" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" opacity={0.15 + (0.85 * i) / 11} transform={`rotate(${i * 30} 12 12)`} />
-    ))}
-  </svg>
-);
-
-// A fixed-position menu kept fully inside the window - the track's "..." menu opens from a button
-// near the bottom of the screen, where opening straight down used to cut most of it off.
-const ViewportClampedMenu: React.FC<{ anchor: PopoverAnchor; className: string; children: React.ReactNode }> = ({ anchor, className, children }) => {
-  const { ref, position } = useClampedPopoverPosition(anchor);
-  return (
-    <div ref={ref} className={`fixed ${className}`} style={{ top: position.top, left: position.left }}>
-      {children}
-    </div>
-  );
-};
-// How long a freeze frame holds (clip menu) - stretch it on the timeline like any image clip.
-const FREEZE_FRAME_SECONDS = 2;
-
-// Space kept past the last clip for the "+" add button (36px wide, 10px from the clip).
-const ADD_BUTTON_ROOM_PX = 56;
-
-// An image clip's filmstrip - the same picture on every tile, from the gallery's own cached
-// thumbnail (get_image_thumbnail) rather than a full-resolution photo decode per tile. The primary
-// file's frame cache above can't serve these: it only ever holds frames of the primary video.
-const imageClipThumbUrls = new Map<string, Promise<string>>();
-// Tiles [first, last) only - the caller puts a spacer before them (see drawWindow).
-const ImageClipTiles: React.FC<{ sourcePath: string; first: number; last: number; tileWidth: number }> = ({ sourcePath, first, last, tileWidth }) => {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    let pending = imageClipThumbUrls.get(sourcePath);
-    if (!pending) {
-      pending = invoke<string>("get_image_thumbnail", { inputPath: sourcePath })
-        .then((thumbPath) => invoke<string>("convert_file_path_to_url", { filepath: thumbPath }))
-        .then((absolutePath) => convertFileSrc(absolutePath));
-      pending.catch(() => imageClipThumbUrls.delete(sourcePath)); // let a later render retry
-      imageClipThumbUrls.set(sourcePath, pending);
-    }
-    pending
-      .then((resolved) => !cancelled && setUrl(resolved))
-      .catch((err) => console.error("Failed to load image clip thumbnail for", sourcePath, err));
-    return () => {
-      cancelled = true;
-    };
-  }, [sourcePath]);
-  return (
-    <>
-      {Array.from({ length: last - first }, (_, j) => first + j).map((i) =>
-        url ? (
-          <img key={i} src={url} className="h-full shrink-0 object-cover" style={{ width: tileWidth }} draggable={false} alt="" />
-        ) : (
-          <div key={i} className="h-full shrink-0 bg-neutral-800" style={{ width: tileWidth }} />
-        )
-      )}
-    </>
-  );
-};
-
-// A video clip from a file other than the primary one - its own frames (videoFrameCache.ts),
-// never the primary's: borrowing those is what made an inserted video show the clips around it.
-// Like the primary's strip, the tiles drawn ask for a frame inside their own stretch of source,
-// nearest `viewCenter` (px into the clip) first - exact when zoomed into a long video.
-const ForeignVideoClipTiles: React.FC<{ clip: Clip; first: number; last: number; tileWidth: number; width: number; pxPerSec: number; viewCenter: number }> = ({ clip, first, last, tileWidth, width, pxPerSec, viewCenter }) => {
-  const [frames, setFrames] = useState<ThumbFrame[]>([]);
-  const owner = useRef({}).current;
-  useEffect(() => {
-    setFrames([]);
-    const stop = subscribeVideoFrames(clip.sourcePath, setFrames);
-    return () => {
-      wantVideoFrames(clip.sourcePath, owner, []);
-      stop();
-    };
-  }, [clip.sourcePath, owner]);
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      const tolerance = Math.max(0.25, ((tileWidth / pxPerSec) * (clip.speed ?? 1)) / 2);
-      const wants: (FrameWant & { distance: number })[] = [];
-      for (let k = first; k < last; k++) {
-        const time = Math.min(clip.end, outputOffsetToSource(clip, Math.min((k + 0.5) * tileWidth, width) / pxPerSec));
-        wants.push({ time, tolerance, distance: Math.abs((k + 0.5) * tileWidth - viewCenter) });
-      }
-      wants.sort((a, b) => a.distance - b.distance);
-      wantVideoFrames(clip.sourcePath, owner, wants.map(({ time, tolerance }) => ({ time, tolerance })));
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [clip, first, last, tileWidth, width, pxPerSec, viewCenter, owner]);
-  return (
-    <>
-      {Array.from({ length: last - first }, (_, j) => first + j).map((k) => {
-        const outputOffset = Math.min((k + 0.5) * tileWidth, width) / pxPerSec;
-        const t = nearestFrame(frames, Math.min(clip.end, outputOffsetToSource(clip, outputOffset)));
-        return t ? (
-          <img key={k} src={t.src} className="h-full shrink-0 object-cover" style={{ width: tileWidth }} draggable={false} alt="" />
-        ) : (
-          <div key={k} className="h-full shrink-0 bg-neutral-800" style={{ width: tileWidth }} />
-        );
-      })}
-    </>
-  );
-};
-
-// Real waveform for a CLIP's own audio (not an AudioOverlay) - same decode-once/slice-per-render
-// shape as AudioChipWaveform above, just keyed by the clip's sourcePath/start/end instead of an
-// overlay's src/trimStart/duration, so a clip's trim handles have precise audio-driven cut points
-// to line up against instead of guessing from the filmstrip's video frames alone. Drawn baseline-up
-// as a bottom ledge (not centered, unlike the audio-overlay chip) with its own scrim behind it, so
-// it reads clearly over a filmstrip frame of any brightness instead of competing with it.
-const ClipWaveform: React.FC<{ sourcePath: string; trimStart: number; trimEnd: number; sourceDuration: number | null; widthPx: number; heightPx: number; visible: [number, number] }> = React.memo(({
-  sourcePath,
-  trimStart,
-  trimEnd,
-  sourceDuration,
-  widthPx,
-  heightPx,
-  visible,
-}) => {
-  // Only the visible part of the clip (its own px) is drawn - see AudioChipWaveform.
-  const [vFrom, vTo] = [Math.max(0, visible[0]), Math.min(widthPx, visible[1])];
-  const vWidth = Math.max(0, vTo - vFrom);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [peaks, setPeaks] = useState<Float32Array | null>(null);
-  const canvasRestoreTick = useCanvasRestoreTick();
-
-  useEffect(() => {
-    let cancelled = false;
-    getWaveformPeaks(sourcePath)
-      .then((p) => {
-        if (!cancelled) setPeaks(p);
-      })
-      .catch(() => {
-        /* getWaveformPeaks already logs - a source with no audio track (or a failed decode) just
-           leaves this clip waveform-less, same degradation AudioChipWaveform already accepts. */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sourcePath]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !peaks || !sourceDuration || vWidth <= 0 || heightPx <= 0) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.round(vWidth * dpr));
-    canvas.height = Math.max(1, Math.round(heightPx * dpr));
-    ctx.scale(dpr, dpr);
-
-    const duration = Math.max(0, trimEnd - trimStart);
-    const secPerPx = duration / Math.max(1, widthPx);
-    const buckets = Math.max(8, Math.floor(vWidth / 2));
-    const windowed = sliceWaveformWindow(peaks, sourceDuration, trimStart + vFrom * secPerPx, vWidth * secPerPx, buckets);
-    const barWidth = vWidth / buckets;
-    ctx.fillStyle = "rgba(255,255,255,0.7)";
-    windowed.forEach((amp, i) => {
-      const barHeight = Math.max(1, amp * heightPx);
-      ctx.fillRect(i * barWidth, heightPx - barHeight, Math.max(1, barWidth - 1), barHeight);
-    });
-    // canvasRestoreTick: a pure redraw trigger, see useCanvasRestoreTick.
-  }, [peaks, widthPx, heightPx, vFrom, vWidth, trimStart, trimEnd, sourceDuration, canvasRestoreTick]);
-
-  if (!peaks) return null;
-  return (
-    <div className="absolute inset-x-0 bottom-0 pointer-events-none" style={{ height: heightPx }}>
-      <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
-      <canvas ref={canvasRef} className="absolute top-0" style={{ left: vFrom, width: vWidth, height: heightPx }} />
-    </div>
-  );
-}, (prev, next) =>
-  prev.sourcePath === next.sourcePath &&
-  prev.trimStart === next.trimStart &&
-  prev.trimEnd === next.trimEnd &&
-  prev.sourceDuration === next.sourceDuration &&
-  prev.widthPx === next.widthPx &&
-  prev.heightPx === next.heightPx &&
-  prev.visible[0] === next.visible[0] &&
-  prev.visible[1] === next.visible[1]
-);
-
-// The main video's own audio level (volume + mute) - see videoEditTypes.ts's
-// videoAudioMuted/videoAudioVolume doc comment for why this is separate from any AudioOverlay's
-// own volume/mute. Its own component (rather than inlined in the lane's JSX) purely so
-// useClampedPopoverPosition - which measures this popover's actual rendered size to keep it
-// on-screen, see that hook's own comment for why the raw anchor alone isn't enough near the
-// bottom of the window - can be called unconditionally the way hooks require; the parent only
-// mounts this at all while the popover should be showing.
-const TrackAudioPopover: React.FC<{
-  anchor: PopoverAnchor;
-  volume: number;
-  muted: boolean;
-  onSetVolume: (volume: number) => void;
-  onSetMuted: (muted: boolean) => void;
-}> = ({ anchor, volume, muted, onSetVolume, onSetMuted }) => {
-  const { ref, position } = useClampedPopoverPosition(anchor);
-  return createPortal(
-    <div
-      ref={ref}
-      data-track-audio-popover
-      style={{ position: "fixed", left: position.left, top: position.top, zIndex: 9999 }}
-      className="w-56 p-3 rounded-lg bg-neutral-900/95 backdrop-blur-md shadow-lg ring-1 ring-white/10 text-white/90 flex flex-col gap-2.5"
-    >
-      <span className="text-xs font-medium">Video audio</span>
-      <label className="flex items-center gap-2 text-[11px]">
-        <span className="w-12 shrink-0 text-white/60">Volume</span>
-        <input type="range" min={0} max={1} step={0.01} value={volume} onChange={(e) => onSetVolume(Number(e.target.value))} className="flex-1 accent-teal-400" />
-        <span className="w-9 shrink-0 text-right tabular-nums text-white/60">{Math.round(volume * 100)}%</span>
-      </label>
-      <button
-        type="button"
-        onClick={() => onSetMuted(!muted)}
-        className={`self-start px-2 py-1 rounded text-[11px] transition-colors ${muted ? "text-red-400 bg-red-500/10" : "text-white/70 hover:text-white hover:bg-white/10"}`}
-      >
-        {muted ? "Muted" : "Mute"}
-      </button>
-    </div>,
-    document.body
-  );
-};
 
 interface VideoTimelineDockerProps {
   file: DockerFile;
@@ -840,6 +214,7 @@ interface VideoTimelineDockerProps {
   isPlaying: boolean;
   onTogglePlay: () => void;
   onConvert: (file: DockerFile) => void;
+  onCompress?: (file: DockerFile) => void;
   onRename: (file: DockerFile, newName: string) => Promise<void>;
   onDelete: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." in the "..." menu (MoveCopyMenu.tsx) - absent hides it.
@@ -966,6 +341,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   isPlaying,
   onTogglePlay,
   onConvert,
+  onCompress,
   onRename,
   onDelete,
   fileTransfer,
@@ -1582,11 +958,13 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const [chaptersAnchor, setChaptersAnchor] = useState<{ left: number; top: number } | null>(null);
   // Screen style (ScreenStylePanel) - the frame, the drawn pointer and shortcut keys, whole-video.
   const [screenStyleAnchor, setScreenStyleAnchor] = useState<{ left: number; top: number } | null>(null);
+  const screenStyleButtonRef = useRef<HTMLButtonElement>(null);
   const clipRecordings = useClipRecordings(editStore.clips);
   const hasEditablePointer = useMemo(() => [...clipRecordings.values()].some((r) => hasPointerPath(r)), [clipRecordings]);
   const shortcutCount = useMemo(() => buildKeyChips(editStore.clips, clipRecordings).reduce((n, c) => n + c.count, 0), [editStore.clips, clipRecordings]);
   // Elements gallery (shapes and animated elements - videoAssets.ts).
   const [elementsAnchor, setElementsAnchor] = useState<{ left: number; top: number } | null>(null);
+  const elementsButtonRef = useRef<HTMLButtonElement>(null);
   // Split screen builder (SplitScreenPanel).
   const [splitAnchor, setSplitAnchor] = useState<{ left: number; top: number } | null>(null);
   // Editing a split screen already made (its group), rather than adding one.
@@ -1660,10 +1038,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // After the canvas has taken (the panel lays its cells out for it).
     if (intent.split) window.setTimeout(() => openSplitPanel(null), 60);
     if (intent.shorts) setShortsOpen(true);
+    if (intent.studioPolish) {
+      window.setTimeout(() => {
+        const rect = studioPolishButtonRef.current?.getBoundingClientRect();
+        setStudioPolishAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+      }, 80);
+    }
+    if (intent.openCaptions) {
+      window.setTimeout(() => {
+        setCaptionsAnchor({ left: window.innerWidth / 2 - 160, top: 120 });
+      }, 80);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intentReady, file.path]);
   // Highlight intro builder (HighlightIntroPanel).
   const [introAnchor, setIntroAnchor] = useState<{ left: number; top: number } | null>(null);
+  // 1-Click Studio Polish (StudioPolishPopover) and Turn into Doc modal.
+  const [studioPolishAnchor, setStudioPolishAnchor] = useState<{ left: number; top: number } | null>(null);
+  const studioPolishButtonRef = useRef<HTMLButtonElement>(null);
+  const [videoToDocOpen, setVideoToDocOpen] = useState(false);
   // The music & sound-effects library (MusicLibraryPanel).
   const [musicAnchor, setMusicAnchor] = useState<{ left: number; top: number } | null>(null);
   // The mixer (MixerPanel), and the strip it opens with its effects showing.
@@ -1723,6 +1116,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     transcript: transcriptAnchor !== null,
     music: musicAnchor !== null,
     mixer: mixerAnchor !== null,
+    studioPolish: studioPolishAnchor !== null,
   };
   const prevDockedPanelsOpen = useRef(dockedPanelsOpen);
   useEffect(() => {
@@ -1739,8 +1133,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     if (opened !== "transcript") setTranscriptAnchor(null);
     if (opened !== "music") setMusicAnchor(null);
     if (opened !== "mixer") setMixerAnchor(null);
+    if (opened !== "studioPolish") setStudioPolishAnchor(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer]);
+  }, [toolPanelHost, dockedPanelsOpen.effects, dockedPanelsOpen.speed, dockedPanelsOpen.noise, dockedPanelsOpen.audio, dockedPanelsOpen.captions, dockedPanelsOpen.transcript, dockedPanelsOpen.music, dockedPanelsOpen.mixer, dockedPanelsOpen.studioPolish]);
   const [viewSwitchState, setViewSwitchState] = useState<ViewSwitchDetectState>({ status: "loading" });
   const viewSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const viewSwitchDataRef = useRef<{ events: ViewSwitchEvent[]; webcamPath: string; clipOutputStart: number } | null>(null);
@@ -1915,323 +1310,81 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   }, [drawWindow, pxPerSec, filmstripClipsKey, nativePixelSize, duration, isProject, file.path]);
   const totalWidth = Math.max(1, totalOutputDuration * pxPerSec);
 
-  // Live drag state for the text-overlay lane below - same delta-based/live-preview shape as
-  // resizeDrag/clipDrag above, just retiming a TextOverlay instead of a Clip. Kept as separate
-  // state (rather than reusing resizeDrag/clipDrag) since the clamping rules differ (against
-  // totalOutputDuration, not a source file's own duration) and an overlay id could otherwise be
-  // mistaken for a clip id sharing the same drag state shape.
-  const [overlayResizeDrag, setOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [overlayDrag, setOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const renderOverlays: TextOverlay[] = editStore.textOverlays.map((o) => {
-    if (overlayResizeDrag && o.id === overlayResizeDrag.id) {
-      return overlayResizeDrag.edge === "start" ? { ...o, startTime: overlayResizeDrag.liveValue } : { ...o, endTime: overlayResizeDrag.liveValue };
-    }
-    if (overlayDrag && o.id === overlayDrag.id) {
-      return { ...o, startTime: overlayDrag.liveStartTime, endTime: overlayDrag.liveStartTime + overlayDrag.duration };
-    }
-    return o;
+  // Overlay drag/resize state, split-screen live following, and quick-add helpers extracted to
+  // useTimelineOverlayDrags.ts. Getters/wrappers avoid touching below-the-fold playhead/snap consts
+  // until an interaction actually fires.
+  const {
+    renderOverlays,
+    beginOverlayResizeDrag,
+    handleOverlayResizeDragMove,
+    endOverlayResizeDrag,
+    beginOverlayDrag,
+    handleOverlayDragMove,
+    endOverlayDrag,
+    renderImageOverlays,
+    beginImageOverlayResizeDrag,
+    handleImageOverlayResizeDragMove,
+    endImageOverlayResizeDrag,
+    beginImageOverlayDrag,
+    handleImageOverlayDragMove,
+    endImageOverlayDrag,
+    renderBlurOverlays,
+    beginBlurOverlayResizeDrag,
+    handleBlurOverlayResizeDragMove,
+    endBlurOverlayResizeDrag,
+    beginBlurOverlayDrag,
+    handleBlurOverlayDragMove,
+    endBlurOverlayDrag,
+    renderAdjustmentLayers,
+    beginAdjustResizeDrag,
+    handleAdjustResizeDragMove,
+    endAdjustResizeDrag,
+    beginAdjustDrag,
+    handleAdjustDragMove,
+    endAdjustDrag,
+    sceneDrag,
+    sceneEdgeDrag,
+    renderScenes,
+    beginSceneDrag,
+    handleSceneDragMove,
+    endSceneDrag,
+    beginSceneEdgeDrag,
+    handleSceneEdgeDragMove,
+    endSceneEdgeDrag,
+    addScene,
+    addAdjustmentLayer,
+    pipOverlayDrag,
+    renderPipOverlays,
+    videoTrackLanes,
+    handleAddBroll,
+    beginPipOverlayResizeDrag,
+    handlePipOverlayResizeDragMove,
+    endPipOverlayResizeDrag,
+    beginPipOverlayDrag,
+    handlePipOverlayDragMove,
+    endPipOverlayDrag,
+  } = useTimelineOverlayDrags({
+    filePath: file.path,
+    isProject,
+    editStore,
+    pxPerSec,
+    totalOutputDuration,
+    getCurrentOutputTime: () => currentOutputTime,
+    getOverlaySnapTargets: () => overlaySnapTargets,
+    isPlaying,
+    toolMode,
+    videoPixelSize,
+    rootRef,
+    outputTimeFromClientX: (clientX) => outputTimeFromClientX(clientX),
+    seekToOutputTime: (outputTime) => seekToOutputTime(outputTime),
+    setSelectedClipId,
+    onSelectOverlay,
+    onSelectImageOverlay,
+    onSelectBlurOverlay,
+    onSelectAdjustment,
+    onSelectScene,
+    onSelectPipOverlay,
   });
-
-  const beginOverlayResizeDrag = (overlay: TextOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!overlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - overlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(overlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      overlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, overlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, overlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endOverlayResizeDrag = () => {
-    if (!overlayResizeDrag) return;
-    const { id, edge, liveValue } = overlayResizeDrag;
-    setOverlayResizeDrag(null);
-    editStore.resizeTextOverlayTime(id, edge, liveValue);
-  };
-
-  const beginOverlayDrag = (overlay: TextOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleOverlayDragMove = (e: React.PointerEvent) => {
-    if (!overlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - overlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - overlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(overlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - overlayDrag.duration));
-    setOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endOverlayDrag = () => {
-    if (!overlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = overlayDrag;
-    setOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveTextOverlayTime(id, liveStartTime);
-    }
-    onSelectOverlay?.(id);
-    // Selecting a text overlay only actually opens it for editing in the main preview once the
-    // playhead sits inside its own time range - VideoOverlayLayer's editingSession is gated on
-    // "active at currentOutputTime" (so text off-screen at the current moment doesn't render an
-    // editor for it). Without this, clicking a chip whose range the playhead wasn't already inside
-    // updated selectedOverlayId but visibly did nothing in the preview, which read as "selecting
-    // from the timeline doesn't work" even though the click itself was registering correctly.
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
-
-  // Same shape as the text-overlay lane's drag state just above, retiming an ImageOverlay instead
-  // - kept as its own state for the same reason overlayResizeDrag/overlayDrag are kept separate
-  // from resizeDrag/clipDrag (a shared id namespace between drag kinds would be a real hazard).
-  const [imageOverlayResizeDrag, setImageOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [imageOverlayDrag, setImageOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const [pipOverlayResizeDrag, setPipOverlayResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; liveValue: number }>(null);
-  const [pipOverlayDrag, setPipOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-    // The video track it started on, and the one under the pointer now (dragging up or down moves
-    // it between tracks; the drop zone above the top one makes a new track).
-    startTrack: number;
-    liveTrack: number;
-  }>(null);
-
-  // A split screen moves and trims as one (alignSplitTiming does it on drop): while one of its
-  // layers is dragged, the rest follow along live.
-  const splitFollow = (() => {
-    const live: { id: string; start: number; end: number } | null = pipOverlayDrag
-      ? { id: pipOverlayDrag.id, start: pipOverlayDrag.liveStartTime, end: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration }
-      : imageOverlayDrag
-        ? { id: imageOverlayDrag.id, start: imageOverlayDrag.liveStartTime, end: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration }
-        : null;
-    const edge: { id: string; edge: "start" | "end"; value: number } | null = pipOverlayResizeDrag
-      ? { id: pipOverlayResizeDrag.id, edge: pipOverlayResizeDrag.edge, value: pipOverlayResizeDrag.liveValue }
-      : imageOverlayResizeDrag
-        ? { id: imageOverlayResizeDrag.id, edge: imageOverlayResizeDrag.edge, value: imageOverlayResizeDrag.liveValue }
-        : null;
-    const id = live?.id ?? edge?.id;
-    const dragged = id ? editStore.pipOverlays.find((o) => o.id === id) ?? editStore.imageOverlays.find((o) => o.id === id) : undefined;
-    if (!dragged?.split || dragged.split.cell < 0) return null;
-    const ds = live ? live.start - dragged.startTime : edge!.edge === "start" ? edge!.value - dragged.startTime : 0;
-    const de = live ? live.end - dragged.endTime : edge!.edge === "end" ? edge!.value - dragged.endTime : 0;
-    return { group: dragged.split.group, id: dragged.id, ds, de };
-  })();
-  const followSplit = <T extends { id: string; startTime: number; endTime: number; split?: { group: string } }>(o: T): T =>
-    splitFollow && o.id !== splitFollow.id && o.split?.group === splitFollow.group ? { ...o, startTime: o.startTime + splitFollow.ds, endTime: o.endTime + splitFollow.de } : o;
-
-  const renderImageOverlays: ImageOverlay[] = editStore.imageOverlays.map((o) => {
-    if (imageOverlayResizeDrag && o.id === imageOverlayResizeDrag.id) {
-      return imageOverlayResizeDrag.edge === "start" ? { ...o, startTime: imageOverlayResizeDrag.liveValue } : { ...o, endTime: imageOverlayResizeDrag.liveValue };
-    }
-    if (imageOverlayDrag && o.id === imageOverlayDrag.id) {
-      return { ...o, startTime: imageOverlayDrag.liveStartTime, endTime: imageOverlayDrag.liveStartTime + imageOverlayDrag.duration };
-    }
-    return followSplit(o);
-  });
-
-  const beginImageOverlayResizeDrag = (overlay: ImageOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectImageOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setImageOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleImageOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!imageOverlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - imageOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(imageOverlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      imageOverlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, imageOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, imageOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setImageOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endImageOverlayResizeDrag = () => {
-    if (!imageOverlayResizeDrag) return;
-    const { id, edge, liveValue } = imageOverlayResizeDrag;
-    setImageOverlayResizeDrag(null);
-    editStore.resizeImageOverlayTime(id, edge, liveValue);
-  };
-
-  const beginImageOverlayDrag = (overlay: ImageOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setImageOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleImageOverlayDragMove = (e: React.PointerEvent) => {
-    if (!imageOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - imageOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - imageOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(imageOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - imageOverlayDrag.duration));
-    setImageOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endImageOverlayDrag = () => {
-    if (!imageOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = imageOverlayDrag;
-    setImageOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveImageOverlayTime(id, liveStartTime);
-    }
-    onSelectImageOverlay?.(id);
-    // Same reasoning as endOverlayDrag's own comment: image overlays are also only rendered (and
-    // so only visibly show selection handles) while the playhead is inside their own time range
-    // (see activeImageOverlays' overlaysActiveAt filter in VideoOverlayLayer.tsx), so selecting one
-    // from the timeline while the playhead is elsewhere needs to bring the playhead along with it.
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
-
-  // ---- Blur-overlay lane drag (move) / resize (retime) - same shape as the image-overlay block
-  // above, just against editStore's blur methods and onSelectBlurOverlay instead. ----------------
-  const [blurOverlayResizeDrag, setBlurOverlayResizeDrag] = useState<null | {
-    id: string;
-    edge: "start" | "end";
-    startClientX: number;
-    startValue: number;
-    oppositeBound: number;
-    liveValue: number;
-  }>(null);
-  const [blurOverlayDrag, setBlurOverlayDrag] = useState<null | {
-    id: string;
-    startClientX: number;
-    startTime: number;
-    duration: number;
-    isDragging: boolean;
-    liveStartTime: number;
-  }>(null);
-
-  const renderBlurOverlays: BlurOverlay[] = editStore.blurOverlays.map((o) => {
-    if (blurOverlayResizeDrag && o.id === blurOverlayResizeDrag.id) {
-      return blurOverlayResizeDrag.edge === "start" ? { ...o, startTime: blurOverlayResizeDrag.liveValue } : { ...o, endTime: blurOverlayResizeDrag.liveValue };
-    }
-    if (blurOverlayDrag && o.id === blurOverlayDrag.id) {
-      return { ...o, startTime: blurOverlayDrag.liveStartTime, endTime: blurOverlayDrag.liveStartTime + blurOverlayDrag.duration };
-    }
-    return o;
-  });
-
-  const beginBlurOverlayResizeDrag = (overlay: BlurOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectBlurOverlay?.(overlay.id);
-    const startValue = edge === "start" ? overlay.startTime : overlay.endTime;
-    const oppositeBound = edge === "start" ? overlay.endTime : overlay.startTime;
-    setBlurOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, startValue, oppositeBound, liveValue: startValue });
-  };
-  const handleBlurOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!blurOverlayResizeDrag) return;
-    e.stopPropagation();
-    const deltaSec = (e.clientX - blurOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(blurOverlayResizeDrag.startValue + deltaSec, overlaySnapTargets, pxPerSec);
-    const clamped =
-      blurOverlayResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, blurOverlayResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, blurOverlayResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setBlurOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue: clamped } : prev));
-  };
-  const endBlurOverlayResizeDrag = () => {
-    if (!blurOverlayResizeDrag) return;
-    const { id, edge, liveValue } = blurOverlayResizeDrag;
-    setBlurOverlayResizeDrag(null);
-    editStore.resizeBlurOverlayTime(id, edge, liveValue);
-  };
-
-  const beginBlurOverlayDrag = (overlay: BlurOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setBlurOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-    });
-  };
-  const handleBlurOverlayDragMove = (e: React.PointerEvent) => {
-    if (!blurOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - blurOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - blurOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(blurOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - blurOverlayDrag.duration));
-    setBlurOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endBlurOverlayDrag = () => {
-    if (!blurOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration } = blurOverlayDrag;
-    setBlurOverlayDrag(null);
-    if (isDragging) {
-      editStore.moveBlurOverlayTime(id, liveStartTime);
-    }
-    onSelectBlurOverlay?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
 
   // Which kind of thing was selected most recently - what Ctrl+C copies when there are several.
   const lastSelectedRef = useRef<"clips" | "overlay">("overlay");
@@ -2241,259 +1394,6 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   useEffect(() => {
     if (selectedOverlayId || selectedImageOverlayId || selectedBlurOverlayId || selectedAdjustmentId || selectedAudioOverlayId || selectedPipOverlayId) lastSelectedRef.current = "overlay";
   }, [selectedOverlayId, selectedImageOverlayId, selectedBlurOverlayId, selectedAdjustmentId, selectedAudioOverlayId, selectedPipOverlayId]);
-
-  // ---- Adjustment-layer lane: move / retime, the blur lane's shape. ----------------------------
-  const [adjustResizeDrag, setAdjustResizeDrag] = useState<null | { id: string; edge: "start" | "end"; startClientX: number; startValue: number; oppositeBound: number; liveValue: number }>(null);
-  const [adjustDrag, setAdjustDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
-  const renderAdjustmentLayers: AdjustmentLayer[] = editStore.adjustmentLayers.map((l) => {
-    if (adjustResizeDrag && l.id === adjustResizeDrag.id) return adjustResizeDrag.edge === "start" ? { ...l, startTime: adjustResizeDrag.liveValue } : { ...l, endTime: adjustResizeDrag.liveValue };
-    if (adjustDrag && l.id === adjustDrag.id) return { ...l, startTime: adjustDrag.liveStartTime, endTime: adjustDrag.liveStartTime + adjustDrag.duration };
-    return l;
-  });
-  const beginAdjustResizeDrag = (layer: AdjustmentLayer, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectAdjustment?.(layer.id);
-    const startValue = edge === "start" ? layer.startTime : layer.endTime;
-    setAdjustResizeDrag({ id: layer.id, edge, startClientX: e.clientX, startValue, oppositeBound: edge === "start" ? layer.endTime : layer.startTime, liveValue: startValue });
-  };
-  const handleAdjustResizeDragMove = (e: React.PointerEvent) => {
-    if (!adjustResizeDrag) return;
-    e.stopPropagation();
-    const raw = snapToTargets(adjustResizeDrag.startValue + (e.clientX - adjustResizeDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
-    const liveValue =
-      adjustResizeDrag.edge === "start"
-        ? Math.max(0, Math.min(raw, adjustResizeDrag.oppositeBound - MIN_OVERLAY_DURATION))
-        : Math.min(totalOutputDuration, Math.max(raw, adjustResizeDrag.oppositeBound + MIN_OVERLAY_DURATION));
-    setAdjustResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endAdjustResizeDrag = () => {
-    if (!adjustResizeDrag) return;
-    const { id, edge, liveValue } = adjustResizeDrag;
-    setAdjustResizeDrag(null);
-    editStore.resizeAdjustmentLayerTime(id, edge, liveValue);
-  };
-  const beginAdjustDrag = (layer: AdjustmentLayer) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setAdjustDrag({ id: layer.id, startClientX: e.clientX, startTime: layer.startTime, duration: layer.endTime - layer.startTime, isDragging: false, liveStartTime: layer.startTime });
-  };
-  const handleAdjustDragMove = (e: React.PointerEvent) => {
-    if (!adjustDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - adjustDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const raw = snapToTargets(adjustDrag.startTime + (e.clientX - adjustDrag.startClientX) / pxPerSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - adjustDrag.duration));
-    setAdjustDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endAdjustDrag = () => {
-    if (!adjustDrag) return;
-    const { id, isDragging, liveStartTime, duration } = adjustDrag;
-    setAdjustDrag(null);
-    if (isDragging) editStore.moveAdjustmentLayerTime(id, liveStartTime);
-    onSelectAdjustment?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime);
-  };
-  // ---- Stage scene lane: move a scene, stretch its last beat, drag a beat's boundary. -------------
-  // A scenes-only project's canvas grows with its scenes, so they move freely there; over clips a
-  // scene stays inside the video, as overlays do.
-  const scenesFree = editStore.clips.length === 0;
-  const [sceneDrag, setSceneDrag] = useState<null | { id: string; startClientX: number; startTime: number; duration: number; isDragging: boolean; liveStartTime: number }>(null);
-  const [sceneEdgeDrag, setSceneEdgeDrag] = useState<null | { id: string; beat: number | "end"; startClientX: number; startValue: number; liveValue: number }>(null);
-  const renderScenes: StageScene[] = editStore.scenes.map((sc) => {
-    if (sceneDrag && sc.id === sceneDrag.id) return { ...sc, startTime: sceneDrag.liveStartTime };
-    if (sceneEdgeDrag && sc.id === sceneEdgeDrag.id)
-      return sceneEdgeDrag.beat === "end" ? setSceneDuration(sc, sceneEdgeDrag.liveValue) : setBeatHold(sc, sceneEdgeDrag.beat, sceneEdgeDrag.liveValue);
-    return sc;
-  });
-  const beginSceneDrag = (sc: StageScene) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setSceneDrag({ id: sc.id, startClientX: e.clientX, startTime: sc.startTime, duration: sceneDuration(sc), isDragging: false, liveStartTime: sc.startTime });
-  };
-  const handleSceneDragMove = (e: React.PointerEvent) => {
-    if (!sceneDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - sceneDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    // Its start or its end snaps - to the other scenes' edges too, so scenes butt end to end exactly.
-    const edges = editStore.scenes.filter((x) => x.id !== sceneDrag.id).flatMap((x) => [x.startTime, x.startTime + sceneDuration(x)]);
-    const targets = [...overlaySnapTargets, ...edges];
-    const free = sceneDrag.startTime + (e.clientX - sceneDrag.startClientX) / pxPerSec;
-    const startTo = snapToTargets(free, targets, pxPerSec);
-    const endTo = snapToTargets(free + sceneDrag.duration, targets, pxPerSec);
-    const startPull = startTo !== free ? Math.abs(startTo - free) : Infinity;
-    const endPull = endTo !== free + sceneDrag.duration ? Math.abs(endTo - (free + sceneDrag.duration)) : Infinity;
-    const raw = startPull === Infinity && endPull === Infinity ? free : startPull <= endPull ? startTo : endTo - sceneDrag.duration;
-    const liveStartTime = Math.max(0, scenesFree ? raw : Math.min(raw, totalOutputDuration - sceneDrag.duration));
-    setSceneDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved, liveStartTime } : prev));
-  };
-  const endSceneDrag = () => {
-    if (!sceneDrag) return;
-    const { id, isDragging, liveStartTime, duration } = sceneDrag;
-    setSceneDrag(null);
-    if (isDragging) editStore.moveSceneTime(id, liveStartTime);
-    onSelectScene?.(id);
-    if (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration) seekToOutputTime(liveStartTime + Math.min(duration, 1.5) * 0.9);
-  };
-  // A beat boundary (`beat` = the beat whose end it is) or the scene's end, dragged: that beat holds
-  // longer or shorter; everything after it moves with it.
-  const beginSceneEdgeDrag = (sc: StageScene, beat: number | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectScene?.(sc.id);
-    const startValue = beat === "end" ? sceneDuration(sc) : sc.beats[beat].hold;
-    setSceneEdgeDrag({ id: sc.id, beat, startClientX: e.clientX, startValue, liveValue: startValue });
-  };
-  const handleSceneEdgeDragMove = (e: React.PointerEvent) => {
-    if (!sceneEdgeDrag) return;
-    e.stopPropagation();
-    const liveValue = Math.max(0.1, sceneEdgeDrag.startValue + (e.clientX - sceneEdgeDrag.startClientX) / pxPerSec);
-    setSceneEdgeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endSceneEdgeDrag = () => {
-    if (!sceneEdgeDrag) return;
-    const { id, beat, liveValue } = sceneEdgeDrag;
-    setSceneEdgeDrag(null);
-    editStore.updateScene(id, (sc) => (beat === "end" ? setSceneDuration(sc, liveValue) : setBeatHold(sc, beat, liveValue)));
-  };
-  const addScene = async () => {
-    // Laid out for the frame it will be seen in: the video's, or a fresh project's own.
-    let frame = videoPixelSize;
-    if (!frame && isProject) frame = await invoke<{ width: number; height: number }>("read_video_project", { projectPath: file.path }).catch(() => null);
-    const total = totalOutputDuration;
-    const startTime = editStore.clips.length > 0 ? Math.max(0, Math.min(currentOutputTime, total - 1)) : Math.max(0, currentOutputTime);
-    const id = editStore.addScene(startTime, frame ?? { width: 1920, height: 1080 });
-    onSelectScene?.(id);
-    seekToOutputTime(startTime + 1.4);
-  };
-
-  const addAdjustmentLayer = () => {
-    const total = totalOutputDuration;
-    if (total <= 0) return;
-    const length = Math.min(5, total);
-    const startTime = Math.max(0, Math.min(currentOutputTime, total - length));
-    // Strong enough to see at once - the grade alone at 0.7 barely shows on a bright screen
-    // recording, which read as "does nothing". The panel opens with it to dial it back.
-    const id = editStore.addAdjustmentLayer(startTime, startTime + length, { look: { preset: "cinematic", intensity: 1 }, vignette: 0.35 });
-    onSelectAdjustment?.(id);
-  };
-
-  // ---- PiP-overlay lane drag (move) / resize (trim into source) - move is shaped like the blur
-  // block above (a PipOverlay has no popover of its own to manage here, unlike audio - clicking its
-  // actual video bubble in the preview, PipOverlayLayer.tsx, is what opens PipOverlayPopover), but
-  // resize reuses the pure resizePipOverlayTime handler the same way audio's own resize does below,
-  // since a PipOverlay trims into a real source file too (trimStart/sourceDuration), unlike blur's
-  // free-stretch box. ------------------------------------------------------------------------------
-
-  const renderPipOverlays: PipOverlay[] = editStore.pipOverlays.map((o) => {
-    if (pipOverlayResizeDrag && o.id === pipOverlayResizeDrag.id) {
-      return pipOverlayResizeDrag.edge === "start" ? { ...o, startTime: pipOverlayResizeDrag.liveValue } : { ...o, endTime: pipOverlayResizeDrag.liveValue };
-    }
-    if (pipOverlayDrag && o.id === pipOverlayDrag.id) {
-      return { ...o, startTime: pipOverlayDrag.liveStartTime, endTime: pipOverlayDrag.liveStartTime + pipOverlayDrag.duration, track: pipOverlayDrag.liveTrack };
-    }
-    return followSplit(o);
-  });
-  // One lane per video track in use, top track first (it draws over the ones below it).
-  const videoTrackLanes = tracksInUse(renderPipOverlays).reverse();
-
-  // B-roll: pick videos; they go full frame over the main video from the playhead, back to back,
-  // on the lowest free video track.
-  const handleAddBroll = async () => {
-    const selected = await openFileDialog({ multiple: true, filters: [{ name: "Video", extensions: [...MEDIA_VIDEO_EXTENSIONS] }] });
-    const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
-    if (paths.length === 0) return;
-    const at = currentOutputTime < totalOutputDuration - 1 ? currentOutputTime : 0;
-    const ids = await editStore.addVideoLayers(paths, at);
-    if (ids[0]) onSelectPipOverlay?.(ids[0]);
-  };
-
-  const beginPipOverlayResizeDrag = (overlay: PipOverlay, edge: "start" | "end") => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    onSelectPipOverlay?.(overlay.id);
-    setPipOverlayResizeDrag({ id: overlay.id, edge, startClientX: e.clientX, liveValue: edge === "start" ? overlay.startTime : overlay.endTime });
-  };
-  const handlePipOverlayResizeDragMove = (e: React.PointerEvent) => {
-    if (!pipOverlayResizeDrag) return;
-    e.stopPropagation();
-    const overlay = editStore.pipOverlays.find((o) => o.id === pipOverlayResizeDrag.id);
-    if (!overlay) return;
-    const deltaSec = (e.clientX - pipOverlayResizeDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets((pipOverlayResizeDrag.edge === "start" ? overlay.startTime : overlay.endTime) + deltaSec, overlaySnapTargets, pxPerSec);
-    const preview = resizePipOverlayTimeHandler([overlay], overlay.id, pipOverlayResizeDrag.edge, totalOutputDuration, raw)[0];
-    const liveValue = pipOverlayResizeDrag.edge === "start" ? preview.startTime : preview.endTime;
-    setPipOverlayResizeDrag((prev) => (prev ? { ...prev, liveValue } : prev));
-  };
-  const endPipOverlayResizeDrag = () => {
-    if (!pipOverlayResizeDrag) return;
-    const { id, edge, liveValue } = pipOverlayResizeDrag;
-    setPipOverlayResizeDrag(null);
-    editStore.resizePipOverlayTime(id, edge, liveValue);
-  };
-
-  const beginPipOverlayDrag = (overlay: PipOverlay) => (e: React.PointerEvent) => {
-    e.stopPropagation();
-    if (toolMode === "razor") {
-      // Razor mode cuts the PiP right where the click landed, same as it does for clip blocks.
-      editStore.splitPipOverlay(overlay.id, outputTimeFromClientX(e.clientX));
-      onSelectPipOverlay?.(overlay.id);
-      setSelectedClipId(null);
-      return;
-    }
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setPipOverlayDrag({
-      id: overlay.id,
-      startClientX: e.clientX,
-      startTime: overlay.startTime,
-      duration: overlay.endTime - overlay.startTime,
-      isDragging: false,
-      liveStartTime: overlay.startTime,
-      startTrack: pipTrack(overlay),
-      liveTrack: pipTrack(overlay),
-    });
-  };
-  const handlePipOverlayDragMove = (e: React.PointerEvent) => {
-    if (!pipOverlayDrag) return;
-    e.stopPropagation();
-    const moved = Math.abs(e.clientX - pipOverlayDrag.startClientX) >= CLICK_DRAG_THRESHOLD_PX;
-    const deltaSec = (e.clientX - pipOverlayDrag.startClientX) / pxPerSec;
-    const raw = snapToTargets(pipOverlayDrag.startTime + deltaSec, overlaySnapTargets, pxPerSec);
-    const liveStartTime = Math.max(0, Math.min(raw, totalOutputDuration - pipOverlayDrag.duration));
-    // The video-track lane under the pointer - or, above the top one, a new track over every other
-    // layer. (Lanes are in the DOM top track first.)
-    const lanes = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-video-track]") ?? []);
-    let overTrack: number | null = null;
-    for (const lane of lanes) {
-      const r = lane.getBoundingClientRect();
-      if (e.clientY >= r.top && e.clientY < r.bottom) overTrack = Number(lane.dataset.videoTrack);
-    }
-    if (overTrack === null && lanes.length > 0 && e.clientY < lanes[0].getBoundingClientRect().top) {
-      overTrack = Math.max(0, ...editStore.pipOverlays.filter((o) => o.id !== pipOverlayDrag.id).map(pipTrack)) + 1;
-    }
-    setPipOverlayDrag((prev) => (prev ? { ...prev, isDragging: prev.isDragging || moved || (overTrack !== null && overTrack !== prev.liveTrack), liveStartTime, liveTrack: overTrack ?? prev.liveTrack } : prev));
-  };
-  const endPipOverlayDrag = () => {
-    if (!pipOverlayDrag) return;
-    const { id, isDragging, liveStartTime, duration, startTrack, liveTrack } = pipOverlayDrag;
-    setPipOverlayDrag(null);
-    if (isDragging) {
-      editStore.movePipOverlayTime(id, liveStartTime, liveTrack !== startTrack ? liveTrack : undefined);
-    }
-    onSelectPipOverlay?.(id);
-    setSelectedClipId(null);
-    // Same reasoning as endBlurOverlayDrag's own comment: bring the playhead into the overlay's
-    // own range on select, so choosing (or just placing) one from the timeline immediately shows
-    // its actual video bubble in the preview instead of leaving it invisible off-screen in time -
-    // the gap that made a freshly-added PiP look like it silently failed. Skipped while actively
-    // playing, though (unlike the other overlay lanes this was copied from) - a PiP chip is often
-    // placed right at/near 0:00 (wherever the playhead happened to sit when it was added), so a
-    // plain click to just glance at/select it while mid-playback would otherwise yank playback
-    // straight back to the start, which reads as "clicking the timeline restarts the video".
-    if (!isPlaying && (currentOutputTime < liveStartTime || currentOutputTime >= liveStartTime + duration)) {
-      seekToOutputTime(liveStartTime);
-    }
-  };
 
   // ---- Audio overlay placement / drag (move) / resize (trim into source) ---------------------
   //
@@ -2963,6 +1863,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // One selection at a time across the clip and PiP lanes, so Split/Delete (which prefer a
       // selected PiP) can never act on a PiP the user has since clicked away from.
       onSelectPipOverlay?.(null);
+      if (clip.sceneId) {
+        onSelectScene?.(clip.sceneId);
+        if (!isPlaying) {
+          const clipStart = outputStarts[index] ?? 0;
+          const clipDur = clipDurations[index] ?? 0;
+          seekToOutputTime(clipStart + Math.min(clipDur, 1.5) * 0.9);
+        }
+        return;
+      }
+      onSelectScene?.(null);
       // Selecting a clip only jumps the playhead to its start while playback is paused - same
       // reasoning as endPipOverlayDrag's own comment just below: yanking the playhead back to a
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
@@ -3643,138 +2553,25 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTimelineInsert]);
 
-  // Bootstrap: whenever a different clip becomes first in playback order - initial load, or a
-  // reorder that puts something else at index 0 - force playback to actually start there, rather
-  // than trusting wherever the native <video> defaults to (source time 0, or wherever the user
-  // last happened to be). Keyed on the first clip's *id* rather than its start/end, so resizing
-  // that same clip's own edges mid-edit doesn't yank playback back to the start every time.
-  // Tracked in bootstrappedClipIdByFile (module-level, keyed by file.path) rather than a useRef -
-  // see that declaration's own comment for why a ref here previously reset on every reopen of
-  // this panel and force-seeked an already-playing video back to the start each time.
-  useEffect(() => {
-    const first = baseClips[0];
-    // A project emptied of every clip goes back to its blank canvas (its primary file) rather
-    // than leaving the deleted clip's picture on screen - and forgets the old first clip, so
-    // bringing it back (undo) plays from it again.
-    if (!first && isProject && !editStore.loading) {
-      bootstrappedClipIdByFile.delete(file.path);
-      setActiveClipIndex(0);
-      onSeek(file.path, 0);
-      return;
-    }
-    if (!first || first.id === "__pending__") return;
-    if (bootstrappedClipIdByFile.get(file.path) === first.id) {
-      if (activeClipIndexRef.current < 0 || activeClipIndexRef.current >= baseClips.length) {
-        const idx = baseClips.findIndex((c) => c.sourcePath === file.path && currentTime >= c.start - SEEK_TOLERANCE_SEC && currentTime <= c.end + SEEK_TOLERANCE_SEC);
-        setActiveClipIndex(idx >= 0 ? idx : 0);
-      }
-      return;
-    }
-    bootstrappedClipIdByFile.set(file.path, first.id);
-    const leftAt = leftAtByFile.get(file.path);
-    leftAtByFile.delete(file.path);
-    const playerAt = getResumeTime(file.path);
-    const unchanged = leftAt && (leftAt.playerAt === undefined ? playerAt === undefined : playerAt !== undefined && Math.abs(playerAt - leftAt.playerAt) < 1.5);
-    if (leftAt && unchanged && leftAt.outputTime > 0 && renderClips.length > 0) {
-      seekToOutputTime(leftAt.outputTime);
-      return;
-    }
-    setActiveClipIndex(0);
-    lastAppliedTimeRef.current = first.start;
-    onSeek(first.sourcePath, first.start);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseClips[0]?.id]);
-
-  // Live-preview: keeps playback following the clips in their *playback* (array) order rather
-  // than raw source order. `activeClipIndexRef` is only ever *advanced* here, never re-derived
-  // from "whichever clip this source time happens to belong to" (see the ref's own comment above
-  // for why that broke reordering) - every tick just checks whether currentTime is still inside
-  // the clip already being tracked, and if not, jumps straight to the start of the next clip in
-  // array order, which may be earlier *or* later in the source file than where it just was. This
-  // is what makes a reordered timeline actually preview in the new order using nothing but seeks
-  // on the same raw <video> element - no re-encoding needed for preview, only at Save. Only
-  // active while this timeline panel is mounted, since onSeek is the only way to reach the real
-  // player from here - closing the panel mid-edit just means preview following pauses, edits
-  // themselves are unaffected either way.
-  useEffect(() => {
-    if (baseClips.length === 0 || currentTime === lastAppliedTimeRef.current) return;
-    const activeIdx = activeClipIndexRef.current;
-    if (activeIdx < 0 || activeIdx >= baseClips.length) return; // not bootstrapped yet
-    const active = baseClips[activeIdx];
-    // Leaving forward is judged against the clip's end itself (less a frame's worth), not end +
-    // tolerance: a clip that runs to the end of its file - any freshly added or duplicated whole
-    // video - stops dead at `end` when the <video> hits "ended", so it never got past end +
-    // tolerance and playback stalled there instead of moving on to the next clip. The tolerance
-    // stays on the start side, where a seek can land a hair early (see SEEK_TOLERANCE_SEC).
-    if (currentTime >= active.start - SEEK_TOLERANCE_SEC && currentTime < active.end - CLIP_END_EPSILON_SEC) return; // still inside it
-
-    const nextIndex = activeIdx + 1;
-    if (nextIndex < baseClips.length) {
-      // Playback running out of one clip carries on into the next - even if the <video> paused
-      // itself on reaching the end of its file. A scrub past the end while paused stays paused.
-      advanceToClip(nextIndex, isPlaying || wasPlayingRef.current);
-    } else if (isPlaying && currentTime >= active.end - CLIP_END_EPSILON_SEC) {
-      // Finished the last clip in playback order - stop there rather than playing on into the
-      // rest of its source (an image clip's proxy runs for minutes; a trimmed video's tail was
-      // cut for a reason). Play again restarts from clip 0 (the isPlaying effect below).
-      stopAtEnd();
-    }
-  }, [currentTime, editStore.clips]);
-  function advanceToClip(index: number, resume: boolean) {
-    const clip = baseClips[index];
-    setActiveClipIndex(index);
-    lastAppliedTimeRef.current = clip.start;
-    onSeek(clip.sourcePath, clip.start, resume);
-  }
-  // The effect above only hears the player's position a few times a second (timeupdate), so on its
-  // own a clip ran up to a quarter second past its cut before the next one was asked for. While
-  // playing, this checks every frame and crosses over on the frame the clip ends - the next clip's
-  // standby (ClipHandoffLayer) takes over in the same tick.
-  const boundaryCheckRef = useRef<() => void>(() => {});
-  const stopRequestedRef = useRef(false);
-  boundaryCheckRef.current = () => {
-    const t = getPlayerTime?.();
-    const index = activeClipIndexRef.current;
-    const clip = baseClips[index];
-    if (t == null || !clip || t < clip.start - SEEK_TOLERANCE_SEC) return;
-    if (t < clip.end - FRAME_BOUNDARY_SEC) return;
-    if (index + 1 < baseClips.length) advanceToClip(index + 1, true);
-    else stopAtEnd(); // the end of the last clip - stop there (see the effect above)
-  };
-  // A definite pause, safe to repeat every frame until it lands. Without onPausePlayer it falls back
-  // to a toggle - once, since isPlaying only turns false a render later and a second toggle would
-  // start it again.
-  function stopAtEnd() {
-    if (onPausePlayer) return onPausePlayer();
-    if (stopRequestedRef.current) return;
-    stopRequestedRef.current = true;
-    onTogglePlay();
-  }
-  useEffect(() => {
-    if (isPlaying) stopRequestedRef.current = false;
-    if (!isPlaying) return;
-    // Play pressed while sitting at the end of the last clip - from the player's own button, k, or
-    // anywhere else that isn't handleTransportPlayClick - starts over from clip 0 instead of being
-    // stopped again on the very next frame.
-    const lastIndex = baseClips.length - 1;
-    const last = baseClips[lastIndex];
-    const t = getPlayerTime?.() ?? currentTime;
-    if (last && activeClipIndexRef.current >= lastIndex && t >= last.end - SEEK_TOLERANCE_SEC) advanceToClip(0, true);
-    if (!getPlayerTime) return;
-    let raf = 0;
-    const tick = () => {
-      boundaryCheckRef.current();
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [isPlaying, getPlayerTime]);
-  // isPlaying as of the previous commit, for the effect above: on reaching the end of its file the
-  // <video> reports its final time and its pause together, so that effect can see the clip end
-  // with isPlaying already false. Declared after it so it still holds the previous value there.
-  const wasPlayingRef = useRef(false);
-  useEffect(() => {
-    wasPlayingRef.current = isPlaying;
+  // Keeps main-player playback synchronized with the timeline's edited clip sequence (bootstrap,
+  // clip-to-clip advancement, 60fps boundary rAF, stop-at-end, and play-from-end restart).
+  useTimelinePlaybackSync({
+    filePath: file.path,
+    isProject,
+    editLoading: editStore.loading,
+    baseClips,
+    editClips: editStore.clips,
+    renderClipsCount: renderClips.length,
+    currentTime,
+    isPlaying,
+    activeClipIndexRef,
+    lastAppliedTimeRef,
+    setActiveClipIndex,
+    onSeek,
+    onTogglePlay,
+    onPausePlayer,
+    getPlayerTime,
+    seekToOutputTime,
   });
 
   const commitRename = async () => {
@@ -3883,6 +2680,82 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
         window.setTimeout(() => setBusyMessage(null), 6000);
       });
   };
+
+  // Listen for actions dispatched from EditorMenuBar at the top of the window
+  useEffect(() => {
+    const onEditorAction = (e: Event) => {
+      const tool = (e as CustomEvent<{ tool: string }>).detail?.tool;
+      if (!tool) return;
+      if (tool === "auto-zoom") {
+        void handleDetectAutoZoom();
+      } else if (tool === "silence") {
+        void handleDetectSilence();
+      } else if (tool === "view-switch") {
+        void handleDetectViewSwitch();
+      } else if (tool === "insert-clip") {
+        void handleInsertClipViaPicker();
+      } else if (tool === "add-scene") {
+        void addScene();
+      } else if (tool === "text-overlay") {
+        onToggleArmPlaceText?.();
+      } else if (tool === "captions") {
+        const rect = captionsButtonRef.current?.getBoundingClientRect();
+        setCaptionsAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 120, top: 120 });
+      } else if (tool === "transcript") {
+        const rect = transcriptButtonRef.current?.getBoundingClientRect();
+        setTranscriptAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 140, top: 120 });
+      } else if (tool === "screen-style") {
+        const rect = screenStyleButtonRef.current?.getBoundingClientRect();
+        setScreenStyleAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+      } else if (tool === "elements") {
+        const rect = elementsButtonRef.current?.getBoundingClientRect();
+        setElementsAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 150, top: 120 });
+      } else if (tool === "split-screen") {
+        const rect = splitButtonRef.current?.getBoundingClientRect();
+        setSplitAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 180, top: 120 });
+      } else if (tool === "effects") {
+        if (selectedClipId) {
+          const rect = effectsButtonRef.current?.getBoundingClientRect();
+          setEffectsPopoverAnchor(rect ? { left: rect.left, top: rect.bottom + 4 } : { left: window.innerWidth / 2 - 160, top: 120 });
+        }
+      } else if (tool === "split") {
+        handleSplit();
+      } else if (tool === "delete") {
+        handleDeleteSegment();
+      } else if (tool === "duplicate") {
+        if (selectedClipIds.length > 1) {
+          editStore.duplicateClips(selectedClipIds);
+        } else if (selectedClip) {
+          editStore.duplicateClip(selectedClip.id);
+        }
+      } else if (tool === "select-all") {
+        setSelectedClipIds(editStore.clips.map((c) => c.id));
+      } else if (tool === "flip-horizontal") {
+        if (selectedClip) {
+          updateSelectedClips({ flipHorizontal: !selectedClip.flipHorizontal });
+        }
+      } else if (tool === "save") {
+        void handleSave();
+      }
+    };
+    window.addEventListener("briefcast:video-tool-trigger", onEditorAction);
+    return () => window.removeEventListener("briefcast:video-tool-trigger", onEditorAction);
+  }, [
+    handleDetectAutoZoom,
+    handleDetectSilence,
+    handleDetectViewSwitch,
+    handleInsertClipViaPicker,
+    addScene,
+    onToggleArmPlaceText,
+    handleSplit,
+    handleDeleteSegment,
+    handleSave,
+    selectedClipId,
+    selectedClipIds,
+    selectedClip,
+    editStore,
+    updateSelectedClips,
+  ]);
 
   // Playhead position on the (output/assembled) ruler - maps currentTime (a raw source
   // timestamp) via whichever clip is currently tracked as active (activeClipIndexRef, clamped
@@ -4114,6 +2987,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     () => cutSoundCues(editStore.clips, editStore.edgeTransitions, editStore.cutSounds ?? undefined),
     [editStore.clips, editStore.edgeTransitions, editStore.cutSounds]
   );
+  // Built-in SFX attached to Stage scene beats (stageSounds.ts) - played alongside cut sounds.
+  const stageCues = useMemo(() => stageSoundCues(editStore.scenes), [editStore.scenes]);
+  const allSoundCues = useMemo(() => {
+    const cutActive =
+      !!editStore.cutSounds?.on &&
+      !editStore.cutSounds.muted &&
+      !silencedBySolo(mixerSession, CUT_SOUNDS_CHANNEL);
+    const merged: CutCue[] = [];
+    if (cutActive) merged.push(...cutCues);
+    if (stageCues.length > 0) merged.push(...stageCues);
+    return merged.sort((a, b) => a.start - b.start);
+  }, [cutCues, stageCues, editStore.cutSounds, mixerSession]);
 
   // Every piece's fades as played: its own, plus a crossfade where pieces of one track overlap and a
   // click-proof edge fade where one is cut mid-sound (audioJoins.ts) - the export's, exactly.
@@ -4197,23 +3082,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const cutPlayer = () => (cutSoundPlayerRef.current ??= new CutSoundPlayer());
   useEffect(() => () => cutSoundPlayerRef.current?.dispose(), []);
   useEffect(() => {
-    if (cutCues.length) cutPlayer().preload(cutCues);
-  }, [cutCues]);
+    if (allSoundCues.length) cutPlayer().preload(allSoundCues);
+  }, [allSoundCues]);
   const cutSoundsSilenced = !editStore.cutSounds || !!editStore.cutSounds.muted || timelineMuted || silencedBySolo(mixerSession, CUT_SOUNDS_CHANNEL);
+  const sfxPlayerVolume = timelineMuted
+    ? 0
+    : !cutSoundsSilenced && editStore.cutSounds?.on
+      ? editStore.cutSounds.volume
+      : stageCues.length > 0
+        ? 0.78
+        : 0;
   useEffect(() => {
-    cutSoundPlayerRef.current?.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
-  }, [cutSoundsSilenced, editStore.cutSounds?.volume]);
+    cutSoundPlayerRef.current?.setVolume(sfxPlayerVolume);
+  }, [sfxPlayerVolume]);
   useEffect(() => {
     const player = cutSoundPlayerRef.current;
-    if (!isPlaying || cutCues.length === 0) {
+    if (!isPlaying || allSoundCues.length === 0) {
       player?.stop();
       return;
     }
     const p = cutPlayer();
-    p.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
+    p.setVolume(sfxPlayerVolume);
     const now = () => getExactOutputTime?.() ?? currentOutputTime;
-    p.play(cutCues, now());
-    const timer = window.setInterval(() => p.check(cutCues, now()), 200);
+    p.play(allSoundCues, now());
+    const timer = window.setInterval(() => p.check(allSoundCues, now()), 200);
     return () => {
       window.clearInterval(timer);
       p.stop();
@@ -4221,7 +3113,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // currentOutputTime is read live through getExactOutputTime; a change of it alone isn't a reason
     // to re-queue (check() catches seeks).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, cutCues]);
+  }, [isPlaying, allSoundCues]);
 
   // The mixer's play: the selected pieces on their own, on their own clock (audition.ts) - the
   // timeline stays where it is. Rebuilt when the selection changes; stopped by the timeline starting,
@@ -4577,7 +3469,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             overflow-x-auto below to ever actually kick in - a flex child's default min-width:auto
             otherwise refuses to shrink below its content's own natural width, which would silently
             defeat this and just widen the whole toolbar (or overflow the panel) instead of scrolling. */}
-        <div className="flex items-center gap-0.5 min-w-0">
+        <div className="flex items-center gap-0.5 min-w-0 flex-1">
           <button
             ref={toolModeButtonRef}
             type="button"
@@ -4599,7 +3491,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           </button>
           <ToolSearch toolbarRef={toolbarRef} />
           <div className="w-px h-5 bg-neutral-700 mx-1 shrink-0" />
-          <div className="timeline-toolbar-scroll flex items-center gap-0.5 min-w-0 overflow-x-auto">
+          <ScrollableToolbarStrip>
           <ActionButton title="Undo" onClick={editStore.undo} disabled={!editStore.canUndo}>
             <IoArrowUndo size={15} />
           </ActionButton>
@@ -4832,8 +3724,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoImageOutline size={15} className={isPlacingImage ? "text-amber-400" : undefined} />
           </ActionButton>
           <button
-            type="button"
+            ref={elementsButtonRef}
             data-elements-trigger
+            type="button"
             title="Add shapes and animated elements"
             onClick={(e) => {
               if (elementsAnchor) {
@@ -4929,8 +3822,9 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
             <IoBookmarkOutline size={15} />
           </button>
           <button
-            type="button"
+            ref={screenStyleButtonRef}
             data-screen-style-panel
+            type="button"
             title="Screen style - frame the video on a wallpaper with rounded corners and a shadow; smooth the pointer, show clicks and shortcut keys"
             onClick={(e) => {
               if (screenStyleAnchor) {
@@ -5004,10 +3898,28 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           >
             <MdOutlineSettingsVoice size={16} />
           </button>
-          </div>
+          </ScrollableToolbarStrip>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            ref={studioPolishButtonRef}
+            type="button"
+            data-studio-polish-button
+            title="1-Click Studio Polish - screen frame, pro voice audio, trim dead air & click auto-zoom"
+            disabled={!editStore.editState || editStore.clips.length === 0}
+            onClick={(e) => {
+              if (studioPolishAnchor) return setStudioPolishAnchor(null);
+              const rect = e.currentTarget.getBoundingClientRect();
+              setStudioPolishAnchor({ left: rect.left, top: rect.bottom + 4 });
+            }}
+            className={`flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-default ${
+              studioPolishAnchor ? "text-neutral-950 bg-amber-400" : "text-amber-200 bg-amber-500/15 hover:bg-amber-500/25"
+            }`}
+          >
+            <IoSparkles size={13} />
+            Polish
+          </button>
           <button
             type="button"
             title="Add a scene - motion graphics that animate from beat to beat: titles, lists, live numbers, diagrams"
@@ -5219,6 +4131,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                         <IoSwapHorizontalOutline size={13} /> Convert
                       </button>
                     )}
+                    {!isProject && onCompress && (
+                      <button
+                        type="button"
+                        className="w-full flex items-center gap-1.5 text-left px-3 py-2 hover:bg-neutral-700"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onCompress(file);
+                        }}
+                      >
+                        <IoContractOutline size={13} /> Compress
+                      </button>
+                    )}
                     {fileTransfer && (
                       <button
                         type="button"
@@ -5428,7 +4352,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 const isPending = clip.id === "__pending__";
                 const left = outputStarts[i] * pxPerSec;
                 const width = Math.max(1, clipDurations[i] * pxPerSec);
-                const isSelected = selectedClipIds.includes(clip.id);
+                const inlineScene = clip.sceneId ? renderScenes.find((sc) => sc.id === clip.sceneId) : undefined;
+                const isSelected = selectedClipIds.includes(clip.id) || (!!inlineScene && selectedSceneId === inlineScene.id);
                 const isDragging = clipDrag?.index === i && clipDrag.isDragging;
                 // Lifted and under the pointer while dragged; gliding aside for it otherwise.
                 const motion: React.CSSProperties = isDragging
@@ -5445,13 +4370,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 // Only the tiles in the drawn window - a long clip zoomed in is thousands of them.
                 const firstTile = Math.max(0, Math.min(tileCount, Math.floor((drawWindow.from - left) / tileWidth)));
                 const lastTile = Math.max(firstTile, Math.min(tileCount, Math.ceil((drawWindow.to - left) / tileWidth)));
-                const isForeignVideo = !isImageClipPath(clip.sourcePath) && clip.sourcePath !== file.path;
-                const clipThumbs = thumbnails.length === 0 || isForeignVideo ? [] : Array.from({ length: lastTile - firstTile }, (_, j) => {
+                const isForeignVideo = !inlineScene && !isImageClipPath(clip.sourcePath) && clip.sourcePath !== file.path;
+                const clipThumbs = inlineScene || thumbnails.length === 0 || isForeignVideo ? [] : Array.from({ length: lastTile - firstTile }, (_, j) => {
                   const k = firstTile + j;
                   const outputOffset = Math.min((k + 0.5) * tileWidth, width) / pxPerSec;
                   return nearestFrame(thumbnails, Math.min(clip.end, outputOffsetToSource(clip, outputOffset)));
                 });
                 const tileSpacer = firstTile > 0 ? <div className="shrink-0" style={{ width: firstTile * tileWidth }} /> : null;
+                const sceneTitle = inlineScene ? (inlineScene.name ?? (inlineScene.elements.find((el) => el.kind === "text")?.props.text ?? "Scene")) : "";
+                const sceneBeatStarts = inlineScene ? stageBeatStarts(inlineScene) : [];
+                const sceneLocal = inlineScene ? currentOutputTime - outputStarts[i] : 0;
                 return (
                   <React.Fragment key={clip.id}>
                   <div
@@ -5464,14 +4392,50 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
                     onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
                     onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
-                    title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`}
-                    className={`tl-clip group/clip absolute inset-y-1 rounded-md overflow-hidden bg-neutral-900 flex ${
+                    title={
+                      isPending
+                        ? undefined
+                        : inlineScene
+                        ? `${sceneTitle} (${formatClipLength(clipDurations[i])}) — click to edit scene, drag left/right to reorder with media`
+                        : toolMode === "razor"
+                        ? `Clip ${i + 1} of ${renderClips.length} — click to split here`
+                        : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`
+                    }
+                    className={`tl-clip group/clip absolute inset-y-1 rounded-md overflow-hidden ${
+                      inlineScene
+                        ? `flex flex-col bg-gradient-to-b ${isSelected ? "from-teal-700/95 to-teal-900/95" : "from-teal-900/90 to-teal-950/95"}`
+                        : "bg-neutral-900 flex"
+                    } ${
                       isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : isDragging ? "cursor-grabbing shadow-[0_10px_24px_rgba(0,0,0,0.55)]" : "cursor-grab"
                     } ${mergingIds?.includes(clip.id) ? "animate-pulse" : ""}`}
                     // A hairline gap either side: clips read as separate pictures, not one band.
                     style={{ left: left + CLIP_GAP / 2, width: Math.max(1, width - CLIP_GAP), ...motion }}
                   >
-                    {isImageClipPath(clip.sourcePath) ? (
+                    {inlineScene ? (
+                      <>
+                        <div className="flex-1 min-h-0 flex flex-col justify-center gap-0.5 px-2.5">
+                          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-white/95">
+                            <IoLayersOutline size={12} className="shrink-0 text-teal-200" />
+                            <span className="truncate">{sceneTitle}</span>
+                          </span>
+                          <span className="text-[9.5px] text-teal-200/75 tabular-nums truncate">
+                            Scene · {inlineScene.beats.length} beat{inlineScene.beats.length === 1 ? "" : "s"} · {formatClipLength(clipDurations[i])}
+                          </span>
+                        </div>
+                        <span className="flex gap-px h-[4px] mx-1.5 mb-1.5">
+                          {inlineScene.beats.map((b, bi) => {
+                            const on = sceneLocal >= sceneBeatStarts[bi] && sceneLocal < sceneBeatStarts[bi] + b.hold;
+                            return (
+                              <span
+                                key={b.id}
+                                className={`rounded-full transition-colors duration-150 ${on ? "bg-white" : isSelected ? "bg-amber-200/80" : "bg-teal-300/45"}`}
+                                style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }}
+                              />
+                            );
+                          })}
+                        </span>
+                      </>
+                    ) : isImageClipPath(clip.sourcePath) ? (
                       <>
                         {tileSpacer}
                         <ImageClipTiles sourcePath={clip.sourcePath} first={firstTile} last={lastTile} tileWidth={tileWidth} />
@@ -5493,8 +4457,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                       <div className="h-full w-full bg-neutral-800" />
                     )}
                     {/* What's on this clip - look, colour, effect, motion, speed, framing, sound -
-                        as small badges; clicking them opens the clip's effects. */}
+                        as small badges; clicking them opens the clip's effects. Inline Scene clips
+                        omit the blank-frame Muted badge so it never crowds the scene title. */}
                     {!isPending &&
+                      !inlineScene &&
                       (() => {
                         const badges = clipEffectBadges(baseClips[i] ?? clip, {
                           look: (name) => GRADE_LOOKS.find((l) => l.value === name)?.label,
@@ -5925,14 +4891,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
-            {/* Stage scene lane - teal. Scenes that overlap stack in rows. Each block shows its beats
-                as a strip along its foot, as long as each holds; the boundary between two beats drags
-                (how long the first holds), as does the scene's end. */}
+            {/* Overlay Stage scene lane - only shown for scenes explicitly placed in Overlay mode
+                (inline scenes live directly side-by-side on the main timeline lane above). */}
             {(() => {
+              const inlineSceneIds = new Set(baseClips.map((c) => c.sceneId).filter((id): id is string => Boolean(id)));
+              const overlayScenes = renderScenes.filter((sc) => !inlineSceneIds.has(sc.id));
               const ROW = 32;
               const rowEnds: number[] = [];
               const rowOf = new Map<string, number>();
-              for (const sc of [...renderScenes].sort((a, b) => a.startTime - b.startTime)) {
+              for (const sc of [...overlayScenes].sort((a, b) => a.startTime - b.startTime)) {
                 const end = sc.startTime + sceneDuration(sc);
                 let r = rowEnds.findIndex((e) => e <= sc.startTime + 1e-6);
                 if (r < 0) r = rowEnds.push(end) - 1;
@@ -5941,10 +4908,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               }
               return (
                 <div
-                  className={`tl-lane relative border-t border-neutral-800 ${sceneDrag?.isDragging || sceneEdgeDrag ? "tl-lane-dragging" : ""} ${renderScenes.length === 0 ? "hidden" : ""}`}
+                  className={`tl-lane relative border-t border-neutral-800 ${sceneDrag?.isDragging || sceneEdgeDrag ? "tl-lane-dragging" : ""} ${overlayScenes.length === 0 ? "hidden" : ""}`}
                   style={{ height: Math.max(1, rowEnds.length) * ROW }}
                 >
-                  {renderScenes.map((sc) => {
+                  {overlayScenes.map((sc) => {
                     const duration = sceneDuration(sc);
                     // Inset by half the gap each side, as clips and audio pieces are.
                     const fullWidth = Math.max(1, duration * pxPerSec);
@@ -6530,6 +5497,50 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           );
         })()}
 
+      {studioPolishAnchor && editStore.editState && (
+        <StudioPolishPopover
+          anchor={studioPolishAnchor}
+          clips={editStore.clips}
+          primarySourcePath={file.path}
+          screenStyle={editStore.screenStyle}
+          onScreenStyle={editStore.setScreenStyle}
+          soundProInput={soundProInput}
+          applySoundPro={editStore.applySoundPro}
+          onLoudnessChange={setExportLoudness}
+          onTrimSilence={editStore.trimSilenceForClip}
+          onApplyAutoZoom={editStore.applyAutoZoomAtClicks}
+          hasEditablePointer={hasEditablePointer}
+          shortcutCount={shortcutCount}
+          onPointerStyle={editStore.updatePointerStyle}
+          onKeystrokeStyle={editStore.updateKeystrokeStyle}
+          onOpenScreenStyle={() => {
+            const anchor = studioPolishAnchor;
+            setStudioPolishAnchor(null);
+            setScreenStyleAnchor(anchor ?? { left: window.innerWidth / 2 - 160, top: 120 });
+          }}
+          onTurnIntoDoc={() => {
+            setStudioPolishAnchor(null);
+            setVideoToDocOpen(true);
+          }}
+          onClose={() => setStudioPolishAnchor(null)}
+        />
+      )}
+
+      {videoToDocOpen && (
+        <VideoToDocModal
+          sourceVideoPath={file.path}
+          fileName={file.name}
+          durationSec={totalOutputDuration}
+          clips={editStore.clips}
+          captions={editStore.captions}
+          sourcePaths={captionSourcePaths}
+          chapters={outputChapters(editStore.clips, editStore.chapters).map((c) => ({ time: c.time, label: c.label }))}
+          lines={captionLines.map((l) => ({ start: l.start, end: l.end, text: l.words.map((w) => w.text).join(" ") }))}
+          onTranscriptGenerated={(language, transcripts) => editStore.setCaptionTranscripts(language, transcripts, { captionsEnabled: false })}
+          onClose={() => setVideoToDocOpen(false)}
+        />
+      )}
+
       {soundProAnchor && editStore.editState && (
         <SoundProPopover
           anchor={soundProAnchor}
@@ -6768,6 +5779,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           primarySourcePath={file.path}
           onChange={editStore.setChapters}
           onSeek={seekToOutputTime}
+          onTurnIntoDoc={() => {
+            setChaptersAnchor(null);
+            setVideoToDocOpen(true);
+          }}
           onClose={() => setChaptersAnchor(null)}
         />
       )}
@@ -6800,6 +5815,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
           onEditLine={editStore.editCaptionLine}
           onClear={editStore.clearCaptions}
           onSeekLine={(line) => onSeek(line.sourcePath, line.sourceStart)}
+          onTurnIntoDoc={() => {
+            setCaptionsAnchor(null);
+            setVideoToDocOpen(true);
+          }}
           onClose={() => setCaptionsAnchor(null)}
         />
       )}

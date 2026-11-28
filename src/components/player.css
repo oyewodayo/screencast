@@ -501,25 +501,16 @@ video {
     background: rgba(0, 0, 0, 0.5);
 }
 
-/* VideoTimelineDocker's toolbar tool cluster - scrolls horizontally once the panel gets too
-   narrow to fit every tool button, rather than overflowing the panel or squishing buttons down.
-   A thin bar (the global 10px one in index.css reads as bulky against this row's own 28px-tall
-   buttons) that only takes up space while actually scrollable. */
+/* VideoTimelineDocker's toolbar tool cluster - hides the native horizontal scrollbar so the
+   28px-tall buttons align on the exact vertical centerline of the static tools beside them;
+   ScrollableToolbarStrip draws crisp left/right edge fade + chevron scroll indicators instead. */
+.timeline-toolbar-scroll {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
 .timeline-toolbar-scroll::-webkit-scrollbar {
-    height: 4px;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.15);
-    border-radius: 9999px;
-}
-
-.timeline-toolbar-scroll::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.3);
+    display: none;
 }
 
 /* Smooth transitions */
@@ -1119,4 +1110,106 @@ input:focus-visible {
 .settings-menu button.settings-row:disabled {
     opacity: 0.5;
     cursor: default;
+}
+
+/* Workspace action pills sitting in .ctl-leading beside Linked items (Study, Doc, Edit).
+   Higher specificity than `.video-controls-container .controls button` so they keep pill padding,
+   compact typography, and a restrained hover without the round-icon scale(1.1) jump. */
+.video-controls-container .controls button.ctl-action-pill {
+    height: 1.75rem;
+    padding: 0 0.55rem;
+    border-radius: 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    line-height: 1;
+    gap: 0.3rem;
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.9);
+    opacity: 1;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.video-controls-container .controls button.ctl-action-pill:hover {
+    background: rgba(255, 255, 255, 0.2);
+    color: #fff;
+    transform: none;
+}
+
+.video-controls-container .controls button.ctl-action-pill.ctl-action-pill-study {
+    background: rgba(16, 185, 129, 0.26);
+    color: #a7f3d0;
+    box-shadow: inset 0 0 0 1px rgba(52, 211, 153, 0.45);
+}
+
+.video-controls-container .controls button.ctl-action-pill.ctl-action-pill-study:hover {
+    background: rgba(16, 185, 129, 0.36);
+    color: #ecfdf5;
+}
+
+.video-controls-container .controls button.ctl-action-pill.ctl-action-pill-editing {
+    background: #2563eb;
+    color: #fff;
+}
+
+.video-controls-container .controls button.ctl-action-pill.ctl-action-pill-editing:hover {
+    background: #3b82f6;
+}
+
+/* Study Note markers on the scrub bar (warm amber dots above the red progress track) */
+.timeline .note-marker {
+    position: absolute;
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    transform: translate(-50%, -50%);
+    background-color: #10b981;
+    border: 1.5px solid rgba(0, 0, 0, 0.75);
+    box-shadow: 0 0 6px rgba(16, 185, 129, 0.75);
+    pointer-events: none;
+    z-index: 2;
+}
+
+/* A–B Study Loop band highlighted directly on the scrub bar */
+.timeline .ab-loop-range {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    background: rgba(245, 158, 11, 0.42);
+    border-left: 2px solid #fbbf24;
+    border-right: 2px solid #fbbf24;
+    border-radius: 2px;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.timeline .ab-loop-pin {
+    position: absolute;
+    top: -4px;
+    bottom: -4px;
+    width: 2px;
+    background: #fbbf24;
+    pointer-events: none;
+    z-index: 2;
+}
+
+/* Subtle on-screen feedback pill (speed changes, A–B loop, slide snaps, percent jumps) */
+.player-osd-pill {
+    position: absolute;
+    top: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 95;
+    padding: 0.35rem 0.75rem;
+    border-radius: 9999px;
+    background: rgba(15, 15, 18, 0.82);
+    backdrop-filter: blur(8px);
+    color: rgba(255, 255, 255, 0.95);
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+    pointer-events: none;
+    white-space: nowrap;
 }

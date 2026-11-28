@@ -5,7 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { trackEvent } from '../utils/telemetry';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { createPortal } from 'react-dom';
-import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline } from 'react-icons/io5';
+import { IoPause, IoPlay, IoPlaySkipBack, IoPlaySkipForward, IoPlaySkipForwardOutline, IoRepeat, IoRepeatOutline, IoBookmark, IoBookmarkOutline, IoTrashOutline, IoSparklesOutline, IoClose, IoAddCircleOutline, IoDocumentTextOutline, IoLanguageOutline, IoMicOutline, IoSchoolOutline } from 'react-icons/io5';
 import { IoIosArrowBack, IoIosArrowForward } from 'react-icons/io';
 import { FaClosedCaptioning, FaCog } from 'react-icons/fa';
 import { BsFullscreen, BsFullscreenExit } from 'react-icons/bs';
@@ -42,12 +42,16 @@ import GradeCanvas from './video/GradeCanvas';
 import BlurBackdrop from './video/BlurBackdrop';
 import { speedAtSource } from '../utils/clipTiming';
 import ThumbnailPicker, { ScrubSpriteMeta, ThumbnailChoice } from './video/ThumbnailPicker';
+import VideoToDocModal from './video/VideoToDocModal';
 import { getPlayableUrl, isPictureless } from '../utils/playableVideo';
 import type { Lut3D } from '../utils/colorGrade';
 import { PlayerCaptionsPanel, PlayerChaptersPanel } from './video/PlayerSidePanels';
+import { PlayerStudyPanel, type AbLoopState } from './video/PlayerStudyPanel';
+import { captureVideoFrameDataUrl, extractCaptionQuoteAt, loadStudyNotes, saveStudyNotes, sortStudyNotes, type StudyNote, type StudyNoteTag } from '../utils/videoStudyNotes';
 import { useToolPanelHost } from './docker/ToolPanelHost';
 import { loadRnnoise, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
+import BrandLoader from './common/BrandLoader';
 import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
 import rnnoiseSimdWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url';
 
@@ -139,6 +143,13 @@ interface KeyboardHandlerActions {
   playPrevious?: () => void;
   playNext?: () => void;
   toggleEditor?: () => void;
+  quickStudyNote?: () => void;
+  quickSnapSlide?: () => void;
+  quickAddChapter?: () => void;
+  setLoopA?: () => void;
+  setLoopB?: () => void;
+  clearLoop?: () => void;
+  seekPercent?: (fraction: number) => void;
 }
 
 // Arrow-key nudge amount, in seconds - matches the YouTube/VLC/QuickTime convention for a single
@@ -684,6 +695,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
   // While the timeline editor drives playback, the chapters are the edit's (editTimeline).
   const chapters = editTimeline?.chapters ?? fileChapters;
   const [showChaptersMenu, setShowChaptersMenu] = useState<boolean>(false);
+  const [showVideoToDocModal, setShowVideoToDocModal] = useState<boolean>(false);
   const [isDetectingChapters, setIsDetectingChapters] = useState<boolean>(false);
   // Which chapter (if any) the cursor is currently near while hovering the timeline - drives the
   // small tooltip in handleTimelineHover below. Plain state (not a ref written directly to the
@@ -1274,15 +1286,213 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filePath, mediaType]);
 
-  // The player's sidebar panels (PlayerSidePanels.tsx), portaled into the parent's Tools tab.
+  // The player's sidebar panels (PlayerSidePanels.tsx & PlayerStudyPanel.tsx), portaled into the parent's Tools tab.
   const toolPanelHost = useToolPanelHost();
-  const [sidebarPanel, setSidebarPanel] = useState<null | 'captions' | 'chapters'>(null);
+  const [sidebarPanel, setSidebarPanel] = useState<null | 'captions' | 'chapters' | 'study'>(null);
   const onSidebarPanelChangeRef = useRef(onSidebarPanelChange);
   onSidebarPanelChangeRef.current = onSidebarPanelChange;
   useEffect(() => {
     onSidebarPanelChangeRef.current?.(sidebarPanel !== null);
   }, [sidebarPanel]);
   useEffect(() => () => onSidebarPanelChangeRef.current?.(false), []);
+
+  // ---- Study Mode notes, A–B study loop, and on-screen feedback pill ----------------------------
+  const [studyNotes, setStudyNotes] = useState<StudyNote[]>([]);
+  const [studyAutoPause, setStudyAutoPause] = useState<boolean>(true);
+  const [studyFocusSignal, setStudyFocusSignal] = useState<number>(0);
+  const [hoveredNote, setHoveredNote] = useState<StudyNote | null>(null);
+  const [abLoop, setAbLoop] = useState<AbLoopState>({ start: null, end: null });
+  const [osdMessage, setOsdMessage] = useState<string | null>(null);
+  const osdTimerRef = useRef<number | null>(null);
+
+  const showOsd = (message: string) => {
+    setOsdMessage(message);
+    if (osdTimerRef.current !== null) window.clearTimeout(osdTimerRef.current);
+    osdTimerRef.current = window.setTimeout(() => {
+      setOsdMessage(null);
+      osdTimerRef.current = null;
+    }, 1400);
+  };
+  useEffect(() => () => {
+    if (osdTimerRef.current !== null) window.clearTimeout(osdTimerRef.current);
+  }, []);
+
+  // Load persisted Study Mode notes (`.notes.json`) whenever the file switches, and clear A–B loop.
+  useEffect(() => {
+    setAbLoop({ start: null, end: null });
+    setHoveredNote(null);
+    if (!filePath || mediaType !== 'video') {
+      setStudyNotes([]);
+      return;
+    }
+    let cancelled = false;
+    void loadStudyNotes(filePath).then((sidecar) => {
+      if (cancelled) return;
+      setStudyNotes(sidecar.notes);
+      setStudyAutoPause(sidecar.autoPauseOnType);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath, mediaType]);
+
+  const persistStudyNotes = (nextNotes: StudyNote[], nextAutoPause: boolean) => {
+    if (!filePath) return;
+    void saveStudyNotes(filePath, { version: 1, autoPauseOnType: nextAutoPause, notes: nextNotes }).catch((err) =>
+      console.error('Failed to save study notes:', err)
+    );
+  };
+
+  const addStudyNote = (draft: { time: number; text: string; tag: StudyNoteTag; quote?: string; snapshotDataUrl?: string }) => {
+    const now = Date.now();
+    const entry: StudyNote = {
+      id: crypto.randomUUID(),
+      time: Math.max(0, draft.time),
+      text: draft.text,
+      tag: draft.tag,
+      quote: draft.quote,
+      snapshotDataUrl: draft.snapshotDataUrl,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setStudyNotes((prev) => {
+      const next = sortStudyNotes([...prev, entry]);
+      persistStudyNotes(next, studyAutoPause);
+      return next;
+    });
+  };
+
+  const updateStudyNote = (id: string, patch: Partial<Pick<StudyNote, 'text' | 'tag' | 'snapshotDataUrl'>>) => {
+    setStudyNotes((prev) => {
+      const next = prev.map((n) => (n.id === id ? { ...n, ...patch, updatedAt: Date.now() } : n));
+      persistStudyNotes(next, studyAutoPause);
+      return next;
+    });
+  };
+
+  const deleteStudyNote = (id: string) => {
+    setStudyNotes((prev) => {
+      const next = prev.filter((n) => n.id !== id);
+      persistStudyNotes(next, studyAutoPause);
+      return next;
+    });
+  };
+
+  const clearAllStudyNotes = () => {
+    setStudyNotes([]);
+    persistStudyNotes([], studyAutoPause);
+  };
+
+  const handleStudyAutoPauseChange = (enabled: boolean) => {
+    setStudyAutoPause(enabled);
+    persistStudyNotes(studyNotes, enabled);
+  };
+
+  const captureCurrentSlide = (): string | null => {
+    const video = videoRef.current;
+    if (!video) return null;
+    return captureVideoFrameDataUrl(video);
+  };
+
+  const captureCurrentQuote = (): string => {
+    const t = videoRef.current?.currentTime ?? playbackClock;
+    const flatLines = playerCaptionLines.map((l) => ({
+      start: l.start,
+      end: l.end,
+      text: l.words.map((w) => w.text).join(' '),
+    }));
+    return extractCaptionQuoteAt(flatLines, t);
+  };
+
+  const setLoopA = () => {
+    const t = editTimelineRef.current?.getTime() ?? videoRef.current?.currentTime ?? 0;
+    setAbLoop((prev) => {
+      const end = prev.end !== null && prev.end > t + 0.5 ? prev.end : null;
+      showOsd(end !== null ? `A–B Loop ${formatChapterTime(t)} → ${formatChapterTime(end)}` : `Loop start A set at ${formatChapterTime(t)}`);
+      return { start: t, end };
+    });
+  };
+
+  const setLoopB = () => {
+    const t = editTimelineRef.current?.getTime() ?? videoRef.current?.currentTime ?? 0;
+    setAbLoop((prev) => {
+      const start = prev.start !== null && prev.start < t - 0.5 ? prev.start : Math.max(0, t - 10);
+      showOsd(`A–B Loop ${formatChapterTime(start)} → ${formatChapterTime(t)}`);
+      return { start, end: t };
+    });
+  };
+
+  const clearAbLoop = () => {
+    setAbLoop({ start: null, end: null });
+    showOsd('A–B Loop cleared');
+  };
+
+  // Enforce A–B study loop smoothly while active.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || abLoop.start === null || abLoop.end === null || abLoop.end <= abLoop.start) return;
+    const loopStart = abLoop.start;
+    const loopEnd = abLoop.end;
+    const enforce = () => {
+      if (video.currentTime >= loopEnd) {
+        video.currentTime = loopStart;
+        if (video.paused && !isDraggingTimelineRef.current) {
+          void video.play().catch(() => {});
+        }
+      }
+    };
+    video.addEventListener('timeupdate', enforce);
+    return () => video.removeEventListener('timeupdate', enforce);
+  }, [abLoop.start, abLoop.end]);
+
+  // Ref-backed smart keyboard actions so createKeyboardHandler always sees fresh state.
+  const smartActionsRef = useRef({
+    quickStudyNote: () => {},
+    quickSnapSlide: () => {},
+    quickAddChapter: () => {},
+    setLoopA: () => {},
+    setLoopB: () => {},
+    clearLoop: () => {},
+    seekPercent: (_fraction: number) => {},
+  });
+  smartActionsRef.current = {
+    quickStudyNote: () => {
+      if (mediaType !== 'video' || !filePath || !onSidebarPanelChangeRef.current) return;
+      setSidebarPanel('study');
+      setStudyFocusSignal((n) => n + 1);
+    },
+    quickSnapSlide: () => {
+      if (mediaType !== 'video' || !filePath) return;
+      const snap = captureCurrentSlide();
+      const t = videoRef.current?.currentTime ?? 0;
+      if (!snap) return;
+      addStudyNote({ time: t, text: '', tag: 'key', snapshotDataUrl: snap });
+      showOsd(`Slide captured at ${formatChapterTime(t)}`);
+    },
+    quickAddChapter: () => {
+      if (mediaType !== 'video' || !filePath) return;
+      addChapterAtCurrentTime();
+      const t = editTimelineRef.current?.getTime() ?? videoRef.current?.currentTime ?? 0;
+      showOsd(`Chapter added at ${formatChapterTime(t)}`);
+    },
+    setLoopA,
+    setLoopB,
+    clearLoop: clearAbLoop,
+    seekPercent: (fraction: number) => {
+      const edit = editTimelineRef.current;
+      if (edit && edit.duration > 0) {
+        const target = fraction * edit.duration;
+        edit.seek(target);
+        showOsd(`${Math.round(fraction * 100)}% (${formatChapterTime(target)})`);
+        return;
+      }
+      const video = videoRef.current;
+      if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
+      const target = fraction * video.duration;
+      video.currentTime = target;
+      showOsd(`${Math.round(fraction * 100)}% (${formatChapterTime(target)})`);
+    },
+  };
 
   // Numeric playback time for the caption renderer and the panels (timeupdate, ~4Hz - the caption
   // layer interpolates between ticks itself). Only listened to while something needs it.
@@ -2265,6 +2475,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       setHoveredChapter(null);
     }
 
+    if (studyNotes.length > 0) {
+      const HOVER_TOLERANCE_SEC = Math.max(1.2, (editTimelineRef.current?.duration ?? video.duration) * 0.012);
+      const nearestNote = studyNotes.find((n) => Math.abs(n.time - hoverTime) <= HOVER_TOLERANCE_SEC) ?? null;
+      setHoveredNote((prev) => (prev?.id === nearestNote?.id ? prev : nearestNote));
+    } else if (hoveredNote) {
+      setHoveredNote(null);
+    }
+
     // Audio's stand-in for the video thumbnail: there's no frame to preview, so show the
     // timestamp under the cursor instead - rounded to whole seconds so this only re-renders
     // roughly once per second of horizontal cursor movement, not on every pixel of mousemove.
@@ -2508,7 +2726,14 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
       playPrevious: () => onPreviousRef.current?.(),
       playNext: () => onNextRef.current?.(),
       // Read live: the file (and whether it's a video) changes without this effect re-running.
-      toggleEditor: () => onEditVideoRef.current?.()
+      toggleEditor: () => onEditVideoRef.current?.(),
+      quickStudyNote: () => smartActionsRef.current.quickStudyNote(),
+      quickSnapSlide: () => smartActionsRef.current.quickSnapSlide(),
+      quickAddChapter: () => smartActionsRef.current.quickAddChapter(),
+      setLoopA: () => smartActionsRef.current.setLoopA(),
+      setLoopB: () => smartActionsRef.current.setLoopB(),
+      clearLoop: () => smartActionsRef.current.clearLoop(),
+      seekPercent: (fraction: number) => smartActionsRef.current.seekPercent(fraction),
     } as KeyboardHandlerActions, { enableArrowSeek: mediaType !== 'audio' });
 
     document.addEventListener('keydown', keyboardHandler);
@@ -2674,7 +2899,8 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					</div>
 					<div className="flex flex-col gap-3 text-sm">
 						{[
-							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
+							{ title: 'Playback', rows: [['Space / K', 'Play / pause'], ['J / L', 'Slow down / speed up'], ['← / →', 'Seek 5s back / forward'], ['0 – 9', 'Jump to 0% – 90%'], [', / .', 'Previous / next frame'], ['Shift+P / Shift+N', 'Previous / next file']] },
+							{ title: 'Study & Smart Player', rows: [['N', 'Open Study Mode & jot a note'], ['S', 'Snap current slide into Study Notes'], ['B', 'Add chapter bookmark here'], ['[ / ]', 'Set A–B study loop start / end'], ['\\', 'Clear A–B study loop']] },
 							...(onEditVideo ? [{ title: 'Editing', rows: [['E', isEditingVideo ? 'Close the editor' : 'Open the editor']] }] : []),
 							{ title: 'Volume', rows: [['M', 'Mute / unmute']] },
 							{ title: 'Display', rows: [['F', 'Fullscreen'], ['T', 'Theater mode'], ['I', 'Picture in picture']] },
@@ -2701,7 +2927,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 		)}
       
     	<div
-        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded`}
+        	className={`w-full h-full video-container ${!isPlaying ? 'paused' : ''} ${captionsVisible ? 'captions' : ''} ${visible ? 'controls-visible' : ''} ${reserveControls ? 'editing' : ''} bg-black rounded-none`}
 			ref={videoContainerRef}
 			// --player-h (live container height, from the ResizeObserver below) caps the control bar's
 			// flyout menus in player.css so a short player scrolls them instead of clipping their top.
@@ -2716,7 +2942,7 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						ref={timelineContainerRef}
 						onMouseDown={handleTimelineMouseDown}
 						onMouseMove={handleTimelineHover}
-						onMouseLeave={() => { setHoveredChapter(null); setAudioHoverTimeLabel(null); }}
+						onMouseLeave={() => { setHoveredChapter(null); setHoveredNote(null); setAudioHoverTimeLabel(null); }}
 					>
 						<div className="timeline">
 						{mediaType === 'audio' && <canvas ref={waveformCanvasRef} className="audio-waveform-canvas" />}
@@ -2731,16 +2957,46 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 						)}
 						<div className="thumb-indicator"></div>
-						{hoveredChapter && videoRef.current && Number.isFinite(videoRef.current.duration) && (
-							<div
-								className="chapter-tooltip"
-								style={{ left: `${(hoveredChapter.time / videoRef.current.duration) * 100}%` }}
-							>
-								{hoveredChapter.label === formatChapterTime(hoveredChapter.time)
-									? hoveredChapter.label
-									: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
-							</div>
-						)}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && videoRef.current.duration > 0 && (() => {
+							const duration = editTimeline?.duration ?? videoRef.current!.duration;
+							if (abLoop.start !== null && abLoop.end !== null && abLoop.end > abLoop.start) {
+								const leftPct = Math.max(0, Math.min(100, (abLoop.start / duration) * 100));
+								const widthPct = Math.max(0.5, Math.min(100 - leftPct, ((abLoop.end - abLoop.start) / duration) * 100));
+								return <div className="ab-loop-range" style={{ left: `${leftPct}%`, width: `${widthPct}%` }} />;
+							}
+							if (abLoop.start !== null) {
+								return <div className="ab-loop-pin" style={{ left: `${Math.max(0, Math.min(100, (abLoop.start / duration) * 100))}%` }} />;
+							}
+							return null;
+						})()}
+						{(hoveredNote || hoveredChapter) && videoRef.current && Number.isFinite(videoRef.current.duration) && (() => {
+							const duration = editTimeline?.duration ?? videoRef.current!.duration;
+							if (hoveredNote) {
+								const preview = hoveredNote.text.trim() || (hoveredNote.snapshotDataUrl ? 'Captured slide' : 'Study note');
+								const clipped = preview.length > 44 ? `${preview.slice(0, 44)}…` : preview;
+								return (
+									<div
+										className="chapter-tooltip"
+										style={{ left: `${(hoveredNote.time / duration) * 100}%` }}
+									>
+										{`${formatChapterTime(hoveredNote.time)} · ${clipped}`}
+									</div>
+								);
+							}
+							if (hoveredChapter) {
+								return (
+									<div
+										className="chapter-tooltip"
+										style={{ left: `${(hoveredChapter.time / duration) * 100}%` }}
+									>
+										{hoveredChapter.label === formatChapterTime(hoveredChapter.time)
+											? hoveredChapter.label
+											: `${formatChapterTime(hoveredChapter.time)} — ${hoveredChapter.label}`}
+									</div>
+								);
+							}
+							return null;
+						})()}
 						{videoRef.current && Number.isFinite(videoRef.current.duration) && (() => {
 							// At most one tick per 0.75% of the bar - closer ones would merge into a
 							// solid white strip over the progress.
@@ -2753,15 +3009,52 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 								return <div key={chapter.id} className="chapter-tick" style={{ left: `${pct}%` }} title={chapter.label} />;
 							});
 						})()}
+						{videoRef.current && Number.isFinite(videoRef.current.duration) && studyNotes.length > 0 && (() => {
+							const duration = editTimeline?.duration ?? videoRef.current!.duration;
+							return studyNotes.map((note) => {
+								const pct = Math.max(0, Math.min(100, (note.time / duration) * 100));
+								return <div key={note.id} className="note-marker" style={{ left: `${pct}%` }} />;
+							});
+						})()}
 						</div>
 					</div>
 					
 					{/* [leading | centred cluster | spacer]: the two flex-1 sides keep the playback cluster
-					    centred, and the leading side (Dashboard's "Back to …") can only ever take the
-					    space beside it, never overlap it. player.css's @container player rules shrink
-					    and then thin out the cluster as the player itself narrows. */}
+					    centred, and the leading side (Dashboard's "Back to …" + Linked items + Watch-mode
+					    Study / Doc pills) keeps player transport controls uncluttered. */}
 					<div className="controls flex flex-row items-center">
-						<div className="ctl-side ctl-leading">{controlsLeading}</div>
+						<div className="ctl-side ctl-leading">
+							{controlsLeading}
+							{mediaType === 'video' && !isEditingVideo && filePath && (
+								<div className="flex items-center gap-1.5 ml-1 pl-2 border-l border-white/15 shrink-0">
+									{onSidebarPanelChange && (
+										<button
+											type="button"
+											onClick={() => setSidebarPanel((prev) => (prev === 'study' ? null : 'study'))}
+											title="Study Mode — timestamped notes, slide snaps & A–B loop (N)"
+											className={`ctl-action-pill ${sidebarPanel === 'study' ? 'ctl-action-pill-study' : ''}`}
+										>
+											<IoSchoolOutline size={13} />
+											<span className="@max-[760px]/player:hidden">Study</span>
+											{studyNotes.length > 0 && (
+												<span className="px-1 rounded-full text-[9.5px] tabular-nums bg-emerald-500/30 text-emerald-200">
+													{studyNotes.length}
+												</span>
+											)}
+										</button>
+									)}
+									<button
+										type="button"
+										onClick={() => setShowVideoToDocModal(true)}
+										title="Turn this video into a structured Briefcast Doc (notes, chapters, transcript & screenshots)"
+										className="ctl-action-pill"
+									>
+										<IoDocumentTextOutline size={13} />
+										<span className="@max-[860px]/player:hidden">Doc</span>
+									</button>
+								</div>
+							)}
+						</div>
 						<div className="ctl-cluster">
 						<div className='flex gap-5'>
 						{onPrevious && (
@@ -3206,6 +3499,44 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 							/>,
 							toolPanelHost
 						)}
+					{toolPanelHost &&
+						sidebarPanel === 'study' &&
+						filePath &&
+						createPortal(
+							<PlayerStudyPanel
+								videoTitle={(filePath.split(/[\\/]/).pop() ?? 'Video').replace(/\.[^.]+$/, '')}
+								notes={studyNotes}
+								autoPauseOnType={studyAutoPause}
+								onAutoPauseChange={handleStudyAutoPauseChange}
+								currentTime={playbackClock}
+								isPlaying={isPlaying}
+								hasCaptions={playerCaptionLines.length > 0}
+								abLoop={abLoop}
+								onSetLoopA={setLoopA}
+								onSetLoopB={setLoopB}
+								onClearLoop={clearAbLoop}
+								onSeek={(t) => {
+									if (videoRef.current) videoRef.current.currentTime = t;
+								}}
+								onPauseForNote={() => {
+									if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
+								}}
+								onResumeAfterNote={() => {
+									if (videoRef.current && videoRef.current.paused) void videoRef.current.play().catch(() => {});
+								}}
+								onCaptureFrame={captureCurrentSlide}
+								onCaptureQuote={captureCurrentQuote}
+								onAddNote={addStudyNote}
+								onUpdateNote={updateStudyNote}
+								onDeleteNote={deleteStudyNote}
+								onClearAllNotes={clearAllStudyNotes}
+								onTurnIntoDoc={() => setShowVideoToDocModal(true)}
+								focusComposerSignal={studyFocusSignal}
+								onClose={() => setSidebarPanel(null)}
+							/>,
+							toolPanelHost
+						)}
+					{osdMessage && <div className="player-osd-pill">{osdMessage}</div>}
 					{mediaType === 'audio' && (
 						<canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 					)}
@@ -3252,9 +3583,13 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 						</div>
 					)}
 					{isRecovering && (
-						<div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none bg-black/40">
-							<div className="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
-							<div className="text-white text-sm">Preparing video{recoveryProgress > 0 ? ` — ${recoveryProgress}%` : '...'}</div>
+						<div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none bg-black/60 backdrop-blur-sm">
+							<BrandLoader
+								variant="contained"
+								size="md"
+								message="Preparing video"
+								progress={recoveryProgress > 0 ? recoveryProgress : undefined}
+							/>
 						</div>
 					)}
 					{activeClipEffects?.colorFilter?.preset === 'vignette' && frameRect && (
@@ -3286,6 +3621,22 @@ const VideoPlayer = React.forwardRef<VideoPlayerHandle, VideoPlayerProps>(({ src
 					</>
 			}
     	</div>
+
+      {showVideoToDocModal && filePath && (
+        <VideoToDocModal
+          sourceVideoPath={filePath}
+          fileName={filePath.split(/[\\/]/).pop() || filePath}
+          durationSec={videoRef.current?.duration && Number.isFinite(videoRef.current.duration) ? videoRef.current.duration : 0}
+          chapters={chapters.map((c) => ({ time: c.time, label: c.label }))}
+          lines={playerCaptionLines.map((l) => ({
+            start: l.start,
+            end: l.end,
+            text: l.words.map((w) => w.text).join(" "),
+          }))}
+          studyNotes={studyNotes}
+          onClose={() => setShowVideoToDocModal(false)}
+        />
+      )}
 
     </div>
 

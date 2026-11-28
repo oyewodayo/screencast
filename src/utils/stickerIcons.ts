@@ -7,7 +7,7 @@
 
 export type IconGroup = "Basics" | "People" | "Talk" | "Media" | "Work" | "Places" | "Things" | "Signs";
 
-interface IconDef {
+export interface StickerIconDef {
   value: string;
   label: string;
   group: IconGroup;
@@ -16,6 +16,8 @@ interface IconDef {
   // Filled rather than stroked.
   solid?: boolean;
 }
+
+type IconDef = StickerIconDef;
 
 const circle = (cx: number, cy: number, r: number) => `M${cx} ${cy - r}a${r} ${r} 0 1 1 0 ${2 * r}a${r} ${r} 0 1 1 0 ${-2 * r}Z`;
 
@@ -131,6 +133,11 @@ export function searchIcons(query: string): typeof STICKER_ICONS {
 }
 
 const byValue = new Map<string, IconDef>(ICON_DEFS.map((d) => [d.value, d as IconDef]));
+
+export function getStickerIconDef(icon: StickerIcon | string | undefined): StickerIconDef | undefined {
+  if (!icon || icon === "none") return undefined;
+  return byValue.get(icon);
+}
 const pathCache = new Map<string, Path2D>();
 const path2d = (d: string): Path2D => {
   let p = pathCache.get(d);

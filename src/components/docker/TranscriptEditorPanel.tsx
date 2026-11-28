@@ -61,7 +61,7 @@ const TranscriptEditorPanel: React.FC<TranscriptEditorPanelProps> = ({ anchor, c
   const [pauseMin, setPauseMin] = useState(1);
   const [preview, setPreview] = useState<Preview>(null);
 
-  const { generate, generating, error, resumable } = useTranscriptGeneration({
+  const { generate, cancel, generating, error, resumable } = useTranscriptGeneration({
     sourcePaths,
     language,
     hasTranscripts: !!captions,
@@ -257,7 +257,7 @@ const TranscriptEditorPanel: React.FC<TranscriptEditorPanelProps> = ({ anchor, c
         </div>
       ) : null}
 
-      {generating && <GenerationProgressBar generating={generating} />}
+      {generating && <GenerationProgressBar generating={generating} onCancel={cancel} />}
 
       {hasTokens && missingSources.length > 0 && !generating && (
         <button

@@ -509,11 +509,87 @@ export function buildDocument(input: BuildInput): BuildResult {
     stats.references = references.length;
   }
 
+function blockPage(b: DocBlock): number | null {
+  switch (b.kind) {
+    case "heading":
+    case "paragraph":
+    case "caption":
+      return b.lines[0]?.page ?? null;
+    case "equation":
+    case "figure":
+    case "table":
+      return b.block.page ?? null;
+    case "toc":
+      return b.entries[0]?.page ?? null;
+    case "references":
+      return b.entries[0]?.lines[0]?.page ?? null;
+    default:
+      return null;
+  }
+}
+
+function blockFirstLineText(b: DocBlock): string {
+  if (b.kind === "heading" || b.kind === "paragraph") {
+    return b.lines[0] ? lineText(b.lines[0]).trim() : "";
+  }
+  return "";
+}
+
+const MAJOR_SECTION_REGEX = /^(dedication|abstract|acknowledgements|acknowledgments|certification|contents|table of contents|list of tables|list of figures|references|bibliography|appendix\b)/i;
+
+function isMajorSectionStart(b: DocBlock): boolean {
+  if (b.kind === "heading" && b.level === 1) return true;
+  if (b.kind === "toc" || b.kind === "references") return true;
+  const text = blockFirstLineText(b);
+  if (MAJOR_SECTION_REGEX.test(text)) return true;
+  if (/^(chapter|part|appendix)\s+\S+/i.test(text)) return true;
+  return false;
+}
+
+function pageBottomFraction(pageNo: number, pages: PageAnalysis[]): number {
+  const p = pages.find((pg) => pg.page === pageNo);
+  if (!p || p.height <= 0) return 1;
+  let maxY = 0;
+  for (const el of p.elements) {
+    if (el.kind === "line") maxY = Math.max(maxY, el.line.bottom);
+    else if (el.kind === "equation" || el.kind === "figure" || el.kind === "table") maxY = Math.max(maxY, el.region.y1);
+    else if (el.kind === "tocEntry") maxY = Math.max(maxY, el.y1);
+  }
+  return maxY / p.height;
+}
+
   // ---- Blocks
   const content: JSONContent[] = [];
   let title = "";
+  const lineH = Math.max(14, (body.lineHeight ?? 1.2) * (body.fontSize ?? 12));
+  let lastBlockPage = blocks[0] ? blockPage(blocks[0]) : null;
+
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
+    const curPage = blockPage(b);
+
+    if (i > 0 && curPage !== null && lastBlockPage !== null && curPage > lastBlockPage) {
+      const prevEndedEarly = pageBottomFraction(lastBlockPage, pages) < 0.80;
+      const isMajor = isMajorSectionStart(b);
+      const isFrontMatter = lastBlockPage <= 10;
+      const multiplePagesJumped = curPage - lastBlockPage >= 2;
+
+      if (isMajor || prevEndedEarly || isFrontMatter || multiplePagesJumped) {
+        if (content.length > 0 && content[content.length - 1].type !== "pageBreak") {
+          content.push({ type: "pageBreak" });
+        }
+      }
+    }
+    if (curPage !== null) lastBlockPage = curPage;
+
+    // Convert large vertical gap into clickable, editable paragraph lines
+    if ((b.kind === "paragraph" || b.kind === "heading") && b.style.spaceBefore > 24) {
+      const emptyCount = Math.min(15, Math.floor(b.style.spaceBefore / lineH));
+      for (let k = 0; k < emptyCount; k++) {
+        content.push({ type: "paragraph" });
+      }
+      b.style.spaceBefore = Math.max(0, b.style.spaceBefore - emptyCount * lineH);
+    }
     switch (b.kind) {
       case "heading": {
         // A heading set on several lines on purpose ("CHAPTER 2" / "LITERATURE REVIEW") keeps its
@@ -605,8 +681,8 @@ export function buildDocument(input: BuildInput): BuildResult {
   return { doc: { type: "doc", content }, title: title || "Imported PDF", page: setup.page, margins: setup.margins, layout, numbering, references, stats };
 }
 
-// A contents list as a rule-less three-column table - label, text, page - drawn with dot leaders
-// (docLayout.css, rules "leaders"). Nested entries keep their indent on the label.
+// A contents list as a rule-less table - text (with integrated label) and page - drawn with dot leaders
+// (docLayout.css, rules "leaders"). Nested entries keep their indent.
 function buildTocTable(entries: TocEntryElement[], span: boolean, ctx: InlineContext, words: Map<string, number>, links: LinkArea[], textIsRoman: boolean, rules: PageRule[]): JSONContent {
   const base = Math.min(...entries.map((e) => e.indent));
   const cell = (content: JSONContent[] | undefined, attrs: Record<string, unknown> = {}): JSONContent => ({
@@ -615,13 +691,17 @@ function buildTocTable(entries: TocEntryElement[], span: boolean, ctx: InlineCon
     content: [{ type: "paragraph", attrs: { noIndent: true, ...attrs }, content: content?.length ? content : undefined }],
   });
   const rows = entries.map((e) => {
-    const text = inlineToJson(inlineContent(e.lines, words, links, textIsRoman, rules), ctx);
-    const indent = e.indent - base;
+    const textNodes = inlineToJson(inlineContent(e.lines, words, links, textIsRoman, rules), ctx);
+    const indent = Math.max(0, e.indent - base);
+    const titleNodes: JSONContent[] = [];
+    if (e.label) {
+      titleNodes.push({ type: "text", text: `${e.label}\u00A0\u00A0 ` });
+    }
+    titleNodes.push(...textNodes);
     return {
       type: "tableRow",
       content: [
-        cell(e.label ? [{ type: "text", text: e.label }] : undefined, indent > 2 ? { indentLeft: toIn(indent) } : {}),
-        cell(text),
+        cell(titleNodes, indent > 2 ? { indentLeft: toIn(indent) } : {}),
         cell([{ type: "text", text: e.pageRef }], { textAlign: "right" }),
       ],
     };

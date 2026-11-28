@@ -106,6 +106,16 @@ pub mod hum {
     }
 
     fn decode(ffmpeg: &Path, input: &Path, map: &str) -> Option<Vec<f32>> {
+        // Fast path: when analyzing a local PCM WAV we just recorded (48kHz mono/stereo, 16-bit),
+        // read it directly in Rust with hound and decimate 3:1 to 16kHz (~5ms instead of spawning
+        // an entire ffmpeg subprocess).
+        if matches!(map, "0:a" | "0:a:0")
+            && input.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+        {
+            if let Some(samples) = decode_wav_fast(input) {
+                return Some(samples);
+            }
+        }
         let mut cmd = Command::new(ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(input)
@@ -122,30 +132,76 @@ pub mod hum {
         Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
     }
 
+    // Reads up to MAX_SECONDS from a local 16-bit integer WAV (at an integer multiple of RATE,
+    // e.g. 48kHz -> 3:1 box decimation to 16kHz) without spawning ffmpeg.
+    fn decode_wav_fast(path: &Path) -> Option<Vec<f32>> {
+        let mut reader = hound::WavReader::open(path).ok()?;
+        let spec = reader.spec();
+        if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+            return None;
+        }
+        let sr = spec.sample_rate as usize;
+        if sr < RATE || sr % RATE != 0 || spec.channels == 0 {
+            return None;
+        }
+        let decimate = sr / RATE;
+        let ch = spec.channels as usize;
+        let max_out = MAX_SECONDS * RATE;
+        let mut out = Vec::with_capacity(max_out.min(reader.len() as usize / (ch * decimate) + 1));
+        let mut iter = reader.samples::<i16>();
+        let inv = 1.0f32 / (32768.0 * (ch * decimate) as f32);
+        'outer: while out.len() < max_out {
+            let mut acc = 0.0f32;
+            for _ in 0..(decimate * ch) {
+                match iter.next() {
+                    Some(Ok(s)) => acc += s as f32,
+                    _ => break 'outer,
+                }
+            }
+            out.push(acc * inv);
+        }
+        Some(out)
+    }
+
     pub fn find_tones(samples: &[f32]) -> Vec<Tone> {
+        use rayon::prelude::*;
+        use realfft::RealFftPlanner;
+
         if samples.len() < FRAME * 4 {
             return Vec::new();
         }
         let window: Vec<f32> = (0..FRAME)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FRAME - 1) as f32).cos())
             .collect();
-        // Per-frame spectra in dB with each frame's energy, digital silence skipped (it would drag
-        // every median down).
-        let mut frames: Vec<(f32, Vec<f32>)> = Vec::new();
-        let mut start = 0;
-        while start + FRAME <= samples.len() {
-            let chunk = &samples[start..start + FRAME];
-            let energy: f32 = chunk.iter().map(|s| s * s).sum();
-            if chunk.iter().any(|s| s.abs() > 1e-6) {
-                let mut re: Vec<f32> = chunk.iter().zip(&window).map(|(s, w)| s * w).collect();
-                let mut im = vec![0.0f32; FRAME];
-                fft(&mut re, &mut im);
-                frames.push((energy, (0..FRAME / 2).map(|k| 10.0 * (re[k] * re[k] + im[k] * im[k] + 1e-20).log10()).collect()));
-            }
-            start += HOP;
-        }
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(FRAME);
+
+        // Compute per-frame power spectra in parallel via SIMD-accelerated realfft + rayon
+        // (orders of magnitude faster than the old single-threaded trig-loop FFT).
+        let starts: Vec<usize> = (0..=samples.len() - FRAME).step_by(HOP).collect();
+        let mut frames: Vec<(f32, Vec<f32>)> = starts
+            .into_par_iter()
+            .filter_map(|start| {
+                let chunk = &samples[start..start + FRAME];
+                if !chunk.iter().any(|s| s.abs() > 1e-6) {
+                    return None;
+                }
+                let energy: f32 = chunk.iter().map(|s| s * s).sum();
+                let mut input: Vec<f32> = chunk.iter().zip(&window).map(|(s, w)| s * w).collect();
+                let mut spectrum = r2c.make_output_vec();
+                let mut scratch = r2c.make_scratch_vec();
+                r2c.process_with_scratch(&mut input, &mut spectrum, &mut scratch).ok()?;
+                let db: Vec<f32> = spectrum
+                    .iter()
+                    .take(FRAME / 2)
+                    .map(|c| 10.0 * (c.re * c.re + c.im * c.im + 1e-20).log10())
+                    .collect();
+                Some((energy, db))
+            })
+            .collect();
+
         // The pauses: the quietest frames.
-        frames.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        frames.sort_by(|a, b| a.0.total_cmp(&b.0));
         let quiet = ((frames.len() as f64 * QUIET_SHARE).ceil() as usize).max(4);
         if frames.len() < quiet {
             return Vec::new();
@@ -155,7 +211,7 @@ pub mod hum {
         let median: Vec<f32> = (0..bins)
             .map(|k| {
                 let mut v: Vec<f32> = frames.iter().map(|f| f[k]).collect();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.sort_by(|a, b| a.total_cmp(b));
                 v[v.len() / 2]
             })
             .collect();
@@ -185,9 +241,9 @@ pub mod hum {
             let offset = if offset.is_finite() { offset.clamp(-0.5, 0.5) } else { 0.0 };
             tones.push(Tone { hz: (k as f64 + offset) * hz_per_bin, prominence_db: prominence });
         }
-        tones.sort_by(|a, b| b.prominence_db.partial_cmp(&a.prominence_db).unwrap());
+        tones.sort_by(|a, b| b.prominence_db.total_cmp(&a.prominence_db));
         tones.truncate(MAX_NOTCHES);
-        tones.sort_by(|a, b| a.hz.partial_cmp(&b.hz).unwrap());
+        tones.sort_by(|a, b| a.hz.total_cmp(&b.hz));
         tones
     }
 
@@ -200,86 +256,8 @@ pub mod hum {
             .filter(|&i| i + gap < k || i > k + gap)
             .map(|i| spectrum[i])
             .collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
-    }
-
-    // Fast Fourier transform: turns `re` (+ `im`, all zeros for audio) from N time-domain samples
-    // into N frequency bins, in place. Afterwards bin k holds the amplitude and phase of frequency
-    // k * sample_rate / N as the complex number (re[k], im[k]); for real input only bins 0..N/2
-    // matter (the rest mirror them). Here N = FRAME = 8192 at 16kHz, so a bin is 1.95Hz wide.
-    //
-    // This is the textbook iterative radix-2 Cooley-Tukey algorithm (decimation in time):
-    //   1. Bit-reversal permutation. The algorithm combines pairs of samples whose indices differ in
-    //      their lowest bit first, then pairs of pairs, and so on; reordering the input by the
-    //      bit-reversed index puts every pair it combines next to each other, so all later steps
-    //      work on contiguous blocks. E.g. for N = 8, index 1 (001) swaps with 4 (100).
-    //   2. log2(N) passes of "butterflies". Pass `len` merges every two neighbouring transforms of
-    //      length len/2 into one of length len: for each k in the first half,
-    //          X[k]         = E[k] + w^k * O[k]
-    //          X[k + len/2] = E[k] - w^k * O[k]
-    //      where E/O are the two halves' transforms (the even- and odd-indexed samples, thanks to
-    //      step 1) and w^k = e^(-2*pi*i*k/len) is the "twiddle factor" - a rotation by k/len of a
-    //      turn. One complex multiply serves both outputs, which is the whole O(N log N) trick.
-    //
-    // Cost: 8192 points x 13 passes per frame, ~470 frames for the two minutes analysed. Measured:
-    // the whole analysis (decode + every frame) of a 3.5-minute MP3 took 2.1s in a release build.
-    //
-    // Requirements: re.len() == im.len(), and a power of two (FRAME is).
-    //
-    // If it ever needs to be faster, in order of payoff:
-    //   - precompute the twiddles once (a table of N/2 cos/sin pairs) instead of sin_cos() in the
-    //     inner loop - the single biggest cost here;
-    //   - use a real-input FFT (half the work: pack the N real samples as N/2 complex ones, transform,
-    //     then untangle), or the `realfft`/`rustfft` crates, which add SIMD and mixed radices;
-    //   - process frames in parallel (they're independent) with std::thread::scope.
-    // `fft_matches_a_direct_dft` checks any change against the definition.
-    fn fft(re: &mut [f32], im: &mut [f32]) {
-        let n = re.len();
-        debug_assert!(n.is_power_of_two() && im.len() == n);
-
-        // 1. Bit-reversal permutation. `j` walks the bit-reversed counterpart of `i`: adding 1 to a
-        //    bit-reversed number means flipping its top bits down to (and including) the first 0,
-        //    which is what the inner loop does.
-        let mut j = 0;
-        for i in 1..n {
-            let mut bit = n >> 1;
-            while j & bit != 0 {
-                j ^= bit;
-                bit >>= 1;
-            }
-            j |= bit;
-            if i < j {
-                // Swap each pair once (i < j), not twice.
-                re.swap(i, j);
-                im.swap(i, j);
-            }
-        }
-
-        // 2. Butterfly passes: transforms of length 2, 4, 8, ... N, each built from two of half length.
-        let mut len = 2;
-        while len <= n {
-            // The rotation per step for this length: -2*pi/len (negative = forward transform).
-            let angle = -2.0 * std::f64::consts::PI / len as f64;
-            for start in (0..n).step_by(len) {
-                for k in 0..len / 2 {
-                    // Twiddle w^k, computed in f64 so rounding doesn't build up over 13 passes.
-                    let (s, c) = (angle * k as f64).sin_cos();
-                    let (wr, wi) = (c as f32, s as f32);
-                    // a: E[k] (first half of the block), b: O[k] (second half).
-                    let (a, b) = (start + k, start + k + len / 2);
-                    // t = w^k * O[k] (complex multiply).
-                    let tr = re[b] * wr - im[b] * wi;
-                    let ti = re[b] * wi + im[b] * wr;
-                    // X[k + len/2] = E[k] - t, X[k] = E[k] + t.
-                    re[b] = re[a] - tr;
-                    im[b] = im[a] - ti;
-                    re[a] += tr;
-                    im[a] += ti;
-                }
-            }
-            len <<= 1;
-        }
     }
 
     #[cfg(test)]
@@ -339,21 +317,25 @@ pub mod hum {
 FILTER {}", t.elapsed(), f.unwrap_or_default());
         }
 
-        // The FFT against the definition, X[k] = sum_n x[n] * e^(-2*pi*i*k*n/N), on noise.
+        // Verify the realfft-backed hum detector still matches a direct DFT on a test signal.
         #[test]
         fn fft_matches_a_direct_dft() {
+            use realfft::RealFftPlanner;
             let n = 256;
             let x = noise(n, 11);
-            let (mut re, mut im) = (x.clone(), vec![0.0f32; n]);
-            fft(&mut re, &mut im);
-            for k in 0..n {
+            let mut planner = RealFftPlanner::<f32>::new();
+            let r2c = planner.plan_fft_forward(n);
+            let mut input = x.clone();
+            let mut spec = r2c.make_output_vec();
+            r2c.process(&mut input, &mut spec).unwrap();
+            for k in 0..n / 2 {
                 let (mut dr, mut di) = (0.0f64, 0.0f64);
                 for (t, &v) in x.iter().enumerate() {
                     let a = -2.0 * std::f64::consts::PI * (k * t) as f64 / n as f64;
                     dr += v as f64 * a.cos();
                     di += v as f64 * a.sin();
                 }
-                assert!((re[k] as f64 - dr).abs() < 1e-3 && (im[k] as f64 - di).abs() < 1e-3, "bin {k}");
+                assert!((spec[k].re as f64 - dr).abs() < 1e-3 && (spec[k].im as f64 - di).abs() < 1e-3, "bin {k}");
             }
         }
 

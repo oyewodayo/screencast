@@ -21,6 +21,7 @@ import { loadTitleFonts } from "../../utils/titleFonts";
 import { drawStageTransition, stageCanDraw } from "./stageTransitions";
 import { drawPhotoFill, needsPhotoFill } from "../../utils/photoFill";
 import { drawClipFx, hasClipFx } from "../../utils/clipFx";
+import { drawLayerMask, hasShapeOrMask } from "../../utils/layerMask";
 
 // A decoded picture: an image, or a canvas it was scaled down into.
 export type StagePicture = HTMLCanvasElement | HTMLImageElement;
@@ -408,6 +409,9 @@ const ProjectStage: React.FC<ProjectStageProps> = ({ project, frame, images, blu
       const w = o.width * PW;
       const h = o.height * PH;
       withAnimation(o, t, x + w / 2, y + h / 2, () => {
+        if (o.blendMode && o.blendMode !== "normal") {
+          ctx.globalCompositeOperation = (o.blendMode === "plus-lighter" ? "lighter" : o.blendMode) as GlobalCompositeOperation;
+        }
         if (o.asset) {
           ctx.translate(x + w / 2, y + h / 2);
           if (o.rotation) ctx.rotate((o.rotation * Math.PI) / 180);
@@ -453,6 +457,16 @@ const ProjectStage: React.FC<ProjectStageProps> = ({ project, frame, images, blu
       c.clip();
       c.imageSmoothingQuality = "high";
       c.drawImage(img, (o.cropX ?? 0) * img.width, (o.cropY ?? 0) * img.height, (o.cropWidth ?? 1) * img.width, (o.cropHeight ?? 1) * img.height, 0, 0, w, h);
+      if (hasShapeOrMask(o)) {
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = Math.max(1, Math.round(w));
+        maskCanvas.height = Math.max(1, Math.round(h));
+        drawLayerMask(maskCanvas.getContext("2d")!, o, maskCanvas.width, maskCanvas.height);
+        c.save();
+        c.globalCompositeOperation = "destination-in";
+        c.drawImage(maskCanvas, 0, 0, w, h);
+        c.restore();
+      }
       const cell = { canvas, pad };
       cells.set(o.id, cell);
       return cell;

@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import { PhonesDockButton } from './PhonesHub';
 import { IoIosArrowDown, IoIosArrowUp} from 'react-icons/io';
-import { IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoMapOutline, IoCutOutline } from 'react-icons/io5'
+import { IoBrushOutline, IoCameraOutline, IoMicCircle, IoPause, IoPlay, IoSquare, IoScanSharp, IoVideocam, IoFolder, IoFolderOpen, IoHomeOutline, IoSettingsOutline, IoDocumentAttachOutline, IoImagesOutline, IoDocumentTextOutline, IoGitNetworkOutline, IoCutOutline } from 'react-icons/io5'
+import RecentHistoryDropup from './RecentHistoryDropup';
+import type { HomeItem } from '../utils/homeLibraryItems';
+import type { FileEntry } from '../utils/libraryEntries';
 
 export type RecordSource = "screen" | "video" | "audio";
 
@@ -73,6 +76,10 @@ interface Props {
     // Same idea as onStartRecordingClick, but for RecordingDocker's other button - a screenshot
     // is a standalone one-shot action, not part of the screen/webcam/mic toggle combo above.
     onScreenshotClick?: () => void;
+    // System-wide screen annotation & Privacy Shield overlay toggle (Ctrl+Shift+D).
+    isAnnotating?: boolean;
+    hasActiveBlur?: boolean;
+    onToggleAnnotation?: () => void;
     // Hides the screenshot/screen-webcam-mic/record-button cluster entirely (Ctrl+Shift+B, see
     // Dashboard.tsx's PANEL_BUTTONS_TOGGLE_SHORTCUT) - for hiding Briefcast's own controls right
     // before presenting/recording a screen that includes this window, so they don't end up baked
@@ -82,10 +89,17 @@ interface Props {
     canSwitchView?: boolean;
     viewMode?: 'screen' | 'camera';
     onSwitchView?: (mode: 'screen' | 'camera') => void;
+    // Recent history dropup for switching to recently touched items when not on home screen
+    historyItems?: HomeItem[];
+    onOpenHistoryItem?: (item: HomeItem) => void;
+    libraryFilesByPath?: Map<string, FileEntry>;
+    arrivals?: Record<string, { from: string; at: number; count: number }>;
+    libraryPreviewDurations?: Map<string, number>;
 }
 const ActiveRecordingState = (
     {
-        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,handleOpenMindmap,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView
+        recordType,isRecording,recordingStartTime,handleFolderSettings,handleGoHome,isHome,handleOpenBoard,isBoard,handleOpenDocs,isDocs,handleOpenWhiteboard,isWhiteboard,isMindmap,handleOpenVideoEditor,isVideoEditor,handleOpenSettings,handleOpenExternalFile,handleStopRecording,isPaused,pauseStartedAt,pausedAccumulatedMs,handlePauseRecording,handleResumeRecording,showDocker,setShowDocker,showFileList,onToggleRecordSource,onStartRecordingClick,onScreenshotClick,isAnnotating,hasActiveBlur,onToggleAnnotation,showRecordingPanelButtons,canSwitchView,viewMode,onSwitchView,
+        historyItems,onOpenHistoryItem,libraryFilesByPath,arrivals,libraryPreviewDurations
 
     }:Props) => {
     const [elapsedTime, setElapsedTime] = useState<number>(0);
@@ -168,7 +182,7 @@ const ActiveRecordingState = (
                     type="button"
                     className={iconButtonClass(isBoard)}
                     onClick={() => handleOpenBoard()}
-                    title="Board"
+                    title="Design"
                     >
                       <IoImagesOutline />
                     </button>
@@ -182,19 +196,11 @@ const ActiveRecordingState = (
                     </button>
                     <button
                     type="button"
-                    className={iconButtonClass(isWhiteboard)}
+                    className={iconButtonClass(isWhiteboard || isMindmap)}
                     onClick={() => handleOpenWhiteboard()}
-                    title="Whiteboard"
+                    title="Whiteboard & Mind maps"
                     >
                       <IoGitNetworkOutline />
-                    </button>
-                    <button
-                    type="button"
-                    className={iconButtonClass(isMindmap)}
-                    onClick={() => handleOpenMindmap()}
-                    title="Mindmap"
-                    >
-                      <IoMapOutline />
                     </button>
                     <button
                     type="button"
@@ -236,6 +242,16 @@ const ActiveRecordingState = (
                         window - see appSettings.ts's showRecordingPanelButtons doc comment. */}
                     {showRecordingPanelButtons && (
                     <div className="px-2 flex items-center gap-0.5">
+                        {!isHome && (
+                            <RecentHistoryDropup
+                                items={historyItems ?? []}
+                                onOpenItem={onOpenHistoryItem ?? (() => {})}
+                                libraryFilesByPath={libraryFilesByPath}
+                                arrivals={arrivals}
+                                libraryPreviewDurations={libraryPreviewDurations}
+                                disabled={isRecording}
+                            />
+                        )}
                         <button
                             type="button"
                             title="Take a screenshot"
@@ -249,6 +265,20 @@ const ActiveRecordingState = (
                         >
                             <IoCameraOutline />
                         </button>
+                        {onToggleAnnotation && (
+                            <button
+                                type="button"
+                                title={hasActiveBlur ? "Annotate & Privacy Shield (active) — Ctrl+Shift+D" : "Annotate & Privacy Shield (Ctrl+Shift+D)"}
+                                onClick={onToggleAnnotation}
+                                aria-pressed={isAnnotating}
+                                className={`relative ${iconButtonClass(isAnnotating)}`}
+                            >
+                                <IoBrushOutline />
+                                {hasActiveBlur && (
+                                    <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-emerald-500 ring-1 ring-neutral-50 dark:ring-neutral-900" />
+                                )}
+                            </button>
+                        )}
                         <div className="w-px h-4 mx-1 bg-neutral-300 dark:bg-white/20" />
                         {(() => {
                             const flags = SOURCE_FLAGS[recordType] ?? { screen: false, video: false, audio: false };

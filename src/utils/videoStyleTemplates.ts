@@ -12,7 +12,7 @@
 //
 // buildStyledProject turns one into an ordinary VideoEditState, so every cut, caption, collage cell
 // and overlay stays editable afterwards; the dialog's stage plays that same state.
-import { AssetKind, makeAsset } from "./videoAssets";
+import { AssetEntrance, AssetKind, AssetLoop, makeAsset } from "./videoAssets";
 import { clipOutputDuration } from "./clipTiming";
 import type { MusicTrack } from "./musicLibrary";
 import type { TextRevealSettings } from "./textReveal";
@@ -23,6 +23,7 @@ import {
   AdjustmentLayer,
   AudioLibraryInfo,
   AudioOverlay,
+  BlendMode,
   Clip,
   ClipCrop,
   ClipFxKind,
@@ -82,10 +83,33 @@ export type TemplateScene =
 
 export const SCENE_PHOTOS: Record<TemplateScene["kind"], number> = { grid: 4, triptych: 3, panels: 2 };
 
+export interface TemplateAccentAsset {
+  kind: AssetKind;
+  // Centre position & box size as fractions of the frame (size scaled cleanly on tall/wide frames).
+  x: number;
+  y: number;
+  size: number;
+  color?: string;
+  color2?: string;
+  entrance?: AssetEntrance;
+  loop?: AssetLoop;
+  glow?: boolean;
+  rotation?: number;
+}
+
+export interface DoubleExposureSpec {
+  // Soft elliptical mask feather (0..0.25) blending the partner photo over each shot.
+  feather?: number;
+  blend?: BlendMode;
+  opacity?: number;
+}
+
 export interface StyleTemplate {
   id: string;
   label: string;
   blurb: string;
+  // Highlights standout new/pro templates in the picker.
+  featured?: boolean;
   // The card's colours, and the word its tile shows in the template's signature look.
   swatch: [string, string];
   cardStyle: string;
@@ -101,6 +125,10 @@ export interface StyleTemplate {
   motionIntensity: number;
   look: GradeLookName | null;
   overlays: AssetKind[];
+  // Decorative animated elements placed across the edit (e.g. pulsing heart, hand-drawn arrow).
+  accentAssets?: TemplateAccentAsset[];
+  // Soft feathered double-exposure blend of adjacent photos on every plain photo shot.
+  doubleExposure?: DoubleExposureSpec;
   // A clip effect (clipFx.ts) on each plain shot in turn - null for none.
   fx: (ClipFxKind | null)[];
   fxIntensity: number;
@@ -120,6 +148,242 @@ const line = (slot: string, style: string, size: number, animation: OverlayAnima
 
 export const STYLE_TEMPLATES: StyleTemplate[] = [
   {
+    id: "runway-cut",
+    label: "Runway Edit",
+    blurb: "High-fashion beat drops — tile walls, 3D flips, iris reveals & chrome titles",
+    featured: true,
+    swatch: ["#0f172a", "#ec4899"],
+    cardStyle: "chrome",
+    cardWord: "VOGUE",
+    beatsPerPhoto: 2,
+    seconds: 1.5,
+    transitions: ["tiles", "flip", "iris", "cube", "split", "pagecurl", "zoomblur", "whip"],
+    transitionShare: 0.4,
+    motion: ["punch-in", "bounce-in", "pulse", "zoom-out", "pan-up"],
+    motionIntensity: 0.55,
+    look: "tealorange",
+    overlays: ["vignette", "twinkle"],
+    fx: [null, "rgbsplit", null, "focus", null],
+    fxIntensity: 0.45,
+    texts: [
+      { id: "kicker", label: "Kicker", sample: "LOOKBOOK 2026" },
+      { id: "h1", label: "Headline", sample: "ICONIC" },
+      { id: "mid", label: "Mid beat", sample: "UNSTOPPABLE" },
+      { id: "end", label: "Closing", sample: "MAKE IT YOURS" },
+    ],
+    captions: [
+      {
+        at: 0,
+        shots: 2,
+        y: 0.5,
+        lines: [
+          line("kicker", "tracked-caps", 0.036, "spread"),
+          line("h1", "chrome", 0.2, "zoomin", { delay: 0.18 }),
+        ],
+      },
+      { at: 4, shots: 1, y: 0.78, lines: [line("mid", "fashion-italic", 0.11, "mask")] },
+      { at: -1, shots: 1, y: 0.5, lines: [line("end", "luxe-serif", 0.12, "blur")] },
+    ],
+    scenes: [{ kind: "grid", at: 5, backdrop: "#09090b" }],
+    suggestBrand: { intro: "neon", outro: true },
+    music: { energy: [4, 5], words: ["fashion", "house", "dance", "pop", "energetic", "stylish", "groove"] },
+  },
+  {
+    id: "dream-blend",
+    label: "Double Exposure",
+    blurb: "Soft-blended portrait loop, golden glow, pulsing heart & twinkling dust",
+    featured: true,
+    swatch: ["#7f1d1d", "#f59e0b"],
+    cardStyle: "dancing",
+    cardWord: "My Love",
+    beatsPerPhoto: 4,
+    seconds: 2.8,
+    transitions: ["fade", "lightleak", "fade", "iris"],
+    transitionShare: 0.45,
+    motion: ["breathe", "float", "zoom-in", "drift"],
+    motionIntensity: 0.42,
+    look: "golden",
+    overlays: ["vignette", "twinkle", "bokeh"],
+    doubleExposure: { feather: 0.22, blend: "screen", opacity: 0.46 },
+    accentAssets: [
+      { kind: "heart", x: 0.5, y: 0.62, size: 0.1, color: "#ef4444", color2: "#fb7185", entrance: "pop", loop: "pulse", glow: true },
+      { kind: "scribble", x: 0.45, y: 0.68, size: 0.14, color: "#fff7ed", entrance: "draw", loop: "float", glow: true, rotation: -12 },
+    ],
+    fx: [null, "focus", null],
+    fxIntensity: 0.35,
+    texts: [
+      { id: "title", label: "Center text", sample: "My Favorite Person" },
+      { id: "sub", label: "Underneath", sample: "ALWAYS & FOREVER" },
+    ],
+    captions: [
+      {
+        at: 0,
+        shots: 99,
+        y: 0.53,
+        lines: [
+          line("title", "dancing", 0.11, "blur", { reveal: { speed: 0.85, exit: "none" } }),
+          line("sub", "tracked-caps", 0.026, "spread", { delay: 0.7, reveal: { exit: "none" } }),
+        ],
+      },
+    ],
+    scenes: [],
+    music: { energy: [1, 3], words: ["romantic", "love", "warm", "acoustic", "rnb", "chill", "sentimental", "emotional"] },
+  },
+  {
+    id: "cinema-trailer",
+    label: "Cinema Trailer",
+    blurb: "Widescreen letterbox, dramatic fades, light beams & blockbuster grade",
+    featured: true,
+    swatch: ["#0c0a09", "#f97316"],
+    cardStyle: "fire",
+    cardWord: "EPIC",
+    beatsPerPhoto: 2,
+    seconds: 1.8,
+    transitions: ["fadeblack", "beam", "zoomblur", "whip", "lightleak", "slice"],
+    transitionShare: 0.42,
+    motion: ["push", "punch-in", "zoom-out", "drift"],
+    motionIntensity: 0.5,
+    look: "tealorange",
+    overlays: ["letterbox", "vignette", "grain"],
+    fx: [null, "focus", null, "rgbsplit"],
+    fxIntensity: 0.45,
+    texts: [
+      { id: "kicker", label: "Opening kicker", sample: "THIS SEASON" },
+      { id: "h1", label: "Main title", sample: "THE NEXT CHAPTER" },
+      { id: "mid", label: "Build-up", sample: "EVERY MOMENT COUNTS" },
+      { id: "end", label: "Final slate", sample: "COMING SOON" },
+    ],
+    captions: [
+      {
+        at: 0,
+        shots: 2,
+        y: 0.5,
+        lines: [
+          line("kicker", "tracked-caps", 0.036, "spread"),
+          line("h1", "chrome", 0.14, "zoomin", { delay: 0.25 }),
+        ],
+      },
+      { at: 3, shots: 2, y: 0.5, lines: [line("mid", "tracked-caps", 0.055, "blur")] },
+      { at: -1, shots: 1, y: 0.5, lines: [line("end", "fire", 0.16, "zoomin")] },
+    ],
+    scenes: [],
+    suggestBrand: { intro: "stamp", outro: true },
+    music: { energy: [4, 5], words: ["epic", "cinematic", "trailer", "dramatic", "action", "orchestral", "intense"] },
+  },
+  {
+    id: "viral-hype",
+    label: "Viral Beat Drop",
+    blurb: "1-beat hyper cuts, glitch, spin, punchy zoom kicks & bold hook stickers",
+    featured: true,
+    swatch: ["#4c1d95", "#facc15"],
+    cardStyle: "comic",
+    cardWord: "HYPE!",
+    beatsPerPhoto: 1,
+    seconds: 0.75,
+    transitions: ["whip", "glitch", "zoomblur", "spin", "blocks", "fadewhite", "slice"],
+    transitionShare: 0.46,
+    motion: ["pulse", "punch-in", "shake", "bounce-in", "vibrate"],
+    motionIntensity: 0.62,
+    look: "cyber",
+    overlays: ["vignette", "sparkles"],
+    fx: ["rgbsplit", null, "echo", null, "huecycle"],
+    fxIntensity: 0.55,
+    texts: [
+      { id: "hook", label: "Hook", sample: "WAIT FOR IT…" },
+      { id: "drop", label: "Beat drop", sample: "BOOM!" },
+      { id: "end", label: "Outro CTA", sample: "FOLLOW FOR MORE" },
+    ],
+    captions: [
+      { at: 0, shots: 2, y: 0.48, lines: [line("hook", "sticker", 0.14, "bounce")] },
+      { at: 3, shots: 2, y: 0.5, lines: [line("drop", "comic", 0.22, "zoomin")] },
+      { at: -2, shots: 2, y: 0.52, lines: [line("end", "bold-yellow", 0.12, "popin")] },
+    ],
+    scenes: [{ kind: "grid", at: 6, backdrop: "#0a0a0a" }],
+    music: { energy: [5, 5], words: ["hype", "trap", "electronic", "energetic", "bass", "dance", "sport"] },
+  },
+  {
+    id: "polaroid-diary",
+    label: "Polaroid Diary",
+    blurb: "Warm 35mm instant frames, light leaks, page curls & handwritten notes",
+    featured: true,
+    swatch: ["#78350f", "#fde68a"],
+    cardStyle: "handwritten",
+    cardWord: "Diary",
+    beatsPerPhoto: 4,
+    seconds: 2.6,
+    transitions: ["pagecurl", "lightleak", "slider", "fade", "strips"],
+    transitionShare: 0.36,
+    motion: ["drift", "float", "zoom-in", "zoom-out"],
+    motionIntensity: 0.4,
+    look: "film",
+    overlays: ["polaroid", "lightleak", "grain"],
+    fx: ["colorin", null, "focus"],
+    fxIntensity: 0.4,
+    texts: [
+      { id: "title", label: "Cover title", sample: "Golden Weekend" },
+      { id: "place", label: "Location / Date", sample: "CAPTURING THE LITTLE THINGS" },
+      { id: "end", label: "Closing note", sample: "Until next time ✦" },
+    ],
+    captions: [
+      {
+        at: 0,
+        shots: 2,
+        y: 0.5,
+        lines: [
+          line("title", "handwritten", 0.14, "blur", { reveal: { speed: 0.9 } }),
+          line("place", "paper-marker", 0.042, "words", { delay: 0.6 }),
+        ],
+      },
+      { at: -1, shots: 1, y: 0.52, lines: [line("end", "handwritten", 0.12, "blur")] },
+    ],
+    scenes: [{ kind: "triptych", at: 3, backdrop: "#1c1917", border: "#faf7f2" }],
+    music: { energy: [2, 3], words: ["indie", "acoustic", "nostalgic", "lofi", "travel", "warm", "chill"] },
+  },
+  {
+    id: "studio-launch",
+    label: "Studio Launch",
+    blurb: "Crisp editorial product showcase with clean wipes, triptych & feature cards",
+    featured: true,
+    swatch: ["#0f172a", "#38bdf8"],
+    cardStyle: "luxe-serif",
+    cardWord: "Launch",
+    beatsPerPhoto: 3,
+    seconds: 2.2,
+    transitions: ["slider", "push", "wipeleft", "iris", "fade", "split"],
+    transitionShare: 0.34,
+    motion: ["zoom-in", "drift", "pan-right", "zoom-out"],
+    motionIntensity: 0.34,
+    look: null,
+    overlays: ["vignette"],
+    fx: [],
+    fxIntensity: 0,
+    texts: [
+      { id: "kicker", label: "Kicker", sample: "INTRODUCING" },
+      { id: "title", label: "Product name", sample: "Designed for Focus" },
+      { id: "w1", label: "Feature 1", sample: "FAST" },
+      { id: "w2", label: "Feature 2", sample: "EFFORTLESS" },
+      { id: "cta", label: "Closing CTA", sample: "Try it today" },
+    ],
+    captions: [
+      {
+        at: 0,
+        shots: 2,
+        y: 0.46,
+        lines: [
+          line("kicker", "tracked-caps", 0.034, "spread"),
+          line("title", "luxe-serif", 0.12, "mask", { delay: 0.25 }),
+        ],
+      },
+      { at: -1, shots: 1, y: 0.5, lines: [line("cta", "caption", 0.065, "popin")] },
+    ],
+    scenes: [
+      { kind: "panels", at: 2, backdrop: "#0f172a", words: [line("w1", "tracked-caps", 0.052, "spread"), line("w2", "tracked-caps", 0.052, "spread", { delay: 0.2 })] },
+      { kind: "triptych", at: 4, backdrop: "#0f172a", border: "#f8fafc" },
+    ],
+    suggestBrand: { intro: "lines", outro: true },
+    music: { energy: [3, 4], words: ["modern", "tech", "clean", "inspiring", "corporate", "electronic", "upbeat"] },
+  },
+  {
     id: "grand-opening",
     label: "Grand Opening",
     blurb: "Made for video - whip and flash cuts, WE ARE OPEN, a shop-now pill",
@@ -133,7 +397,7 @@ export const STYLE_TEMPLATES: StyleTemplate[] = [
     motion: ["punch-in", "zoom-in", "pan-right", "zoom-out"],
     motionIntensity: 0.5,
     look: null,
-    overlays: [],
+    overlays: ["vignette", "sparkles"],
     fx: [null, null, "rgbsplit", null, null],
     fxIntensity: 0.4,
     texts: [
@@ -174,8 +438,8 @@ export const STYLE_TEMPLATES: StyleTemplate[] = [
     transitionShare: 0.4,
     motion: ["zoom-in", "drift", "push", "zoom-out"],
     motionIntensity: 0.35,
-    look: null,
-    overlays: [],
+    look: "golden",
+    overlays: ["vignette", "twinkle"],
     fx: [],
     fxIntensity: 0,
     texts: [
@@ -803,6 +1067,53 @@ export function buildStyledProject(imagePaths: string[], frame: VideoProjectFram
       const say = (text: string, style: string, size: number, y: number) =>
         text.trim() ? captionLines([line("t", style, size, "fade")], () => text.trim(), frame, y, start, end, ctx.measure) : [];
       textOverlays.push(...say(brand.name.toUpperCase(), "tracked-caps", 0.03, 0.05), ...say(brand.website, "tracked-caps", 0.024, 0.95));
+    }
+  }
+
+  // ---- double exposure soft portrait blend (overlays the next photo with a feathered mask) ----
+  if (template?.doubleExposure && options.overlays && content.length >= 2) {
+    const { feather = 0.22, blend = "screen", opacity = 0.46 } = template.doubleExposure;
+    for (let idx = 0; idx < content.length; idx++) {
+      const sIdx = content[idx];
+      const nextIdx = content[(idx + 1) % content.length];
+      const shot = shots[sIdx];
+      const partner = shots[nextIdx];
+      if (shot.scene || partner.scene) continue;
+      const partnerPath = partner.photos[0];
+      if (!partnerPath || ctx.videoOf?.(partnerPath)) continue;
+      const start = bounds[sIdx];
+      const end = bounds[sIdx + 1];
+      imageOverlays.push({
+        ...makeImageOverlay(partnerPath, 0, 0, 1, 1, start, end),
+        ...coverCrop(ctx.aspectOf?.(partnerPath) ?? 1, aspect),
+        opacity,
+        blendMode: blend,
+        animation: "fade",
+        mask: { shape: "ellipse", x: 0.08, y: 0.08, width: 0.84, height: 0.84, feather, invert: false },
+      });
+    }
+  }
+
+  // ---- decorative accent assets (pulsing hearts, hand-drawn scribbles, etc.) ----
+  if (template?.accentAssets?.length && options.overlays && content.length) {
+    const start = bounds[content[0]];
+    const end = bounds[content[content.length - 1] + 1];
+    const short = Math.min(1, aspect);
+    for (const acc of template.accentAssets) {
+      const h = acc.size * short;
+      const w = h / aspect;
+      imageOverlays.push({
+        ...makeImageOverlay("", acc.x - w / 2, acc.y - h / 2, w, h, start, end, {
+          ...makeAsset(acc.kind),
+          ...(acc.color ? { color: acc.color } : {}),
+          ...(acc.color2 ? { color2: acc.color2 } : {}),
+          ...(acc.entrance ? { entrance: acc.entrance } : {}),
+          ...(acc.loop ? { loop: acc.loop } : {}),
+          ...(acc.glow !== undefined ? { glow: acc.glow } : {}),
+          exit: false,
+        }),
+        ...(acc.rotation ? { rotation: acc.rotation } : {}),
+      });
     }
   }
 

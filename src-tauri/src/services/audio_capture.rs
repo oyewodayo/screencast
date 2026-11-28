@@ -27,7 +27,7 @@
 // Runs on its own OS thread because WASAPI/COM state is per-thread.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -37,9 +37,7 @@ use wasapi::{
 };
 
 pub const SAMPLE_RATE: u32 = 48000;
-const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
-const BYTES_PER_FRAME: usize = (CHANNELS as usize) * (BITS_PER_SAMPLE as usize / 8);
 // How far a packet may land from its QPC position before the writer re-anchors instead of
 // trusting the device clock. Comfortably above packet jitter (~10ms), and small enough that sync
 // never wanders further than this before being pulled back.
@@ -157,12 +155,20 @@ fn run_capture(
         .get_iaudioclient()
         .map_err(|e| format!("Failed to open the audio device: {}", e))?;
 
+    // Microphones are voice-only and immediately downmixed to mono during enhancement, so capturing
+    // mono halves temp WAV disk I/O and storage; system audio stays stereo.
+    let channels: u16 = match source {
+        AudioSource::Microphone(_) => 1,
+        AudioSource::SystemOutput => 2,
+    };
+    let bytes_per_frame: usize = (channels as usize) * (BITS_PER_SAMPLE as usize / 8);
+
     let format = WaveFormat::new(
         BITS_PER_SAMPLE as usize,
         BITS_PER_SAMPLE as usize,
         &SampleType::Int,
         SAMPLE_RATE as usize,
-        CHANNELS as usize,
+        channels as usize,
         None,
     );
     // The mic is captured RAW - past Windows' and the driver's own voice effects (Realtek and
@@ -173,15 +179,17 @@ fn run_capture(
         && audio_client
             .set_properties(AudioClientProperties::new().set_option(StreamOption::Raw))
             .is_ok();
-    log::info!("Audio capture {:?} opened{}", source, if raw { " (raw)" } else { "" });
-    let (_default_period, min_period) = audio_client
+    log::info!("Audio capture {:?} opened{} ({}ch)", source, if raw { " (raw)" } else { "" }, channels);
+    let (default_period, _min_period) = audio_client
         .get_device_period()
         .map_err(|e| format!("Failed to query the audio device's timing: {}", e))?;
     // autoconvert: the audio engine converts from the device's native format to this fixed one,
-    // so nothing here depends on what the device natively runs at.
+    // so nothing here depends on what the device natively runs at. Use default_period (~10ms)
+    // instead of min_period (~3ms) to cut thread wakeups ~3x with no sync impact (packets carry
+    // QPC timestamps either way).
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: min_period,
+        buffer_duration_hns: default_period.max(100_000),
     };
     audio_client
         .initialize_client(&format, &Direction::Capture, &mode)
@@ -194,7 +202,7 @@ fn run_capture(
         .map_err(|e| format!("Failed to get the audio capture client: {}", e))?;
 
     let spec = WavSpec {
-        channels: CHANNELS,
+        channels,
         sample_rate: SAMPLE_RATE,
         bits_per_sample: BITS_PER_SAMPLE,
         sample_format: SampleFormat::Int,
@@ -210,7 +218,7 @@ fn run_capture(
     // one - loopback delivers nothing at all until something plays.
     let started_hns = now_hns();
     let mut timeline = Timeline::new(started_hns);
-    let mut buf = vec![0u8; BYTES_PER_FRAME * SAMPLE_RATE as usize];
+    let mut buf = vec![0u8; bytes_per_frame * SAMPLE_RATE as usize];
 
     while !stop_flag.load(Ordering::SeqCst) {
         loop {
@@ -219,8 +227,8 @@ fn run_capture(
                 Ok(_) => break,
                 Err(e) => return Err(format!("Audio capture read failed: {}", e)),
             };
-            if buf.len() < frames * BYTES_PER_FRAME {
-                buf.resize(frames * BYTES_PER_FRAME, 0);
+            if buf.len() < frames * bytes_per_frame {
+                buf.resize(frames * bytes_per_frame, 0);
             }
             let (read, info) = capture
                 .read_from_device(&mut buf)
@@ -235,20 +243,26 @@ fn run_capture(
                 Some(info.timestamp as i64)
             };
             let (pad, skip) = timeline.place(packet_hns, read as u64);
-            for _ in 0..pad * CHANNELS as u64 {
-                writer.write_sample(0i16).map_err(write_err)?;
-            }
-            let data = &buf[(skip as usize).min(read) * BYTES_PER_FRAME..read * BYTES_PER_FRAME];
-            if info.flags.silent {
-                for _ in 0..data.len() / 2 {
-                    writer.write_sample(0i16).map_err(write_err)?;
+            let pad_samples = (pad * channels as u64) as usize;
+            let data = &buf[(skip as usize).min(read) * bytes_per_frame..read * bytes_per_frame];
+            let data_samples = data.len() / 2;
+            let total_samples = pad_samples + data_samples;
+            if total_samples > 0 {
+                // Batch header accounting once per packet via get_i16_writer instead of per sample.
+                let mut sw = writer.get_i16_writer(total_samples as u32);
+                for _ in 0..pad_samples {
+                    sw.write_sample(0i16);
                 }
-            } else {
-                for pair in data.chunks_exact(2) {
-                    writer
-                        .write_sample(i16::from_le_bytes([pair[0], pair[1]]))
-                        .map_err(write_err)?;
+                if info.flags.silent {
+                    for _ in 0..data_samples {
+                        sw.write_sample(0i16);
+                    }
+                } else {
+                    for pair in data.chunks_exact(2) {
+                        sw.write_sample(i16::from_le_bytes([pair[0], pair[1]]));
+                    }
                 }
+                sw.flush().map_err(write_err)?;
             }
         }
         // A periodic wake-up to check the stop flag, not an error: silence (or loopback with
@@ -408,16 +422,24 @@ impl Timeline {
 }
 
 // QPC "now" in the same 100ns units WASAPI reports packet times in.
+// QueryPerformanceFrequency is fixed at OS boot, so caching it avoids a redundant Win32 syscall on
+// every frame, audio packet, and mouse event.
 pub fn now_hns() -> i64 {
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-    let mut counter = 0i64;
-    let mut freq = 0i64;
-    unsafe {
-        let _ = QueryPerformanceCounter(&mut counter);
-        let _ = QueryPerformanceFrequency(&mut freq);
-    }
+    static QPC_FREQ: OnceLock<i64> = OnceLock::new();
+    let freq = *QPC_FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        unsafe {
+            let _ = QueryPerformanceFrequency(&mut f);
+        }
+        f
+    });
     if freq == 0 {
         return 0;
+    }
+    let mut counter = 0i64;
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut counter);
     }
     ((counter as i128 * 10_000_000) / freq as i128) as i64
 }

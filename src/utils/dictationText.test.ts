@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { buildWhisperPrompt, fitToContext, isLikelyHallucination, parseDictation, stripNonSpeech, trailingPeriodToDrop } from "./dictationText";
+import {
+  buildWhisperPrompt,
+  describeDictationOp,
+  fitToContext,
+  isLikelyHallucination,
+  isScreenEcho,
+  parseDictation,
+  stripNonSpeech,
+  trailingPeriodToDrop,
+} from "./dictationText";
 
 const en = { commands: true };
 
@@ -21,6 +30,28 @@ describe("isLikelyHallucination", () => {
   it("keeps them after real speech", () => {
     expect(isLikelyHallucination("Thank you.", 2500)).toBe(false);
     expect(isLikelyHallucination("Thank you for the reference letter.", 600)).toBe(false);
+  });
+  it("drops repetition loops and subtitle watermarks", () => {
+    expect(isLikelyHallucination("Let's stand up on play. Let's stand up on play. Let's stand up on play.", 2200)).toBe(true);
+    expect(isLikelyHallucination("Subtitles by Amara.org community", 1800)).toBe(true);
+  });
+  it("drops screen-text echoes of the document title or preceding text during silence/noise", () => {
+    const title = "CERN HG-CAL Experiment Team";
+    const preceding = "Glory Toluwanimi Ogunsola ogunsolaglory5@gmail.com CERN HG-CAL EXPERIMENT TEAM, UNIVERSITY OF IBADAN";
+    expect(isScreenEcho("CERN HG-CAL Experiment Team.", title, preceding, 900)).toBe(true);
+    expect(isScreenEcho("UNIVERSITY OF IBADAN", title, preceding, 800)).toBe(true);
+    expect(
+      isLikelyHallucination("CERN HG-CAL Experiment Team, University of Ibadan", 1400, {
+        title,
+        precedingText: preceding,
+      })
+    ).toBe(true);
+    expect(
+      isLikelyHallucination("We are preparing the detector calibration report.", 1800, {
+        title,
+        precedingText: preceding,
+      })
+    ).toBe(false);
   });
 });
 
@@ -69,6 +100,54 @@ describe("parseDictation", () => {
 
   it("joins whisper segment newlines with a space", () => {
     expect(parseDictation("First half\nsecond half.", en)).toEqual([{ kind: "text", text: "First half second half." }]);
+  });
+
+  it("recognises smart voice commands for tables, formatting, alignment, and checklists", () => {
+    expect(parseDictation("Insert a 3 by 2 table.", en)).toEqual([{ kind: "insertTable", rows: 3, cols: 2 }]);
+    expect(parseDictation("Create table four by three", en)).toEqual([{ kind: "insertTable", rows: 4, cols: 3 }]);
+    expect(parseDictation("Dr. Omololu, next cell, oakinojo at gmail dot com, next row", en)).toEqual([
+      { kind: "text", text: "Dr. Omololu" },
+      { kind: "tableNav", direction: "next" },
+      { kind: "text", text: "oakinojo@gmail.com" },
+      { kind: "tableNav", direction: "row" },
+    ]);
+    expect(parseDictation("Important result, bold that.", en)).toEqual([
+      { kind: "text", text: "Important result" },
+      { kind: "formatLast", format: "bold" },
+    ]);
+    expect(parseDictation("Highlight that green.", en)).toEqual([
+      { kind: "formatLast", format: "highlight", color: "#bbf7d0" },
+    ]);
+    expect(parseDictation("Delete last 3 words.", en)).toEqual([{ kind: "deleteWord", count: 3 }]);
+    expect(parseDictation("Heading one Project Overview", en)).toEqual([
+      { kind: "heading", level: 1 },
+      { kind: "text", text: "Project Overview" },
+    ]);
+    expect(parseDictation("Checklist Buy sensors, next item, Calibrate readout, check that", en)).toEqual([
+      { kind: "taskList" },
+      { kind: "text", text: "Buy sensors" },
+      { kind: "listItem" },
+      { kind: "text", text: "Calibrate readout" },
+      { kind: "checkItem", checked: true },
+    ]);
+  });
+
+  it("auto-formats spoken emails, scientific units, and cleans hesitation stutters", () => {
+    expect(parseDictation("Contact temidayo dot solomon at cern dot ch for details.", en)).toEqual([
+      { kind: "text", text: "Contact temidayo.solomon@cern.ch for details." },
+    ]);
+    expect(parseDictation("The sensor operates at 25 degrees celsius plus or minus 2.", en)).toEqual([
+      { kind: "text", text: "The sensor operates at 25°C ± 2." },
+    ]);
+    expect(parseDictation("We um need to the the review the data.", en)).toEqual([
+      { kind: "text", text: "We need to the review the data." },
+    ]);
+  });
+
+  it("describes non-text voice commands for live UI badges", () => {
+    expect(describeDictationOp({ kind: "insertTable", rows: 3, cols: 2 })).toBe("⊞ 3×2 Table");
+    expect(describeDictationOp({ kind: "formatLast", format: "bold" })).toBe("B Bolded");
+    expect(describeDictationOp({ kind: "text", text: "hello" })).toBeNull();
   });
 });
 

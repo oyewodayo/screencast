@@ -17,6 +17,7 @@ import { DocVersionSummary } from "../../utils/docTypes";
 import { getDocContentExtensions, docProseClassName } from "../../utils/docSchemaExtensions";
 import { snapshotBibliography, type BibliographySource } from "../../utils/docBibliography";
 import { createDocStructureExtension } from "../../utils/docStructure";
+import BrandLoader from "../common/BrandLoader";
 
 interface DocVersionHistoryPanelProps {
   docId: string;
@@ -176,7 +177,9 @@ const DocVersionHistoryPanel: React.FC<DocVersionHistoryPanelProps> = ({ docId, 
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-8 py-8">
               {previewLoading ? (
-                <p className="text-sm text-neutral-400 dark:text-neutral-500">Loading…</p>
+                <div className="flex items-center justify-center py-16">
+                  <BrandLoader variant="contained" size="md" message="Loading preview…" />
+                </div>
               ) : previewError ? (
                 <p className="text-sm text-red-500 dark:text-red-400">{previewError}</p>
               ) : previewEditor ? (

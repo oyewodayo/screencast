@@ -1,9 +1,9 @@
 // utils/editorIntent.ts
 //
-// What the Video Editor's home asked for when it opened a video from one of its starters ("Vertical
-// for TikTok & Reels", "Split screen", "Make Shorts"): held here until the editor has loaded that
-// video and knows its frame, then taken - once - by the timeline (VideoTimelineDocker), which sets
-// it up: the canvas chosen, the split-screen panel or Shorts opened.
+// What the Video Editor's home or the post-recording popup asked for when it opened a video from
+// one of its starters ("Vertical for TikTok & Reels", "Split screen", "Make Shorts", "Studio
+// Polish", "Add Captions"): held here until the editor has loaded that video and knows its frame,
+// then taken - once - by the timeline (VideoTimelineDocker), which sets it up.
 export interface EditorIntent {
   // A canvas preset id (canvasFormats.ts) to start in.
   canvas?: string;
@@ -11,6 +11,10 @@ export interface EditorIntent {
   split?: boolean;
   // Open Shorts.
   shorts?: boolean;
+  // Open the 1-click Studio Polish popover (and optionally auto-scan).
+  studioPolish?: boolean;
+  // Open the Captions panel so the user can transcribe immediately.
+  openCaptions?: boolean;
 }
 
 let pending: { path: string; intent: EditorIntent } | null = null;

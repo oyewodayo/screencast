@@ -82,7 +82,7 @@ pub struct FaceMatchingStatus {
 
 #[tauri::command]
 pub async fn face_matching_status(app_handle: AppHandle) -> Result<FaceMatchingStatus, String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
+    if !crate::commands::background_removal::ENGINE_SUPPORTED {
         return Ok(FaceMatchingStatus { state: "unsupported", download_mb: 0 });
     }
     let dir = engine_dir(&app_handle)?;
@@ -104,8 +104,8 @@ struct DownloadProgress {
 // Fetches whatever's missing of the engine and the two models. Emits "face-matching-download".
 #[tauri::command]
 pub async fn download_face_matching(app_handle: AppHandle, window: Window) -> Result<(), String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
-        return Err("Face matching isn't available on this platform yet.".into());
+    if !crate::commands::background_removal::ENGINE_SUPPORTED {
+        return Err("Face matching isn't available on this system: it needs Windows, Linux on x86-64, or a Mac with Apple Silicon.".into());
     }
     let dir = engine_dir(&app_handle)?;
     DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);

@@ -23,6 +23,7 @@ pub(crate) mod commands {
     pub mod audio_tracks;
     pub mod background_removal;
     pub mod camera_effects;
+    pub mod compression;
     pub mod conversion;
     pub mod derived_images;
     pub mod embedded_scan;
@@ -106,6 +107,9 @@ pub(crate) mod services {
     // The tray icon the closed window hides to - see the module's own comment.
     pub mod tray;
     pub mod utility;
+    pub mod window_affinity;
+    pub mod macos_permissions;
+    pub mod wayland_portal;
     pub mod whisper_model;
     // The AI voice: Kokoro text-to-speech on ONNX Runtime, and the text -> phonemes front end it needs.
     pub mod tts;
@@ -121,14 +125,9 @@ pub(crate) mod services {
     pub mod audio_capture;
     // Default cleanup of every recording's audio - see the module's own doc comment.
     pub mod audio_enhance;
-    // A Win32 low-level mouse hook, Windows-only for the same reason audio_capture above is
-    // (SetWindowsHookExW/WH_MOUSE_LL has no cross-platform equivalent this app's existing `windows`
-    // crate dependency could reuse) - see the module's own doc comment for why this needed no new
-    // Cargo dependency at all.
-    #[cfg(target_os = "windows")]
+    // Mouse click tracking for the editor's auto-zoom on click.
     pub mod click_tracker;
     // The editable pointer and shortcut keys of a screen recording (the editor's Screen Style).
-    #[cfg(target_os = "windows")]
     pub mod input_tracker;
     // The annotation overlay's privacy blur - live acrylic regions you can still type through.
     // Stubbed off Windows inside the module, so its commands register everywhere.
@@ -188,6 +187,16 @@ use tauri::{AppHandle, Manager, RunEvent};
 /// Entry point for every platform.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Guarantee Per-Monitor V2 DPI awareness before any window/monitor geometry queries so mixed
+    // multi-monitor DPI setups (e.g. 4K 150% + 1080p 100%) always return physical pixel rects,
+    // including during dev runs without an embedded application manifest.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+
     logging::init();
 
     // Must run before any TLS use (phone camera server, updater, telemetry) - see Cargo.toml's
@@ -277,6 +286,8 @@ fn setup(app: &AppHandle) {
     services::phone_transfer::autostart(app.clone());
     services::usb_phone::start(app);
     services::responsiveness::start_ui_watchdog(app);
+    #[cfg(target_os = "macos")]
+    services::window_affinity::exclude_overlays_from_capture(app);
     #[cfg(target_os = "windows")]
     services::webview_recovery::install(app);
     // ffmpeg version and encoders, checked once in the background; the UI asks for the result.
@@ -295,12 +306,18 @@ fn setup(app: &AppHandle) {
     // screen capture); doing them now in the background means the device pickers and the first
     // recording never wait on them.
     commands::recording::warm_device_cache(app);
+    // Sweep orphaned multi-GB temp intermediates left behind by a previous crash/force-quit.
+    std::thread::spawn(commands::recording::cleanup_stale_capture_intermediates);
     // A recording that never reached its stop (crash, kill) leaves notifications muted.
     std::thread::spawn(services::quiet_notifications::restore);
     commands::recording::prewarm_rec_completed_modal(app);
     if let Ok(ffmpeg_path) = services::utility::get_ffmpeg_path(app) {
+        // Probe hardware encoder and GPU screen capture in parallel rather than serially.
+        let ff_hw = ffmpeg_path.clone();
         std::thread::spawn(move || {
-            services::hw_encoder::detect(&ffmpeg_path);
+            services::hw_encoder::detect(&ff_hw);
+        });
+        std::thread::spawn(move || {
             commands::recording::warm_screen_capture(&ffmpeg_path);
         });
     }
@@ -331,6 +348,7 @@ fn on_run_event(app: &AppHandle, event: RunEvent) {
             api.prevent_exit();
         }
         RunEvent::Exit => {
+            let _ = commands::conversion::cancel_transcription();
             commands::window_capture::cleanup_stale_window_screenshots();
             commands::native_playback::cleanup_all_sessions(
                 &app.state::<commands::native_playback::NativePlaybackState>(),

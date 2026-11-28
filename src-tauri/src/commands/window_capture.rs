@@ -103,7 +103,7 @@ pub struct MonitorInfo {
     pub(crate) y: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
-    is_primary: bool,
+    pub(crate) is_primary: bool,
 }
 
 // Only macOS's implementation actually needs the AppHandle (to resolve ffmpeg's bundled path

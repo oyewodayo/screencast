@@ -4,23 +4,21 @@
 // A ProseMirror plugin, not React state, because the thing it tracks - *where* the next chunk of
 // dictated text lands - is a document position, and positions have to be mapped through every
 // transaction (the user typing above it, a collaborator's remote edit, an earlier chunk landing)
-// to stay correct. The previous implementation kept a raw {from, to} in a ref and wrote interim
-// text straight into the document, so any edit during dictation shifted the range and the final
-// transcript replaced the wrong text; it also churned the Y.Doc and undo stack with every interim
-// guess.
+// to stay correct.
 //
-// Here interim text never touches the document: it's a widget decoration at the anchor (grey,
-// with a pulsing "…" while chunks are still transcribing). Only final text is inserted, one
-// transaction per chunk, so undo/"scratch that" step back a phrase at a time.
-//
-// The anchor follows the user: clicking or arrowing somewhere else mid-dictation moves the
-// insertion point there (Google Docs' behaviour), detected as a selection change shortly after real
-// keyboard/mouse input rather than any selection change - remote Yjs updates and our own inserts
-// also move the selection and must not re-anchor.
+// Interim text never touches the document: it's a widget decoration at the anchor (rendered
+// word-by-word with a subtle slide-in animation and pulsing status dots while chunks are
+// transcribing). Only final text is inserted, one transaction per chunk, so undo/"scratch that"
+// step back a phrase at a time.
 import { Command, Editor, Extension } from "@tiptap/core";
 import { Plugin, PluginKey, TextSelection, EditorState, Transaction } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
-import { DictationOp, fitToContext, trailingPeriodToDrop } from "./dictationText";
+import {
+  describeDictationOp,
+  DictationOp,
+  fitToContext,
+  trailingPeriodToDrop,
+} from "./dictationText";
 
 interface DictationRange {
   from: number;
@@ -33,13 +31,23 @@ export interface DictationPluginState {
   lastRange: DictationRange | null;
   preview: string;
   pending: number;
+  lastAction: string | null;
+  lastActionId: number;
 }
 
 type DictationMeta = Partial<DictationPluginState>;
 
 export const dictationPluginKey = new PluginKey<DictationPluginState>("docDictation");
 
-const IDLE: DictationPluginState = { active: false, anchor: null, lastRange: null, preview: "", pending: 0 };
+const IDLE: DictationPluginState = {
+  active: false,
+  anchor: null,
+  lastRange: null,
+  preview: "",
+  pending: 0,
+  lastAction: null,
+  lastActionId: 0,
+};
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -49,6 +57,7 @@ declare module "@tiptap/core" {
       endDictation: () => ReturnType;
       setDictationPreview: (preview: string) => ReturnType;
       setDictationPending: (pending: number) => ReturnType;
+      setDictationAction: (lastAction: string | null) => ReturnType;
     };
   }
 }
@@ -61,17 +70,44 @@ function clampPos(state: EditorState, pos: number): number {
   return Math.max(0, Math.min(pos, state.doc.content.size));
 }
 
-function buildPreviewWidget(preview: string, pending: number): HTMLElement {
+let actionClearTimer: ReturnType<typeof setTimeout> | null = null;
+let prevRenderedWords: string[] = [];
+
+function buildPreviewWidget(preview: string, pending: number, lastAction: string | null): HTMLElement {
   const el = document.createElement("span");
   el.className = "doc-dictation-preview";
   el.setAttribute("contenteditable", "false");
   el.setAttribute("aria-live", "polite");
+
+  if (lastAction) {
+    const badge = document.createElement("span");
+    badge.className = "doc-dictation-action-pill";
+    badge.textContent = lastAction;
+    el.appendChild(badge);
+  }
+
   if (preview) {
     const text = document.createElement("span");
     text.className = "doc-dictation-preview-text";
-    text.textContent = preview;
+    const leadingSpace = /^\s/.test(preview) ? " " : "";
+    const words = preview.trim().split(/\s+/).filter(Boolean);
+    if (leadingSpace) {
+      text.appendChild(document.createTextNode(" "));
+    }
+    words.forEach((w, idx) => {
+      if (idx > 0) text.appendChild(document.createTextNode(" "));
+      const wordSpan = document.createElement("span");
+      const isNewWord = idx >= prevRenderedWords.length || prevRenderedWords[idx] !== w;
+      wordSpan.className = isNewWord ? "doc-dictation-word is-new" : "doc-dictation-word";
+      wordSpan.textContent = w;
+      text.appendChild(wordSpan);
+    });
+    prevRenderedWords = words;
     el.appendChild(text);
+  } else {
+    prevRenderedWords = [];
   }
+
   if (pending > 0 || !preview) {
     const dots = document.createElement("span");
     dots.className = `doc-dictation-dots${pending > 0 ? " is-working" : ""}`;
@@ -95,14 +131,22 @@ const DocDictation = Extension.create({
       beginDictation:
         () =>
         ({ tr, dispatch, state }) => {
-          if (dispatch) tr.setMeta(dictationPluginKey, { ...IDLE, active: true, anchor: state.selection.head } satisfies DictationMeta);
+          if (dispatch) {
+            tr.setMeta(dictationPluginKey, {
+              ...IDLE,
+              active: true,
+              anchor: state.selection.head,
+            } satisfies DictationMeta);
+          }
           return true;
         },
       // Stops listening but keeps the anchor - chunks still transcribing land where they belong.
-      pauseDictation: () => withMeta({ active: false, preview: "" }),
+      pauseDictation: () => withMeta({ active: false, preview: "", lastAction: null }),
       endDictation: () => withMeta({ ...IDLE }),
       setDictationPreview: (preview: string) => withMeta({ preview }),
       setDictationPending: (pending: number) => withMeta({ pending }),
+      setDictationAction: (lastAction: string | null) =>
+        withMeta({ lastAction, lastActionId: Date.now() }),
     };
   },
 
@@ -143,7 +187,10 @@ const DocDictation = Extension.create({
           if (Date.now() - lastUserInput > 800) return null;
           const moved = trs.some((tr) => tr.selectionSet && !tr.getMeta(dictationPluginKey));
           if (!moved || newState.selection.head === st.anchor) return null;
-          return newState.tr.setMeta(dictationPluginKey, { anchor: newState.selection.head, lastRange: null } satisfies DictationMeta);
+          return newState.tr.setMeta(dictationPluginKey, {
+            anchor: newState.selection.head,
+            lastRange: null,
+          } satisfies DictationMeta);
         },
         props: {
           handleDOMEvents: {
@@ -156,14 +203,16 @@ const DocDictation = Extension.create({
             if (!st.active && st.pending === 0) return null;
             const decorations: Decoration[] = [];
             if (st.lastRange) {
-              decorations.push(Decoration.inline(st.lastRange.from, st.lastRange.to, { class: "doc-dictation-fresh" }));
+              decorations.push(
+                Decoration.inline(st.lastRange.from, st.lastRange.to, { class: "doc-dictation-fresh" })
+              );
             }
-            if (st.anchor !== null && (st.preview || st.pending > 0 || st.active)) {
+            if (st.anchor !== null && (st.preview || st.pending > 0 || st.active || st.lastAction)) {
               const pos = clampPos(state, st.anchor);
               decorations.push(
-                Decoration.widget(pos, () => buildPreviewWidget(st.preview, st.pending), {
+                Decoration.widget(pos, () => buildPreviewWidget(st.preview, st.pending, st.lastAction), {
                   side: 1,
-                  key: `dictation:${st.preview}:${st.pending > 0}`,
+                  key: `dictation:${st.preview}:${st.pending > 0}:${st.lastAction ?? ""}:${st.lastActionId}`,
                   ignoreSelection: true,
                 })
               );
@@ -181,8 +230,8 @@ export default DocDictation;
 // The plain text between the start of the anchor's textblock and the anchor - what fitToContext()
 // needs to decide spacing and capitalisation. Inline leaf nodes (images, hard breaks) count as a
 // newline so "after a line break" reads as a fresh line.
-function textBeforeAnchor(state: EditorState, anchor: number): string {
-  const $pos = state.doc.resolve(anchor);
+export function textBeforeAnchor(state: EditorState, anchor: number): string {
+  const $pos = state.doc.resolve(clampPos(state, anchor));
   if (!$pos.parent.isTextblock) return "";
   return $pos.parent.textBetween(0, $pos.parentOffset, undefined, "\n").replace(/^[\s\S]*\n/, "");
 }
@@ -194,12 +243,141 @@ export function documentTextBeforeDictation(editor: Editor, max = 800): string {
   return state.doc.textBetween(Math.max(0, anchor - max * 2), anchor, "\n", " ").slice(-max);
 }
 
+// Finds the range to target for "bold that" / "scratch that" when lastRange is absent or when
+// targeting the last word/sentence in the current textblock.
+function resolveTargetRange(
+  state: EditorState,
+  anchor: number,
+  lastRange: DictationRange | null,
+  fallbackMode: "lastRangeOrWord" | "words" | "sentence",
+  wordCount = 1
+): DictationRange | null {
+  if (fallbackMode === "lastRangeOrWord" && lastRange && lastRange.to > lastRange.from) {
+    return {
+      from: Math.max(0, clampPos(state, lastRange.from)),
+      to: clampPos(state, lastRange.to),
+    };
+  }
+  const $pos = state.doc.resolve(clampPos(state, anchor));
+  if (!$pos.parent.isTextblock) return null;
+  const blockStart = $pos.start();
+  const before = $pos.parent.textBetween(0, $pos.parentOffset, undefined, "\uFFFC");
+  if (!before.trim()) return null;
+
+  if (fallbackMode === "sentence") {
+    // Delete back to the end of the previous sentence or start of the block.
+    const trimmed = before.replace(/\s+$/, "");
+    const withoutTrailingMark = trimmed.replace(/[.!?…]+$/, "");
+    const prevBoundary = Math.max(
+      withoutTrailingMark.lastIndexOf(". "),
+      withoutTrailingMark.lastIndexOf("! "),
+      withoutTrailingMark.lastIndexOf("? "),
+      withoutTrailingMark.lastIndexOf("\n")
+    );
+    const startOffset = prevBoundary >= 0 ? prevBoundary + 2 : 0;
+    return { from: blockStart + startOffset, to: anchor };
+  }
+
+  // Match the last `wordCount` words before the anchor.
+  const tokens = [...before.matchAll(/\S+/g)];
+  if (tokens.length === 0) return null;
+  const targetToken = tokens[Math.max(0, tokens.length - wordCount)];
+  const startOffset = targetToken.index ?? 0;
+  // Include a leading space when deleting words so we don't leave double spaces behind.
+  const adjustedStart =
+    fallbackMode === "words" && startOffset > 0 && before[startOffset - 1] === " "
+      ? startOffset - 1
+      : startOffset;
+  return { from: blockStart + adjustedStart, to: anchor };
+}
+
+function toTitleCase(str: string): string {
+  return str.replace(/\b[\p{L}][\p{L}'’]*/gu, (w) => w.charAt(0).toLocaleUpperCase() + w.slice(1).toLocaleLowerCase());
+}
+
+function isInsideTable(state: EditorState, pos: number): boolean {
+  const $pos = state.doc.resolve(clampPos(state, pos));
+  for (let d = $pos.depth; d > 0; d--) {
+    const name = $pos.node(d).type.name;
+    if (name === "table" || name === "tableRow" || name === "tableCell" || name === "tableHeader") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Moves to the first cell of the next row in a table, or appends a new row if already on the last row.
+function moveOrAddNextTableRow(editor: Editor, anchor: number): void {
+  const { state } = editor;
+  const $pos = state.doc.resolve(clampPos(state, anchor));
+  let tableDepth = -1;
+  let rowDepth = -1;
+  for (let d = $pos.depth; d > 0; d--) {
+    const name = $pos.node(d).type.name;
+    if (rowDepth === -1 && name === "tableRow") rowDepth = d;
+    if (name === "table") {
+      tableDepth = d;
+      break;
+    }
+  }
+  if (tableDepth === -1 || rowDepth === -1) return;
+
+  const tableNode = $pos.node(tableDepth);
+  const rowIndex = $pos.index(tableDepth);
+  if (rowIndex + 1 < tableNode.childCount) {
+    // Move to the first cell of rowIndex + 1
+    let rowPos = $pos.start(tableDepth);
+    for (let i = 0; i <= rowIndex; i++) {
+      rowPos += tableNode.child(i).nodeSize;
+    }
+    // Inside tableRow (+1), inside first cell (+1), inside its first paragraph (+1)
+    const targetPos = clampPos(state, rowPos + 3);
+    editor
+      .chain()
+      .setTextSelection(targetPos)
+      .command(({ tr }) => {
+        tr.setMeta(dictationPluginKey, { anchor: targetPos, lastRange: null } satisfies DictationMeta);
+        return true;
+      })
+      .run();
+  } else {
+    // On the last row: add a new row below and jump to its first cell!
+    editor
+      .chain()
+      .setTextSelection(anchor)
+      .addRowAfter()
+      .goToNextCell()
+      .command(({ tr }) => {
+        tr.setMeta(dictationPluginKey, { anchor: tr.selection.head, lastRange: null } satisfies DictationMeta);
+        return true;
+      })
+      .run();
+  }
+}
+
+function flashEditorAction(editor: Editor, label: string | null, onAction?: (label: string) => void): void {
+  if (!label) return;
+  onAction?.(label);
+  if (actionClearTimer) clearTimeout(actionClearTimer);
+  editor.commands.setDictationAction(label);
+  actionClearTimer = setTimeout(() => {
+    if (!editor.isDestroyed) {
+      editor.commands.setDictationAction(null);
+    }
+  }, 2200);
+}
+
 // Applies one parsed chunk at the dictation anchor. Returns true when the chunk asked to stop.
-export function applyDictationOps(editor: Editor, ops: DictationOp[]): boolean {
+export function applyDictationOps(
+  editor: Editor,
+  ops: DictationOp[],
+  onAction?: (label: string) => void
+): boolean {
   let stop = false;
   for (const op of ops) {
     const st = getDictationState(editor.state);
     const anchor = clampPos(editor.state, st.anchor ?? editor.state.selection.head);
+    const label = describeDictationOp(op);
     const resync = ({ tr }: { tr: Transaction }) => {
       tr.setMeta(dictationPluginKey, { anchor: tr.selection.head, lastRange: null } satisfies DictationMeta);
       return true;
@@ -222,7 +400,10 @@ export function applyDictationOps(editor: Editor, ops: DictationOp[]): boolean {
             tr.insertText(text, from);
             const end = from + text.length;
             tr.setSelection(TextSelection.create(tr.doc, end));
-            tr.setMeta(dictationPluginKey, { anchor: end, lastRange: { from, to: end } } satisfies DictationMeta);
+            tr.setMeta(dictationPluginKey, {
+              anchor: end,
+              lastRange: { from: text.startsWith(" ") ? from + 1 : from, to: end },
+            } satisfies DictationMeta);
             return true;
           })
           .run();
@@ -230,29 +411,168 @@ export function applyDictationOps(editor: Editor, ops: DictationOp[]): boolean {
       }
       case "lineBreak":
         editor.chain().setTextSelection(anchor).setHardBreak().command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
       case "paragraph":
         editor
           .chain()
           .setTextSelection(anchor)
-          .first(({ commands }) => [() => commands.splitListItem("listItem"), () => commands.splitBlock()])
+          .first(({ commands }) => [
+            () => commands.splitListItem("taskItem"),
+            () => commands.splitListItem("listItem"),
+            () => commands.splitBlock(),
+          ])
           .command(resync)
           .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "listItem":
+        editor
+          .chain()
+          .setTextSelection(anchor)
+          .first(({ commands }) => [
+            () => commands.splitListItem("taskItem"),
+            () => commands.splitListItem("listItem"),
+            () => commands.toggleBulletList(),
+          ])
+          .command(resync)
+          .run();
+        flashEditorAction(editor, label, onAction);
         break;
       case "bulletList":
         editor.chain().setTextSelection(anchor).toggleBulletList().command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
       case "orderedList":
         editor.chain().setTextSelection(anchor).toggleOrderedList().command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
+      case "taskList":
+        editor.chain().setTextSelection(anchor).toggleTaskList().command(resync).run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "checkItem": {
+        editor
+          .chain()
+          .command(({ tr, state }) => {
+            const $pos = state.doc.resolve(anchor);
+            for (let d = $pos.depth; d > 0; d--) {
+              const node = $pos.node(d);
+              if (node.type.name === "taskItem") {
+                const pos = $pos.before(d);
+                const checked = op.checked ?? !node.attrs.checked;
+                tr.setNodeMarkup(pos, undefined, { ...node.attrs, checked });
+                return true;
+              }
+            }
+            return false;
+          })
+          .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      }
       case "heading":
         editor.chain().setTextSelection(anchor).setHeading({ level: op.level }).command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
       case "normalText":
         editor.chain().setTextSelection(anchor).setParagraph().command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
-      case "scratch": {
-        const range = st.lastRange;
+      case "blockquote":
+        editor.chain().setTextSelection(anchor).toggleBlockquote().command(resync).run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "horizontalRule":
+        editor.chain().setTextSelection(anchor).setHorizontalRule().command(resync).run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "pageBreak":
+        editor
+          .chain()
+          .setTextSelection(anchor)
+          .insertContent({ type: "pageBreak" })
+          .command(resync)
+          .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "insertTable":
+        editor
+          .chain()
+          .setTextSelection(anchor)
+          .insertTable({ rows: op.rows, cols: op.cols, withHeaderRow: true })
+          .command(resync)
+          .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "tableNav": {
+        if (!isInsideTable(editor.state, anchor)) break;
+        if (op.direction === "next") {
+          editor.chain().setTextSelection(anchor).goToNextCell().command(resync).run();
+        } else if (op.direction === "prev") {
+          editor.chain().setTextSelection(anchor).goToPreviousCell().command(resync).run();
+        } else {
+          moveOrAddNextTableRow(editor, anchor);
+        }
+        flashEditorAction(editor, label, onAction);
+        break;
+      }
+      case "formatLast": {
+        const range = resolveTargetRange(editor.state, anchor, st.lastRange, "lastRangeOrWord");
+        if (!range) break;
+        const { from, to } = range;
+        const keepAnchor = ({ tr }: { tr: Transaction }) => {
+          const end = clampPos(editor.state, to);
+          tr.setSelection(TextSelection.create(tr.doc, end));
+          tr.setMeta(dictationPluginKey, { anchor: end, lastRange: { from, to: end } } satisfies DictationMeta);
+          return true;
+        };
+        if (op.format === "bold") {
+          editor.chain().setTextSelection({ from, to }).toggleBold().command(keepAnchor).run();
+        } else if (op.format === "italic") {
+          editor.chain().setTextSelection({ from, to }).toggleItalic().command(keepAnchor).run();
+        } else if (op.format === "underline") {
+          editor.chain().setTextSelection({ from, to }).toggleUnderline().command(keepAnchor).run();
+        } else if (op.format === "strike") {
+          editor.chain().setTextSelection({ from, to }).toggleStrike().command(keepAnchor).run();
+        } else if (op.format === "code") {
+          editor.chain().setTextSelection({ from, to }).toggleCode().command(keepAnchor).run();
+        } else if (op.format === "highlight") {
+          editor
+            .chain()
+            .setTextSelection({ from, to })
+            .toggleHighlight({ color: op.color ?? "#fef08a" })
+            .command(keepAnchor)
+            .run();
+        } else if (op.format === "uppercase" || op.format === "lowercase" || op.format === "titlecase") {
+          editor
+            .chain()
+            .command(({ tr, state }) => {
+              const rawText = state.doc.textBetween(from, to);
+              if (!rawText) return false;
+              const converted =
+                op.format === "uppercase"
+                  ? rawText.toLocaleUpperCase()
+                  : op.format === "lowercase"
+                    ? rawText.toLocaleLowerCase()
+                    : toTitleCase(rawText);
+              tr.insertText(converted, from, to);
+              const end = from + converted.length;
+              tr.setSelection(TextSelection.create(tr.doc, end));
+              tr.setMeta(dictationPluginKey, { anchor: end, lastRange: { from, to: end } } satisfies DictationMeta);
+              return true;
+            })
+            .run();
+        }
+        flashEditorAction(editor, label, onAction);
+        break;
+      }
+      case "align":
+        editor.chain().setTextSelection(anchor).setTextAlign(op.alignment).command(resync).run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "deleteWord": {
+        const range = resolveTargetRange(editor.state, anchor, st.lastRange, "words", op.count ?? 1);
         if (!range) break;
         editor
           .chain()
@@ -263,12 +583,57 @@ export function applyDictationOps(editor: Editor, ops: DictationOp[]): boolean {
             return true;
           })
           .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      }
+      case "deleteSentence": {
+        const range = resolveTargetRange(editor.state, anchor, st.lastRange, "sentence");
+        if (!range) break;
+        editor
+          .chain()
+          .command(({ tr }) => {
+            tr.delete(range.from, range.to);
+            tr.setSelection(TextSelection.create(tr.doc, range.from));
+            tr.setMeta(dictationPluginKey, { anchor: range.from, lastRange: null } satisfies DictationMeta);
+            return true;
+          })
+          .run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      }
+      case "scratch": {
+        const range =
+          st.lastRange && st.lastRange.to > st.lastRange.from
+            ? st.lastRange
+            : resolveTargetRange(editor.state, anchor, null, "sentence");
+        if (!range) break;
+        editor
+          .chain()
+          .command(({ tr }) => {
+            // Also trim a single leading space before lastRange if deleting it would leave a trailing space.
+            const delFrom =
+              range.from > 1 && tr.doc.textBetween(range.from - 1, range.from) === " "
+                ? range.from - 1
+                : range.from;
+            tr.delete(delFrom, range.to);
+            tr.setSelection(TextSelection.create(tr.doc, delFrom));
+            tr.setMeta(dictationPluginKey, { anchor: delFrom, lastRange: null } satisfies DictationMeta);
+            return true;
+          })
+          .run();
+        flashEditorAction(editor, label, onAction);
         break;
       }
       case "undo":
         editor.chain().undo().command(resync).run();
+        flashEditorAction(editor, label, onAction);
+        break;
+      case "redo":
+        editor.chain().redo().command(resync).run();
+        flashEditorAction(editor, label, onAction);
         break;
       case "stop":
+        flashEditorAction(editor, label, onAction);
         stop = true;
         break;
     }

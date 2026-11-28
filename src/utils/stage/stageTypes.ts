@@ -246,6 +246,18 @@ export interface StageElement {
   textReveal?: StageTextReveal;
 }
 
+export interface StageCamera {
+  // 1 = 100% (default), > 1 zooms in, < 1 zooms out.
+  zoom?: number;
+  // Stage-unit offset from the stage's centre (positive moves camera right/down).
+  panX?: number;
+  panY?: number;
+  // Clockwise camera roll in degrees.
+  tilt?: number;
+}
+
+export type StageBeatSound = "none" | "whoosh" | "swoosh" | "swipe" | "pop" | "click" | "sparkle" | "boom";
+
 export interface StageBeat {
   id: string;
   // Seconds from this beat's start to the next one's (the last beat's runs to the scene's end).
@@ -257,9 +269,35 @@ export interface StageBeat {
   changes: Record<string, Partial<StageProps>>;
   // Element id -> the route it takes as it moves into this beat (straight when absent).
   paths?: Record<string, StagePath>;
+  // Virtual camera framing in this beat (carries forward until a later beat changes it).
+  camera?: StageCamera;
+  // Built-in SFX fired as this beat begins (overrides scene.beatSound; "none" silences).
+  sound?: StageBeatSound;
 }
 
-export type StageBackground = { kind: "none" } | { kind: "color"; color: string };
+export type StageBackgroundPattern = "none" | "dots" | "grid";
+
+export interface StageBackgroundStyle {
+  // Paper texture overlay (GPU-rendered, crisp at any resolution).
+  pattern?: StageBackgroundPattern;
+  // Cell spacing in stage units (default 42 for dots, 56 for grid).
+  patternSize?: number;
+  // Pattern opacity 0..1 (default 0.16 dots, 0.09 grid).
+  patternOpacity?: number;
+  // Optional custom hex/css color for dots/grid (absent = auto light/dark ink).
+  patternColor?: string;
+  // Animated pattern drift speed in stage units/sec (0 = still).
+  patternDrift?: number;
+  // Studio backdrop effects (0..1): radial edge vignette, centre spotlight glow, subtle film grain.
+  vignette?: number;
+  glow?: number;
+  grain?: number;
+}
+
+export type StageBackground =
+  | { kind: "none" }
+  | ({ kind: "color"; color: string } & StageBackgroundStyle)
+  | ({ kind: "gradient"; from: string; to: string; angle?: number; radial?: boolean; motion?: number } & StageBackgroundStyle);
 
 export interface StageScene {
   id: string;
@@ -282,6 +320,8 @@ export interface StageScene {
   stagger: number;
   // Seconds between one new word of a text arriving and the next.
   wordStagger?: number;
+  // Default sound fired on each beat (per-beat `sound` overrides it).
+  beatSound?: StageBeatSound;
   channels?: StageChannel[];
 }
 

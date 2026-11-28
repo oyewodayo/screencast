@@ -12,7 +12,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AnnotationFade, AnnotationPointer, AnnotationStyle, AnnotationTapSound } from "./annotationStyles";
+import type { AnnotationFade, AnnotationHandStyle, AnnotationPointer, AnnotationStyle, AnnotationTapSound } from "./annotationStyles";
 
 export interface AppSettings {
   defaultRecordType: string;
@@ -55,6 +55,10 @@ export interface AppSettings {
   // The cursor stand-in shown while drawing (see AnnotationPointer.tsx). "custom" uses
   // annotationPointerImage, a downscaled PNG data URL - empty falls back to the hand.
   annotationPointer: AnnotationPointer;
+  // Which built-in hand graphic to use when annotationPointer === "hand".
+  annotationHandStyle: AnnotationHandStyle;
+  // Relative scale of the pointer graphic (0.6 = small .. 1.25 = large; default 0.85).
+  annotationPointerScale: number;
   annotationPointerImage: string;
   // Expanding ring where each press lands, and the synthesised tap that goes with it (volume 0-1).
   annotationTapRipple: boolean;
@@ -188,6 +192,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   annotationShadow: false,
   annotationShowToolbar: true,
   annotationPointer: "hand",
+  annotationHandStyle: "classic",
+  annotationPointerScale: 0.85,
   annotationPointerImage: "",
   annotationTapRipple: true,
   annotationTapSound: "pop",
@@ -359,14 +365,18 @@ export function updateSettings(patch: Partial<AppSettings>): boolean {
 }
 
 export function saveSettings(settings: AppSettings): void {
-  cache = { ...settings };
+  const next = { ...settings };
+  cache = next;
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_DOM_EVENT, { detail: next }));
+  }
   if (backendAvailable) {
-    pendingWrite = cache;
+    pendingWrite = next;
     void flushWrites();
     return;
   }
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch (err) {
     console.error("Failed to save settings:", err);
   }

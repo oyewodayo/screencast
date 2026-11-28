@@ -6,7 +6,7 @@
 // in pin order (homeScreenFiles.ts); everything else ranks by the later of when it was last opened
 // here and when it last changed.
 
-export type HomeItemKind = "file" | "doc" | "whiteboard" | "mindmap";
+export type HomeItemKind = "file" | "doc" | "whiteboard" | "mindmap" | "board";
 
 export interface HomeItem {
   key: string; // file path, or "<kind>:<id>"
@@ -48,10 +48,35 @@ export function buildHomeItems(input: {
   docs: HomeCreationLike[];
   whiteboards: HomeCreationLike[];
   mindmaps: HomeCreationLike[];
+  boards?: HomeCreationLike[];
+  externalFiles?: Record<string, HomeFileLike> | HomeFileLike[];
+  query?: string;
   limit?: number;
 }): HomeItem[] {
   const { files, pinnedPaths, recentPaths, openedAt, limit = HOME_LIST_SIZE } = input;
-  const byPath = new Map(files.map((f) => [f.path, f]));
+  const q = input.query?.trim().toLowerCase() ?? "";
+  const byPath = new Map<string, HomeFileLike>(files.map((f) => [f.path, f]));
+
+  if (input.externalFiles) {
+    const extList = Array.isArray(input.externalFiles)
+      ? input.externalFiles
+      : Object.values(input.externalFiles);
+    for (const f of extList) {
+      if (!byPath.has(f.path)) {
+        byPath.set(f.path, f);
+      }
+    }
+  }
+
+  const resolveFile = (p: string): HomeFileLike => {
+    const existing = byPath.get(p);
+    if (existing) return existing;
+    const name = p.split(/[\\/]/).pop() || p;
+    const fallback: HomeFileLike = { path: p, name };
+    byPath.set(p, fallback);
+    return fallback;
+  };
+
   const fileItem = (f: HomeFileLike, pinned: boolean): HomeItem => ({
     key: f.path,
     kind: "file",
@@ -61,29 +86,50 @@ export function buildHomeItems(input: {
     pinned,
   });
 
-  const pinned = pinnedPaths
-    .map((p) => byPath.get(p))
-    .filter((f): f is HomeFileLike => !!f)
-    .map((f) => fileItem(f, true));
-
-  // Files compete on recency only once opened here (or, before any open history exists, the whole
-  // library by modified time) - otherwise every untouched recording would crowd out the
-  // documents someone is actually working on.
-  const recentFiles = recentPaths.map((p) => byPath.get(p)).filter((f): f is HomeFileLike => !!f);
-  const fileCandidates = (recentFiles.length > 0 ? recentFiles : files).filter((f) => !pinnedPaths.includes(f.path)).map((f) => fileItem(f, false));
-
   const creation = (kind: Exclude<HomeItemKind, "file">) => (c: HomeCreationLike): HomeItem => {
     const key = homeItemKey(kind, c.id);
     return { key, kind, id: c.id, name: c.name || "Untitled", time: Math.max(openedAt[key] ?? 0, parseTime(c.updated_at)), pinned: false };
   };
-  const rest = [
-    ...fileCandidates,
+
+  const allCreations: HomeItem[] = [
     ...input.docs.map(creation("doc")),
     ...input.whiteboards.map(creation("whiteboard")),
     ...input.mindmaps.map(creation("mindmap")),
+    ...(input.boards ?? []).map(creation("board")),
+  ];
+  const creationByKey = new Map(allCreations.map((c) => [c.key, c]));
+
+  const isCreationKey = (k: string) =>
+    k.startsWith("doc:") || k.startsWith("whiteboard:") || k.startsWith("mindmap:") || k.startsWith("board:");
+  const pinned: HomeItem[] = [];
+  const pinnedKeys = new Set<string>();
+  for (const p of pinnedPaths) {
+    if (pinnedKeys.has(p)) continue;
+    if (creationByKey.has(p)) {
+      pinned.push({ ...creationByKey.get(p)!, pinned: true });
+      pinnedKeys.add(p);
+    } else if (!isCreationKey(p)) {
+      pinned.push(fileItem(resolveFile(p), true));
+      pinnedKeys.add(p);
+    }
+  }
+
+  // When searching, match across the entire library (files + creations) instead of only recent opens.
+  // Otherwise files compete on recency once opened here, falling back to modified time before history exists.
+  const recentFiles = recentPaths.map(resolveFile);
+  const candidateFileList = q ? Array.from(byPath.values()) : recentFiles.length > 0 ? recentFiles : files;
+  const fileCandidates = candidateFileList
+    .filter((f) => !pinnedKeys.has(f.path))
+    .map((f) => fileItem(f, false));
+
+  const rest = [
+    ...fileCandidates,
+    ...allCreations.filter((c) => !pinnedKeys.has(c.key)),
   ].sort((a, b) => b.time - a.time);
 
-  return [...pinned, ...rest].slice(0, limit);
+  const combined = [...pinned, ...rest];
+  const filtered = q ? combined.filter((item) => item.name.toLowerCase().includes(q)) : combined;
+  return filtered.slice(0, limit);
 }
 
 export function relativeTime(ms: number, now = Date.now()): string {

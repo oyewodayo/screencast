@@ -26,7 +26,8 @@
 // whiteboard's own three.js scenes are untouched. Alpha is premultiplied throughout.
 import * as THREE from "three";
 import type { CompiledStage, SampledElement } from "./stageEngine";
-import { sampleStage, stageGlyphSets, stageTextStates } from "./stageEngine";
+import { sampleStage, sampleStageCamera, stageGlyphSets, stageTextStates } from "./stageEngine";
+import { isLightStageBackground } from "./stageEditing";
 import { hasTemplate } from "./stageChannels";
 import { parseStageColor } from "./stageColor";
 import type { MeasuredText } from "./stageLayout";
@@ -131,6 +132,12 @@ uniform float mapLod;
 uniform float dotT;
 uniform float dotCell;
 uniform vec3 palette[4];
+// Optional studio paper pattern over background fill: (kind: 0 none / 1 dots / 2 grid, spacingPx, alpha, driftPx).
+uniform vec4 bgPattern;
+// Explicit RGB ink color for dots/grid pattern.
+uniform vec4 bgPatternColor;
+// Studio backdrop effects: (vignette 0..1, spotlight glow 0..1, film grain 0..1, timeSec).
+uniform vec4 bgEffects;
 in vec2 vUv;
 out vec4 outColor;
 float hash12(vec2 p) {
@@ -282,8 +289,10 @@ void main() {
   vec4 c = color;
   if (useGrad > 0.5) {
     float g;
-    if (gradType > 0.5) g = length(p / max(size * 0.5, vec2(1.0)));
-    else {
+    if (gradType > 0.5) {
+      float rScale = max(0.35, gradDir.x);
+      g = length(p / max(size * 0.5 * rScale, vec2(1.0)));
+    } else {
       // 0 at the start corner side, 1 at the far side, for any direction.
       float span = abs(gradDir.x) * size.x + abs(gradDir.y) * size.y;
       g = dot(p, gradDir) / max(span, 1.0) + 0.5;
@@ -291,6 +300,36 @@ void main() {
     c = mix(color, color2, clamp(g, 0.0, 1.0));
   }
   vec4 fill = vec4(c.rgb, 1.0) * c.a;
+  if (bgPattern.x > 0.5 && bgPattern.y > 2.0) {
+    vec2 pp = p - vec2(bgPattern.w, bgPattern.w * 0.65);
+    vec2 cell = mod(pp + bgPattern.y * 0.5, bgPattern.y) - bgPattern.y * 0.5;
+    float pat = 0.0;
+    if (bgPattern.x < 1.5) {
+      float r = max(1.1, bgPattern.y * 0.055);
+      pat = clamp(0.5 - (length(cell) - r), 0.0, 1.0);
+    } else {
+      vec2 dg = abs(cell);
+      pat = clamp(0.5 - (min(dg.x, dg.y) - 0.6), 0.0, 1.0);
+    }
+    float pa = pat * bgPattern.z * c.a;
+    fill = vec4(bgPatternColor.rgb, 1.0) * pa + fill * (1.0 - pa);
+  }
+  if (bgEffects.x > 0.001 || bgEffects.y > 0.001 || bgEffects.z > 0.001) {
+    vec2 nq = p / max(size * 0.5, vec2(1.0));
+    float r2 = dot(nq, nq);
+    if (bgEffects.y > 0.001) {
+      float spot = exp(-r2 * 1.65) * bgEffects.y * 0.34;
+      fill.rgb = clamp(fill.rgb + vec3(spot) * fill.a, 0.0, 1.0);
+    }
+    if (bgEffects.x > 0.001) {
+      float vig = clamp(smoothstep(0.32, 1.68, r2) * bgEffects.x * 0.74, 0.0, 0.88);
+      fill.rgb *= (1.0 - vig);
+    }
+    if (bgEffects.z > 0.001) {
+      float n = (hash12(floor(p + size * 0.5) + fract(bgEffects.w * 13.37) * 97.0) - 0.5) * bgEffects.z * 0.14;
+      fill.rgb = clamp(fill.rgb + vec3(n) * fill.a, 0.0, 1.0);
+    }
+  }
   float merged = 1.0;
   if (useMap > 0.5) {
     vec4 t = picture(p, mapLod);
@@ -545,6 +584,9 @@ const boxMaterial = () =>
       dotT: { value: 1 },
       dotCell: { value: 16 },
       palette: { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] },
+      bgPattern: { value: new THREE.Vector4(0, 48, 0, 0) },
+      bgPatternColor: { value: new THREE.Vector4(1, 1, 1, 1) },
+      bgEffects: { value: new THREE.Vector4(0, 0, 0, 0) },
     },
     ...premultipliedBlend,
   });
@@ -1143,10 +1185,19 @@ export class StageRenderer {
   private draw(compiled: CompiledStage, t: number): void {
     const scene = compiled.scene;
     const scale = this.scale;
-    this.camera.left = 0;
-    this.camera.right = scene.width;
-    this.camera.top = 0;
-    this.camera.bottom = STAGE_HEIGHT;
+    const cam = sampleStageCamera(compiled, t);
+    const halfW = scene.width / (2 * cam.zoom);
+    const halfH = STAGE_HEIGHT / (2 * cam.zoom);
+    const camX = scene.width / 2 + cam.panX;
+    const camY = STAGE_HEIGHT / 2 + cam.panY;
+    const camRotZ = -(cam.tilt * Math.PI) / 180;
+    this.camera.left = -halfW;
+    this.camera.right = halfW;
+    this.camera.top = -halfH;
+    this.camera.bottom = halfH;
+    this.camera.position.set(camX, camY, 0);
+    this.camera.rotation.set(0, 0, camRotZ);
+    this.camera.updateMatrixWorld();
     this.camera.updateProjectionMatrix();
     // Perspective about the stage's centre: w = 1 - z/D, with z kept out of clipping. Everything at
     // z = 0 and untilted - nearly always - projects exactly as the orthographic camera alone would.
@@ -1156,16 +1207,61 @@ export class StageRenderer {
     this.camera.projectionMatrixInverse.copy(this.camera.projectionMatrix).invert();
 
     let order = 0;
-    if (scene.background.kind === "color") {
+    if (scene.background.kind === "color" || scene.background.kind === "gradient") {
       const u = this.background.material.uniforms;
-      setRgba(u.color.value, undefined, scene.background.color);
+      if (scene.background.kind === "color") {
+        setRgba(u.color.value, undefined, scene.background.color);
+        u.useGrad.value = 0;
+        u.gradType.value = 0;
+        u.gradDir.value.set(1, 0);
+      } else {
+        setRgba(u.color.value, undefined, scene.background.from);
+        setRgba(u.color2.value, undefined, scene.background.to);
+        u.useGrad.value = 1;
+        const motion = Math.max(0, Math.min(1, scene.background.motion ?? 0));
+        if (scene.background.radial) {
+          u.gradType.value = 1;
+          const pulse = motion > 0 ? 1 + Math.sin(t * (1.2 + motion * 2.4)) * 0.22 * motion : 1;
+          u.gradDir.value.set(pulse, 0);
+        } else {
+          u.gradType.value = 0;
+          const deg = (scene.background.angle ?? 135) + (motion > 0 ? t * motion * 36 : 0);
+          const a = (deg * Math.PI) / 180;
+          u.gradDir.value.set(Math.sin(a), -Math.cos(a));
+        }
+      }
+      const pat = scene.background.pattern ?? "none";
+      const light = isLightStageBackground(scene.background);
+      const patKind = pat === "dots" ? 1 : pat === "grid" ? 2 : 0;
+      const defaultSpacing = pat === "dots" ? 42 : 56;
+      const patSpacing = Math.max(12, Math.min(200, scene.background.patternSize ?? defaultSpacing)) * scale;
+      const defaultAlpha = pat === "dots" ? (light ? 0.16 : 0.18) : light ? 0.09 : 0.1;
+      const patAlpha = Math.max(0, Math.min(1, scene.background.patternOpacity ?? defaultAlpha));
+      const patDrift = (scene.background.patternDrift ?? 0) * t * scale;
+      u.bgPattern.value.set(patKind, patSpacing, patAlpha, patDrift);
+      if (scene.background.patternColor) {
+        setRgba(u.bgPatternColor.value, undefined, scene.background.patternColor);
+      } else {
+        const inkV = light ? 0.07 : 1;
+        u.bgPatternColor.value.set(inkV, inkV, inkV, 1);
+      }
+      u.bgEffects.value.set(
+        Math.max(0, Math.min(1, scene.background.vignette ?? 0)),
+        Math.max(0, Math.min(1, scene.background.glow ?? 0)),
+        Math.max(0, Math.min(1, scene.background.grain ?? 0)),
+        t
+      );
       u.size.value.set(scene.width * scale, STAGE_HEIGHT * scale);
       u.margin.value = 0;
       u.radius.value = 0;
       u.blurPx.value = 0;
       u.strokePx.value = 0;
       u.opacity.value = 1;
-      this.background.matrix.makeTranslation(scene.width / 2, STAGE_HEIGHT / 2, 0).multiply(this.tmp.makeScale(scene.width, STAGE_HEIGHT, 1));
+      // Aligned to the active camera frustum so zooming out, panning, or tilting never shows black borders.
+      this.background.matrix
+        .makeTranslation(camX, camY, 0)
+        .multiply(this.tmp.makeRotationZ(camRotZ))
+        .multiply(this.tmp.makeScale(halfW * 2, halfH * 2, 1));
       this.background.matrixWorldNeedsUpdate = true;
       this.background.renderOrder = order++;
       this.background.visible = true;
@@ -1230,9 +1326,13 @@ export class StageRenderer {
         } else u.shapeMix.value = 1;
         if (gradient) {
           setRgba(u.color2.value, undefined, gradient.to);
-          const a = ((gradient.angle ?? 180) * Math.PI) / 180;
-          // CSS angles: 0deg points up, 90deg right (y down here).
-          u.gradDir.value.set(Math.sin(a), -Math.cos(a));
+          if (gradient.type === "radial") {
+            u.gradDir.value.set(1, 0);
+          } else {
+            const a = ((gradient.angle ?? 180) * Math.PI) / 180;
+            // CSS angles: 0deg points up, 90deg right (y down here).
+            u.gradDir.value.set(Math.sin(a), -Math.cos(a));
+          }
         }
         setRgba(u.shadowColor.value, undefined, shadow?.color);
         if (shadow) {

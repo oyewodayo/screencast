@@ -28,6 +28,7 @@ import {
 } from "../../utils/letterheadSources";
 import "./docLetterhead.css";
 import ColorInput from "../common/ColorInput";
+import BrandLoader from "../common/BrandLoader";
 
 export interface LetterheadApplyOptions {
   saveToLibrary: boolean;
@@ -355,7 +356,9 @@ const DocLetterheadDialog: React.FC<Props> = ({ current, sheet, onApply, onRemov
             <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4">
               {tab === "library" &&
                 (library === null ? (
-                  <div className="text-sm text-neutral-400">Loading…</div>
+                  <div className="py-8 flex justify-center">
+                    <BrandLoader variant="contained" size="sm" message="Loading letterheads…" />
+                  </div>
                 ) : library.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-neutral-300 dark:border-neutral-600 p-6 text-center text-sm text-neutral-500">
                     Letterheads you save appear here, ready for any document.

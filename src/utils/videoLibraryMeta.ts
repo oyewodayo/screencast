@@ -10,7 +10,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { thumbnailLimiter } from "./concurrencyLimiter";
 import { clipOutputDuration } from "./clipTiming";
 import { canvasPreset } from "./canvasFormats";
-import type { VideoEditState } from "./videoEditTypes";
+import { isNeutralFx } from "./audioFx";
+import { isNeutralMaster } from "./masterBus";
+import { hasAudioCleanup, isVideoProjectPath, type Clip, type VideoEditState } from "./videoEditTypes";
 
 export interface VideoProbe {
   duration: number | null;
@@ -91,19 +93,81 @@ export function probeVideo(file: FileVersion): Promise<VideoProbe> {
 
 // Edits change while the app runs, so these are kept per session and re-read when asked to.
 const summaries = new Map<string, Promise<EditSummary | null>>();
+export function invalidateEditSummary(path: string): void {
+  summaries.delete(path);
+}
+
 export function readEditSummary(path: string, fresh = false): Promise<EditSummary | null> {
   let pending = fresh ? undefined : summaries.get(path);
   if (!pending) {
-    pending = thumbnailLimiter(() => invoke<string | null>("load_video_edit_state", { videoPath: path })).then((json) => (json ? summarize(JSON.parse(json)) : null));
+    pending = thumbnailLimiter(() => invoke<string | null>("load_video_edit_state", { videoPath: path })).then((json) => (json ? summarize(JSON.parse(json), path) : null));
     pending.catch(() => summaries.delete(path));
     summaries.set(path, pending);
   }
   return pending;
 }
 
-function summarize(state: Partial<VideoEditState>): EditSummary | null {
+const normPath = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+
+function isClipEdited(clip: Clip, sourceDuration: number, videoPath?: string): boolean {
+  if (videoPath && clip.sourcePath && normPath(clip.sourcePath) !== normPath(videoPath)) return true;
+  if (clip.start > 0.05) return true;
+  if (sourceDuration > 0 && Math.abs(clip.end - sourceDuration) > 0.5) return true;
+  if (clip.colorFilter && clip.colorFilter.preset !== "none" && clip.colorFilter.intensity > 0) return true;
+  if (clip.grade && Object.values(clip.grade).some((v) => v !== undefined && v !== 0)) return true;
+  if (clip.stabilize && clip.stabilize.strength > 0) return true;
+  if (clip.reversedFrom) return true;
+  if (clip.speedRamp) return true;
+  if (clip.kenBurns) return true;
+  if (clip.transitionIn) return true;
+  if (clip.cutSound !== undefined) return true;
+  if (clip.crop && (clip.crop.x > 0.001 || clip.crop.y > 0.001 || clip.crop.width < 0.999 || clip.crop.height < 0.999)) return true;
+  if (clip.flipHorizontal) return true;
+  if (clip.speed !== undefined && Math.abs(clip.speed - 1) > 1e-4) return true;
+  if (hasAudioCleanup(clip)) return true;
+  if (clip.muted) return true;
+  if (clip.fx) return true;
+  return false;
+}
+
+// True only when a sidecar represents genuine editing work rather than an untouched 1-clip
+// placeholder state (which older versions accidentally wrote when a video was merely watched).
+export function hasVideoEdits(state: Partial<VideoEditState>, videoPath?: string): boolean {
+  if (videoPath && isVideoProjectPath(videoPath)) return true;
+  const clips = state.clips ?? [];
+  if (
+    (state.textOverlays?.length ?? 0) > 0 ||
+    (state.imageOverlays?.length ?? 0) > 0 ||
+    (state.blurOverlays?.length ?? 0) > 0 ||
+    (state.audioOverlays?.length ?? 0) > 0 ||
+    (state.pipOverlays?.length ?? 0) > 0 ||
+    (state.adjustmentLayers?.length ?? 0) > 0 ||
+    (state.scenes?.length ?? 0) > 0 ||
+    (state.chapters?.length ?? 0) > 0
+  ) {
+    return true;
+  }
+  if (state.captions && (state.captions.settings?.enabled || Object.values(state.captions.transcripts ?? {}).some((w) => w.length > 0))) {
+    return true;
+  }
+  if (state.canvas || state.screenStyle || state.pointerStyle || state.keystrokeStyle) return true;
+  if (state.videoAudioMuted) return true;
+  if (state.videoAudioVolume !== undefined && Math.abs(state.videoAudioVolume - 1) > 1e-4) return true;
+  if (state.videoAudioFx && !isNeutralFx(state.videoAudioFx)) return true;
+  if (state.master && !isNeutralMaster(state.master)) return true;
+  if ((state.hiddenVideoTracks?.length ?? 0) > 0) return true;
+  if (state.edgeTransitions && (state.edgeTransitions.intro || state.edgeTransitions.outro)) return true;
+  if (state.cutSounds?.on) return true;
+
+  if (clips.length === 0) return false;
+  if (clips.length > 1) return true;
+  return isClipEdited(clips[0], state.duration ?? 0, videoPath);
+}
+
+export function summarize(state: Partial<VideoEditState>, videoPath?: string): EditSummary | null {
   const clips = state.clips ?? [];
   if (clips.length === 0 && !(state.scenes?.length || state.audioOverlays?.length)) return null;
+  if (!hasVideoEdits(state, videoPath)) return null;
   const groups = new Set([...(state.pipOverlays ?? []), ...(state.imageOverlays ?? [])].flatMap((o) => (o.split ? [o.split.group] : [])));
   const canvas = state.canvas ?? null;
   const updated = state.updatedAt ? Date.parse(state.updatedAt) : NaN;

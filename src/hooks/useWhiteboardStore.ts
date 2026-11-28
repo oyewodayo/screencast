@@ -15,7 +15,16 @@
 // cross-page undo is rarely what anyone actually wants anyway.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { WhiteboardCommand, WhiteboardDocument, WhiteboardEdge, WhiteboardNode, WhiteboardPage, createEmptyWhiteboardPage } from "../utils/whiteboardTypes";
+import {
+  WhiteboardCanvasTheme,
+  WhiteboardCommand,
+  WhiteboardDocument,
+  WhiteboardEdge,
+  WhiteboardGridStyle,
+  WhiteboardNode,
+  WhiteboardPage,
+  createEmptyWhiteboardPage,
+} from "../utils/whiteboardTypes";
 import { applyCommand, invertCommand, undoDeleteNode } from "../handlers/whiteboardHandlers";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
@@ -54,11 +63,14 @@ export interface UseWhiteboardStoreResult {
   pasteItems: (nodes: WhiteboardNode[], edges: WhiteboardEdge[]) => void;
   setShowGrid: (show: boolean) => void;
   setSnapToGrid: (snap: boolean) => void;
+  setCanvasTheme: (theme: WhiteboardCanvasTheme) => void;
+  setGridStyle: (style: WhiteboardGridStyle) => void;
   // Not an undo command - same reasoning as Board/Docs not undo-tracking a title edit.
   renameWhiteboard: (name: string) => void;
   // ---- Pages - none of these are undo-tracked (same reasoning as renameWhiteboard: page
   // structure is workspace organization, not diagram content you'd expect Ctrl+Z to touch).
   addPage: () => void;
+  appendPages: (newPages: WhiteboardPage[]) => void;
   renamePage: (pageId: string, name: string) => void;
   // Refuses to delete the whiteboard's last remaining page - every whiteboard always has at least
   // one page, same invariant a spreadsheet enforces on its last sheet tab.
@@ -310,6 +322,22 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     scheduleAutosave();
   }, [scheduleAutosave]);
 
+  const setCanvasTheme = useCallback(
+    (canvasTheme: WhiteboardCanvasTheme) => {
+      setDoc((prev) => (prev ? { ...prev, canvasTheme } : prev));
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
+  const setGridStyle = useCallback(
+    (gridStyle: WhiteboardGridStyle) => {
+      setDoc((prev) => (prev ? { ...prev, gridStyle, showGrid: gridStyle !== "none" } : prev));
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
+
   const renameWhiteboard = useCallback(
     (name: string) => {
       setDoc((prev) => (prev ? { ...prev, name, updatedAt: new Date().toISOString() } : prev));
@@ -328,6 +356,25 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     setRedoStack([]);
     scheduleAutosave();
   }, [scheduleAutosave]);
+
+  const appendPages = useCallback(
+    (newPages: WhiteboardPage[]) => {
+      if (newPages.length === 0) return;
+      setDoc((prev) => {
+        if (!prev) return prev;
+        // If the whiteboard currently has only a single completely blank page, replace it with the
+        // imported slide pages so Slide 1 isn't preceded by an orphan empty "Page 1".
+        const replaceOnlyBlank =
+          prev.pages.length === 1 && prev.pages[0].nodes.length === 0 && prev.pages[0].edges.length === 0;
+        const pages = replaceOnlyBlank ? newPages : [...prev.pages, ...newPages];
+        return { ...prev, pages, activePageId: newPages[0].id, updatedAt: new Date().toISOString() };
+      });
+      setUndoStack([]);
+      setRedoStack([]);
+      scheduleAutosave();
+    },
+    [scheduleAutosave]
+  );
 
   const renamePage = useCallback(
     (pageId: string, name: string) => {
@@ -448,8 +495,11 @@ export default function useWhiteboardStore(whiteboardId: string | undefined): Us
     pasteItems,
     setShowGrid,
     setSnapToGrid,
+    setCanvasTheme,
+    setGridStyle,
     renameWhiteboard,
     addPage,
+    appendPages,
     renamePage,
     deletePage,
     duplicatePage,

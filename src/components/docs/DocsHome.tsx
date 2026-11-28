@@ -24,6 +24,7 @@ import FileInfoModal from "../Modals/FileInfoModal";
 import DocPdfImportDialog from "./DocPdfImportDialog";
 import { defaultLetterhead, type SavedLetterhead } from "../../utils/letterheadLibrary";
 import { letterheadMargins, writeLetterhead } from "../../utils/docLetterhead";
+import BrandLoader from "../common/BrandLoader";
 
 interface DocsHomeProps {
   onOpenDoc: (id: string) => void;
@@ -839,7 +840,9 @@ const DocsHome: React.FC<DocsHomeProps> = ({ onOpenDoc }) => {
           <>
             <p className="text-xs text-gray-500 dark:text-neutral-400 mb-4">Deleted documents are kept here until you delete them permanently.</p>
             {trashedDocs === null ? (
-              <p className="text-sm text-gray-400 dark:text-neutral-500">Loading…</p>
+              <div className="py-8 flex justify-center">
+                <BrandLoader variant="contained" size="sm" message="Loading trash…" />
+              </div>
             ) : trashedDocs.length === 0 ? (
               <p className="text-sm text-gray-400 dark:text-neutral-500">Trash is empty</p>
             ) : (

@@ -46,7 +46,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Extension, Path, Query, State,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -67,6 +68,17 @@ const MANIFEST: &str = include_str!("phone_transfer_manifest.json");
 const SERVICE_WORKER: &str = include_str!("phone_transfer_sw.js");
 // The Remote, Voice-over, Prompter and Beam tabs - kept apart from the page for its size.
 const STUDIO: &str = include_str!("phone_transfer_studio.js");
+// Direct Phone-to-Phone WebRTC P2P engine + built-in camera QR scanner.
+const P2P: &str = include_str!("phone_transfer_p2p.js");
+
+fn transfer_pwa_url() -> String {
+    std::env::var("BRIEFCAST_TRANSFER_PWA_URL")
+        .ok()
+        .or_else(|| option_env!("BRIEFCAST_TRANSFER_PWA_URL").map(str::to_string))
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://transfer.briefcast.app".to_string())
+}
 const ICON_192: &[u8] = include_bytes!("phone_transfer_icons/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("phone_transfer_icons/icon-512.png");
 const ICON_MASKABLE: &[u8] = include_bytes!("phone_transfer_icons/maskable-512.png");
@@ -265,12 +277,20 @@ impl PairingKey {
     }
 }
 
+struct LanP2pPeer {
+    name: String,
+    platform: String,
+    room: Option<String>,
+    tx: mpsc::UnboundedSender<String>,
+}
+
 // Everything the server tasks and the commands share. Plain std mutexes: every critical section is
 // a few map operations, and none is ever held across an await.
 #[derive(Default)]
 struct Hub {
     devices: Mutex<Vec<Device>>,
     sessions: Mutex<HashMap<String, Session>>,
+    p2p_peers: Mutex<HashMap<String, LanP2pPeer>>,
     offers: Mutex<HashMap<String, Offer>>,
     key: Mutex<Option<PairingKey>>,
     // New phones waiting for approval, by request id.
@@ -722,6 +742,181 @@ async fn studio() -> Response {
     static_file("text/javascript; charset=utf-8", STUDIO.as_bytes())
 }
 
+async fn p2p_script() -> Response {
+    static_file("text/javascript; charset=utf-8", P2P.as_bytes())
+}
+
+// Allows the standalone hosted PWA (https://transfer.briefcast.app) to communicate directly with
+// Briefcast Desktop over LAN HTTPS/HTTP, including Chrome's Private Network Access preflight.
+async fn cors_and_pna(req: Request<Body>, next: Next) -> Response {
+    let apply = |h: &mut HeaderMap| {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Range"));
+        h.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Content-Length, Content-Range, Content-Disposition"),
+        );
+        h.insert(
+            HeaderName::from_static("access-control-allow-private-network"),
+            HeaderValue::from_static("true"),
+        );
+    };
+    if req.method() == Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        apply(resp.headers_mut());
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    apply(resp.headers_mut());
+    resp
+}
+
+// Local LAN WebRTC signaling broker for zero-internet hotspot Phone-to-Phone transfers.
+async fn lan_p2p_ws_upgrade(ws: WebSocketUpgrade, State(ctx): State<Ctx>) -> Response {
+    ws.on_upgrade(move |socket| lan_p2p_session(socket, ctx))
+}
+
+fn broadcast_lan_p2p_peers(hub: &Hub) {
+    let peers = hub.p2p_peers.lock().unwrap();
+    let list: Vec<(&String, String, String, Option<String>)> = peers
+        .iter()
+        .map(|(id, p)| (id, p.name.clone(), p.platform.clone(), p.room.clone()))
+        .collect();
+    for (id, peer) in peers.iter() {
+        let visible: Vec<_> = list
+            .iter()
+            .filter(|(other_id, _, _, _)| *other_id != id)
+            .map(|(other_id, name, platform, room)| {
+                json!({ "id": other_id, "name": name, "platform": platform, "room": room })
+            })
+            .collect();
+        let _ = peer.tx.send(json!({ "type": "peers", "peers": visible }).to_string());
+    }
+}
+
+async fn lan_p2p_session(socket: WebSocket, ctx: Ctx) {
+    use futures_util::{SinkExt, StreamExt};
+    let (mut sink, mut stream) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let peer_id = format!("lan-{}", pairing_key());
+
+    let writer = tokio::spawn(async move {
+        while let Some(text) = rx.recv().await {
+            if sink.send(Message::Text(text)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    {
+        let mut peers = ctx.hub.p2p_peers.lock().unwrap();
+        peers.insert(
+            peer_id.clone(),
+            LanP2pPeer {
+                name: "Phone".into(),
+                platform: "Device".into(),
+                room: None,
+                tx: tx.clone(),
+            },
+        );
+    }
+    let _ = tx.send(json!({ "type": "welcome", "id": peer_id, "peers": [] }).to_string());
+    broadcast_lan_p2p_peers(&ctx.hub);
+
+    loop {
+        let msg = match tokio::time::timeout(Duration::from_secs(45), stream.next()).await {
+            Ok(Some(Ok(m))) => m,
+            _ => break,
+        };
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        if text.len() > 65_536 {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("ping") => {
+                let _ = tx.send(json!({ "type": "pong" }).to_string());
+            }
+            Some("hello") => {
+                let name = clean_name(v.get("name").and_then(|s| s.as_str()).unwrap_or("Phone"));
+                let platform = clean_name(v.get("platform").and_then(|s| s.as_str()).unwrap_or("Device"));
+                if let Some(p) = ctx.hub.p2p_peers.lock().unwrap().get_mut(&peer_id) {
+                    if !name.is_empty() {
+                        p.name = name;
+                    }
+                    if !platform.is_empty() {
+                        p.platform = platform;
+                    }
+                }
+                broadcast_lan_p2p_peers(&ctx.hub);
+            }
+            Some("room.create") => {
+                let num = (now_ms() ^ (ctx.hub.seq.fetch_add(1, Ordering::Relaxed) * 2654435761)) % 900_000 + 100_000;
+                let code = format!("{num:06}");
+                if let Some(p) = ctx.hub.p2p_peers.lock().unwrap().get_mut(&peer_id) {
+                    p.room = Some(code.clone());
+                }
+                let _ = tx.send(json!({ "type": "room.created", "code": code }).to_string());
+                broadcast_lan_p2p_peers(&ctx.hub);
+            }
+            Some("room.join") => {
+                let code: String = v
+                    .get("code")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .take(6)
+                    .collect();
+                if code.len() == 6 {
+                    if let Some(p) = ctx.hub.p2p_peers.lock().unwrap().get_mut(&peer_id) {
+                        p.room = Some(code.clone());
+                    }
+                    let _ = tx.send(json!({ "type": "room.joined", "code": code }).to_string());
+                    broadcast_lan_p2p_peers(&ctx.hub);
+                }
+            }
+            Some("room.leave") => {
+                if let Some(p) = ctx.hub.p2p_peers.lock().unwrap().get_mut(&peer_id) {
+                    p.room = None;
+                }
+                broadcast_lan_p2p_peers(&ctx.hub);
+            }
+            Some("signal") => {
+                let Some(to) = v.get("to").and_then(|s| s.as_str()) else { continue };
+                let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let peers = ctx.hub.p2p_peers.lock().unwrap();
+                let (from_name, from_platform) = peers
+                    .get(&peer_id)
+                    .map(|p| (p.name.clone(), p.platform.clone()))
+                    .unwrap_or_else(|| ("Phone".into(), "Device".into()));
+                if let Some(dest) = peers.get(to) {
+                    let _ = dest.tx.send(
+                        json!({
+                            "type": "signal",
+                            "from": peer_id,
+                            "fromName": from_name,
+                            "fromPlatform": from_platform,
+                            "data": data,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    writer.abort();
+    ctx.hub.p2p_peers.lock().unwrap().remove(&peer_id);
+    broadcast_lan_p2p_peers(&ctx.hub);
+}
+
 async fn icon(Path(name): Path<String>) -> Response {
     match name.as_str() {
         "icon-192.png" => static_file("image/png", ICON_192),
@@ -754,7 +949,10 @@ async fn tls_target(headers: HeaderMap, State(ctx): State<Ctx>) -> Response {
     match ip.and_then(|ip| lan_tls::host_for(ip, &tls.install_id, &tls.zone)) {
         Some(host) => (
             [(header::CACHE_CONTROL, "no-store")],
-            axum::Json(json!({ "https": format!("https://{host}:{}", tls.port) })),
+            axum::Json(json!({
+                "https": format!("https://{host}:{}", tls.port),
+                "pwa": transfer_pwa_url(),
+            })),
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1683,15 +1881,18 @@ async fn ensure_server(app: &AppHandle, state: &PhoneTransferState) -> Result<Ph
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
         .route("/studio.js", get(studio))
+        .route("/p2p.js", get(p2p_script))
         .route("/icons/:name", get(icon))
         .route("/share", post(share_without_worker))
         .route("/handoff", get(redeem_handoff))
         .route("/tls", get(tls_target))
         .route("/ws", get(ws_upgrade))
+        .route("/p2p/ws", get(lan_p2p_ws_upgrade))
         .route("/f/:id", get(serve_file))
         // The body is streamed straight to disk, never buffered, so there's nothing for axum's 2MB
         // default limit to protect - and a phone video is routinely gigabytes.
         .route("/u", post(receive_upload).layer(DefaultBodyLimit::disable()))
+        .layer(middleware::from_fn(cors_and_pna))
         .with_state(ctx);
 
     tauri::async_runtime::spawn(run_tls(Ctx { hub: hub.clone(), app: app.clone() }, router.clone()));

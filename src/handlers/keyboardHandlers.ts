@@ -30,6 +30,19 @@ interface KeyboardHandlers {
   // E - into the editing timeline (or out of it), the same as Settings > Edit video. Only offered
   // for a video file.
   toggleEditor?: () => void;
+  // Smart Study Player shortcuts:
+  // N - open Study Mode and focus the quick-note composer
+  // S - instant slide capture into Study Notes
+  // B - add a chapter bookmark at the current timestamp
+  // [ / ] / \ - set A–B study loop start, end, or clear loop
+  // 0–9 - seek to 0%–90% of video duration
+  quickStudyNote?: () => void;
+  quickSnapSlide?: () => void;
+  quickAddChapter?: () => void;
+  setLoopA?: () => void;
+  setLoopB?: () => void;
+  clearLoop?: () => void;
+  seekPercent?: (fraction: number) => void;
   onPlaybackRateChange?: (rate: number) => void;
   onVolumeChange?: (volume: number) => void;
 }
@@ -142,6 +155,50 @@ export const createKeyboardHandler = (
         if (!handlers.toggleEditor || e.repeat) break;
         e.preventDefault();
         handlers.toggleEditor();
+        break;
+      case "n":
+        if (!handlers.quickStudyNote || e.repeat) break;
+        e.preventDefault();
+        handlers.quickStudyNote();
+        break;
+      case "s":
+        if (!handlers.quickSnapSlide || e.repeat) break;
+        e.preventDefault();
+        handlers.quickSnapSlide();
+        break;
+      case "b":
+        if (!handlers.quickAddChapter || e.repeat) break;
+        e.preventDefault();
+        handlers.quickAddChapter();
+        break;
+      case "[":
+        if (!handlers.setLoopA || e.repeat) break;
+        e.preventDefault();
+        handlers.setLoopA();
+        break;
+      case "]":
+        if (!handlers.setLoopB || e.repeat) break;
+        e.preventDefault();
+        handlers.setLoopB();
+        break;
+      case "\\":
+        if (!handlers.clearLoop || e.repeat) break;
+        e.preventDefault();
+        handlers.clearLoop();
+        break;
+      case "0":
+      case "1":
+      case "2":
+      case "3":
+      case "4":
+      case "5":
+      case "6":
+      case "7":
+      case "8":
+      case "9":
+        if (!enableArrowSeek || !handlers.seekPercent) break;
+        e.preventDefault();
+        handlers.seekPercent(Number(e.key) / 10);
         break;
       default:
         break;

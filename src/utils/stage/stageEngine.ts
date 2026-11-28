@@ -136,6 +136,15 @@ export interface CompiledStage {
   beatStarts: number[];
   tracks: ElementTrack[];
   channels: Map<string, StageChannel>;
+  camera: Track;
+}
+
+export interface SampledCamera {
+  zoom: number;
+  panX: number;
+  panY: number;
+  tilt: number;
+  moving: boolean;
 }
 
 // A letter of a morphing text, in its element's box.
@@ -472,7 +481,45 @@ export function compileStage(scene: StageScene, measure?: StageMeasure): Compile
     return { ...track, element, glyphs, live, enterWipe: element.enter?.wipe, exitWipe: element.exit?.wipe };
   });
 
-  return { scene: sceneWithBeats, duration, beatStarts, tracks, channels };
+  const camera = compileCameraTrack(beats, beatStarts, scene.spring);
+
+  return { scene: sceneWithBeats, duration, beatStarts, tracks, channels, camera };
+}
+
+function compileCameraTrack(beats: StageScene["beats"], beatStarts: number[], sceneSpring: StageScene["spring"]): Track {
+  const camVec = (panX: number, panY: number, zoom: number, tilt: number): Vec => {
+    const v = zeros();
+    v[X] = panX;
+    v[Y] = panY;
+    v[SCALE] = Math.max(0.25, zoom);
+    v[ROT] = tilt;
+    v[OPACITY] = 1;
+    return v;
+  };
+  const camDiscrete: Discrete = { anchorX: 0.5, anchorY: 0.5, hasColor: false };
+  let cur = { panX: 0, panY: 0, zoom: 1, tilt: 0 };
+  const resolved = beats.map((b) => {
+    if (b.camera) {
+      cur = {
+        panX: b.camera.panX ?? cur.panX,
+        panY: b.camera.panY ?? cur.panY,
+        zoom: b.camera.zoom ?? cur.zoom,
+        tilt: b.camera.tilt ?? cur.tilt,
+      };
+    }
+    return { ...cur };
+  });
+  const first = resolved[0] ?? { panX: 0, panY: 0, zoom: 1, tilt: 0 };
+  const initial = camVec(first.panX, first.panY, first.zoom, first.tilt);
+  const goals: Goal[] = [];
+  for (let b = 1; b < beats.length; b++) {
+    const prev = resolved[b - 1];
+    const next = resolved[b];
+    if (prev.panX === next.panX && prev.panY === next.panY && prev.zoom === next.zoom && prev.tilt === next.tilt) continue;
+    const spring = SPRING_PRESETS[beats[b].spring ?? sceneSpring] ?? SPRING_PRESETS.smooth;
+    goals.push({ t: beatStarts[b], shown: { vector: camVec(next.panX, next.panY, next.zoom, next.tilt), discrete: camDiscrete }, spring });
+  }
+  return buildTrack(initial, camDiscrete, goals, STILL, STILL);
 }
 
 const beatAtTime = (beatStarts: number[], t: number) => {
@@ -885,13 +932,32 @@ export function sampleStage(c: CompiledStage, t: number): SampledElement[] {
   return out;
 }
 
+// Virtual camera framing `t` seconds into the scene (zoom, pan, tilt).
+export function sampleStageCamera(c: CompiledStage, t: number): SampledCamera {
+  const s = trackAt(c.camera, t);
+  return {
+    zoom: Math.max(0.25, s.x[SCALE]),
+    panX: s.x[X],
+    panY: s.x[Y],
+    tilt: s.x[ROT],
+    moving: s.moving,
+  };
+}
+
 // Whether anything is moving at `t`, or will start to before `until` - the preview redraws only then.
 export function stageIsMoving(c: CompiledStage, t: number, until = t): boolean {
+  const bg = c.scene.background;
+  if (bg.kind !== "none") {
+    if (bg.kind === "gradient" && (bg.motion ?? 0) > 0.001) return true;
+    if (bg.pattern && bg.pattern !== "none" && (bg.patternDrift ?? 0) > 0.001) return true;
+    if ((bg.grain ?? 0) > 0.001) return true;
+  }
+  const pending = (tr: Track) => {
+    const i = segmentIndexAt(tr.segments, t);
+    return i + 1 < tr.segments.length && tr.segments[i + 1].t <= until;
+  };
+  if (pending(c.camera) || trackAt(c.camera, t).moving) return true;
   for (const track of c.tracks) {
-    const pending = (tr: Track) => {
-      const i = segmentIndexAt(tr.segments, t);
-      return i + 1 < tr.segments.length && tr.segments[i + 1].t <= until;
-    };
     if (pending(track) || track.glyphs?.some(pending)) return true;
     if (sample(track, t, c.channels, c.beatStarts, c.duration).moving) return true;
   }

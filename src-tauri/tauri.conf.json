@@ -9,7 +9,8 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "resources": [
-      "licenses/*"
+      "licenses/*",
+      "models/rnnoise/*"
     ],
     "icon": [
       "icons/32x32.png",
@@ -21,7 +22,7 @@
   },
   "productName": "Briefcast",
   "mainBinaryName": "Briefcast",
-  "version": "0.1.5",
+  "version": "0.1.8",
   "identifier": "com.withbriefs.briefcast",
   "plugins": {
     "updater": {
@@ -42,7 +43,7 @@
         ],
         "enable": true
       },
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost http://127.0.0.1:* 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' asset: http://asset.localhost https://asset.localhost http://127.0.0.1:* data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; frame-src 'self' asset: http://asset.localhost https://asset.localhost; connect-src ipc: http://ipc.localhost http://127.0.0.1:* 'self' asset: http://asset.localhost https://asset.localhost; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     },
     "windows": [
       {
@@ -53,7 +54,8 @@
         "height": 600,
         "minWidth": 850,
         "minHeight": 600,
-        "visible": false
+        "visible": false,
+        "zoomHotkeysEnabled": true
       },
       {
         "label": "recording-overlay",

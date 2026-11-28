@@ -7,7 +7,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { IoBookmarkOutline, IoClose, IoSparklesOutline } from "react-icons/io5";
+import { IoBookmarkOutline, IoClose, IoDocumentTextOutline, IoSparklesOutline } from "react-icons/io5";
 import { CaptionTrack, Clip, VideoChapter } from "../../utils/videoEditTypes";
 import { chapterAtOutputTime, chapterOutputTime, formatChapterTimestamp, suggestChapters, youtubeChapterLines } from "../../utils/videoChapters";
 import { useClampedPopoverPosition } from "../../hooks/useClampedPopoverPosition";
@@ -23,6 +23,7 @@ interface Props {
   primarySourcePath: string;
   onChange: (chapters: VideoChapter[]) => void;
   onSeek: (outputTime: number) => void;
+  onTurnIntoDoc?: () => Promise<void> | void;
   onClose: () => void;
 }
 
@@ -45,13 +46,14 @@ const LabelField: React.FC<{ value: string; onCommit: (v: string) => void }> = (
   );
 };
 
-const ChaptersPanel: React.FC<Props> = ({ anchor, clips, chapters, captions, currentOutputTime, durationSec, primarySourcePath, onChange, onSeek, onClose }) => {
+const ChaptersPanel: React.FC<Props> = ({ anchor, clips, chapters, captions, currentOutputTime, durationSec, primarySourcePath, onChange, onSeek, onTurnIntoDoc, onClose }) => {
   const { ref, position } = useClampedPopoverPosition(anchor);
   const dockHost = useToolPanelHost();
   useFloatingDismiss("[data-chapters-panel]", onClose, !!dockHost);
   useDockSnap(ref, !!dockHost);
   const [recordingMarkers, setRecordingMarkers] = useState<{ time: number; label: string }[]>([]);
   const [note, setNote] = useState<string | null>(null);
+  const [creatingDoc, setCreatingDoc] = useState(false);
 
   // The recording's own chapter markers (placed in the player), in its source seconds.
   useEffect(() => {
@@ -152,10 +154,36 @@ const ChaptersPanel: React.FC<Props> = ({ anchor, clips, chapters, captions, cur
         </div>
       )}
       {placed.length > 0 && youtube.problem && <span className="text-[11px] text-amber-200/80">For YouTube: {youtube.problem.toLowerCase()}.</span>}
-      {chapters.length > 0 && (
-        <button type="button" onClick={() => onChange([])} className="self-end text-[10px] text-white/40 hover:text-white/80">
-          Remove all
-        </button>
+      {(chapters.length > 0 || onTurnIntoDoc) && (
+        <div className="flex items-center justify-between gap-2 pt-1 border-t border-white/10">
+          {onTurnIntoDoc ? (
+            <button
+              type="button"
+              disabled={creatingDoc}
+              onClick={async () => {
+                setCreatingDoc(true);
+                try {
+                  await onTurnIntoDoc();
+                } catch (err) {
+                  setNote(`Couldn't create doc: ${err}`);
+                } finally {
+                  setCreatingDoc(false);
+                }
+              }}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 ring-1 ring-emerald-400/25 text-[11px] font-medium text-emerald-200 disabled:opacity-40 transition-colors"
+            >
+              <IoDocumentTextOutline size={12} />
+              {creatingDoc ? "Creating doc…" : "Turn into Briefcast Doc"}
+            </button>
+          ) : (
+            <span />
+          )}
+          {chapters.length > 0 && (
+            <button type="button" onClick={() => onChange([])} className="text-[10px] text-white/40 hover:text-white/80">
+              Remove all
+            </button>
+          )}
+        </div>
       )}
     </div>,
     dockHost ?? document.body

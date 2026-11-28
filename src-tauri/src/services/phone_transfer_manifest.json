@@ -2,13 +2,36 @@
   "id": "/",
   "name": "Briefcast Transfer",
   "short_name": "Briefcast",
-  "description": "Move files between this phone and Briefcast on your computer, over your Wi-Fi.",
+  "description": "Transfer files at full original quality between phones and Briefcast on your computer — plus Studio Remote, Voice-Over, and Teleprompter.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#f5f5f4",
   "theme_color": "#0b0b0c",
+  "shortcuts": [
+    {
+      "name": "Phone to Phone",
+      "short_name": "Nearby",
+      "description": "Send files directly to another phone",
+      "url": "/#mode=p2p",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Voice-Over Studio",
+      "short_name": "Voice",
+      "description": "Record a voice-over take",
+      "url": "/#tab=voice",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Teleprompter",
+      "short_name": "Prompter",
+      "description": "Open VoicePace teleprompter",
+      "url": "/#tab=prompter",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
   "share_target": {
     "action": "/share",
     "method": "POST",

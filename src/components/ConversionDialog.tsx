@@ -221,6 +221,7 @@ const IMAGE_FORMATS: FormatOption[] = [
   { value: 'jpeg', label: 'JPEG' },
   { value: 'webp', label: 'WebP' },
   { value: 'bmp', label: 'BMP' },
+  { value: 'pdf', label: 'PDF' },
 ];
 
 export interface ConversionProfile {

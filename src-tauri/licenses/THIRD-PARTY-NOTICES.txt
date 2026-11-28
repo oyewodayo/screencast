@@ -48,7 +48,8 @@ These Windows builds come from the MSYS2 project (https://www.msys2.org), which 
 source package for every binary it ships.
 
 
-whisper.cpp (whisper-cli.exe, whisper.dll, ggml*.dll) and the Whisper base model (ggml-base.bin)
+whisper.cpp (whisper-cli and its libraries: whisper-cli.exe, whisper.dll and ggml*.dll on Windows; built from
+source for macOS and Linux) and the Whisper base model (ggml-base.bin)
 -------------------------------------------------------------------------------------------------
 whisper.cpp 1.9.3 and ggml - MIT License - https://github.com/ggml-org/whisper.cpp
 Whisper model weights - MIT License, (c) OpenAI - https://github.com/openai/whisper

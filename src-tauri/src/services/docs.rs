@@ -975,7 +975,10 @@ pub async fn export_doc_pdf(
     #[cfg(not(windows))]
     {
         let _ = (webview, width_in, height_in, output, m_top, m_right, m_bottom, m_left);
-        Err("Download as PDF is only available on Windows - use Print and choose Save as PDF".to_string())
+        // This system's web engine (WebKit) doesn't lay out CSS page-margin boxes, which is what draws a
+        // document's headers, footers, page numbers and letterhead - a PDF printed from it would quietly
+        // leave them out, so none is made. Word keeps all of them.
+        Err("Download as PDF isn't available on this system yet - its web engine can't print headers, footers and page numbers. Export as Word (.docx), Markdown or a web page instead.".to_string())
     }
 }
 

@@ -33,6 +33,7 @@ import type { PopoverAnchor } from "../../hooks/useClampedPopoverPosition";
 import { folderCollapse, useCollapsedFolders } from "./folderCollapse";
 import SidebarFileRow, { type SidebarRowActions } from "./SidebarFileRow";
 import { useStableCallbacks } from "../../hooks/useStableCallbacks";
+import { stopAllVideoPreviews } from "../video/VideoHoverPreview";
 
 export const SidebarSkeleton: React.FC<{ isGridView: boolean }> = ({ isGridView }) => (
   <div className="space-y-3 animate-pulse select-none" aria-busy="true" aria-label="Loading files">
@@ -134,6 +135,7 @@ export interface SidebarFileTreeProps {
   toggleFileSelected: (path: string) => void;
   setAddMenuFor: Dispatch<SetStateAction<string | null>>;
   setConversionFile: Dispatch<SetStateAction<{ path: string; name: string } | null>>;
+  setCompressionFile: Dispatch<SetStateAction<{ path: string; name: string } | null>>;
   setCreatingFolderIn: Dispatch<SetStateAction<string | null>>;
   setDocsScreen: Dispatch<SetStateAction<DocsScreen | null>>;
   setDraggingFiles: Dispatch<SetStateAction<FileEntry[] | null>>;
@@ -220,6 +222,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setCreatingFolderIn,
     setDocsScreen,
     setDraggingFiles,
@@ -243,6 +246,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
   const [openingFolder, setOpeningFolder] = useState<string | null>(null);
   useEffect(() => setOpeningPath(null), [selectedPath]);
   useEffect(() => setOpeningFolder(null), [selectedFolder]);
+  useEffect(() => () => stopAllVideoPreviews(), [activeFileCategory, isGridView]);
   const shownPath = openingPath ?? selectedPath;
   const shownFolder = openingFolder ?? selectedFolder;
 
@@ -280,6 +284,7 @@ const SidebarFileTree: React.FC<SidebarFileTreeProps> = (props) => {
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setDocsScreen,
     setDraggingFiles,
     setDragOverFolder,

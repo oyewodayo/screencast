@@ -309,7 +309,7 @@ const AiVoicePanel: React.FC<AiVoicePanelProps> = ({ placeAt, timelinePlaying, o
   // ---- Not ready: the download offer, or why there isn't one ------------------------------------
 
   if (status && status.state === "unsupported") {
-    return <p className="text-[11px] leading-snug text-white/55">The AI voice runs on Windows for now - it isn't available on this computer yet.</p>;
+    return <p className="text-[11px] leading-snug text-white/55">The AI voice isn't available on this computer: it needs Windows, Linux on a 64-bit PC, or a Mac with Apple Silicon.</p>;
   }
 
   if (!ready) {

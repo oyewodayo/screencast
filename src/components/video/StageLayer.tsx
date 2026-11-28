@@ -13,7 +13,7 @@ import { createPortal } from "react-dom";
 import { IoChevronDown, IoChevronUp, IoClose, IoLayersOutline } from "react-icons/io5";
 import { FrameRect } from "../../utils/videoFrameRect";
 import { StageRenderer } from "../../utils/stage/stageRenderer";
-import { CompiledStage, SampledElement, sampleStage } from "../../utils/stage/stageEngine";
+import { CompiledStage, SampledElement, sampleStage, sampleStageCamera } from "../../utils/stage/stageEngine";
 import { compiledFor, stageDrag, whenCompiled } from "../../utils/stage/stageLive";
 import { beatIndexAt, beatRestTime, deleteElement, duplicateElement, elementInBeat, sceneEnd, setElementProps } from "../../utils/stage/stageEditing";
 import { STAGE_HEIGHT, StageElement, StageScene } from "../../utils/stage/stageTypes";
@@ -176,6 +176,8 @@ interface ControlsProps {
   onUpdateScene: (id: string, edit: (s: StageScene) => StageScene) => void;
   onDeleteScene: (id: string) => void;
   onDuplicateScene: (id: string) => void;
+  isSceneInline?: (id: string) => boolean;
+  onToggleScenePlacement?: (id: string) => void;
   onSeek: (t: number) => void;
 }
 
@@ -277,7 +279,7 @@ function dragTarget(scene: StageScene, id: string): StageElement | undefined {
   return e;
 }
 
-const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutputTime, selectedSceneId, onSelectScene, onUpdateScene, onDeleteScene, onDuplicateScene, onSeek }) => {
+const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutputTime, selectedSceneId, onSelectScene, onUpdateScene, onDeleteScene, onDuplicateScene, isSceneInline, onToggleScenePlacement, onSeek }) => {
   const host = useToolPanelHost();
   const scene = scenes.find((s) => s.id === selectedSceneId) ?? null;
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
@@ -329,6 +331,10 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
   const k = frameRect.height / STAGE_HEIGHT;
   // Everything showing now; boxes are picked by their area, a connector near its line.
   const all: SampledElement[] = useMemo(() => (compiled && active ? sampleStage(compiled, local) : []), [compiled, active, local]);
+  const cam = useMemo(
+    () => (compiled && active ? sampleStageCamera(compiled, local) : { zoom: 1, panX: 0, panY: 0, tilt: 0, moving: false }),
+    [compiled, active, local]
+  );
   const samples = useMemo(() => all.filter((s) => s.kind !== "connector"), [all]);
   const byId = useMemo(() => new Map(all.map((s) => [s.id, s])), [all]);
   const sceneRef = useRef(scene);
@@ -395,16 +401,30 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
   if (!scene) return null;
 
   const selected = samples.find((s) => s.id === selectedElementId);
+  const camRad = (cam.tilt * Math.PI) / 180;
+  const camCos = Math.cos(camRad);
+  const camSin = Math.sin(camRad);
+  const clientToStage = (clientX: number, clientY: number, box: DOMRect) => {
+    const rx = (clientX - box.left - box.width / 2) / cam.zoom;
+    const ry = (clientY - box.top - box.height / 2) / cam.zoom;
+    const ux = rx * camCos + ry * camSin;
+    const uy = -rx * camSin + ry * camCos;
+    return { x: scene.width / 2 + cam.panX + ux / k, y: STAGE_HEIGHT / 2 + cam.panY + uy / k };
+  };
+  const screenDeltaToStage = (dxPx: number, dyPx: number) => {
+    const rx = dxPx / (cam.zoom * k);
+    const ry = dyPx / (cam.zoom * k);
+    return { dx: rx * camCos + ry * camSin, dy: -rx * camSin + ry * camCos };
+  };
   const hit = (clientX: number, clientY: number, box: DOMRect): SampledElement | null => {
-    const x = (clientX - box.left) / k;
-    const y = (clientY - box.top) / k;
+    const { x, y } = clientToStage(clientX, clientY, box);
     for (let i = samples.length - 1; i >= 0; i--) {
       const s = samples[i];
       if (insideBox(geoOf(s), x, y)) return s;
     }
     // Nearest line within a few screen pixels.
     let near: SampledElement | null = null;
-    let nearest = 8 / k;
+    let nearest = 8 / (k * cam.zoom);
     for (const s of all) {
       const c = s.kind === "connector" ? scene.elements.find((el) => el.id === s.id)?.connector : undefined;
       const a = c && byId.get(c.from);
@@ -431,8 +451,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (xform) {
-      const dx = (e.clientX - xform.startX) / k;
-      const dy = (e.clientY - xform.startY) / k;
+      const { dx, dy } = screenDeltaToStage(e.clientX - xform.startX, e.clientY - xform.startY);
       const element = scene.elements.find((el) => el.id === xform.id);
       const rules = resizeRules(element);
       let next = { ...xform.next };
@@ -442,7 +461,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
         const at = { x: e.clientX, y: e.clientY };
         const rect = (e.currentTarget as HTMLElement).closest("[data-stage-surface]")?.getBoundingClientRect();
         if (rect) {
-          const toStage = (p: { x: number; y: number }) => ({ x: (p.x - rect.left) / k, y: (p.y - rect.top) / k });
+          const toStage = (p: { x: number; y: number }) => clientToStage(p.x, p.y, rect);
           next.rotation = turnBox(xform.box, toStage(origin), toStage(at), e.shiftKey);
         }
       } else {
@@ -452,7 +471,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
         let box = r;
         if (!e.ctrlKey && Math.abs(xform.box.rotation % 360) < 0.01 && xform.box.scale === 1) {
           const others = samples.filter((o) => o.id !== xform.id);
-          const snapped = snapResize(r, xform.handle, others, scene.width, 6 / k, keepAspect);
+          const snapped = snapResize(r, xform.handle, others, scene.width, 6 / (k * cam.zoom), keepAspect);
           box = snapped.box;
           guides = snapped.guides;
         }
@@ -464,8 +483,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
       return;
     }
     if (!drag) return;
-    let dx = (e.clientX - drag.startX) / k;
-    let dy = (e.clientY - drag.startY) / k;
+    let { dx, dy } = screenDeltaToStage(e.clientX - drag.startX, e.clientY - drag.startY);
     // Shift keeps the move to one axis - whichever it has gone further along.
     if (e.shiftKey) {
       if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
@@ -477,7 +495,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
     const box = selected ?? samples.find((s) => s.id === drag.target);
     if (moved && box && !e.altKey && !e.shiftKey) {
       const moving = new Set(scene.elements.filter((el) => el.id === drag.target || dragTarget(scene, el.id)?.id === drag.target).map((el) => el.id));
-      const snapped = snapMove(box, dx, dy, samples.filter((s) => !moving.has(s.id)), scene.width, 6 / k);
+      const snapped = snapMove(box, dx, dy, samples.filter((s) => !moving.has(s.id)), scene.width, 6 / (k * cam.zoom));
       dx = snapped.dx;
       dy = snapped.dy;
       guides = snapped.guides;
@@ -571,6 +589,8 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
       onUpdate={(edit) => onUpdateScene(scene.id, edit)}
       onSeek={onSeek}
       onDuplicate={() => onDuplicateScene(scene.id)}
+      isInline={isSceneInline ? isSceneInline(scene.id) : undefined}
+      onTogglePlacement={onToggleScenePlacement ? () => onToggleScenePlacement(scene.id) : undefined}
       onDelete={() => {
         onDeleteScene(scene.id);
         onSelectScene(null);
@@ -612,11 +632,16 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
     maxHeight: Math.max(160, frameRect.height + 2 * frameRect.top - 16 - (document.querySelector(".video-container.editing") ? 0 : 64)),
   };
 
+  const camTransform =
+    cam.zoom !== 1 || cam.panX !== 0 || cam.panY !== 0 || cam.tilt !== 0
+      ? `scale(${cam.zoom}) rotate(${cam.tilt}deg) translate(${-cam.panX * k}px, ${-cam.panY * k}px)`
+      : undefined;
+
   return (
     <>
       {active && (
         <div
-          className="absolute left-0 top-0"
+          className="absolute left-0 top-0 overflow-hidden"
           data-stage-surface=""
           style={{ width: frameRect.width, height: frameRect.height, pointerEvents: "auto", cursor: drag?.moved ? "grabbing" : "default" }}
           onPointerDown={onPointerDown}
@@ -626,6 +651,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
           onDoubleClick={onDoubleClick}
           title={selected ? "Drag to move it in this beat (Alt: no snapping) - arrows nudge - double-click text to edit it" : "Click an element to select it"}
         >
+          <div className="absolute inset-0" style={{ transformOrigin: "50% 50%", transform: camTransform }}>
           {!drag?.moved &&
             !xform &&
             samples.map((s) =>
@@ -692,7 +718,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
                   onPointerMove={(e) => {
                     if (!bending) return;
                     const rect = (e.currentTarget as Element).closest("[data-stage-surface]")!.getBoundingClientRect();
-                    const px = (e.clientX - rect.left) / k, py = (e.clientY - rect.top) / k;
+                    const { x: px, y: py } = clientToStage(e.clientX, e.clientY, rect);
                     let next = ((px - mx) * nx + (py - my) * ny) / len;
                     next = Math.max(-1, Math.min(1, next));
                     // Near the line it snaps straight.
@@ -807,6 +833,7 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
               }}
             />
           )}
+          </div>
         </div>
       )}
       {!active && (

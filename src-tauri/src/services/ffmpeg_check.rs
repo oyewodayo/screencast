@@ -83,9 +83,9 @@ fn fix_hint() -> &'static str {
     if cfg!(target_os = "windows") {
         "Briefcast ships its own ffmpeg on Windows - reinstall Briefcast to restore it."
     } else if cfg!(target_os = "macos") {
-        "Install or update it with `brew install ffmpeg` (or `brew upgrade ffmpeg`), then switch back to Briefcast - it checks again by itself."
+        "Reinstall Briefcast to restore its bundled ffmpeg, or install one with `brew install ffmpeg` and switch back to Briefcast - it checks again by itself."
     } else {
-        "Install ffmpeg 5.1 or newer from your distribution - Ubuntu 22.04's is 4.4, too old; Ubuntu 24.04 and Debian 12 or newer are fine - or put a newer ffmpeg first on your PATH, then switch back to Briefcast - it checks again by itself."
+        "Install ffmpeg 5.1 or newer from your distribution (e.g. `sudo apt install ffmpeg`, `sudo dnf install ffmpeg`, or `sudo pacman -S ffmpeg` — Ubuntu 22.04's 4.4 is too old; Ubuntu 24.04+ and Debian 12+ are fine), then switch back to Briefcast - it checks again by itself."
     }
 }
 

@@ -8,20 +8,25 @@
 // regardless of whether draw mode is still on - so a circle drawn just before exiting draw mode
 // still gets to fade naturally instead of vanishing instantly.
 import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
-import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute, IoEyeOff } from 'react-icons/io5';
+import { IoClose, IoPencil, IoSparkles, IoFlash, IoArrowUndo, IoTrashOutline, IoHandLeft, IoEllipse, IoAdd, IoImage, IoVolumeHigh, IoVolumeMute, IoShieldCheckmarkOutline, IoOptionsOutline, IoSettingsOutline } from 'react-icons/io5';
 import { BsHighlighter } from 'react-icons/bs';
-import { loadSettings } from '../utils/appSettings';
-import AnnotationPointer, { AnnotationPointerHandle, resolvePointer } from './AnnotationPointer';
+import { AppSettings, loadSettings, SETTINGS_CHANGED_DOM_EVENT, updateSettings } from '../utils/appSettings';
+import type { AutoBlurMode } from '../utils/privacyShield';
+import AnnotationPointer, { AnnotationPointerHandle, HandSwatchGraphic, resolvePointer } from './AnnotationPointer';
 import ScreenBlurLayer from './ScreenBlurLayer';
 import useScreenBlur from '../hooks/useScreenBlur';
 import { playTapSound } from '../utils/annotationSound';
 import {
   ANNOTATION_COLORS,
+  ANNOTATION_FADES,
+  ANNOTATION_HAND_STYLES,
   ANNOTATION_POINTERS,
   ANNOTATION_STYLES,
   ANNOTATION_TAP_SOUNDS,
   AnnotationFade,
+  AnnotationHandStyle,
   AnnotationInk,
   AnnotationPointer as PointerKind,
   AnnotationStrokePoint,
@@ -30,6 +35,7 @@ import {
   bakeAnnotationInk,
   BakedInk,
   drawAnnotationInk,
+  drawLiveInkSegment,
   fadeTiming,
   fadeTotalMs,
   strokeOpacity,
@@ -38,6 +44,8 @@ import {
 // Settings > Annotation's pointer/tap options, re-read each time draw mode turns on like the ink.
 interface PointerConfig {
   kind: PointerKind;
+  handStyle: AnnotationHandStyle;
+  scale: number;
   image: string;
   ripple: boolean;
   sound: AnnotationTapSound;
@@ -48,6 +56,8 @@ const readPointerConfig = (): PointerConfig => {
   const st = loadSettings();
   return {
     kind: st.annotationPointer,
+    handStyle: st.annotationHandStyle,
+    scale: st.annotationPointerScale,
     image: st.annotationPointerImage,
     ripple: st.annotationTapRipple,
     sound: st.annotationTapSound,
@@ -69,9 +79,8 @@ interface Stroke extends AnnotationInk {
   baked?: BakedInk | null;
 }
 
-// A predicted pointer position further than this from the real one is a bad guess (a flick, a
-// sudden stop) and is ignored.
-const MAX_PREDICTION_PX = 48;
+// Slop distance to differentiate a stationary tap from a stroke.
+
 
 const STYLE_ICONS: Record<AnnotationStyle, React.ReactNode> = {
   pen: <IoPencil size={14} />,
@@ -92,12 +101,18 @@ const POINTER_ICONS: Record<PointerKind, React.ReactNode> = {
 };
 
 const AnnotationOverlayWindow = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Dual-canvas architecture for zero-lag drawing during 60fps presenting/recording:
+  // - bakedCanvasRef (bottom): holds finished/fading strokes; never repainted while dragging.
+  // - liveCanvasRef  (top, desynchronized): draws ONLY the active stroke incrementally in O(1)
+  //   per pointer sample, then hands off to bakedCanvasRef on pointerup.
+  const bakedCanvasRef = useRef<HTMLCanvasElement>(null);
+  const liveCanvasRef = useRef<HTMLCanvasElement>(null);
+  const liveCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
-  // Where the pointer is about to be (PointerEvent.getPredictedEvents) - drawn as the live
-  // stroke's last stretch, never stored in it, so the ink's tip keeps up with the hand.
-  const predictedTailRef = useRef<AnnotationStrokePoint[]>([]);
+  const livePrevMidRef = useRef<{ x: number; y: number } | null>(null);
+  const liveDirtyRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
+
   const rafRef = useRef<number | null>(null);
   const wakeTimerRef = useRef<number | null>(null);
 
@@ -108,76 +123,144 @@ const AnnotationOverlayWindow = () => {
     const st = loadSettings();
     return { color: st.annotationColor, width: st.annotationWidth, style: st.annotationStyle, fade: st.annotationFade, shadow: st.annotationShadow };
   });
+  const inkRef = useRef(ink);
+  inkRef.current = ink;
   const [showToolbar, setShowToolbar] = useState(() => loadSettings().annotationShowToolbar);
   const [pointerCfg, setPointerCfg] = useState<PointerConfig>(readPointerConfig);
+  const pointerCfgRef = useRef(pointerCfg);
+  pointerCfgRef.current = pointerCfg;
   // Null until the toolbar is dragged: it sits bottom-centre, where it's out of the way of the
   // slide's content but still close to hand.
   const [toolbarPos, setToolbarPos] = useState<{ x: number; y: number } | null>(null);
-  // The toolbar gets out of the way (fades, stops catching the mouse) while a stroke is in progress.
-  const [drawing, setDrawing] = useState(false);
-  // Which toolbar popover (pointer / tap sound picker) is open.
-  const [menu, setMenu] = useState<'pointer' | 'sound' | null>(null);
+  // Which toolbar popover (pointer / tap sound / live options & Privacy Shield) is open.
+  const [menu, setMenu] = useState<'pointer' | 'sound' | 'options' | null>(null);
+  const [shieldCfg, setShieldCfg] = useState(() => {
+    const st = loadSettings();
+    return {
+      strength: st.annotationBlurStrength,
+      autoWhatsApp: st.annotationAutoBlurWhatsApp,
+      autoText: st.annotationAutoBlurText,
+    };
+  });
+  const drawModeActiveRef = useRef(false);
+  drawModeActiveRef.current = drawModeActive;
   const toolbarRef = useRef<HTMLDivElement>(null);
   const pointerRef = useRef<AnnotationPointerHandle>(null);
   const pressRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const pointerKind = resolvePointer(pointerCfg.kind, pointerCfg.image);
-  // "blur" swaps drawing for placing privacy blur regions (B). Regions outlive draw mode - they're
-  // native windows (services/screen_blur.rs) that stay up, click-through, until removed.
-  const [tool, setTool] = useState<'ink' | 'blur'>('ink');
+
+  // Fade/restore the floating toolbar imperatively during a stroke so pointerdown/pointerup never
+  // trigger a React re-render mid-gesture.
+  const setToolbarDrawing = (active: boolean) => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    el.style.opacity = active ? '0.12' : '1';
+    el.style.pointerEvents = active ? 'none' : 'auto';
+  };
+  // "blur" swaps drawing for placing Privacy Shield blur regions (B). Regions outlive draw mode -
+  // they're native windows (services/screen_blur.rs) that stay up, click-through, until removed.
+  const [tool, setToolState] = useState<'ink' | 'blur'>('ink');
+  const setTool = (next: 'ink' | 'blur' | ((prev: 'ink' | 'blur') => 'ink' | 'blur')) => {
+    setToolState((prev) => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      if (resolved !== prev) void emit('annotation-tool-changed', { tool: resolved });
+      return resolved;
+    });
+  };
   const blur = useScreenBlur(drawModeActive);
   const dragStateRef = useRef({ dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 });
 
-  // Sizes the canvas's backing store to the window's real pixel dimensions (HiDPI-sharp) - the
-  // window itself is only ever resized once, at creation, but this also covers first mount.
+  // Sizes both canvases cleanly (capped at 2x DPR so multi-monitor 4K overlays never waste memory
+  // bandwidth) and enables `desynchronized: true` on the live canvas for lowest Windows DWM latency.
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const baked = bakedCanvasRef.current;
+    const live = liveCanvasRef.current;
+    if (!baked || !live) return;
 
     const resize = (): void => {
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      canvas.style.width = `${window.innerWidth}px`;
-      canvas.style.height = `${window.innerHeight}px`;
-      const ctx = canvas.getContext('2d');
-      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      for (const c of [baked, live]) {
+        c.width = Math.round(w * dpr);
+        c.height = Math.round(h * dpr);
+        c.style.width = `${w}px`;
+        c.style.height = `${h}px`;
+      }
+      const bCtx = baked.getContext('2d');
+      if (bCtx) bCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const lCtx = live.getContext('2d', { desynchronized: true, alpha: true }) ?? live.getContext('2d');
+      if (lCtx) lCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      liveCtxRef.current = lCtx;
       requestRender();
     };
 
     resize();
     window.addEventListener('resize', resize);
-    // A context restored after a GPU reset comes back blank and without the DPR transform -
-    // resize() puts both back.
-    canvas.addEventListener('contextrestored', resize);
+    baked.addEventListener('contextrestored', resize);
+    live.addEventListener('contextrestored', resize);
     return () => {
       window.removeEventListener('resize', resize);
-      canvas.removeEventListener('contextrestored', resize);
+      baked.removeEventListener('contextrestored', resize);
+      live.removeEventListener('contextrestored', resize);
     };
   }, []);
 
-  // Draw-mode on/off comes from the main window (global hotkey) - Dashboard.tsx is the one that
-  // actually flips this window's click-through state on the window handle; this listener just
-  // drives the toolbar's visibility/cursor here.
+  // Draw-mode on/off comes from the main window (global hotkey, dock or recording pill) -
+  // Dashboard.tsx flips this window's click-through state; this listener drives the toolbar's
+  // visibility/cursor and optional initial tool here.
   useEffect(() => {
-    const unlistenPromise = listen<{ active: boolean }>('annotation-mode-changed', (event) => {
+    const unlistenPromise = listen<{ active: boolean; tool?: 'ink' | 'blur' }>('annotation-mode-changed', (event) => {
       if (event.payload.active) {
+        if (drawModeActiveRef.current && event.payload.tool) {
+          setToolState(event.payload.tool);
+          return;
+        }
         const st = loadSettings();
         setInk({ color: st.annotationColor, width: st.annotationWidth, style: st.annotationStyle, fade: st.annotationFade, shadow: st.annotationShadow });
         setShowToolbar(st.annotationShowToolbar);
         setPointerCfg(readPointerConfig());
-        setTool('ink');
+        setShieldCfg({
+          strength: st.annotationBlurStrength,
+          autoWhatsApp: st.annotationAutoBlurWhatsApp,
+          autoText: st.annotationAutoBlurText,
+        });
+        setMenu(null);
+        setToolState(event.payload.tool ?? 'ink');
       } else {
         // "Until I exit" strokes end with draw mode; fading ones get to finish.
         strokesRef.current = strokesRef.current.filter((st) => fadeTotalMs(st.style, st.fade) > 0);
         currentStrokeRef.current = null;
+        livePrevMidRef.current = null;
         pressRef.current = null;
+        clearLiveCanvas();
         pointerRef.current?.hide();
-        setDrawing(false);
+        setToolbarDrawing(false);
+        setMenu(null);
         requestRender();
       }
       setDrawModeActive(event.payload.active);
     });
+    const onSettings = (e: Event) => {
+      const st = (e as CustomEvent<AppSettings>).detail ?? loadSettings();
+      setPointerCfg({
+        kind: st.annotationPointer,
+        handStyle: st.annotationHandStyle,
+        scale: st.annotationPointerScale,
+        image: st.annotationPointerImage,
+        ripple: st.annotationTapRipple,
+        sound: st.annotationTapSound,
+        volume: st.annotationSoundVolume,
+      });
+      setShieldCfg({
+        strength: st.annotationBlurStrength,
+        autoWhatsApp: st.annotationAutoBlurWhatsApp,
+        autoText: st.annotationAutoBlurText,
+      });
+    };
+    window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
     return () => {
+      window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
       unlistenPromise.then((fn) => fn());
     };
   }, []);
@@ -220,28 +303,50 @@ const AnnotationOverlayWindow = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [drawModeActive]);
 
-  // Draws on demand rather than in a perpetual loop: a frame is requested by pointer input, Clear
-  // and resizes, and frames keep coming only while some stroke is actually fading out. A stroke
-  // holding at full opacity looks the same every frame, so its hold is waited out on a timer
-  // rather than redrawn ~60 times a second - those redraws used to compete with the stroke being
-  // drawn right then. So an idle overlay - hidden, empty, or holding only "Until I exit" strokes -
-  // costs no CPU/GPU at all, which matters while recording or presenting alongside heavier apps.
-  //
-  // Finished strokes are bitmaps (bakeAnnotationInk) - one drawImage each, whatever their glow -
-  // and only the stroke under the pen is traced live.
+  const clearLiveCanvas = (): void => {
+    const live = liveCanvasRef.current;
+    const lCtx = liveCtxRef.current;
+    if (!live || !lCtx) return;
+    const dirty = liveDirtyRef.current;
+    if (dirty) {
+      const pad = 48;
+      const x = Math.max(0, Math.floor(dirty.minX - pad));
+      const y = Math.max(0, Math.floor(dirty.minY - pad));
+      const w = Math.min(window.innerWidth - x, Math.ceil(dirty.maxX - x + pad));
+      const h = Math.min(window.innerHeight - y, Math.ceil(dirty.maxY - y + pad));
+      if (w > 0 && h > 0) lCtx.clearRect(x, y, w, h);
+      liveDirtyRef.current = null;
+    } else {
+      lCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    }
+  };
+
+  const expandDirty = (x: number, y: number, pad: number): void => {
+    const d = liveDirtyRef.current;
+    if (!d) {
+      liveDirtyRef.current = { minX: x - pad, minY: y - pad, maxX: x + pad, maxY: y + pad };
+    } else {
+      if (x - pad < d.minX) d.minX = x - pad;
+      if (y - pad < d.minY) d.minY = y - pad;
+      if (x + pad > d.maxX) d.maxX = x + pad;
+      if (y + pad > d.maxY) d.maxY = y + pad;
+    }
+  };
+
+  // Draws finished & fading strokes onto bakedCanvasRef on demand — NEVER invoked per mousemove
+  // during active drawing, so live strokes never contend with full-screen redraws.
   const render = (): void => {
     rafRef.current = null;
     if (wakeTimerRef.current !== null) {
       window.clearTimeout(wakeTimerRef.current);
       wakeTimerRef.current = null;
     }
-    const canvas = canvasRef.current;
+    const canvas = bakedCanvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
-    // clearRect in CSS pixels under the DPR transform (see the resize effect) - covers the canvas.
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     const now = performance.now();
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     strokesRef.current = strokesRef.current.filter((st) => strokeOpacity(now - st.finishedAt, st.style, st.fade) > 0);
     let fadingOut = false;
     let nextFadeAt = Infinity;
@@ -260,11 +365,6 @@ const AnnotationOverlayWindow = () => {
       const fadeStart = stroke.finishedAt + fadeTiming(stroke.style, stroke.fade).hold;
       if (now >= fadeStart) fadingOut = true;
       else nextFadeAt = Math.min(nextFadeAt, fadeStart);
-    }
-    const current = currentStrokeRef.current;
-    if (current) {
-      const tail = predictedTailRef.current;
-      drawAnnotationInk(ctx, tail.length > 0 ? { ...current, points: current.points.concat(tail) } : current, 1);
     }
     if (fadingOut) requestRender();
     else if (Number.isFinite(nextFadeAt)) wakeTimerRef.current = window.setTimeout(requestRender, Math.max(0, nextFadeAt - now));
@@ -299,89 +399,139 @@ const AnnotationOverlayWindow = () => {
     pressure: e.pressure > 0 ? e.pressure : 0.5,
   });
 
+  // Native low-latency pointer listener directly on liveCanvasRef (uses `pointerrawupdate` when
+  // available on Windows WebView2/Chromium, falling back to `pointermove`). Bypasses React's
+  // synthetic event dispatch and draws each incremental segment in O(1) with zero lag.
+  useEffect(() => {
+    const live = liveCanvasRef.current;
+    if (!live) return;
+
+    const onRawMove = (ev: PointerEvent): void => {
+      if (!drawModeActiveRef.current) return;
+      pointerRef.current?.move(ev.clientX, ev.clientY);
+      const stroke = currentStrokeRef.current;
+      if (!stroke) return;
+      const press = pressRef.current;
+      if (press && !press.moved && Math.hypot(ev.clientX - press.x, ev.clientY - press.y) > TAP_SLOP_PX) {
+        press.moved = true;
+      }
+
+      const lCtx = liveCtxRef.current;
+      const pad = Math.max(16, stroke.width * 3.5);
+
+      if (ev.shiftKey) {
+        const a = stroke.points[0];
+        const dist = Math.hypot(ev.clientX - a.x, ev.clientY - a.y);
+        const n = Math.max(2, Math.ceil(dist / 6));
+        const line: AnnotationStrokePoint[] = [];
+        for (let i = 0; i <= n; i++) {
+          const t = i / n;
+          line.push({ x: a.x + (ev.clientX - a.x) * t, y: a.y + (ev.clientY - a.y) * t, pressure: 0.5 });
+        }
+        stroke.points = line;
+        clearLiveCanvas();
+        if (lCtx) {
+          drawLiveInkSegment(lCtx, a, { x: (a.x + ev.clientX) * 0.5, y: (a.y + ev.clientY) * 0.5 }, { x: ev.clientX, y: ev.clientY }, stroke, 0.5);
+          expandDirty(a.x, a.y, pad);
+          expandDirty(ev.clientX, ev.clientY, pad);
+        }
+        livePrevMidRef.current = { x: ev.clientX, y: ev.clientY };
+        return;
+      }
+
+      const coalesced = ev.getCoalescedEvents?.() ?? [];
+      const list = coalesced.length > 0 ? coalesced : [ev];
+      for (const sample of list) {
+        const pts = stroke.points;
+        const last = pts[pts.length - 1];
+        const pressure = sample.pressure > 0 ? sample.pressure : 0.5;
+        const x = sample.clientX;
+        const y = sample.clientY;
+        if (!last) {
+          pts.push({ x, y, pressure });
+          livePrevMidRef.current = { x, y };
+          expandDirty(x, y, pad);
+          continue;
+        }
+        const dx = x - last.x;
+        const dy = y - last.y;
+        if (dx * dx + dy * dy < 1.44) continue;
+        const mid = { x: (last.x + x) * 0.5, y: (last.y + y) * 0.5 };
+        const from = livePrevMidRef.current ?? last;
+        if (lCtx) drawLiveInkSegment(lCtx, from, last, mid, stroke, pressure);
+        pts.push({ x, y, pressure });
+        livePrevMidRef.current = mid;
+        expandDirty(x, y, pad);
+      }
+    };
+
+    const eventName = 'onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove';
+    live.addEventListener(eventName as 'pointermove', onRawMove, { passive: true });
+    return () => {
+      live.removeEventListener(eventName as 'pointermove', onRawMove);
+    };
+  }, []);
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    // Guards against a stray event landing here during the brief async round-trip of the
-    // click-through toggle - in the steady state, ignoreCursorEvents already stops these from
-    // reaching the canvas at all while draw mode is off.
     if (!drawModeActive) return;
-    setMenu(null);
+    if (menu) setMenu(null);
     e.currentTarget.setPointerCapture(e.pointerId);
+    const activeInk = inkRef.current;
+    const pt = getPoint(e);
     currentStrokeRef.current = {
-      points: [getPoint(e)],
-      ...ink,
+      points: [pt],
+      ...activeInk,
       finishedAt: 0,
     };
+    livePrevMidRef.current = { x: pt.x, y: pt.y };
+    const pad = Math.max(16, activeInk.width * 3.5);
+    liveDirtyRef.current = { minX: pt.x - pad, minY: pt.y - pad, maxX: pt.x + pad, maxY: pt.y + pad };
+    // Draw immediate dot at touchdown so even quick taps feel instantaneous
+    const lCtx = liveCtxRef.current;
+    if (lCtx) {
+      drawLiveInkSegment(lCtx, pt, pt, { x: pt.x + 0.01, y: pt.y + 0.01 }, activeInk, pt.pressure);
+    }
     pressRef.current = { x: e.clientX, y: e.clientY, moved: false };
     pointerRef.current?.move(e.clientX, e.clientY);
     pointerRef.current?.setPressed(true);
-    playTapSound(pointerCfg.sound, pointerCfg.volume);
-    setDrawing(true);
-    requestRender();
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    // Hovering counts too: the hand follows the cursor whether or not a stroke is in progress -
-    // drawn where the pointer is about to be rather than where it was, which is what makes it feel
-    // stuck to the cursor instead of chasing it a frame or two behind.
-    const predicted = (e.nativeEvent.getPredictedEvents?.() ?? []).filter(
-      (ev) => Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) <= MAX_PREDICTION_PX
-    );
-    const lead = predicted.length > 0 ? predicted[predicted.length - 1] : e;
-    pointerRef.current?.move(lead.clientX, lead.clientY);
-    const stroke = currentStrokeRef.current;
-    if (!stroke) return;
-    predictedTailRef.current = e.shiftKey
-      ? []
-      : predicted.map((ev) => ({ x: ev.clientX, y: ev.clientY, pressure: ev.pressure > 0 ? ev.pressure : 0.5 }));
-    const press = pressRef.current;
-    if (press && !press.moved && Math.hypot(e.clientX - press.x, e.clientY - press.y) > TAP_SLOP_PX) press.moved = true;
-
-    if (e.shiftKey) {
-      // Holding Shift snaps the stroke to a straight line from where it began - evenly spaced
-      // samples so perfect-freehand renders it as one clean, steady line.
-      const a = stroke.points[0];
-      const dist = Math.hypot(e.clientX - a.x, e.clientY - a.y);
-      const n = Math.max(2, Math.ceil(dist / 6));
-      const line: AnnotationStrokePoint[] = [];
-      for (let i = 0; i <= n; i++) {
-        const t = i / n;
-        line.push({ x: a.x + (e.clientX - a.x) * t, y: a.y + (e.clientY - a.y) * t, pressure: 0.5 });
-      }
-      stroke.points = line;
-      requestRender();
-      return;
-    }
-
-    // Coalesced events: a stylus reports far more often than the screen refreshes.
-    const coalesced = e.nativeEvent.getCoalescedEvents?.() ?? [];
-    for (const ev of coalesced.length > 0 ? coalesced : [e.nativeEvent]) {
-      stroke.points.push({
-        x: ev.clientX,
-        y: ev.clientY,
-        pressure: ev.pressure > 0 ? ev.pressure : 0.5,
-      });
-    }
-    requestRender();
+    playTapSound(pointerCfgRef.current.sound, pointerCfgRef.current.volume);
+    setToolbarDrawing(true);
   };
 
   const finishStroke = (e?: React.PointerEvent<HTMLCanvasElement>): void => {
     pointerRef.current?.setPressed(false);
     const press = pressRef.current;
     pressRef.current = null;
-    predictedTailRef.current = [];
-    setDrawing(false);
-    if (!currentStrokeRef.current) return;
+    setToolbarDrawing(false);
+    const stroke = currentStrokeRef.current;
+    if (!stroke) return;
+
+    if (e) {
+      const last = stroke.points[stroke.points.length - 1];
+      if (last && Math.hypot(e.clientX - last.x, e.clientY - last.y) >= 0.5) {
+        stroke.points.push({
+          x: e.clientX,
+          y: e.clientY,
+          pressure: e.pressure > 0 ? e.pressure : 0.5,
+        });
+      }
+    }
+
     // A cancel (e.g. the OS taking the pointer) isn't a tap, so no ring.
     if (e?.type === 'pointerup' && press && !press.moved) pointerRef.current?.tap(press.x, press.y);
-    currentStrokeRef.current.finishedAt = performance.now();
-    strokesRef.current.push(currentStrokeRef.current);
+    stroke.finishedAt = performance.now();
+    strokesRef.current.push(stroke);
     currentStrokeRef.current = null;
+    livePrevMidRef.current = null;
+    clearLiveCanvas();
     requestRender();
   };
 
   const handleClear = (): void => {
     strokesRef.current = [];
     currentStrokeRef.current = null;
+    livePrevMidRef.current = null;
+    clearLiveCanvas();
     requestRender();
   };
 
@@ -430,13 +580,16 @@ const AnnotationOverlayWindow = () => {
 
   return (
     <div className="relative w-screen h-screen overflow-hidden">
+      <canvas ref={bakedCanvasRef} className="absolute inset-0 pointer-events-none" />
       <canvas
-        ref={canvasRef}
+        ref={liveCanvasRef}
         className="absolute inset-0"
-        // The hand/dot/custom pointer replaces the cursor entirely; "crosshair" keeps the system one.
-        style={{ cursor: !drawModeActive ? 'default' : pointerKind === 'system' ? 'crosshair' : 'none' }}
+        // Marker uses uniform layer opacity so incremental segments don't darken where they overlap.
+        style={{
+          cursor: !drawModeActive ? 'default' : pointerKind === 'system' ? 'crosshair' : 'none',
+          opacity: ink.style === 'marker' ? 0.42 : 1,
+        }}
         onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
         onPointerUp={finishStroke}
         onPointerCancel={finishStroke}
         onPointerLeave={() => {
@@ -448,7 +601,10 @@ const AnnotationOverlayWindow = () => {
         <ScreenBlurLayer
           regions={blur.regions}
           interactive={tool === 'blur'}
-          onBegin={blur.begin}
+          onBegin={(id, mode, rect, pointer) => {
+            setMenu(null);
+            blur.begin(id, mode, rect, pointer);
+          }}
           onTrack={blur.track}
           onEnd={blur.end}
           onRemove={blur.remove}
@@ -457,19 +613,25 @@ const AnnotationOverlayWindow = () => {
 
       {/* Placing blur uses a plain crosshair - the hand would sit over the very thing being hidden. */}
       {drawModeActive && tool === 'ink' && (
-        <AnnotationPointer ref={pointerRef} kind={pointerKind} color={ink.color} image={pointerCfg.image} ripple={pointerCfg.ripple} />
+        <AnnotationPointer
+          ref={pointerRef}
+          kind={pointerKind}
+          handStyle={pointerCfg.handStyle}
+          scale={pointerCfg.scale}
+          color={ink.color}
+          image={pointerCfg.image}
+          ripple={pointerCfg.ripple}
+        />
       )}
 
       {drawModeActive && showToolbar && (
         <div
           ref={toolbarRef}
-          className="absolute flex items-center gap-2 px-3 py-2 rounded-2xl bg-neutral-900/90 backdrop-blur-md shadow-2xl ring-1 ring-white/10 transition-opacity duration-200"
+          className="absolute flex items-center gap-2 px-3 py-2 rounded-2xl bg-neutral-900/90 backdrop-blur-md shadow-2xl ring-1 ring-white/10 transition-opacity duration-150"
           style={{
             ...(toolbarPos
               ? { left: toolbarPos.x, top: toolbarPos.y }
               : { left: '50%', bottom: 28, transform: 'translateX(-50%)' }),
-            opacity: drawing ? 0.12 : 1,
-            pointerEvents: drawing ? 'none' : 'auto',
           }}
           // The toolbar is a real cursor target - the hand steps aside while it's over it.
           onPointerEnter={() => pointerRef.current?.hide()}
@@ -504,15 +666,19 @@ const AnnotationOverlayWindow = () => {
 
           <button
             onClick={() => setTool((t) => (t === 'blur' ? 'ink' : 'blur'))}
-            data-tip="Blur - drag over anything private. You can still type underneath."
+            data-tip="Privacy Shield - drag to blur anything private. You can still click and type underneath."
             data-tip-kbd="B"
-            aria-label="Blur"
+            aria-label="Privacy Shield"
             aria-pressed={tool === 'blur'}
             className={`relative w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
-              tool === 'blur' ? 'bg-white/20 text-white' : 'text-white/60 hover:text-white hover:bg-white/10'
+              tool === 'blur'
+                ? 'bg-sky-500/30 text-sky-300 ring-1 ring-sky-400/50'
+                : blur.count > 0 || shieldCfg.autoWhatsApp !== 'off' || shieldCfg.autoText !== 'off'
+                ? 'text-emerald-300 hover:text-emerald-200 hover:bg-white/10'
+                : 'text-white/60 hover:text-white hover:bg-white/10'
             }`}
           >
-            <IoEyeOff size={15} />
+            <IoShieldCheckmarkOutline size={15} />
             {blur.count > 0 && (
               <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 rounded-full bg-sky-500 text-[9px] font-semibold leading-[14px] text-white text-center">
                 {blur.count}
@@ -533,30 +699,61 @@ const AnnotationOverlayWindow = () => {
           <div className="w-px h-5 bg-white/20 mx-1" />
 
           {/* The palette, plus Settings' custom colour when it isn't one of them. */}
-          {(ANNOTATION_COLORS.includes(ink.color.toLowerCase()) ? ANNOTATION_COLORS : [...ANNOTATION_COLORS, ink.color]).map((color) => (
-            <button
-              key={color}
-              onClick={() => {
-                setInk((prev) => ({ ...prev, color }));
-                setTool('ink');
-              }}
-              aria-label={`Color ${color}`}
-              aria-pressed={ink.color.toLowerCase() === color.toLowerCase()}
-              className="relative h-8 w-4 flex items-end justify-center"
-            >
-              {/* A little pen, colour-coded: the chosen one is lifted out of the tray. */}
-              <span
-                className="block w-3 rounded-t-full rounded-b-[2px] ring-1 ring-black/40 shadow-md"
-                style={{
-                  height: 26,
-                  backgroundColor: color,
-                  backgroundImage: 'linear-gradient(90deg, rgba(255,255,255,0.35), rgba(255,255,255,0) 45%, rgba(0,0,0,0.25))',
-                  transform: `translateY(${ink.color.toLowerCase() === color.toLowerCase() ? -7 : 4}px)`,
-                  transition: 'transform 180ms cubic-bezier(0.3, 1.5, 0.5, 1)',
-                }}
-              />
-            </button>
-          ))}
+          <div className={`flex items-end ${pointerKind === 'hand' ? 'gap-1' : 'gap-2'}`}>
+            {(ANNOTATION_COLORS.includes(ink.color.toLowerCase()) ? ANNOTATION_COLORS : [...ANNOTATION_COLORS, ink.color]).map((color) => {
+              const selected = ink.color.toLowerCase() === color.toLowerCase();
+              if (pointerKind === 'hand') {
+                return (
+                  <button
+                    key={color}
+                    onClick={() => {
+                      setInk((prev) => ({ ...prev, color }));
+                      setTool('ink');
+                    }}
+                    aria-label={`Hand color ${color}`}
+                    aria-pressed={selected}
+                    className={`relative h-8 flex items-end justify-center transition-transform duration-150 hover:-translate-y-0.5 ${
+                      pointerCfg.handStyle === 'stylus' ? 'w-5' : 'w-[26px]'
+                    }`}
+                  >
+                    <span
+                      className="block origin-bottom"
+                      style={{
+                        transform: selected ? 'translateY(-6px) scale(1.12)' : 'translateY(3px) scale(0.95)',
+                        transition: 'transform 180ms cubic-bezier(0.3, 1.5, 0.5, 1)',
+                      }}
+                    >
+                      <HandSwatchGraphic color={color} handStyle={pointerCfg.handStyle} />
+                    </span>
+                  </button>
+                );
+              }
+              return (
+                <button
+                  key={color}
+                  onClick={() => {
+                    setInk((prev) => ({ ...prev, color }));
+                    setTool('ink');
+                  }}
+                  aria-label={`Color ${color}`}
+                  aria-pressed={selected}
+                  className="relative h-8 w-4 flex items-end justify-center"
+                >
+                  {/* A little pen, colour-coded: the chosen one is lifted out of the tray. */}
+                  <span
+                    className="block w-3 rounded-t-full rounded-b-[2px] ring-1 ring-black/40 shadow-md"
+                    style={{
+                      height: 26,
+                      backgroundColor: color,
+                      backgroundImage: 'linear-gradient(90deg, rgba(255,255,255,0.35), rgba(255,255,255,0) 45%, rgba(0,0,0,0.25))',
+                      transform: `translateY(${selected ? -7 : 4}px)`,
+                      transition: 'transform 180ms cubic-bezier(0.3, 1.5, 0.5, 1)',
+                    }}
+                  />
+                </button>
+              );
+            })}
+          </div>
 
           <div className="w-px h-5 bg-white/20 mx-1" />
 
@@ -602,7 +799,7 @@ const AnnotationOverlayWindow = () => {
                           }
                           setMenu(null);
                         }}
-                        data-tip={o.disabled ? 'Upload an image in Settings > Annotation' : undefined}
+                        data-tip={o.disabled ? 'Upload an image in Settings > Annotate & Shield' : undefined}
                         className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors disabled:opacity-35 ${
                           current === o.id ? 'bg-white/20 text-white' : 'text-white/75 hover:text-white hover:bg-white/10'
                         }`}
@@ -611,11 +808,203 @@ const AnnotationOverlayWindow = () => {
                         {o.label}
                       </button>
                     ))}
+                    {kind === 'pointer' && pointerCfg.kind === 'hand' && (
+                      <div className="mt-1 pt-1 border-t border-white/10 flex flex-col gap-0.5">
+                        <span className="px-2 py-0.5 text-[9.5px] font-semibold uppercase tracking-wider text-white/40">Hand style</span>
+                        {ANNOTATION_HAND_STYLES.map((hs) => (
+                          <button
+                            key={hs.id}
+                            onClick={() => {
+                              setPointerCfg((prev) => ({ ...prev, handStyle: hs.id }));
+                              updateSettings({ annotationHandStyle: hs.id });
+                              setMenu(null);
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] text-left transition-colors ${
+                              pointerCfg.handStyle === hs.id ? 'bg-blue-500/30 text-blue-200' : 'text-white/70 hover:text-white hover:bg-white/10'
+                            }`}
+                          >
+                            {hs.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             );
           })}
+
+          <div className="relative">
+            <button
+              onClick={() => setMenu(menu === 'options' ? null : 'options')}
+              aria-label="Ink & Privacy Shield options"
+              aria-expanded={menu === 'options'}
+              data-tip="Ink size, fade & Privacy Shield"
+              className={`w-7 h-7 flex items-center justify-center rounded-md transition-colors ${
+                menu === 'options' ? 'bg-white/20 text-white' : 'text-white/70 hover:text-white hover:bg-white/10'
+              }`}
+            >
+              <IoOptionsOutline size={15} />
+            </button>
+            {menu === 'options' && (
+              <div
+                className={`absolute right-0 w-72 p-3 rounded-2xl bg-neutral-900/95 backdrop-blur-md shadow-2xl ring-1 ring-white/12 text-white space-y-3 ${
+                  toolbarPos && toolbarPos.y < 360 ? 'top-full mt-3' : 'bottom-full mb-3'
+                }`}
+              >
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-white/45">Ink</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextShadow = !ink.shadow;
+                        setInk((prev) => ({ ...prev, shadow: nextShadow }));
+                        updateSettings({ annotationShadow: nextShadow });
+                      }}
+                      className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                        ink.shadow ? 'bg-white/20 text-white' : 'text-white/55 hover:text-white hover:bg-white/10'
+                      }`}
+                    >
+                      Shadow {ink.shadow ? 'On' : 'Off'}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-xs text-white/75 w-10">Size</span>
+                    <input
+                      type="range"
+                      min={2}
+                      max={20}
+                      step={1}
+                      value={ink.width}
+                      onChange={(e) => {
+                        const width = Number(e.target.value);
+                        setInk((prev) => ({ ...prev, width }));
+                        updateSettings({ annotationWidth: width });
+                      }}
+                      className="flex-1 accent-blue-400 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono tabular-nums text-white/60 w-5 text-right">{ink.width}</span>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-white/75">Fade</span>
+                    <div className="flex p-0.5 gap-0.5 rounded-lg bg-white/8">
+                      {ANNOTATION_FADES.map((f) => (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() => {
+                            setInk((prev) => ({ ...prev, fade: f.id }));
+                            updateSettings({ annotationFade: f.id });
+                          }}
+                          className={`px-1.5 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                            ink.fade === f.id ? 'bg-white/20 text-white' : 'text-white/55 hover:text-white'
+                          }`}
+                        >
+                          {f.id === 'never' ? 'Stay' : f.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-t border-white/10 pt-2.5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300/90">
+                      <IoShieldCheckmarkOutline size={12} /> Privacy Shield
+                    </span>
+                    {blur.count > 0 && (
+                      <button
+                        type="button"
+                        onClick={blur.clear}
+                        className="text-[11px] font-medium text-sky-300 hover:text-sky-200 hover:underline"
+                      >
+                        Unblur all ({blur.count})
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-xs text-white/75 w-14">Blur</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={shieldCfg.strength}
+                      onChange={(e) => {
+                        const strength = Number(e.target.value);
+                        setShieldCfg((prev) => ({ ...prev, strength }));
+                        updateSettings({ annotationBlurStrength: strength });
+                        void invoke('screen_blur_configure', { config: { strength } }).catch(() => {});
+                      }}
+                      className="flex-1 accent-sky-400 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono tabular-nums text-white/60 w-6 text-right">{shieldCfg.strength}</span>
+                  </div>
+
+                  {(
+                    [
+                      ['WhatsApp', 'autoWhatsApp', 'annotationAutoBlurWhatsApp'] as const,
+                      ['Sensitive text', 'autoText', 'annotationAutoBlurText'] as const,
+                    ]
+                  ).map(([label, localKey, settingKey]) => (
+                    <div key={localKey} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-white/75">{label}</span>
+                      <div className="flex p-0.5 gap-0.5 rounded-lg bg-white/8">
+                        {(
+                          [
+                            ['off', 'Off'],
+                            ['recording', 'Rec'],
+                            ['always', 'Always'],
+                          ] as [AutoBlurMode, string][]
+                        ).map(([mode, modeLabel]) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => {
+                              setShieldCfg((prev) => ({ ...prev, [localKey]: mode }));
+                              updateSettings({ [settingKey]: mode });
+                            }}
+                            className={`px-1.5 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                              shieldCfg[localKey] === mode
+                                ? mode === 'off'
+                                  ? 'bg-white/20 text-white'
+                                  : 'bg-emerald-500/30 text-emerald-200'
+                                : 'text-white/55 hover:text-white'
+                            }`}
+                          >
+                            {modeLabel}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+
+                  <div className="flex items-center justify-between text-[11px] text-white/50 pt-0.5">
+                    <span>Blur active window anywhere</span>
+                    <kbd className="px-1.5 py-0.5 rounded bg-white/10 font-mono text-[10px] text-white/80">Ctrl+Alt+B</kbd>
+                  </div>
+                </div>
+
+                <div className="border-t border-white/10 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenu(null);
+                      void emit('open-settings-request', { section: 'annotation' });
+                    }}
+                    className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/8 hover:bg-white/15 text-xs font-medium text-white/85 hover:text-white transition-colors"
+                  >
+                    <IoSettingsOutline size={13} />
+                    All Annotate &amp; Privacy Shield settings…
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="w-px h-5 bg-white/20 mx-1" />
 

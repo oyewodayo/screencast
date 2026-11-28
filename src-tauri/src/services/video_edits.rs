@@ -87,6 +87,44 @@ pub fn load_video_chapters(video_path: String) -> Result<Option<String>, String>
         .map_err(|e| format!("Failed to read chapters: {}", e))
 }
 
+// Study / learning notes (PlayerStudyPanel) - stored next to the video as `.notes.json` so
+// watching and studying a lecture never touches `.edits.json` or marks the video as "Edited".
+fn notes_sidecar_path_for(video_path: &Path) -> PathBuf {
+    let mut name = video_path.as_os_str().to_os_string();
+    name.push(OsString::from(".notes.json"));
+    PathBuf::from(name)
+}
+
+#[command(async)]
+pub fn save_video_notes(video_path: String, json: String) -> Result<(), String> {
+    let _serial = crate::services::responsiveness::serial();
+    let video = PathBuf::from(&video_path);
+    if !video.exists() {
+        return Err(format!("Video does not exist: {}", video_path));
+    }
+
+    let sidecar = notes_sidecar_path_for(&video);
+    let tmp_file_name = format!("{}.tmp", sidecar.file_name().unwrap().to_string_lossy());
+    let tmp = sidecar.with_file_name(tmp_file_name);
+
+    fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Failed to write study notes: {}", e))?;
+    crate::services::sidecars::commit_sidecar(&tmp, &sidecar).map_err(|e| format!("Failed to save study notes: {}", e))?;
+
+    Ok(())
+}
+
+#[command(async)]
+pub fn load_video_notes(video_path: String) -> Result<Option<String>, String> {
+    let _serial = crate::services::responsiveness::serial();
+    let sidecar = notes_sidecar_path_for(&PathBuf::from(&video_path));
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&sidecar)
+        .map(Some)
+        .map_err(|e| format!("Failed to read study notes: {}", e))
+}
+
 // A video project: a timeline that isn't attached to any one recording - made from images (or
 // started empty) in the Video Editor. The project file itself is only a small header (frame size);
 // its timeline lives in the exact same ".edits.json" sidecar a recording's edits do, so the editor

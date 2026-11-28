@@ -113,3 +113,24 @@ export function cancelBackgroundRemoval(layerId: string) {
 }
 
 export const dismissBackgroundError = (layerId: string) => setJob(layerId, null);
+
+// Cuts the person out of a still image (source can be a filesystem path or a base64 data URL).
+// Returns the resulting cutout as a PNG data URL ("data:image/png;base64,...").
+export async function removeImageBackground(source: string, onDownloadProgress?: (progress: number) => void): Promise<string> {
+  const status = await backgroundRemovalStatus();
+  if (status.state === "unsupported") {
+    throw new Error("Background removal isn't available on this computer yet.");
+  }
+  if (status.state === "needs-download") {
+    await downloadBackgroundEngine(onDownloadProgress ?? (() => {}));
+  }
+  try {
+    return await invoke<string>("remove_image_background", { source });
+  } catch (err) {
+    if (String(err).includes("ENGINE_MISSING")) {
+      await downloadBackgroundEngine(onDownloadProgress ?? (() => {}));
+      return await invoke<string>("remove_image_background", { source });
+    }
+    throw err;
+  }
+}

@@ -527,17 +527,37 @@ Annotation, Files, and PDF Annotator:
 **Windows** is the best-tested platform: it has installers, and Briefcast bundles its own
 ffmpeg and the other tools it shells out to.
 
-**macOS and Linux** have installers too, from v0.1.5 (a universal .dmg; an .AppImage and a
-.deb), built by the release workflow - and they still build and run from source. CI builds and
-tests both on every push, and on Linux a real screen + microphone recording has been checked
-end to end (X11 capture with PulseAudio, Ubuntu 22.04); the macOS code has not yet been run on
-real hardware. On these platforms Briefcast uses the
-ffmpeg and libheif installed on the system rather than bundled copies, and tells you at
-startup if the ffmpeg it finds is too old or missing an encoder. Not available there yet: the
-screenshot picker (Alt+Shift+S), the privacy blur, click / pointer / shortcut tracking for
-auto-zoom, the live preview while recording cameras only, USB phone transfer, and email
-through a desktop mail client. Linux screen capture needs X11 (or XWayland); under a pure
-Wayland session there is nothing to capture.
+**macOS and Linux** have installers too (a universal .dmg; an .AppImage and a .deb), built by the
+release workflow - and they still build and run from source. CI builds and tests both on every
+push. On Linux a real screen + microphone recording has been checked end to end (X11 capture with
+PulseAudio, Ubuntu 22.04), and so have the speech engine, the AI engine and the clipboard; **the
+macOS code has not been run on real hardware**. On these systems Briefcast uses the ffmpeg and
+libheif installed on the system rather than bundled copies (an app started from Finder doesn't see
+Homebrew's folders, so those are searched too), and tells you at startup if the ffmpeg is too old or
+missing an encoder.
+
+Parity with Windows, feature by feature:
+
+- **Works:** recording (screen, window, camera, mic; system sound through a PulseAudio monitor on
+  Linux, a virtual device such as BlackHole on a Mac), the editor, transitions, effects, photo videos,
+  exports, captions, editing by transcript and filler-word removal (whisper.cpp, built per system by
+  `scripts/build-whisper-engine.sh` and bundled; the ~150 MB speech model downloads on first use),
+  "Remove noise" (the RNNoise model is committed in `models/rnnoise`), sharing - links, the
+  clipboard as text and as files, the chat apps that are installed, email with the file attached
+  (Mail on a Mac, `xdg-email` on Linux) - companion files hidden in Finder / `.hidden`, the camera
+  bubble's border, and the phone's Wi-Fi transfer.
+- **On Linux (x86-64) and Apple Silicon Macs (macOS 14+):** background removal, face matching, the
+  AI voice and the live camera background, on one ONNX Runtime engine downloaded on first use - on
+  the CPU, so slower than Windows' DirectML. The version pinned here publishes no Intel Mac build.
+- **Linux only:** picking a colour from the screen (X11).
+- **Windows only, so far:** the editable pointer, click ripples, shortcut keys on screen and
+  auto-zoom at clicks (they hook the mouse and keyboard); the privacy blur; USB phone transfer; the
+  screenshot picker's overlay (the simpler capture is used elsewhere); the Windows share window;
+  and "Download as PDF" for documents - WebKit, the web engine there, doesn't draw CSS page-margin
+  boxes, which is what puts a document's headers, footers and page numbers on a printed page, so a
+  PDF made from it would silently leave them out (Word, Markdown and web-page export are complete).
+  Linux screen capture needs X11 (or XWayland); under a pure Wayland session there is nothing to
+  capture.
 
 ## Prerequisites
 
@@ -564,10 +584,13 @@ sudo apt install build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev lib
 **macOS**: the Xcode command line tools (`xcode-select --install`), then
 `brew install ffmpeg libheif`.
 
-On macOS and Linux, skip the Windows binaries described below - nothing needs to be placed in
-`src-tauri/binaries/`. Those are bundled through `src-tauri/tauri.windows.conf.json`, which
-Tauri applies on Windows only. (The noise-removal model, `binaries/rnnoise/`, is among them, so
-"Remove noise" uses ffmpeg's built-in denoiser on macOS and Linux for now.)
+On macOS and Linux, skip the Windows binaries described below. Those are bundled through
+`src-tauri/tauri.windows.conf.json`, which Tauri applies on Windows only. The one thing those
+systems do need to build or test captions locally is the speech engine: run
+`scripts/build-whisper-engine.sh src-tauri/binaries/whisper` (CMake and a C++ compiler; it builds
+the same whisper.cpp version the Windows bundle uses), or put a `whisper-cli` on your PATH
+(`brew install whisper-cpp` on macOS) - Briefcast looks in both places. The RNNoise model is
+committed in `src-tauri/models/rnnoise/`, so there is nothing to download for it.
 
 On Windows, Briefcast shells out to `ffmpeg.exe`/`ffprobe.exe`/`ffplay.exe` at
 `src-tauri/binaries/ffmpeg/` rather than requiring a system-wide install — but those
@@ -623,10 +646,10 @@ pinned SHA-256) from
 into `%LOCALAPPDATA%\com.withbriefs.briefcast\whisper\`, showing download progress.
 
 The audio cleanup tool's "Remove noise" mode exports through ffmpeg's `arnndn` filter, which
-needs an RNNoise model file: download
-[`bd.rnnn`](https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn)
-(~300KB, from GregorR/rnnoise-models - trained on voice over recording noise) into
-`src-tauri/binaries/rnnoise/`. Without it, export falls back to the spectral `afftdn` filter.
+needs an RNNoise model file. It is [`bd.rnnn`](https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn)
+(~300KB, from GregorR/rnnoise-models - trained on voice over recording noise), committed in
+`src-tauri/models/rnnoise/` and bundled on every system - nothing to download. Without it, export
+would fall back to the spectral `afftdn` filter.
 
 ```bash
 npm run tauri dev
@@ -741,7 +764,7 @@ screencast/
 │   ├── binaries/ffmpeg/             # Bundled ffmpeg/ffprobe/ffplay
 │   ├── binaries/heif/               # Bundled libheif (heif-dec.exe + DLLs) - HEIC/HEIF fallback decode
 │   ├── binaries/whisper/            # Bundled whisper.cpp CLI + DLLs - captions and Docs voice typing (model downloaded on first use)
-│   ├── binaries/rnnoise/            # bd.rnnn RNNoise model - arnndn for the audio cleanup tool's "Remove noise" export
+│   ├── models/rnnoise/              # bd.rnnn RNNoise model - arnndn for the audio cleanup tool's "Remove noise" export (every system)
 │   └── tauri.conf.json              # Tauri app/window/permissions configuration
 └── public/                          # Static assets (icons, notification sounds)
 ```

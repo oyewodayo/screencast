@@ -183,7 +183,7 @@ export const docProseClassName = [
   "[&_.ProseMirror_pre::before]:text-[10px] [&_.ProseMirror_pre::before]:uppercase [&_.ProseMirror_pre::before]:tracking-wide [&_.ProseMirror_pre::before]:text-neutral-400",
   // Blockquote: a soft tint behind the existing left-border-and-italic Typography default, so it
   // reads as its own block rather than just indented italic text.
-  "[&_.ProseMirror_blockquote]:bg-neutral-50 dark:[&_.ProseMirror_blockquote]:bg-neutral-800/40 [&_.ProseMirror_blockquote]:rounded-r-md [&_.ProseMirror_blockquote]:py-1",
+  "[&_.ProseMirror_blockquote]:border-l-2 [&_.ProseMirror_blockquote]:border-neutral-300 dark:[&_.ProseMirror_blockquote]:border-neutral-600 [&_.ProseMirror_blockquote]:pl-3 [&_.ProseMirror_blockquote]:py-0.5 [&_.ProseMirror_blockquote]:not-italic",
   // Empty-doc placeholder ("Start writing…") - @tiptap/extension-placeholder decorates the empty
   // paragraph with `is-editor-empty` + a data-placeholder attribute rather than rendering real
   // text, so this is what actually makes it visible. Harmless on the read-only preview too, since
@@ -210,7 +210,7 @@ export const docProseClassName = [
   "print:[&_[data-page-break]]:[break-after:page] print:[&_[data-page-break]]:[page-break-after:always] print:[&_[data-page-break]]:h-0 print:[&_[data-page-break]]:my-0 print:[&_[data-page-break]::after]:hidden",
   "[&_.tableWrapper]:overflow-x-auto [&_.tableWrapper]:w-full [&_.tableWrapper]:my-4 [&_.tableWrapper]:pb-1",
   "[&_.ProseMirror_table]:table-fixed [&_.ProseMirror_table]:border-collapse [&_.ProseMirror_table]:w-full [&_.ProseMirror_table]:min-w-[28rem]",
-  "[&_.ProseMirror_th]:relative [&_.ProseMirror_th]:border [&_.ProseMirror_th]:border-neutral-300 dark:[&_.ProseMirror_th]:border-neutral-700 [&_.ProseMirror_th]:bg-neutral-100 dark:[&_.ProseMirror_th]:bg-neutral-800 [&_.ProseMirror_th]:px-3 [&_.ProseMirror_th]:py-2 [&_.ProseMirror_th]:align-top",
+  "[&_.ProseMirror_th]:relative [&_.ProseMirror_th]:border [&_.ProseMirror_th]:border-neutral-300 dark:[&_.ProseMirror_th]:border-neutral-700 [&_.ProseMirror_th]:px-3 [&_.ProseMirror_th]:py-2 [&_.ProseMirror_th]:align-top",
   "[&_.ProseMirror_td]:relative [&_.ProseMirror_td]:border [&_.ProseMirror_td]:border-neutral-300 dark:[&_.ProseMirror_td]:border-neutral-700 [&_.ProseMirror_td]:px-3 [&_.ProseMirror_td]:py-2 [&_.ProseMirror_td]:align-top",
   "[&_.ProseMirror_th>p]:my-0 [&_.ProseMirror_td>p]:my-0 [&_.ProseMirror_th>*+*]:mt-2 [&_.ProseMirror_td>*+*]:mt-2",
   "[&_.ProseMirror_.selectedCell]:after:content-[''] [&_.ProseMirror_.selectedCell]:after:absolute [&_.ProseMirror_.selectedCell]:after:inset-0 [&_.ProseMirror_.selectedCell]:after:bg-blue-400/20 [&_.ProseMirror_.selectedCell]:after:pointer-events-none",

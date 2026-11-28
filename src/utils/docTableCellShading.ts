@@ -35,6 +35,29 @@ function toHex(value: string | null | undefined): string | null {
   return null;
 }
 
+// Upgrades washed-out near-white borders (e.g. #e5e5e5) and missing inner edges on bordered grid
+// cells so table grids always look crisp and complete on screen and in exports.
+export function normalizeRenderedCellBorders(edges: string[]): string[] {
+  const trimmed = edges.map((e) => e.trim());
+  const visibleCount = trimmed.filter((e) => e && e !== "none").length;
+  // Borderless layout cell (0 visible) or single-rule callout/underline cell (1 visible): keep as-is.
+  if (visibleCount < 2) return trimmed;
+  return trimmed.map((edge) => {
+    if (!edge || edge === "none") return "0.75pt solid #94a3b8";
+    return edge.replace(/#([0-9a-f]{6})\b/i, (full, hex: string) => {
+      const n = parseInt(hex, 16);
+      const r = (n >> 16) & 255;
+      const g = (n >> 8) & 255;
+      const b = n & 255;
+      // If the border is a very faint near-white grey, deepen it to slate-400 so it's clearly visible.
+      if (r >= 0xd0 && g >= 0xd0 && b >= 0xd0 && Math.max(r, g, b) - Math.min(r, g, b) <= 20) {
+        return "#94a3b8";
+      }
+      return full;
+    });
+  });
+}
+
 // Imported from Word: the cell's vertical alignment, and its four edges as CSS ("t|r|b|l") when the
 // document set its own borders (forms, letterheads) instead of the editor's grid.
 const layoutAttributes = {
@@ -44,15 +67,22 @@ const layoutAttributes = {
       const v = el.getAttribute("data-valign") ?? el.style.verticalAlign;
       return v === "middle" || v === "bottom" || v === "top" ? v : null;
     },
-    renderHTML: (attrs: Record<string, unknown>) => (attrs.verticalAlign ? { "data-valign": String(attrs.verticalAlign), style: `vertical-align: ${attrs.verticalAlign}` } : {}),
+    renderHTML: (attrs: Record<string, unknown>) =>
+      attrs.verticalAlign
+        ? { "data-valign": String(attrs.verticalAlign), style: `vertical-align: ${attrs.verticalAlign}` }
+        : {},
   },
   borders: {
     default: null,
     parseHTML: (el: HTMLElement) => el.getAttribute("data-borders") || null,
     renderHTML: (attrs: Record<string, unknown>) => {
-      const b = typeof attrs.borders === "string" ? attrs.borders.split("|") : null;
-      if (!b || b.length !== 4) return {};
-      return { "data-borders": attrs.borders as string, style: `border-top: ${b[0]}; border-right: ${b[1]}; border-bottom: ${b[2]}; border-left: ${b[3]}` };
+      const raw = typeof attrs.borders === "string" ? attrs.borders.split("|") : null;
+      if (!raw || raw.length !== 4) return {};
+      const b = normalizeRenderedCellBorders(raw);
+      return {
+        "data-borders": attrs.borders as string,
+        style: `border-top: ${b[0]}; border-right: ${b[1]}; border-bottom: ${b[2]}; border-left: ${b[3]}`,
+      };
     },
   },
 };
@@ -66,7 +96,11 @@ const backgroundAttribute = {
       if (!bg) return {};
       // data-shade="dark": docLayout.css switches the cell's text to white, so a navy or charcoal
       // fill is readable without the user recolouring every run inside it.
-      return { "data-background": bg, ...(isDarkShade(bg) ? { "data-shade": "dark" } : {}), style: `--cell-bg: ${bg}; background-color: ${bg}` };
+      return {
+        "data-background": bg,
+        ...(isDarkShade(bg) ? { "data-shade": "dark" } : {}),
+        style: `--cell-bg: ${bg}; background-color: ${bg}`,
+      };
     },
   },
 };

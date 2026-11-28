@@ -58,6 +58,8 @@ import { captionLabel, crossRefText, computeStructureFromJson, createDocStructur
 import { citationSpaceBefore, formatCitation, styleInfo, segmentsToText } from "../../utils/docCitationStyles";
 import { CITATION_EDIT_EVENT, CROSSREF_EDIT_EVENT, OPEN_PICKER_EVENT, type InlineEditDetail, type OpenPickerDetail } from "../../utils/docStructureNodes";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import DocSelectionBubble from "./DocSelectionBubble";
+import BrandLoader from "../common/BrandLoader";
 import DocReferencesSidebar from "./DocReferencesSidebar";
 import DocOutlinePanel from "./DocOutlinePanel";
 import DocCitePicker, { type CitePickerMode } from "./DocCitePicker";
@@ -82,6 +84,8 @@ import "./docStructure.css";
 import "./docFonts.css";
 import "./docLayout.css";
 import "../board/boardFonts.css";
+
+const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 interface DocsEditorProps {
   docId: string;
@@ -398,7 +402,7 @@ function readRulerVisible(): boolean {
 }
 
 const headerIconClass = (active = false) =>
-  `relative h-9 w-9 shrink-0 inline-flex items-center justify-center rounded-full transition-colors ${
+  `relative h-8 w-8 shrink-0 inline-flex items-center justify-center rounded-full transition-colors ${
     active
       ? "bg-[#d3e3fd] text-[#041e49] dark:bg-blue-500/30 dark:text-blue-50"
       : "text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.06] dark:hover:bg-white/10"
@@ -439,21 +443,30 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
       return !v;
     });
   }, []);
-  // Comments and References share the right-hand slot.
+  // Comments, References, Help, and Document Style share the right-hand slot.
   const toggleComments = useCallback(() => {
     setShowReferences(false);
     setShowHelp(false);
+    setShowStyle(false);
     setShowComments((v) => !v);
   }, []);
   const toggleReferences = useCallback(() => {
     setShowComments(false);
     setShowHelp(false);
+    setShowStyle(false);
     setShowReferences((v) => !v);
   }, []);
   const toggleHelp = useCallback(() => {
     setShowComments(false);
     setShowReferences(false);
+    setShowStyle(false);
     setShowHelp((v) => !v);
+  }, []);
+  const toggleStyle = useCallback(() => {
+    setShowComments(false);
+    setShowReferences(false);
+    setShowHelp(false);
+    setShowStyle((v) => !v);
   }, []);
 
   const menuProps = (id: "export" | "pageSetup") => ({
@@ -461,29 +474,41 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     onOpenChange: (next: boolean) => setHeaderMenu((cur) => (next ? id : cur === id ? null : cur)),
   });
 
+  const extensions = useMemo(
+    () => [
+      // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
+      // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
+      // headless schema builder so the live editor and the importer can never drift apart.
+      ...getDocContentExtensions(docId),
+      // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
+      // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
+      // eventually receive remote updates too.
+      ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
+      createDocImagePasteExtension(docId),
+      createSlashCommandExtension(docId),
+      // Numbers figures, tables, equations and citations; formats the reference list.
+      createDocStructureExtension(bib.store),
+      DocFindReplace,
+      DocAutoPaginate,
+      DocDictation,
+      DocPaint,
+      DocShortcuts,
+      Placeholder.configure({ placeholder: "Start writing, type “/” for blocks, or press Ctrl+Shift+S to dictate…" }),
+    ],
+    [docId, store.ydoc, bib.store]
+  );
+
   const editor = useEditor(
     {
-      extensions: [
-        // Schema-contributing extensions (StarterKit, Underline, Link, Image, Table+*, TextAlign,
-        // TextStyle, Color) live in getDocContentExtensions() - shared with docxImport.ts's
-        // headless schema builder so the live editor and the importer can never drift apart.
-        ...getDocContentExtensions(docId),
-        // Collaboration's own history (Yjs UndoManager) replaces StarterKit's plain history -
-        // undo/redo need to walk CRDT operations, not a linear command stack, once this doc can
-        // eventually receive remote updates too.
-        ...(store.ydoc ? [Collaboration.configure({ document: store.ydoc })] : []),
-        createDocImagePasteExtension(docId),
-        createSlashCommandExtension(docId),
-        // Numbers figures, tables, equations and citations; formats the reference list.
-        createDocStructureExtension(bib.store),
-        DocFindReplace,
-        DocAutoPaginate,
-        DocDictation,
-        DocPaint,
-        DocShortcuts,
-        Placeholder.configure({ placeholder: "Start writing, type “/” for blocks, or press Ctrl+Shift+S to dictate…" }),
-      ],
+      extensions,
       editable: !store.loading,
+      editorProps: {
+        attributes: {
+          spellcheck: "false",
+          autocorrect: "off",
+          autocapitalize: "off",
+        },
+      },
       // Focuses the content area as soon as the doc is ready, so opening a doc (new or existing)
       // lets you start typing immediately instead of requiring a click into the editor first.
       autofocus: "start",
@@ -509,7 +534,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         store.setTitle(firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine);
       },
     },
-    [store.ydoc]
+    [extensions]
   );
 
   const dictation = useDocDictation(editor && !store.loading ? editor : null, store.title);
@@ -603,14 +628,35 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     return () => ro.disconnect();
   }, [store.loading]);
 
+  // Graceful dissolve/fade-out when document finishes loading
+  const isDocumentReady = !store.loading && Boolean(editor);
+  const [showDocLoader, setShowDocLoader] = useState(!isDocumentReady);
+  const [isLoaderFading, setIsLoaderFading] = useState(false);
+
+  useEffect(() => {
+    if (isDocumentReady) {
+      if (showDocLoader && !isLoaderFading) {
+        setIsLoaderFading(true);
+        const timer = setTimeout(() => {
+          setShowDocLoader(false);
+          setIsLoaderFading(false);
+        }, 320);
+        return () => clearTimeout(timer);
+      }
+    } else {
+      setShowDocLoader(true);
+      setIsLoaderFading(false);
+    }
+  }, [isDocumentReady, showDocLoader, isLoaderFading]);
+
   // Meta-only transaction, not an editor recreation - changing page size or margins shouldn't
   // disturb cursor position or the Collaboration binding; docAutoPaginate.ts's plugin `update()`
   // recomputes on it (a top/bottom margin change doesn't resize view.dom, so its ResizeObserver
   // wouldn't notice on its own).
   useEffect(() => {
-    if (!editor) return;
+    if (!editor || store.loading) return;
     editor.commands.setPaginationLayout(page, paginationMargins, layout.columns);
-  }, [editor, page, paginationMargins, layout.columns]);
+  }, [editor, page, paginationMargins, layout.columns, store.loading]);
 
   const handleBack = useCallback(() => {
     dictation.stop();
@@ -826,10 +872,16 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         showNotice({ text: `Saved ${saved.split(/[\\/]/).pop()}`, path: saved }, 10000);
       } catch (err) {
         console.error(`Failed to export document as .${kind}:`, err);
-        showNotice({ text: err instanceof Error ? err.message : String(err), error: true }, 8000);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (kind === "pdf" && (msg.includes("web engine") || msg.includes("isn't available on this system"))) {
+          showNotice({ text: "Opening system print dialog to Save as PDF…" }, 5000);
+          handlePrint();
+          return;
+        }
+        showNotice({ text: msg, error: true }, 8000);
       }
     },
-    [editor, store.title, writeExport, showNotice]
+    [editor, store.title, writeExport, showNotice, handlePrint]
   );
 
   // "Copy contents" in the Share dialog: the same self-contained HTML as the .html export (images
@@ -914,15 +966,57 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     }
   }, [store, showNotice]);
 
+  const [docZoom, setDocZoomState] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem("briefcast.docs.zoom"));
+      return Number.isFinite(saved) && saved >= 50 && saved <= 200 ? saved : 100;
+    } catch {
+      return 100;
+    }
+  });
+  const setDocZoom = useCallback((next: number) => {
+    const clamped = Math.max(50, Math.min(200, Math.round(next)));
+    setDocZoomState(clamped);
+    try {
+      localStorage.setItem("briefcast.docs.zoom", String(clamped));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const [showWordStats, setShowWordStats] = useState(false);
+
   // Recomputed per doc change, not per render - the editor re-renders this component on every
   // transaction, including selection-only ones that can't change the counts.
-  const { wordCount, charCount } = useMemo(() => {
-    if (!editor) return { wordCount: 0, charCount: 0 };
-    const text = editor.state.doc.textBetween(0, editor.state.doc.content.size, " ", " ");
+  const { wordCount, charCount, charNoSpaces, paragraphCount, readingMinutes } = useMemo(() => {
+    if (!editor) return { wordCount: 0, charCount: 0, charNoSpaces: 0, paragraphCount: 0, readingMinutes: 0 };
+    const text = editor.state.doc.textBetween(0, editor.state.doc.content.size, "\n", " ");
     const trimmed = text.trim();
-    return { wordCount: trimmed ? trimmed.split(/\s+/).length : 0, charCount: text.length };
+    const words = trimmed ? trimmed.split(/\s+/).length : 0;
+    const noSpaces = text.replace(/\s+/g, "").length;
+    let paragraphs = 0;
+    editor.state.doc.descendants((node) => {
+      if ((node.type.name === "paragraph" || node.type.name === "heading") && node.textContent.trim().length > 0) {
+        paragraphs++;
+      }
+      return true;
+    });
+    return {
+      wordCount: words,
+      charCount: text.length,
+      charNoSpaces: noSpaces,
+      paragraphCount: paragraphs,
+      readingMinutes: words === 0 ? 0 : Math.max(1, Math.round(words / 220)),
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, editor?.state.doc]);
+
+  const selectedWordCount = useMemo(() => {
+    if (!editor || !showWordStats || editor.state.selection.empty) return 0;
+    const { from, to } = editor.state.selection;
+    const selText = editor.state.doc.textBetween(from, to, " ", " ").trim();
+    return selText ? selText.split(/\s+/).length : 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, showWordStats, editor?.state.selection]);
 
   const openComments = store.comments.filter((c) => !c.resolved_at).length;
 
@@ -988,6 +1082,19 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           e.preventDefault();
           e.stopPropagation();
           dictation.toggle();
+        } else if (mod && e.shiftKey && e.key.toLowerCase() === "c") {
+          // Google Docs' Word Count shortcut.
+          e.preventDefault();
+          setShowWordStats((v) => !v);
+        } else if (mod && !e.shiftKey && (e.key === "=" || e.key === "+")) {
+          e.preventDefault();
+          setDocZoom(docZoom + 10);
+        } else if (mod && !e.shiftKey && e.key === "-") {
+          e.preventDefault();
+          setDocZoom(docZoom - 10);
+        } else if (mod && !e.shiftKey && e.key === "0") {
+          e.preventDefault();
+          setDocZoom(100);
         }
       }}
     >
@@ -1007,6 +1114,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${firstTop ?? margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0; min-height: 0; }
+          .doc-zoom-wrap { zoom: 1 !important; }
         }
         @media print {
           /* The paper is @page's background (colour and watermark), so everything above it -
@@ -1016,11 +1124,11 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         }
       `}</style>
 
-      <header className="shrink-0 flex items-center gap-2 pl-2 pr-3 pt-2 print:hidden">
+      <header className="shrink-0 flex items-center gap-1.5 pl-2 pr-3 pt-1.5 pb-0.5 print:hidden">
         <button type="button" onClick={handleBack} data-tip="Back to docs" aria-label="Back to docs" className={headerIconClass()}>
-          <IoArrowBack size={19} />
+          <IoArrowBack size={17} />
         </button>
-        <MdDescription size={30} className="shrink-0 text-[#4285f4]" aria-hidden />
+        <MdDescription size={26} className="shrink-0 text-[#4285f4]" aria-hidden />
 
         <div className="min-w-0 flex-1 flex flex-col">
           <input
@@ -1036,23 +1144,74 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
             aria-label="Document title"
             spellCheck={false}
             style={{ fieldSizing: "content" } as React.CSSProperties}
-            className="min-w-[8rem] max-w-full px-1.5 -ml-1.5 h-7 rounded text-[17px] leading-7 bg-transparent border border-transparent hover:border-neutral-300 dark:hover:border-neutral-700 focus:border-blue-500 outline-none text-neutral-900 dark:text-neutral-100 truncate"
+            className="min-w-[8rem] max-w-full px-1.5 -ml-1.5 h-6.5 rounded text-[15px] leading-6 bg-transparent border border-transparent hover:border-neutral-300 dark:hover:border-neutral-700 focus:border-blue-500 outline-none text-neutral-900 dark:text-neutral-100 truncate"
           />
-          <div className="flex items-center gap-2 h-5 text-xs text-neutral-500 dark:text-neutral-400 min-w-0">
+          <div className="flex items-center gap-2 h-4 text-[11px] text-neutral-500 dark:text-neutral-400 min-w-0">
             {store.saveError ? (
               <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400" data-tip={String(store.saveError)}>
-                <IoWarningOutline size={14} /> Couldn’t save
+                <IoWarningOutline size={13} /> Couldn’t save
               </span>
             ) : (
               <span className="inline-flex items-center gap-1 shrink-0">
-                <IoCloudDoneOutline size={14} /> {store.isSaving ? "Saving…" : "Saved"}
+                <IoCloudDoneOutline size={13} /> {store.isSaving ? "Saving…" : "Saved"}
               </span>
             )}
             {editor && !store.loading && (
-              <span className="shrink-0" data-tip={`${charCount.toLocaleString()} characters`}>
-                · {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
-                {pageCount > 1 && ` · ${pageCount} pages`}
-              </span>
+              <div className="relative shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowWordStats((v) => !v)}
+                  className="inline-flex items-center gap-1 rounded px-1 -mx-1 hover:bg-black/[0.05] dark:hover:bg-white/10 transition-colors"
+                  data-tip="Word count & reading time"
+                  data-tip-kbd="Ctrl+Shift+C"
+                >
+                  <span>
+                    · {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
+                    {pageCount > 1 && ` · ${pageCount} pages`}
+                    {readingMinutes > 0 && ` · ~${readingMinutes} min read`}
+                  </span>
+                </button>
+                {showWordStats && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowWordStats(false)} />
+                    <div className="absolute left-0 top-full mt-1.5 z-50 w-60 rounded-xl bg-white dark:bg-neutral-900 shadow-2xl ring-1 ring-black/10 dark:ring-white/15 p-3 text-xs text-neutral-700 dark:text-neutral-200">
+                      <div className="flex items-center justify-between pb-2 mb-2 border-b border-neutral-200 dark:border-neutral-800">
+                        <span className="font-semibold text-neutral-900 dark:text-white">Word count</span>
+                        <span className="text-[10px] text-neutral-400">Ctrl+Shift+C</span>
+                      </div>
+                      <dl className="space-y-1.5">
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Pages</dt>
+                          <dd className="font-medium tabular-nums">{pageCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Words</dt>
+                          <dd className="font-medium tabular-nums">
+                            {selectedWordCount > 0 ? `${selectedWordCount.toLocaleString()} of ` : ""}
+                            {wordCount.toLocaleString()}
+                          </dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Characters</dt>
+                          <dd className="font-medium tabular-nums">{charCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Characters (no spaces)</dt>
+                          <dd className="font-medium tabular-nums">{charNoSpaces.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Paragraphs</dt>
+                          <dd className="font-medium tabular-nums">{paragraphCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between pt-1 border-t border-neutral-200 dark:border-neutral-800">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Est. reading time</dt>
+                          <dd className="font-medium tabular-nums">{readingMinutes > 0 ? `${readingMinutes} min` : "< 1 min"}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
             {statusNotice && (
               <span className={`inline-flex items-center gap-1.5 min-w-0 ${statusNotice.error ? "text-red-600 dark:text-red-400" : "text-blue-700 dark:text-blue-300"}`}>
@@ -1081,10 +1240,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         </div>
 
         <button type="button" data-tip={showOutline ? "Hide outline" : "Show outline"} aria-label="Document outline" aria-pressed={showOutline} onClick={toggleOutline} className={headerIconClass(showOutline)}>
-          <TbListTree size={19} strokeWidth={1.75} />
+          <TbListTree size={16} strokeWidth={1.75} />
         </button>
         <button type="button" data-tip="Find and replace" data-tip-kbd="Ctrl+F" aria-label="Find and replace" onClick={() => setShowFindReplace((v) => !v)} className={headerIconClass(showFindReplace)}>
-          <IoSearch size={18} />
+          <IoSearch size={16} />
         </button>
         <button
           type="button"
@@ -1096,13 +1255,13 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           }}
           className={headerIconClass(showVersionHistory)}
         >
-          <IoTimeOutline size={20} />
+          <IoTimeOutline size={17} />
         </button>
-        <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={() => setShowStyle(true)} className={headerIconClass(showStyle)}>
-          <TbTypography size={20} strokeWidth={1.75} />
+        <button type="button" data-tip="Document style: font, spacing, columns, captions" aria-label="Document style" aria-pressed={showStyle} onClick={toggleStyle} className={headerIconClass(showStyle)}>
+          <TbTypography size={17} strokeWidth={1.75} />
         </button>
         <button type="button" data-tip="References" aria-label="References" aria-pressed={showReferences} onClick={toggleReferences} className={headerIconClass(showReferences)}>
-          <TbBooks size={20} strokeWidth={1.75} />
+          <TbBooks size={17} strokeWidth={1.75} />
           {bib.entries.length > 0 && (
             <span className="absolute top-1 right-0.5 min-w-4 h-4 px-1 rounded-full bg-neutral-600 dark:bg-neutral-500 text-white text-[10px] leading-4 font-semibold text-center tabular-nums">
               {bib.entries.length}
@@ -1110,10 +1269,10 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           )}
         </button>
         <button type="button" data-tip="Guide: writing a two-column paper" aria-label="Help: writing a two-column paper" aria-pressed={showHelp} onClick={toggleHelp} className={headerIconClass(showHelp)}>
-          <IoHelpCircleOutline size={21} />
+          <IoHelpCircleOutline size={18} />
         </button>
         <button type="button" data-tip="Comments" aria-label="Comments" onClick={toggleComments} className={headerIconClass(showComments)}>
-          <IoChatbubbleOutline size={19} />
+          <IoChatbubbleOutline size={16} />
           {openComments > 0 && (
             <span className="absolute top-1 right-1 min-w-4 h-4 px-1 rounded-full bg-blue-600 text-white text-[10px] leading-4 font-semibold text-center">
               {openComments}
@@ -1128,7 +1287,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           aria-label="Letterhead"
           className={headerIconClass(!!letterhead)}
         >
-          <TbFileCertificate size={19} strokeWidth={1.75} />
+          <TbFileCertificate size={16} strokeWidth={1.75} />
         </button>
         <Dropdown
           {...menuProps("pageSetup")}
@@ -1136,7 +1295,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           align="right"
           keepSelection={false}
           bare
-          trigger={<IoOptionsOutline size={19} />}
+          trigger={<IoOptionsOutline size={16} />}
           triggerClassName={headerIconClass(headerMenu === "pageSetup")}
         >
           <DocPageSetupPopover
@@ -1164,12 +1323,12 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           align="right"
           trigger={
             <>
-              <MdFileDownload size={18} />
+              <MdFileDownload size={15} />
               <span>Export</span>
-              <MdArrowDropDown size={18} className="-mr-1.5" />
+              <MdArrowDropDown size={15} className="-mr-1" />
             </>
           }
-          triggerClassName="ml-1 h-9 pl-3.5 pr-3 inline-flex items-center gap-1.5 rounded-full text-sm font-medium bg-[#c2e7ff] hover:bg-[#b0dcf7] text-[#001d35] dark:bg-blue-500/25 dark:hover:bg-blue-500/35 dark:text-blue-50 transition-colors"
+          triggerClassName="ml-1 h-8 pl-3 pr-2.5 inline-flex items-center gap-1 rounded-full text-xs font-medium bg-[#c2e7ff] hover:bg-[#b0dcf7] text-[#001d35] dark:bg-blue-500/25 dark:hover:bg-blue-500/35 dark:text-blue-50 transition-colors"
           panelClassName="w-64 py-1.5"
         >
           <div className="px-3 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide text-neutral-400">Send</div>
@@ -1207,7 +1366,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           <button type="button" onClick={handlePrint} className={menuItemClass}>
             <MdPrint size={18} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
             <span className="flex-1">Print…</span>
-            <span className="text-xs text-neutral-400">Ctrl+P</span>
+            <span className="text-xs text-neutral-400">{isMac ? "⌘P" : "Ctrl+P"}</span>
           </button>
         </Dropdown>
       </header>
@@ -1235,6 +1394,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
           twoColumns={layout.columns === 2}
           typeset={!!layout.body}
+          zoom={docZoom}
+          onZoomChange={setDocZoom}
+        />
+      )}
+
+      {editor && !store.loading && (
+        <DocSelectionBubble
+          editor={editor}
+          disabled={dictation.phase === "listening"}
+          onOpenLink={() => setLinkOpen(true)}
+          onAddComment={(text) => void submitComment(text)}
         />
       )}
 
@@ -1248,7 +1418,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col print:block">
         <div
           ref={scrollerRef}
-          className={`flex-1 min-h-0 overflow-y-auto px-4 sm:px-8 pb-10 ${showRuler ? "" : "pt-6"} bg-[var(--doc-canvas)] print:h-auto print:overflow-visible print:block print:p-0 print:bg-white`}
+          className={`flex-1 min-h-0 overflow-y-auto [scrollbar-width:thin] px-4 sm:px-8 pb-10 ${showRuler ? "" : "pt-6"} bg-[var(--doc-canvas)] print:h-auto print:overflow-visible print:block print:p-0 print:bg-white`}
         >
           {showRuler && editor && (
             // Sticky inside the scroller and exactly as wide as the page card, so ruler positions
@@ -1269,71 +1439,85 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
               </div>
             </div>
           )}
-          {store.loading || !editor ? (
-            <div className="flex items-center justify-center h-full text-neutral-400 dark:text-neutral-500 text-sm">Loading…</div>
-          ) : store.loadError ? (
+          {store.loadError ? (
             <div className="flex items-center justify-center h-full text-red-500 dark:text-red-400 text-sm">{store.loadError}</div>
           ) : (
-            // The "page": a bounded card on the backdrop, square-cornered like a printed page (and
-            // like docAutoPaginate.ts's flat page-gap dividers). Width and padding - the exact real
-            // 1in print margin, which docAutoPaginate.ts measures against - come from the
-            // `.doc-page-card` rule injected above.
-            // Print frame: see the <style> comment above and docPageLayout.css. On screen the table
-            // collapses to plain blocks.
-            <table className="doc-print-frame">
-              <thead aria-hidden>
-                <tr>
-                  <td>
-                    <div className="doc-print-spacer" style={{ height: `${margins.top}in` }} />
-                  </td>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>
-                    {/* Paper colour: --doc-paper (docLayout.css) is the page's one fill - the card,
-                        two-column sheets, page-break gaps and leader backgrounds all read it - and
-                        data-page-color swaps it for the document's colour. */}
-                    <div
-                      ref={pageRef}
-                      lang="en"
-                      style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
-                      data-page-color={pageColor ?? undefined}
-                      data-page-dark={pageDark ? "" : undefined}
-                      className={`doc-page-card ${cardClass} relative mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
-                    >
-                      {/* Two columns: one drawn sheet per page behind the multicol rows. */}
-                      {twoColumns &&
-                        Array.from({ length: pageCount }, (_, k) => (
-                          <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(page) + PAGE_GAP_PX), height: pageHeightPx(page) }} />
-                        ))}
-                      {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
-                          flips the editor's text, heading and link colours. */}
-                      <EditorContent editor={editor} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
-                      {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
-                      <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
-                      <DocPageChromeOverlay
-                        chrome={pageChrome}
-                        pageCount={pageCount}
-                        page={page}
-                        margins={margins}
-                        title={store.title}
-                        date={todayLabel()}
-                        dark={pageDark}
-                        onEdit={(band) => setChromeEditor({ focus: band })}
-                      />
-                    </div>
-                  </td>
-                </tr>
-              </tbody>
-              <tfoot aria-hidden>
-                <tr>
-                  <td>
-                    <div className="doc-print-spacer" style={{ height: `${margins.bottom}in` }} />
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
+            <>
+              {editor && (
+                <div className="doc-zoom-wrap" style={docZoom !== 100 ? ({ zoom: docZoom / 100 } as React.CSSProperties) : undefined}>
+                <table className="doc-print-frame">
+                  <thead aria-hidden>
+                    <tr>
+                      <td>
+                        <div className="doc-print-spacer" style={{ height: `${margins.top}in` }} />
+                      </td>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        {/* Paper colour: --doc-paper (docLayout.css) is the page's one fill - the card,
+                            two-column sheets, page-break gaps and leader backgrounds all read it - and
+                            data-page-color swaps it for the document's colour. */}
+                        <div
+                          ref={pageRef}
+                          lang="en"
+                          style={pageColor ? ({ ...cardStyle, "--doc-page-color": pageColor } as React.CSSProperties) : cardStyle}
+                          data-page-color={pageColor ?? undefined}
+                          data-page-dark={pageDark ? "" : undefined}
+                          className={`doc-page-card ${cardClass} relative mx-auto bg-[var(--doc-paper)] ring-1 ring-neutral-200 dark:ring-neutral-800 shadow-[0_1px_3px_rgba(60,64,67,0.15)] print:shadow-none print:ring-0 print:mx-0 print:min-h-0`}
+                        >
+                          {/* Two columns: one drawn sheet per page behind the multicol rows. */}
+                          {twoColumns &&
+                            Array.from({ length: pageCount }, (_, k) => (
+                              <div key={k} className="doc-sheet" aria-hidden style={{ top: k * (pageHeightPx(page) + PAGE_GAP_PX), height: pageHeightPx(page) }} />
+                            ))}
+                          {/* Dark paper takes light text, as on Word's automatic colour: prose-invert
+                              flips the editor's text, heading and link colours. */}
+                          <EditorContent editor={editor} spellCheck={false} className={pageDark ? `${docProseClassName} prose-invert` : docProseClassName} />
+                          {letterhead && <DocLetterheadOverlay firstUrl={letterheadUrls.first} restUrl={letterheadUrls.rest} pageCount={pageCount} page={page} dark={pageDark} />}
+                          <DocWatermarkOverlay dataUrl={watermarkUrl} pageCount={pageCount} page={page} skipFirstPage={watermark.skipFirstPage} dark={pageDark} />
+                          <DocPageChromeOverlay
+                            chrome={pageChrome}
+                            pageCount={pageCount}
+                            page={page}
+                            margins={margins}
+                            title={store.title}
+                            date={todayLabel()}
+                            dark={pageDark}
+                            onEdit={(band) => setChromeEditor({ focus: band })}
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                  <tfoot aria-hidden>
+                    <tr>
+                      <td>
+                        <div className="doc-print-spacer" style={{ height: `${margins.bottom}in` }} />
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+                </div>
+              )}
+
+              {/* Infinite animated beam loader with graceful dissolve on finish */}
+              {showDocLoader && (
+                <div
+                  className={`absolute inset-0 z-30 flex items-center justify-center bg-[#f8f9fa] dark:bg-[#111214] transition-all duration-300 ease-out ${
+                    isLoaderFading ? "opacity-0 scale-[1.02] pointer-events-none" : "opacity-100 scale-100"
+                  }`}
+                >
+                  <BrandLoader
+                    variant="contained"
+                    size="md"
+                    message="Loading document"
+                    isFading={isLoaderFading}
+                  />
+                </div>
+              )}
+            </>
           )}
         </div>
         {showRuler && (
@@ -1367,12 +1551,26 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           <DocHelpPanel
             isJournal={layout.columns === 2 && !!layout.body}
             onApplyJournal={() => applyPaperStyle("journal")}
-            onOpenStyle={() => setShowStyle(true)}
+            onOpenStyle={() => {
+              setShowHelp(false);
+              setShowStyle(true);
+            }}
             onClose={() => setShowHelp(false)}
           />
         )}
         {editor && showReferences && bib.store && (
           <DocReferencesSidebar editor={editor} store={bib.store} entries={bib.entries} style={bib.style} onClose={() => setShowReferences(false)} />
+        )}
+        {showStyle && store.ydoc && bib.store && (
+          <DocStyleDialog
+            ydoc={store.ydoc}
+            layout={layout}
+            bib={bib.store}
+            citationStyle={bib.style}
+            docFonts={docFonts}
+            onMargins={(m) => void store.setPageSetup({ margins: m })}
+            onClose={() => setShowStyle(false)}
+          />
         )}
       </div>
 
@@ -1384,18 +1582,6 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
             <DocCrossRefPicker editor={editor} mode={picker.mode} onClose={closePicker} />
           )}
         </FloatingPanel>
-      )}
-
-      {showStyle && store.ydoc && bib.store && (
-        <DocStyleDialog
-          ydoc={store.ydoc}
-          layout={layout}
-          bib={bib.store}
-          citationStyle={bib.style}
-          docFonts={docFonts}
-          onMargins={(m) => void store.setPageSetup({ margins: m })}
-          onClose={() => setShowStyle(false)}
-        />
       )}
 
       {signing === "studio" && <DocSignatureStudio onPlace={(sig) => void handleSignaturePlace(sig)} onClose={() => setSigning(null)} />}

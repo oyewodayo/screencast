@@ -7,8 +7,24 @@
 // button has - a fresh whiteboard has nothing analogous to pick (no background/size presets yet).
 import React, { useCallback, useEffect, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { IoAdd, IoCopyOutline, IoEllipsisVertical, IoGitNetworkOutline, IoSearchOutline, IoTrashOutline, IoInformationCircleOutline } from "react-icons/io5";
-import { createEmptyWhiteboardDocument, WhiteboardSummary } from "../../utils/whiteboardTypes";
+import {
+  IoAdd,
+  IoCopyOutline,
+  IoEllipsisVertical,
+  IoGitNetworkOutline,
+  IoMapOutline,
+  IoSearchOutline,
+  IoTrashOutline,
+  IoInformationCircleOutline,
+} from "react-icons/io5";
+import { WhiteboardSummary } from "../../utils/whiteboardTypes";
+import type { MindmapSummary } from "../../utils/mindmapTypes";
+import {
+  createWhiteboardFromTemplate,
+  WHITEBOARD_TEMPLATES,
+  WhiteboardTemplateId,
+} from "../../utils/whiteboardTemplates";
+import { migratedWhiteboardIdForMindmap, openOrMigrateLegacyMindmap } from "../../utils/mindmapMigration";
 import FileInfoModal from "../Modals/FileInfoModal";
 
 interface WhiteboardHomeProps {
@@ -23,6 +39,8 @@ function formatUpdatedAt(iso: string): string {
 
 const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => {
   const [whiteboards, setWhiteboards] = useState<WhiteboardSummary[] | null>(null);
+  const [legacyMindmaps, setLegacyMindmaps] = useState<MindmapSummary[]>([]);
+  const [migratingMindmapId, setMigratingMindmapId] = useState<string | null>(null);
   // Item whose Info panel (FileInfoModal) is open.
   const [infoItem, setInfoItem] = useState<{ id: string; name: string } | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -38,7 +56,13 @@ const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => 
 
   const refresh = useCallback(() => {
     invoke<WhiteboardSummary[]>("list_whiteboards")
-      .then(setWhiteboards)
+      .then((list) => {
+        setWhiteboards(list);
+        const migratedIds = new Set(list.map((w) => w.id));
+        invoke<MindmapSummary[]>("list_mindmaps")
+          .then((mms) => setLegacyMindmaps(mms.filter((m) => !migratedIds.has(migratedWhiteboardIdForMindmap(m.id)))))
+          .catch(() => setLegacyMindmaps([]));
+      })
       .catch((err) => {
         console.error("Failed to list whiteboards:", err);
         setError(err instanceof Error ? err.message : String(err));
@@ -63,22 +87,44 @@ const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => 
     return () => document.removeEventListener("click", handleClickOutside);
   }, [openMenuId]);
 
-  const handleCreate = useCallback(async () => {
-    setIsCreating(true);
-    setError(null);
-    try {
-      const id = crypto.randomUUID();
-      const existingCount = whiteboards?.length ?? 0;
-      const doc = createEmptyWhiteboardDocument(id, `Whiteboard ${existingCount + 1}`);
-      await invoke("create_whiteboard", { id, name: doc.name, json: JSON.stringify(doc) });
-      onOpenWhiteboard(id);
-    } catch (err) {
-      console.error("Failed to create whiteboard:", err);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsCreating(false);
-    }
-  }, [whiteboards, onOpenWhiteboard]);
+  const handleCreate = useCallback(
+    async (template: WhiteboardTemplateId = "blank") => {
+      setIsCreating(true);
+      setError(null);
+      try {
+        const id = crypto.randomUUID();
+        const existingCount = whiteboards?.length ?? 0;
+        const meta = WHITEBOARD_TEMPLATES.find((t) => t.id === template);
+        const title = template === "blank" ? `Whiteboard ${existingCount + 1}` : `${meta?.name ?? "Whiteboard"} ${existingCount + 1}`;
+        const doc = createWhiteboardFromTemplate(id, title, template);
+        await invoke("create_whiteboard", { id, name: doc.name, json: JSON.stringify(doc) });
+        onOpenWhiteboard(id);
+      } catch (err) {
+        console.error("Failed to create whiteboard:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsCreating(false);
+      }
+    },
+    [whiteboards, onOpenWhiteboard]
+  );
+
+  const handleOpenLegacyMindmap = useCallback(
+    async (mindmap: MindmapSummary) => {
+      setMigratingMindmapId(mindmap.id);
+      setError(null);
+      try {
+        const wbId = await openOrMigrateLegacyMindmap(mindmap.id);
+        onOpenWhiteboard(wbId);
+      } catch (err) {
+        console.error("Failed to import legacy mindmap:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setMigratingMindmapId(null);
+      }
+    },
+    [onOpenWhiteboard]
+  );
 
   const handleDeleteWhiteboard = useCallback(async (id: string): Promise<void> => {
     try {
@@ -129,21 +175,81 @@ const WhiteboardHome: React.FC<WhiteboardHomeProps> = ({ onOpenWhiteboard }) => 
           <IoGitNetworkOutline size={28} />
         </div>
         <div>
-          <p className="text-gray-700 dark:text-neutral-200 font-medium">Whiteboards</p>
+          <p className="text-gray-700 dark:text-neutral-200 font-medium">Whiteboards & Mind Maps</p>
           <p className="text-gray-500 dark:text-neutral-400 text-sm mt-1">
-            Sketch flowcharts and diagrams with shapes and connectors, on an infinite canvas.
+            Sketch flowcharts, diagrams, mind maps, and learning roadmaps on one infinite canvas.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => void handleCreate()}
-          disabled={isCreating}
-          className="mt-1 flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
-        >
-          <IoAdd size={16} /> {isCreating ? "Creating…" : "New whiteboard"}
-        </button>
+        <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleCreate("blank")}
+            disabled={isCreating}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+          >
+            <IoAdd size={16} /> {isCreating ? "Creating…" : "New whiteboard"}
+          </button>
+        </div>
         {error && <p className="text-red-500 dark:text-red-400 text-xs">{error}</p>}
       </div>
+
+      {/* Starter Templates Gallery */}
+      <div className="relative w-full max-w-3xl">
+        <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">Start from a template</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+          {WHITEBOARD_TEMPLATES.filter((t) => t.id !== "blank").map((tpl) => (
+            <button
+              key={tpl.id}
+              type="button"
+              disabled={isCreating}
+              onClick={() => void handleCreate(tpl.id)}
+              className="group flex flex-col items-start gap-1 p-3 rounded-lg bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500 text-left transition-colors disabled:opacity-50"
+            >
+              <div className="w-full flex items-center justify-between gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: tpl.accent }} />
+                {tpl.badge && (
+                  <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-gray-100 dark:bg-neutral-800 text-gray-500 dark:text-neutral-400">
+                    {tpl.badge}
+                  </span>
+                )}
+              </div>
+              <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 mt-0.5">
+                {tpl.name}
+              </span>
+              <span className="text-[11px] leading-snug text-gray-500 dark:text-neutral-400 line-clamp-2">
+                {tpl.tagline}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {legacyMindmaps.length > 0 && (
+        <div className="relative w-full max-w-3xl">
+          <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-neutral-500 mb-2 text-center">
+            Previous mind maps (click to open in Whiteboard)
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+            {legacyMindmaps.map((mm) => (
+              <button
+                key={mm.id}
+                type="button"
+                disabled={migratingMindmapId === mm.id}
+                onClick={() => void handleOpenLegacyMindmap(mm)}
+                className="flex items-center gap-2 px-3 py-2.5 rounded-md bg-white dark:bg-neutral-900 border border-dashed border-teal-300 dark:border-teal-700/70 hover:border-teal-500 text-left transition-colors disabled:opacity-50"
+              >
+                <IoMapOutline size={16} className="text-teal-500 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-medium text-neutral-700 dark:text-neutral-200 truncate">
+                    {migratingMindmapId === mm.id ? "Importing…" : mm.name || "Untitled mind map"}
+                  </p>
+                  <p className="text-[11px] text-gray-400 dark:text-neutral-500">{formatUpdatedAt(mm.updated_at)}</p>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {whiteboards && whiteboards.length > 0 && (
         <div className="relative w-full max-w-3xl">

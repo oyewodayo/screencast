@@ -28,6 +28,26 @@ const DEBOUNCE_MS: u64 = 600;
 #[derive(Default)]
 pub struct FileWatcherState(pub Mutex<Option<Debouncer<RecommendedWatcher>>>);
 
+fn is_internal_file(path: &Path) -> bool {
+    let lossy = path.to_string_lossy();
+    if lossy.ends_with(".progress.log") || lossy.ends_with(".tmp") {
+        return true;
+    }
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with('.')
+            || name == "Boards"
+            || name == "Whiteboards"
+            || name == "Mindmaps"
+            || name == "Docs"
+            || name == "Projects"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // Starts (or restarts) watching `dir` for this app session. Failures are only logged, never
 // surfaced to the user — real-time refresh is a nice-to-have layered on top of the sidebar's
 // existing on-mount scan and manual refresh button, never something the rest of the app should
@@ -37,9 +57,9 @@ pub fn start_watching(app_handle: &AppHandle, dir: &Path) {
     let result = new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         move |res: DebounceEventResult| match res {
-            // Capture bookkeeping (a stray progress log) changes constantly and never alters what
-            // the sidebar shows - not worth a library rescan.
-            Ok(events) if events.iter().any(|e| !e.path.to_string_lossy().ends_with(".progress.log")) => {
+            // Exclude internal project storage, temporary files, and progress logs from triggering
+            // sidebar rescans — only real user library changes should cause a refresh.
+            Ok(events) if events.iter().any(|e| !is_internal_file(&e.path)) => {
                 if let Err(e) = emit_handle.emit("refresh-file-list", ()) {
                     log::warn!("Failed to emit refresh-file-list from file watcher: {}", e);
                 }

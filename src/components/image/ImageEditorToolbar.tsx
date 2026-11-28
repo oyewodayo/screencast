@@ -43,6 +43,7 @@ import {
   TbFlipVertical,
   TbRotate,
   TbRotateClockwise,
+  TbScissors,
 } from "react-icons/tb";
 import { MdBlurOn, MdFormatBold, MdFormatColorFill, MdLooksOne } from "react-icons/md";
 import { ImageAdjustments, ImageEditTool, NEUTRAL_ADJUSTMENTS } from "../../utils/imageEditTypes";
@@ -299,6 +300,9 @@ interface ImageEditorToolbarProps {
   onBringForward: () => void;
   onSendBackward: () => void;
   onClose: () => void;
+  onRemoveBackground?: () => void;
+  isRemovingBackground?: boolean;
+  onRemovePlacedImageBackground?: () => void;
 }
 
 // overscroll-contain keeps scroll momentum from chaining into the canvas pane (or the window
@@ -386,6 +390,9 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
   onBringForward,
   onSendBackward,
   onClose,
+  onRemoveBackground,
+  isRemovingBackground,
+  onRemovePlacedImageBackground,
 }) => {
   if (tool === "crop") {
     // A focused, minimal panel while cropping - the full tool palette (shapes/adjustments/etc.)
@@ -458,6 +465,26 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
               <TbFlipVertical size={17} />
             </IconButton>
           </div>
+          {onRemoveBackground && (
+            <button
+              type="button"
+              title="Remove background - cuts people out of the photo using AI"
+              disabled={isRemovingBackground}
+              onClick={onRemoveBackground}
+              className="mt-1 self-start flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 hover:bg-blue-100 dark:hover:bg-blue-500/20 disabled:opacity-50 disabled:pointer-events-none transition-colors duration-150"
+            >
+              {isRemovingBackground ? (
+                <>
+                  <span className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Removing background...
+                </>
+              ) : (
+                <>
+                  <TbScissors size={15} /> Remove background
+                </>
+              )}
+            </button>
+          )}
         </Section>
 
         {/* Inserting an image isn't a persistent tool the way pen/arrow/etc. are - it's a one-shot
@@ -697,15 +724,38 @@ const ImageEditorToolbar: React.FC<ImageEditorToolbarProps> = ({
                   />
                 </label>
               </div>
-              <button
-                type="button"
-                title="Crop this image - cuts it down to a chosen region, independent of the main board's own Crop tool"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={onCropImageClick}
-                className="self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150"
-              >
-                <IoCropOutline size={14} /> Crop image
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  title="Crop this image - cuts it down to a chosen region, independent of the main board's own Crop tool"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={onCropImageClick}
+                  className="self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors duration-150"
+                >
+                  <IoCropOutline size={14} /> Crop image
+                </button>
+                {onRemovePlacedImageBackground && (
+                  <button
+                    type="button"
+                    title="Remove background - cuts people out of this placed image"
+                    disabled={isRemovingBackground}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={onRemovePlacedImageBackground}
+                    className="self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] disabled:opacity-50 disabled:pointer-events-none transition-colors duration-150"
+                  >
+                    {isRemovingBackground ? (
+                      <>
+                        <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                        Cutting...
+                      </>
+                    ) : (
+                      <>
+                        <TbScissors size={14} /> Remove bg
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
               <label className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                 <span className="w-12 shrink-0 flex items-center gap-1">
                   <TbBorderRadius size={14} /> Corners

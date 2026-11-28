@@ -23,7 +23,13 @@
 // VideoEditorScreen for the two states that model that.
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import {
+  VideoHoverPlayer,
+  cancelVideoPreview,
+  scheduleVideoPreview,
+  stopAllVideoPreviews,
+  useIsVideoPreviewActive,
+} from "./VideoHoverPreview";
 import {
   IoArrowForward,
   IoClose,
@@ -68,6 +74,8 @@ interface VideoEditorHomeProps {
   resolveThumbnailUrl: (file: { name: string; path: string }, bypassCache?: boolean) => Promise<string>;
   // Opens a video in the editor - set up for `intent` when it came from a starter.
   onOpenVideo: (file: VideoEditorFile, intent?: EditorIntent) => void;
+  // Opens a video in clean Watch mode (no editor timeline/chrome) when the user just wants to play it.
+  onWatchVideo?: (file: VideoEditorFile) => void;
   // Opens the OS file picker filtered to video extensions and edits whatever comes back, from
   // anywhere on disk - the reason this screen exists as a standalone tool rather than only being
   // reachable from a file that's already open in the library.
@@ -89,8 +97,6 @@ interface VideoEditorHomeProps {
 // Below this many videos the search box is more clutter than help - same threshold reasoning as
 // WhiteboardHome's own search box.
 const SEARCH_VISIBLE_THRESHOLD = 6;
-// How long the pointer rests on a tile before it starts moving.
-const HOVER_PREVIEW_DELAY_MS = 350;
 
 type Filter = "all" | "edited" | "vertical" | "exports" | "projects";
 type Sort = "recent" | "name" | "length" | "size";
@@ -132,19 +138,19 @@ interface TileProps {
   thumbUrl: string | undefined;
   probe: VideoProbe | undefined;
   edit: EditSummary | null | undefined;
-  previewing: boolean;
   picking: boolean;
   // Its exports, newest first - shown on it rather than as tiles of their own.
   exports: VideoEditorFile[] | undefined;
   onOpen: (video: VideoEditorFile) => void;
+  onWatch?: (video: VideoEditorFile) => void;
   onVisible: (path: string) => void;
-  onHover: (path: string | null) => void;
   onSendToPhone: (video: VideoEditorFile) => void;
 }
 
 // Memoized so a thumbnail or a probe arriving re-renders its own tile, not the whole grid.
-const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previewing, picking, exports, onOpen, onVisible, onHover, onSendToPhone }: TileProps) {
+const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, picking, exports, onOpen, onWatch, onVisible, onSendToPhone }: TileProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const previewing = useIsVideoPreviewActive("editor-home", video.path);
   // Asks for its poster, length and edit only once it scrolls into view.
   useEffect(() => {
     const el = ref.current;
@@ -163,10 +169,21 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
       ref={ref}
       role="button"
       tabIndex={0}
-      onClick={() => onOpen(video)}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onOpen(video))}
-      onPointerEnter={() => onHover(video.path)}
-      onPointerLeave={() => onHover(null)}
+      onClick={() => {
+        cancelVideoPreview("editor-home", video.path);
+        onOpen(video);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          cancelVideoPreview("editor-home", video.path);
+          onOpen(video);
+        }
+      }}
+      onPointerEnter={() => scheduleVideoPreview("editor-home", video.path, video.size)}
+      onPointerLeave={() => cancelVideoPreview("editor-home", video.path)}
+      onFocus={() => scheduleVideoPreview("editor-home", video.path, video.size)}
+      onBlur={() => cancelVideoPreview("editor-home", video.path)}
       title={picking ? `Use ${video.name}` : `Edit ${video.name}`}
       className={`group text-left rounded-xl overflow-hidden bg-white dark:bg-neutral-900 border shadow-sm hover:shadow-md transition-all outline-none cursor-pointer focus-visible:ring-2 focus-visible:ring-blue-500 ${
         picking ? "border-blue-300 dark:border-blue-500/50 hover:border-blue-500 hover:-translate-y-0.5" : "border-gray-200 dark:border-neutral-800 hover:border-blue-400 dark:hover:border-blue-500"
@@ -174,9 +191,55 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
     >
       <div className="relative aspect-video bg-neutral-100 dark:bg-neutral-950 overflow-hidden">
         {thumbUrl ? <Poster url={thumbUrl} vertical={isVertical(probe)} /> : <span className="absolute inset-0 flex items-center justify-center"><IoFilmOutline size={28} className="text-neutral-300 dark:text-neutral-700" /></span>}
-        {previewing && <HoverPreview path={video.path} start={probe?.duration ? probe.duration * 0.15 : 0} vertical={isVertical(probe)} />}
-        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/10 transition-colors pointer-events-none">
-          {!previewing && <IoPlay size={26} className="text-white opacity-0 group-hover:opacity-90 transition-opacity drop-shadow" />}
+        {previewing && (
+          <VideoHoverPlayer
+            path={video.path}
+            start={probe?.duration ? probe.duration * 0.15 : undefined}
+            fit={isVertical(probe) ? "contain" : "cover"}
+            backdropClassName={isVertical(probe) ? "bg-black/40" : ""}
+            onFailed={() => cancelVideoPreview("editor-home", video.path)}
+          />
+        )}
+        <div className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/20 transition-colors pointer-events-none">
+          {!previewing && (
+            picking ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/75 text-white text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity shadow">
+                <IoCutOutline size={13} />
+                Use video
+              </span>
+            ) : (
+              <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-auto">
+                {onWatch && !project && (
+                  <button
+                    type="button"
+                    title="Play in Watch mode"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      cancelVideoPreview("editor-home", video.path);
+                      onWatch(video);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/95 text-neutral-900 hover:bg-white text-xs font-semibold shadow-md transition-colors"
+                  >
+                    <IoPlay size={12} className="text-red-600" />
+                    Play
+                  </button>
+                )}
+                <button
+                  type="button"
+                  title="Open in Video Editor"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    cancelVideoPreview("editor-home", video.path);
+                    onOpen(video);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/75 text-white hover:bg-blue-600 text-xs font-medium shadow-md transition-colors"
+                >
+                  <IoCutOutline size={12} />
+                  {edit ? "Resume" : "Edit"}
+                </button>
+              </div>
+            )
+          )}
         </div>
         <div className="absolute left-2 top-2 flex gap-1 pointer-events-none">
           {edit && <span className="px-1.5 py-0.5 rounded bg-blue-600/90 text-white text-[10px] font-medium">Edited</span>}
@@ -184,24 +247,75 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
           {edit?.canvasLabel && edit.canvasAspect && <span className="px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-medium">{edit.canvasAspect < 1 ? "Vertical" : edit.canvasLabel}</span>}
         </div>
         {duration && <span className="absolute right-2 bottom-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-medium tabular-nums pointer-events-none">{formatMediaDuration(duration)}</span>}
-        {!picking && (!project || !!exports?.length) && (
-          <button
-            type="button"
-            // What gets shared is the finished video, when there is one.
-            title={exports?.length ? `Send the latest export (${exportLabel(exports[0].path)}) to your phone` : "Send to your phone"}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSendToPhone(exports?.[0] ?? video);
-            }}
-            className="absolute right-2 top-2 p-1.5 rounded-full bg-black/55 text-white opacity-0 group-hover:opacity-100 hover:bg-black/75 transition-opacity"
-          >
-            <IoPhonePortraitOutline size={14} />
-          </button>
+        {!picking && (
+          <div className="absolute right-2 top-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {onWatch && !project && previewing && (
+              <button
+                type="button"
+                title="Play in Watch mode"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelVideoPreview("editor-home", video.path);
+                  onWatch(video);
+                }}
+                className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/90 text-neutral-900 text-[10.5px] font-semibold hover:bg-white transition-colors shadow"
+              >
+                <IoPlay size={11} className="text-red-600" />
+                Play
+              </button>
+            )}
+            {(!project || !!exports?.length) && (
+              <button
+                type="button"
+                // What gets shared is the finished video, when there is one.
+                title={exports?.length ? `Send the latest export (${exportLabel(exports[0].path)}) to your phone` : "Send to your phone"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSendToPhone(exports?.[0] ?? video);
+                }}
+                className="p-1.5 rounded-full bg-black/65 text-white hover:bg-black/85 transition-colors"
+              >
+                <IoPhonePortraitOutline size={14} />
+              </button>
+            )}
+          </div>
         )}
       </div>
       <div className="px-3 py-2.5">
         <p className="text-sm font-medium leading-snug text-gray-800 dark:text-neutral-100 line-clamp-2 break-words">{video.name}</p>
         <p className="mt-0.5 text-xs text-neutral-400 dark:text-neutral-500 truncate">{meta}</p>
+        {!picking && (
+          <div className="mt-2.5 flex items-center gap-1.5">
+            {onWatch && !project && (
+              <button
+                type="button"
+                title={`Play ${video.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelVideoPreview("editor-home", video.path);
+                  onWatch(video);
+                }}
+                className="group/play flex-1 h-7 inline-flex items-center justify-center gap-1 rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50/70 dark:bg-neutral-800/70 text-xs font-medium text-gray-700 dark:text-neutral-200 hover:bg-red-600 hover:text-white hover:border-red-600 dark:hover:bg-red-600 dark:hover:text-white dark:hover:border-red-600 transition-colors"
+              >
+                <IoPlay size={12} className="text-red-600 dark:text-red-500 group-hover/play:text-white transition-colors" />
+                Play
+              </button>
+            )}
+            <button
+              type="button"
+              title={`Edit ${video.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                cancelVideoPreview("editor-home", video.path);
+                onOpen(video);
+              }}
+              className="flex-1 h-7 inline-flex items-center justify-center gap-1 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-600 hover:text-white dark:hover:bg-blue-500 dark:hover:text-white text-xs font-medium transition-colors"
+            >
+              <IoCutOutline size={12} />
+              {edit ? "Resume" : "Edit"}
+            </button>
+          </div>
+        )}
         {!!exports?.length && (
           <div className="mt-2 flex flex-wrap items-center gap-1">
             <span className="text-[10px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500 mr-0.5">Exports</span>
@@ -227,26 +341,6 @@ const VideoTile = memo(function VideoTile({ video, thumbUrl, probe, edit, previe
     </div>
   );
 });
-
-// The tile's video moving under the pointer - one at a time (the webview has few decoders to
-// spare), muted, from a little way in.
-const HoverPreview: React.FC<{ path: string; start: number; vertical: boolean }> = ({ path, start, vertical }) => {
-  const [shown, setShown] = useState(false);
-  return (
-    <video
-      src={convertFileSrc(path)}
-      muted
-      autoPlay
-      loop
-      playsInline
-      onLoadedMetadata={(e) => {
-        if (start > 0) e.currentTarget.currentTime = start;
-      }}
-      onPlaying={() => setShown(true)}
-      className={`absolute inset-0 w-full h-full ${vertical ? "object-contain bg-black/40" : "object-cover"} transition-opacity duration-300 ${shown ? "opacity-100" : "opacity-0"}`}
-    />
-  );
-};
 
 // ---- Starters -------------------------------------------------------------------------------
 
@@ -302,8 +396,9 @@ const ContinueCard: React.FC<{
   edit: EditSummary;
   latestExport: VideoEditorFile | undefined;
   onResume: () => void;
+  onWatch?: () => void;
   onSendToPhone: (file: VideoEditorFile) => void;
-}> = ({ video, thumbUrl, probe, edit, latestExport, onResume, onSendToPhone }) => {
+}> = ({ video, thumbUrl, probe, edit, latestExport, onResume, onWatch, onSendToPhone }) => {
   const vertical = (edit.canvasAspect ?? 1) < 1;
   const parts = describeEdit(edit);
   const trimmed = edit.sourceDuration > 0 && edit.outputDuration > 0 && Math.abs(edit.sourceDuration - edit.outputDuration) > 0.5;
@@ -357,6 +452,17 @@ const ContinueCard: React.FC<{
             Resume editing
             <IoArrowForward size={15} />
           </button>
+          {onWatch && (
+            <button
+              type="button"
+              onClick={onWatch}
+              title={`Play ${video.name} in Watch mode`}
+              className="group/play flex items-center gap-2 px-3.5 py-2 rounded-lg border border-gray-200 dark:border-neutral-700 bg-gray-50/70 dark:bg-neutral-800/70 text-sm font-medium text-gray-800 dark:text-neutral-100 hover:border-red-600 hover:bg-red-600 hover:text-white dark:hover:border-red-600 dark:hover:bg-red-600 dark:hover:text-white active:scale-[0.98] transition-all outline-none"
+            >
+              <IoPlay size={14} className="text-red-600 dark:text-red-500 group-hover/play:text-white transition-colors" />
+              Play
+            </button>
+          )}
           {latestExport && (
             <button
               type="button"
@@ -376,7 +482,7 @@ const ContinueCard: React.FC<{
 
 // ---- The screen -------------------------------------------------------------------------------
 
-const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, resolveThumbnailUrl, onOpenVideo, onOpenExternalVideo, onCreateVideo, onSendToPhone, externalDrag = false, droppedPaths = null, onTidyUp }) => {
+const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, resolveThumbnailUrl, onOpenVideo, onWatchVideo, onOpenExternalVideo, onCreateVideo, onSendToPhone, externalDrag = false, droppedPaths = null, onTidyUp }) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<Sort>("recent");
@@ -385,8 +491,6 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
   const [thumbUrls, putThumbUrl] = useBatchedRecord<string>();
   const [probes, putProbe] = useBatchedRecord<VideoProbe>();
   const [edits, setEdits] = useState<Record<string, EditSummary | null>>({});
-  const [hovered, setHovered] = useState<string | null>(null);
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const libraryRef = useRef<HTMLElement>(null);
 
@@ -399,6 +503,12 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
     const starter = pickingRef.current;
     setPicking(null);
     onOpenVideoRef.current(video, starter?.intent);
+  }, []);
+  const onWatchVideoRef = useRef(onWatchVideo);
+  onWatchVideoRef.current = onWatchVideo;
+  const watchVideo = useCallback((video: VideoEditorFile) => {
+    setPicking(null);
+    onWatchVideoRef.current?.(video);
   }, []);
   const onSendRef = useRef(onSendToPhone);
   onSendRef.current = onSendToPhone;
@@ -419,7 +529,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
         .then((url) => putThumbUrl(path, url))
         .catch((err) => console.error(`Failed to resolve thumbnail for ${path}:`, err));
       if (!isVideoProjectPath(path)) probeVideo(video).then((p) => putProbe(path, p)).catch(() => {});
-      readEditSummary(path)
+      readEditSummary(path, true)
         .then((s) => setEdits((prev) => ({ ...prev, [path]: s })))
         .catch(() => setEdits((prev) => ({ ...prev, [path]: null })));
     },
@@ -509,15 +619,8 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [droppedPaths]);
 
-  // A tile moves once the pointer has rested on it a moment.
-  useEffect(() => {
-    if (!hovered) {
-      setPreviewPath(null);
-      return;
-    }
-    const timer = window.setTimeout(() => setPreviewPath(hovered), HOVER_PREVIEW_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, [hovered]);
+  // Release any active preview when leaving the Video Editor home screen.
+  useEffect(() => () => stopAllVideoPreviews(), []);
 
   // VideoPlayer's "set current frame as thumbnail" rewrites the cached jpg at the same path -
   // bypassCache=true is what gets the new bytes.
@@ -574,12 +677,11 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
       thumbUrl={thumbUrls[video.path]}
       probe={probes[video.path]}
       edit={edits[video.path]}
-      previewing={previewPath === video.path}
       picking={!!picking}
       exports={filter === "exports" || isExportName(video.path) ? undefined : exportsByBase.get(exportBase(video.path))}
       onOpen={openVideo}
+      onWatch={onWatchVideo ? watchVideo : undefined}
       onVisible={loadMeta}
-      onHover={setHovered}
       onSendToPhone={sendToPhone}
     />
   );
@@ -621,6 +723,7 @@ const VideoEditorHome: React.FC<VideoEditorHomeProps> = ({ videos, recentPaths, 
             edit={continueEdit}
             latestExport={exportsByBase.get(exportBase(continueVideo.path))?.[0] ?? exportsOf(continueVideo.path, videos)[0]}
             onResume={() => openVideo(continueVideo)}
+            onWatch={onWatchVideo && !isVideoProjectPath(continueVideo.path) ? () => watchVideo(continueVideo) : undefined}
             onSendToPhone={sendToPhone}
           />
         )}

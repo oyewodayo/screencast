@@ -13,6 +13,14 @@
 // doc comment for why undo is per-page rather than a single global stack).
 
 import { ColormapName, colormapPalette, DEFAULT_COLORMAP } from "./colormaps";
+import type { StickerIcon } from "./stickerIcons";
+import type {
+  MindmapCheckStyle,
+  MindmapColorKey,
+  MindmapListItem,
+  MindmapProgress,
+  MindmapResource,
+} from "./mindmapTypes";
 
 export type WhiteboardShapeType =
   | "rectangle"
@@ -160,7 +168,40 @@ export type WhiteboardShapeType =
   // (imageCrop*) - see each field's own doc comment.
   | "image"
   | "text"
-  | "freehand";
+  | "freehand"
+  // True containment frame / slide container: moving it moves all nodes whose centers sit inside it.
+  | "artboard"
+  // Native Mind Map & Learning Roadmap node types merged into Whiteboard.
+  | "mindmapTopic"
+  | "mindmapSubtopic"
+  | "mindmapChecklist"
+  | "mindmapLinksGroup"
+  | "icon"
+  | "folder";
+
+export const MINDMAP_TOPIC_SHAPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
+  "mindmapTopic",
+  "mindmapSubtopic",
+]);
+
+export const MINDMAP_SHAPE_TYPES: ReadonlySet<WhiteboardShapeType> = new Set<WhiteboardShapeType>([
+  "mindmapTopic",
+  "mindmapSubtopic",
+  "mindmapChecklist",
+  "mindmapLinksGroup",
+]);
+
+export function isMindmapNode(node: Pick<WhiteboardNode, "shapeType">): boolean {
+  return MINDMAP_SHAPE_TYPES.has(node.shapeType);
+}
+
+export function isMindmapTopicNode(node: Pick<WhiteboardNode, "shapeType">): boolean {
+  return MINDMAP_TOPIC_SHAPES.has(node.shapeType);
+}
+
+export function isArtboardNode(node: Pick<WhiteboardNode, "shapeType">): boolean {
+  return node.shapeType === "artboard";
+}
 
 // Shapes that render as an open/line-style glyph with no interior region to speak of (a circuit
 // symbol, a coordinate-axes cross) - same treatment as freehand/text: default fillColor is null,
@@ -228,6 +269,45 @@ export type AxisPlacement = "origin" | "edge" | "box" | "none";
 
 export type WhiteboardFillType ="solid" | "linear" | "radial" | "image";
 export type WhiteboardFillPattern = "none" | "grid" | "dots" | "lines" | "diagonal";
+export type WhiteboardCanvasTheme = "light" | "paper" | "blueprint" | "dark";
+export type WhiteboardGridStyle = "dots" | "lines" | "none";
+
+export type WhiteboardBlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "color-dodge"
+  | "color-burn"
+  | "hard-light"
+  | "soft-light"
+  | "difference"
+  | "exclusion"
+  | "hue"
+  | "saturation"
+  | "color"
+  | "luminosity";
+
+export const WHITEBOARD_BLEND_MODES: { value: WhiteboardBlendMode; label: string }[] = [
+  { value: "normal", label: "Normal" },
+  { value: "multiply", label: "Multiply" },
+  { value: "screen", label: "Screen" },
+  { value: "overlay", label: "Overlay" },
+  { value: "darken", label: "Darken" },
+  { value: "lighten", label: "Lighten" },
+  { value: "color-dodge", label: "Color Dodge" },
+  { value: "color-burn", label: "Color Burn" },
+  { value: "hard-light", label: "Hard Light" },
+  { value: "soft-light", label: "Soft Light" },
+  { value: "difference", label: "Difference" },
+  { value: "exclusion", label: "Exclusion" },
+  { value: "hue", label: "Hue" },
+  { value: "saturation", label: "Saturation" },
+  { value: "color", label: "Color" },
+  { value: "luminosity", label: "Luminosity" },
+];
 
 export interface WhiteboardGradientStop {
   offset: number; // 0-1
@@ -585,6 +665,8 @@ export function resolveSeriesData(node: SeriesSource): ResolvedSeries {
 
 interface WhiteboardItemBase {
   id: string;
+  // Vector icon identifier from `utils/stickerIcons.ts` when `shapeType === "icon"`.
+  iconName?: StickerIcon;
   createdAt: number;
   updatedAt: number;
   // Explicit layer rank across both nodes and edges on a page (higher = further in front). Absent -
@@ -1125,6 +1207,8 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   textDecoration: "none" | "underline";
   textAlign: "left" | "center" | "right";
   verticalAlign: "top" | "middle" | "bottom";
+  // CSS mix-blend-mode / Canvas2D globalCompositeOperation ("normal" / absent = standard source-over).
+  blendMode?: WhiteboardBlendMode;
   // "freehand" only - the stroke's points, each a fraction (0-1) of this node's own width/height
   // rather than an absolute document-space coordinate. That's what lets a freehand node reuse
   // every other node kind's move/resize machinery for free: dragging the node just changes x/y
@@ -1138,6 +1222,25 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   // same points, just with a marker on one end. Absent/"none" on a plain ink stroke.
   startArrowType?: ArrowheadType;
   endArrowType?: ArrowheadType;
+  // "freehand" only - renders as a wide translucent highlighter stroke with multiply blending.
+  freehandHighlighter?: boolean;
+  // ---- Mind Map / Learning Roadmap semantic fields ----------------------------------------------
+  // Optional coherent palette key ("A".."H") matching MINDMAP_PALETTE.
+  mindmapColorKey?: MindmapColorKey;
+  // Collapses all descendant branches reachable from this node via outgoing edges.
+  mindmapCollapsed?: boolean;
+  // Long-form topic description shown in the Topic Details drawer & Study Mode.
+  mindmapDescription?: string;
+  // Learner progress state ("pending" | "in-progress" | "done" | "skipped").
+  mindmapProgress?: MindmapProgress;
+  // Whether to display the top-right emerald checkmark badge when mindmapProgress === "done" (defaults to true).
+  mindmapShowDoneBadge?: boolean;
+  // Curated resource links attached to a topic/subtopic.
+  mindmapResources?: MindmapResource[];
+  // Inline items for "mindmapChecklist" and "mindmapLinksGroup" cards.
+  mindmapItems?: MindmapListItem[];
+  mindmapCheckStyle?: MindmapCheckStyle;
+  mindmapCheckColor?: string;
 }
 
 // Which side of a node an edge attaches to - "auto" (the default for a new connection) means
@@ -1295,15 +1398,10 @@ export interface WhiteboardDocument {
   id: string;
   name: string;
   showGrid: boolean;
-  // Whether dragging/resizing a node, or dragging a free-floating connector endpoint/waypoint,
-  // snaps to the same GRID_SIZE lattice showGrid's dots mark (see WhiteboardCanvas.tsx's
-  // snapCoord/isSnapEnabled) - independent of showGrid itself, same "visibility vs. behavior are
-  // two separate switches" convention draw.io's own Grid/Snap-to-Grid menu items use, so a user can
-  // snap without the visual dots (a cleaner-looking export) or show the dots without snapping
-  // (free-form sketching with just a visual reference). Absent on a document predating this field -
-  // resolves to true (see useWhiteboardStore.ts's migrateDocument), matching showGrid's own
-  // "on by default" treatment.
   snapToGrid: boolean;
+  // Visual studio canvas background mood and grid pattern (absent = "light" + "dots").
+  canvasTheme?: WhiteboardCanvasTheme;
+  gridStyle?: WhiteboardGridStyle;
   pages: WhiteboardPage[];
   // Not undo-tracked (see useWhiteboardStore.ts's setActivePage) - which page was open is a view
   // preference, not diagram content, same reasoning as showGrid.
@@ -1420,6 +1518,13 @@ const SHAPE_DEFAULT_SIZE: Record<WhiteboardShapeType, { width: number; height: n
   // one were ever created through the generic factory with no bitmap behind it (the toolbar preview
   // tile's placeholder glyph, for instance).
   image: { width: 240, height: 180 },
+  artboard: { width: 640, height: 420 },
+  mindmapTopic: { width: 180, height: 48 },
+  mindmapSubtopic: { width: 160, height: 40 },
+  mindmapChecklist: { width: 230, height: 132 },
+  mindmapLinksGroup: { width: 230, height: 118 },
+  icon: { width: 72, height: 72 },
+  folder: { width: 176, height: 136 },
 };
 
 // The longest edge a freshly imported image's box starts at, in document units. A modern camera or
@@ -1477,11 +1582,61 @@ export function createDefaultWhiteboardNode(
       | "axisYTitle"
       | "tableRows"
       | "tableCols"
+      | "mindmapColorKey"
+      | "mindmapCollapsed"
+      | "mindmapDescription"
+      | "mindmapProgress"
+      | "mindmapShowDoneBadge"
+      | "mindmapResources"
+      | "mindmapItems"
+      | "mindmapCheckStyle"
+      | "mindmapCheckColor"
+      | "iconName"
     >
   >
 ): WhiteboardNode {
   const now = Date.now();
   const size = SHAPE_DEFAULT_SIZE[shapeType];
+  const defaultFillColor =
+    shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || shapeType === "icon" || LINE_ONLY_SHAPES.has(shapeType)
+      ? null
+      : shapeType === "mindmapTopic"
+      ? "#fbe25c"
+      : shapeType === "mindmapSubtopic"
+      ? "#fcdfa5"
+      : shapeType === "artboard"
+      ? "#ffffff"
+      : shapeType === "folder"
+      ? "#3b82f6"
+      : "#ffffff";
+  const defaultStrokeColor =
+    shapeType === "freehand"
+      ? "#111111"
+      : shapeType === "mindmapTopic"
+      ? "#b59a00"
+      : shapeType === "mindmapSubtopic"
+      ? "#c9973c"
+      : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup"
+      ? "#d1d5db"
+      : shapeType === "artboard"
+      ? "#cbd5e1"
+      : shapeType === "folder"
+      ? "#1d4ed8"
+      : "#000000";
+  const defaultText =
+    shapeType === "equation"
+      ? "E = mc^2"
+      : shapeType === "artboard"
+      ? "Frame"
+      : shapeType === "mindmapTopic"
+      ? "Topic"
+      : shapeType === "mindmapSubtopic"
+      ? "Subtopic"
+      : shapeType === "mindmapChecklist"
+      ? "Checklist"
+      : shapeType === "mindmapLinksGroup"
+      ? "Resources"
+      : "";
   return {
     kind: "node",
     id,
@@ -1490,24 +1645,22 @@ export function createDefaultWhiteboardNode(
     y: y - size.height / 2,
     width: size.width,
     height: size.height,
-    // "equation" gets a real starting formula rather than blank - an empty math shape has nothing
-    // to double-click-and-discover the way an empty text label's own placeholder hint already
-    // covers, so showing something immediately is worth the (easily deleted) default text this is
-    // the one shapeType where every other one intentionally starts blank.
-    text: shapeType === "equation" ? "E = mc^2" : "",
-    // "equation" keeps the SAME null/transparent fill every other blank-starting shape gets, but
-    // (unlike them) its own body is actually rendered now (see WhiteboardCanvas.tsx's own div for
-    // "rectangle"/"equation") - a card/background/corner-radius around the formula, entirely
-    // opt-in via the style panel's Fill/Stroke/Corner radius fields.
-    fillColor: shapeType === "text" || shapeType === "equation" || shapeType === "freehand" || LINE_ONLY_SHAPES.has(shapeType) ? null : "#ffffff",
-    strokeColor: shapeType === "freehand" ? "#111111" : "#000000",
-    // 0 rather than the usual 2 - a fresh equation should still look like just the formula (no
-    // border) until the user deliberately turns Stroke width up in the style panel, not gain a
-    // visible box around it the instant it becomes possible to have one.
-    // A stacked figure draws dozens of overlapping traces - at the usual 2 they merge into a solid
-    // block, so a waterfall starts at the thin line weight a real spectral figure uses.
-    strokeWidth: shapeType === "equation" ? 0 : shapeType === "waterfallChart" ? 1.2 : 2,
-    cornerRadius: 0,
+    text: defaultText,
+    fillColor: defaultFillColor,
+    strokeColor: defaultStrokeColor,
+    strokeWidth: shapeType === "equation" || shapeType === "text" ? 0 : shapeType === "waterfallChart" ? 1.2 : shapeType === "artboard" ? 1.5 : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" ? 1.5 : 2,
+    cornerRadius:
+      shapeType === "mindmapTopic"
+        ? 8
+        : shapeType === "mindmapSubtopic" || shapeType === "text"
+        ? 6
+        : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup"
+        ? 10
+        : shapeType === "artboard"
+        ? 12
+        : shapeType === "folder"
+        ? 12
+        : 0,
     // "bondLine" reuses `sides` for its own one number (how many zigzag bonds/segments) - same
     // "no dedicated field for a shape that only needs one integer" convention "polygon" already
     // set for its own side count.
@@ -1574,23 +1727,39 @@ export function createDefaultWhiteboardNode(
         : undefined,
     tableHeaderRow: shapeType === "table" ? true : undefined,
     fontFamily: "system-ui, sans-serif",
-    // Tick numbers and axis captions on a dense multi-panel figure - 16 (every other shape's label
-    // size) overwhelms a plot this size, where the text is scaffolding around the data rather than
-    // the content itself.
-    fontSize: shapeType === "waterfallChart" ? 11 : 16,
-    fontColor: "#111111",
-    fontWeight: "normal",
+    fontSize: shapeType === "waterfallChart" ? 11 : shapeType === "mindmapSubtopic" ? 14 : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" ? 13 : shapeType === "mindmapTopic" ? 15 : 16,
+    fontColor: shapeType === "mindmapTopic" || shapeType === "mindmapSubtopic" ? "#20211f" : shapeType === "folder" ? "#ffffff" : "#111111",
+    fontWeight: shapeType === "mindmapTopic" || shapeType === "folder" ? "bold" : "normal",
     fontStyle: "normal",
     textDecoration: "none",
-    textAlign: "center",
-    // "vector" defaults its optional magnitude label ABOVE the line rather than centered on/through
-    // it - "middle" would visually collide with the arrow itself for the thin box a vector starts
-    // at (see SHAPE_DEFAULT_SIZE).
-    verticalAlign: shapeType === "vector" ? "top" : "middle",
-    // Only "vector" sets these here - "freehand" gets its own via createFreehandWhiteboardNode, and
-    // every other shapeType leaves them undefined (meaningless off a vector/freehand node).
+    textAlign: shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" || shapeType === "text" ? "left" : "center",
+    verticalAlign: shapeType === "vector" || shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" || shapeType === "text" ? "top" : "middle",
     startArrowType: shapeType === "vector" ? "none" : undefined,
     endArrowType: shapeType === "vector" ? "triangle" : undefined,
+    mindmapColorKey:
+      overrides?.mindmapColorKey ??
+      (shapeType === "mindmapTopic" ? "B" : shapeType === "mindmapSubtopic" ? "C" : shapeType === "mindmapChecklist" || shapeType === "mindmapLinksGroup" ? "A" : undefined),
+    mindmapCollapsed: overrides?.mindmapCollapsed,
+    mindmapDescription: overrides?.mindmapDescription,
+    mindmapProgress: overrides?.mindmapProgress,
+    mindmapShowDoneBadge: overrides?.mindmapShowDoneBadge,
+    mindmapResources: overrides?.mindmapResources,
+    mindmapItems:
+      overrides?.mindmapItems ??
+      (shapeType === "mindmapChecklist"
+        ? [
+            { id: `${id}-i1`, text: "First milestone", checked: false },
+            { id: `${id}-i2`, text: "Second milestone", checked: false },
+          ]
+        : shapeType === "mindmapLinksGroup"
+        ? [
+            { id: `${id}-l1`, text: "Documentation", url: "" },
+            { id: `${id}-l2`, text: "Reference guide", url: "" },
+          ]
+        : undefined),
+    mindmapCheckStyle: overrides?.mindmapCheckStyle,
+    mindmapCheckColor: overrides?.mindmapCheckColor,
+    iconName: shapeType === "icon" ? overrides?.iconName ?? "star" : undefined,
     createdAt: now,
     updatedAt: now,
   };
@@ -1687,7 +1856,11 @@ const FREEHAND_MIN_SIZE = 8;
 // Builds a freehand node from a raw drag gesture's collected document-space points - computes the
 // stroke's own bounding box for the node's x/y/width/height, then re-expresses every point as a
 // 0-1 fraction of that box (see WhiteboardNode.points's own doc comment for why).
-export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number; y: number }[], style?: { color?: string; width?: number }): WhiteboardNode {
+export function createFreehandWhiteboardNode(
+  id: string,
+  rawPoints: { x: number; y: number }[],
+  style?: { color?: string; width?: number; highlighter?: boolean }
+): WhiteboardNode {
   const now = Date.now();
   const xs = rawPoints.map((p) => p.x);
   const ys = rawPoints.map((p) => p.y);
@@ -1695,6 +1868,7 @@ export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number;
   const minY = Math.min(...ys);
   const width = Math.max(FREEHAND_MIN_SIZE, Math.max(...xs) - minX);
   const height = Math.max(FREEHAND_MIN_SIZE, Math.max(...ys) - minY);
+  const isHighlighter = Boolean(style?.highlighter);
   return {
     kind: "node",
     id,
@@ -1705,8 +1879,11 @@ export function createFreehandWhiteboardNode(id: string, rawPoints: { x: number;
     height,
     text: "",
     fillColor: null,
-    strokeColor: style?.color ?? "#111111",
-    strokeWidth: style?.width ?? 2.5,
+    strokeColor: style?.color ?? (isHighlighter ? "#fde047" : "#111111"),
+    strokeWidth: style?.width ?? (isHighlighter ? 18 : 3),
+    opacity: isHighlighter ? 0.42 : undefined,
+    blendMode: isHighlighter ? "multiply" : undefined,
+    freehandHighlighter: isHighlighter || undefined,
     cornerRadius: 0,
     fontFamily: "system-ui, sans-serif",
     fontSize: 16,
@@ -1884,6 +2061,7 @@ export function createDefaultWhiteboardEdge(id: string, source: WhiteboardEndpoi
     strokeWidth: 2,
     strokeStyle: "solid",
     routing: "orthogonal",
+    cornerRadius: 12,
     startArrowType: "none",
     endArrowType: "triangle",
     createdAt: now,

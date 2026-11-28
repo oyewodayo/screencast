@@ -6,19 +6,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppSettings, DEFAULT_SETTINGS, loadSettings, saveSettings } from "../../utils/appSettings";
 import { ThemePreference, useTheme } from "../../contexts/ThemeContext";
 import { formatFileSize } from "../../utils/Formater";
-import { ANNOTATION_COLORS, ANNOTATION_FADES, ANNOTATION_POINTERS, ANNOTATION_STYLES, ANNOTATION_TAP_SOUNDS } from "../../utils/annotationStyles";
-import { playTapSound } from "../../utils/annotationSound";
-import { HandGraphic } from "../AnnotationPointer";
-import AnnotationPreview from "./AnnotationPreview";
+import AnnotationSettingsTab from "./AnnotationSettingsTab";
 import ColorInput from "../common/ColorInput";
 
-interface SettingsModalProps {
+export type SettingsSectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
+export type SettingsInitialTarget = SettingsSectionKey | "audio" | "shortcuts";
+
+export interface SettingsModalProps {
   onClose: () => void;
   onSave: (settings: AppSettings) => void;
   // Fired after the Briefcast storage folder has actually moved (see the Storage section below) -
   // Dashboard.tsx owns the file list and whichever file is currently open, neither of which this
   // modal has access to, so it can't refresh/invalidate those itself.
   onStorageChanged: () => void;
+  initialSection?: SettingsInitialTarget;
 }
 
 const RECORD_TYPE_OPTIONS: { value: string; label: string; category: "video" | "audio" | "image" }[] = [
@@ -62,48 +63,6 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
     {children}
   </label>
 );
-
-// Pill-style single choice (annotation style/fade) - same look as a segmented control.
-const Segmented = <T extends string>({ value, options, onChange, disabled }: {
-  value: T;
-  options: { id: T; label: string }[];
-  onChange: (value: T) => void;
-  disabled?: boolean;
-}) => (
-  <div className="flex p-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-800">
-    {options.map((o) => (
-      <button
-        key={o.id}
-        type="button"
-        disabled={disabled}
-        onClick={() => onChange(o.id)}
-        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
-          value === o.id
-            ? "bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-400 shadow-sm"
-            : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-100"
-        }`}
-      >
-        {o.label}
-      </button>
-    ))}
-  </div>
-);
-
-// Whether Windows has an OCR language for sensitive-text detection - it can't work without one.
-const OcrStatus: React.FC = () => {
-  const [language, setLanguage] = useState<string | null | undefined>(undefined);
-  useEffect(() => {
-    invoke<string | null>("screen_blur_ocr_language").then(setLanguage, () => setLanguage(null));
-  }, []);
-  if (language === undefined) return null;
-  return language ? (
-    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">Reads text with Windows' built-in OCR ({language}) - nothing leaves this PC.</p>
-  ) : (
-    <p className="text-xs text-amber-600 dark:text-amber-400 text-right">
-      Windows has no OCR language installed. Add one in Settings › Time &amp; language › Language (with "Optical character recognition").
-    </p>
-  );
-};
 
 // Mirrors services/telemetry.rs's TelemetrySettings. `available` is false in builds compiled
 // without analytics/crash-report keys (dev and source builds), which send nothing regardless.
@@ -162,13 +121,13 @@ const HOME_BACKGROUND_OPTIONS: { value: AppSettings["homeBackgroundStyle"]; labe
   { value: "plain", label: "Plain" },
 ];
 
-type SectionKey = "appearance" | "recording" | "storage" | "cache" | "annotation" | "files" | "pdf" | "privacy" | "help";
+type SectionKey = SettingsSectionKey;
 const SECTION_NAV: { key: SectionKey; label: string }[] = [
   { key: "appearance", label: "Appearance" },
   { key: "recording", label: "Recording" },
   { key: "storage", label: "Storage" },
   { key: "cache", label: "Cache" },
-  { key: "annotation", label: "Annotation" },
+  { key: "annotation", label: "Annotate & Shield" },
   { key: "files", label: "Files" },
   { key: "pdf", label: "PDF Annotator" },
   { key: "privacy", label: "Privacy" },
@@ -227,10 +186,34 @@ const BulletList: React.FC<{ items: React.ReactNode[] }> = ({ items }) => (
 // doesn't show a mismatched slash direction on Windows.
 const joinDisplayPath = (parent: string, child: string): string => `${parent}${parent.includes("\\") ? "\\" : "/"}${child}`;
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorageChanged }) => {
+const resolveInitialSection = (target?: SettingsInitialTarget): SettingsSectionKey => {
+  if (target === "audio") return "recording";
+  if (target === "shortcuts") return "help";
+  if (target && SECTION_NAV.some((s) => s.key === target)) return target as SettingsSectionKey;
+  return "appearance";
+};
+
+const SettingsModal: React.FC<SettingsModalProps> = ({
+  onClose,
+  onSave,
+  onStorageChanged,
+  initialSection = "appearance",
+}) => {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const { theme, setTheme } = useTheme();
-  const [activeSection, setActiveSection] = useState<SectionKey>("appearance");
+  const [activeSection, setActiveSection] = useState<SettingsSectionKey>(() => resolveInitialSection(initialSection));
+
+  useEffect(() => {
+    if (initialSection) {
+      setActiveSection(resolveInitialSection(initialSection));
+      if (initialSection === "audio") {
+        const timer = setTimeout(() => {
+          document.getElementById("settings-audio-device")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 150);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [initialSection]);
   // "Start Briefcast when I sign in" lives with the OS (services/autostart.rs), not in the settings
   // file, so it's read from there and written back on Save. null until read.
   const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
@@ -661,20 +644,22 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     placeholder="Recording"
                   />
                 </Field>
-                <Field label="Audio device">
-                  <select
-                    className={fieldInputClass}
-                    value={settings.defaultAudioDevice}
-                    onChange={(e) => update("defaultAudioDevice", e.target.value)}
-                  >
-                    <option value="">First detected device</option>
-                    {connectedAudioDevices?.map((device) => (
-                      <option key={device} value={device}>
-                        {device}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <div id="settings-audio-device" className="scroll-mt-6">
+                  <Field label="Audio device">
+                    <select
+                      className={fieldInputClass}
+                      value={settings.defaultAudioDevice}
+                      onChange={(e) => update("defaultAudioDevice", e.target.value)}
+                    >
+                      <option value="">First detected device</option>
+                      {connectedAudioDevices?.map((device) => (
+                        <option key={device} value={device}>
+                          {device}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
                 <Field label="Enhance audio automatically">
                   <input
                     type="checkbox"
@@ -930,394 +915,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
             )}
 
             {activeSection === "annotation" && (
-              <>
-              <Section title="Presentation annotation">
-                <Field label="Enable annotation tool">
-                  <input
-                    type="checkbox"
-                    checked={settings.enableAnnotationTool}
-                    onChange={(e) => update("enableAnnotationTool", e.target.checked)}
-                    className="w-4 h-4 accent-blue-500 cursor-pointer"
-                  />
-                </Field>
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                  While enabled, press Ctrl+Shift+D (Cmd+Shift+D on Mac) anywhere to draw on screen — circle or underline
-                  anything to emphasize it. Press Esc or the shortcut again to stop.
-                </p>
-                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
-                  <Field label="Show toolbar while drawing">
-                    <input
-                      type="checkbox"
-                      checked={settings.annotationShowToolbar}
-                      onChange={(e) => update("annotationShowToolbar", e.target.checked)}
-                      className="w-4 h-4 accent-blue-500 cursor-pointer"
-                    />
-                  </Field>
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                    {settings.annotationShowToolbar
-                      ? "Turn off to draw with nothing else on screen, so it looks like magic."
-                      : "Hidden - drive it from the keyboard instead:"}
-                  </p>
-                  {/* Shown either way - they work with the toolbar too. */}
-                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
-                    {[
-                      ["Esc", "Stop drawing"],
-                      ["Backspace", "Clear the screen"],
-                      ["1 – 8", "Pick a colour"],
-                      ["P  M  N  L", "Pen, Marker, Neon, Laser"],
-                      ["Ctrl+Z", "Undo the last stroke"],
-                      ["Hold Shift", "Draw a straight line"],
-                      ["B", "Blur something private"],
-                      ["Shift+Backspace", "Remove every blur"],
-                    ].map(([keys, what]) => (
-                      <div key={keys} className="flex items-center justify-between gap-2">
-                        <span>{what}</span>
-                        <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
-                          {keys}
-                        </kbd>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </Section>
-
-              <Section title="Ink">
-                {/* Everything below applies from the next time draw mode opens - no restart. */}
-                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
-                  <AnnotationPreview
-                    color={settings.annotationColor}
-                    width={settings.annotationWidth}
-                    style={settings.annotationStyle}
-                    shadow={settings.annotationShadow}
-                  />
-
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Color</span>
-                    <div className="flex items-center gap-1.5">
-                      {ANNOTATION_COLORS.map((c) => (
-                        <button
-                          key={c}
-                          type="button"
-                          onClick={() => update("annotationColor", c)}
-                          aria-label={`Color ${c}`}
-                          aria-pressed={settings.annotationColor.toLowerCase() === c}
-                          className={`w-6 h-6 rounded-full ring-1 ring-black/15 dark:ring-white/25 transition-transform hover:scale-110 ${
-                            settings.annotationColor.toLowerCase() === c ? "outline outline-2 outline-offset-2 outline-blue-500" : ""
-                          }`}
-                          style={{ backgroundColor: c }}
-                        />
-                      ))}
-                      <label
-                        className={`relative w-6 h-6 rounded-full cursor-pointer ring-1 ring-black/15 dark:ring-white/25 bg-[conic-gradient(#ef4444,#facc15,#22c55e,#3b82f6,#a855f7,#ef4444)] ${
-                          ANNOTATION_COLORS.includes(settings.annotationColor.toLowerCase()) ? "" : "outline outline-2 outline-offset-2 outline-blue-500"
-                        }`}
-                        data-tip="Custom color"
-                      >
-                        <ColorInput
-                          value={settings.annotationColor}
-                          onChange={(e) => update("annotationColor", e.target.value)}
-                          className="absolute inset-0 opacity-0 cursor-pointer"
-                        />
-                      </label>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Style</span>
-                      <Segmented value={settings.annotationStyle} options={ANNOTATION_STYLES} onChange={(v) => update("annotationStyle", v)} />
-                    </div>
-                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
-                      {ANNOTATION_STYLES.find((st) => st.id === settings.annotationStyle)?.hint}
-                    </p>
-                  </div>
-
-                  <Field label="Size">
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="range"
-                        min={2}
-                        max={24}
-                        step={1}
-                        value={settings.annotationWidth}
-                        onChange={(e) => update("annotationWidth", Number(e.target.value))}
-                        className="w-32 accent-blue-500"
-                      />
-                      <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-6 text-right">{settings.annotationWidth}</span>
-                    </div>
-                  </Field>
-
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Fade out</span>
-                      <Segmented
-                        value={settings.annotationFade}
-                        options={ANNOTATION_FADES}
-                        onChange={(v) => update("annotationFade", v)}
-                        disabled={settings.annotationStyle === "laser"}
-                      />
-                    </div>
-                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
-                      {settings.annotationStyle === "laser"
-                        ? "Laser trails always vanish in under a second."
-                        : settings.annotationFade === "never"
-                        ? "Strokes stay until you press Clear or leave draw mode."
-                        : "How long each stroke stays before fading away."}
-                    </p>
-                  </div>
-
-                  <Field label="Drop shadow">
-                    <input
-                      type="checkbox"
-                      checked={settings.annotationShadow}
-                      disabled={settings.annotationStyle === "neon" || settings.annotationStyle === "laser"}
-                      onChange={(e) => update("annotationShadow", e.target.checked)}
-                      className="w-4 h-4 accent-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-default"
-                    />
-                  </Field>
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
-                    {settings.annotationStyle === "neon" || settings.annotationStyle === "laser"
-                      ? "Neon and Laser already glow, so they don't use a shadow."
-                      : "Keeps ink readable on busy or same-coloured backgrounds."}
-                  </p>
-                </div>
-              </Section>
-
-              <Section title="Pointer and tap">
-                <div className={`flex flex-col gap-3 transition-opacity ${settings.enableAnnotationTool ? "" : "opacity-40 pointer-events-none"}`}>
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-sm text-neutral-700 dark:text-neutral-300">Pointer</span>
-                      <div className="flex items-center gap-3">
-                        {settings.annotationPointer === "hand" && (
-                          <div className="relative w-6 h-9 overflow-hidden" aria-hidden>
-                            <div className="absolute left-3 top-1.5" style={{ transform: "rotate(-26deg)" }}>
-                              <HandGraphic color={settings.annotationColor} stick={false} />
-                            </div>
-                          </div>
-                        )}
-                        <Segmented value={settings.annotationPointer} options={ANNOTATION_POINTERS} onChange={(v) => update("annotationPointer", v)} />
-                      </div>
-                    </div>
-                    <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
-                      {settings.annotationPointer === "hand"
-                        ? "A little hand on a stick that follows your cursor, in the colour you're drawing with."
-                        : settings.annotationPointer === "dot"
-                        ? "A glowing dot in the ink colour."
-                        : settings.annotationPointer === "custom"
-                        ? "Your own image - its top centre is the point."
-                        : "The system crosshair."}
-                    </p>
-                  </div>
-
-                  {settings.annotationPointer === "custom" && (
-                    <Field label="Pointer image">
-                      <div className="flex items-center gap-2">
-                        {settings.annotationPointerImage && (
-                          <img src={settings.annotationPointerImage} alt="" className="h-8 w-auto max-w-[3rem] object-contain" />
-                        )}
-                        <input
-                          type="file"
-                          accept="image/png,image/webp"
-                          onChange={(e) => {
-                            const file = e.target.files?.[0];
-                            e.target.value = "";
-                            if (!file) return;
-                            // Downscaled before it's stored: settings live in localStorage, and the
-                            // pointer is only ever drawn ~64px tall.
-                            const url = URL.createObjectURL(file);
-                            const img = new Image();
-                            img.onload = () => {
-                              const scale = Math.min(1, 160 / img.naturalHeight);
-                              const canvas = document.createElement("canvas");
-                              canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
-                              canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
-                              canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
-                              update("annotationPointerImage", canvas.toDataURL("image/png"));
-                              URL.revokeObjectURL(url);
-                            };
-                            img.onerror = () => URL.revokeObjectURL(url);
-                            img.src = url;
-                          }}
-                          className="text-xs text-neutral-500 dark:text-neutral-400 file:mr-2 file:px-2.5 file:py-1 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-neutral-100 dark:file:bg-neutral-800 file:text-neutral-700 dark:file:text-neutral-200 file:cursor-pointer"
-                        />
-                      </div>
-                    </Field>
-                  )}
-
-                  <Field label="Tap ripple">
-                    <input
-                      type="checkbox"
-                      checked={settings.annotationTapRipple}
-                      onChange={(e) => update("annotationTapRipple", e.target.checked)}
-                      className="w-4 h-4 accent-blue-500 cursor-pointer"
-                    />
-                  </Field>
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">A ring spreads from the point where you click, so viewers see exactly where.</p>
-
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Tap sound</span>
-                    <Segmented
-                      value={settings.annotationTapSound}
-                      options={ANNOTATION_TAP_SOUNDS}
-                      onChange={(v) => {
-                        update("annotationTapSound", v);
-                        playTapSound(v, settings.annotationSoundVolume);
-                      }}
-                    />
-                  </div>
-
-                  <Field label="Volume">
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      disabled={settings.annotationTapSound === "off"}
-                      value={settings.annotationSoundVolume}
-                      onChange={(e) => update("annotationSoundVolume", Number(e.target.value))}
-                      onPointerUp={() => playTapSound(settings.annotationTapSound, settings.annotationSoundVolume)}
-                      className="w-32 accent-blue-500 disabled:opacity-40"
-                    />
-                  </Field>
-                </div>
-              </Section>
-
-              <Section title="Privacy blur">
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-1">
-                  Press B while drawing and drag over anything private. The blur stays on screen and in recordings, and you
-                  can still click and type underneath it.
-                </p>
-                <Field label="Strength">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={5}
-                      value={settings.annotationBlurStrength}
-                      onChange={(e) => {
-                        const strength = Number(e.target.value);
-                        update("annotationBlurStrength", strength);
-                        // Live: any blur already on screen changes as the slider moves.
-                        void invoke("screen_blur_configure", { config: { strength } }).catch(() => {});
-                      }}
-                      className="w-32 accent-blue-500"
-                    />
-                    <span className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums w-8 text-right">
-                      {settings.annotationBlurStrength}
-                    </span>
-                  </div>
-                </Field>
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">
-                  Even at 0 text can't be read. Higher adds more blur and frost.
-                </p>
-
-                <div className="flex flex-col gap-1">
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur WhatsApp chats</span>
-                    <Segmented
-                      value={settings.annotationAutoBlurWhatsApp}
-                      options={[
-                        { id: "off", label: "Off" },
-                        { id: "recording", label: "While recording" },
-                        { id: "always", label: "Always" },
-                      ]}
-                      onChange={(v) => update("annotationAutoBlurWhatsApp", v)}
-                    />
-                  </div>
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
-                    {settings.annotationAutoBlurWhatsApp === "off"
-                      ? "WhatsApp is never blurred automatically."
-                      : "Follows the WhatsApp window as it moves, resizes or switches chats."}
-                  </p>
-                </div>
-                {settings.annotationAutoBlurWhatsApp !== "off" && (
-                  <div className="flex items-center justify-end gap-4 text-sm text-neutral-700 dark:text-neutral-300">
-                    {(
-                      [
-                        ["chatList", "Chat list"],
-                        ["contact", "Contact name & photo"],
-                        ["messages", "Messages"],
-                      ] as const
-                    ).map(([key, label]) => (
-                      <label key={key} className="flex items-center gap-1.5 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={settings.annotationBlurWhatsAppParts[key]}
-                          onChange={(e) => update("annotationBlurWhatsAppParts", { ...settings.annotationBlurWhatsAppParts, [key]: e.target.checked })}
-                          className="w-4 h-4 accent-blue-500 cursor-pointer"
-                        />
-                        {label}
-                      </label>
-                    ))}
-                  </div>
-                )}
-
-                <div className="flex flex-col gap-1 pt-2">
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-sm text-neutral-700 dark:text-neutral-300">Auto-blur sensitive text</span>
-                    <Segmented
-                      value={settings.annotationAutoBlurText}
-                      options={[
-                        { id: "off", label: "Off" },
-                        { id: "recording", label: "While recording" },
-                        { id: "always", label: "Always" },
-                      ]}
-                      onChange={(v) => update("annotationAutoBlurText", v)}
-                    />
-                  </div>
-                  <p className="text-xs text-neutral-400 dark:text-neutral-500 text-right">
-                    {settings.annotationAutoBlurText === "off"
-                      ? "Text on screen is never blurred automatically."
-                      : "Watches the window you're using and blurs what matches below. A safety net, not a guarantee: new text can show for a moment before it's blurred, and unusual fonts can be missed."}
-                  </p>
-                  {settings.annotationAutoBlurText !== "off" && <OcrStatus />}
-                </div>
-                {settings.annotationAutoBlurText !== "off" && (
-                  <>
-                    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm text-neutral-700 dark:text-neutral-300">
-                      {(
-                        [
-                          ["passwords", "Passwords & PINs"],
-                          ["keys", "API keys, tokens & private keys"],
-                          ["financial", "Card & bank numbers"],
-                          ["personal", "Emails & phone numbers"],
-                        ] as const
-                      ).map(([key, label]) => (
-                        <label key={key} className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={settings.annotationBlurTextRules[key]}
-                            onChange={(e) => update("annotationBlurTextRules", { ...settings.annotationBlurTextRules, [key]: e.target.checked })}
-                            className="w-4 h-4 accent-blue-500 cursor-pointer"
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                    <Field label="Also blur these words">
-                      <input
-                        type="text"
-                        value={settings.annotationBlurKeywords}
-                        onChange={(e) => update("annotationBlurKeywords", e.target.value)}
-                        placeholder="Client name, project codename…"
-                        className="w-56 px-2 py-1 rounded-md text-sm bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100 placeholder:text-neutral-400"
-                      />
-                    </Field>
-                    <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2 text-right">Separate with commas. Matching ignores upper/lower case.</p>
-                  </>
-                )}
-
-                <div className="flex items-center justify-between gap-4 pt-2">
-                  <span className="text-sm text-neutral-700 dark:text-neutral-300">Blur the whole window you're using</span>
-                  <kbd className="px-1.5 py-0.5 rounded-md font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700">
-                    Ctrl+Alt+B
-                  </kbd>
-                </div>
-                <p className="text-xs text-neutral-400 dark:text-neutral-500 -mt-2">Works anywhere. Press it again to unblur.</p>
-              </Section>
-              </>
+              <AnnotationSettingsTab settings={settings} update={update} />
             )}
 
             {activeSection === "files" && (
@@ -1453,7 +1051,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ onClose, onSave, onStorag
                     <>Pause and resume a recording without losing your place - paused time is never included in the finished video.</>,
                     <>Take a Full Screen, Monitor, or Window screenshot from the same target picker recording uses.</>,
                     <>Overlay one or more webcams onto a screen recording - choose their shape, corner position, and size.</>,
-                    <>Capture system audio ("what you hear") alongside your mic (Windows only).</>,
+                    <>Capture system audio ("what you hear") alongside your mic (Windows and Linux; on a Mac it needs a virtual audio device such as BlackHole).</>,
                   ]} />
                 </Section>
 

@@ -7,7 +7,7 @@
       "binaries/heif/*",
       "binaries/whisper/*.exe",
       "binaries/whisper/*.dll",
-      "binaries/rnnoise/*",
+      "models/rnnoise/*",
       "licenses/*"
     ]
   }

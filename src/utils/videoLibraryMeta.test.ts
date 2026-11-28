@@ -1,30 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { describeEdit, exportBase, exportLabel, exportsOf, isExportName } from "./videoLibraryMeta";
+import { hasVideoEdits, summarize } from "./videoLibraryMeta";
+import { createEmptyState } from "./videoEditTypes";
 
-describe("video library details", () => {
-  it("finds a video's exports, newest first", () => {
-    const files = [
-      { path: "C:/v/Demo.mp4", size: 1, modified: 1 },
-      { path: "C:/v/Demo (edited).mp4", size: 1, modified: 5 },
-      { path: "C:/v/Demo (share-ready) (2).mp4", size: 1, modified: 9 },
-      { path: "C:/v/Demo two (edited).mp4", size: 1, modified: 7 },
+describe("videoLibraryMeta watch vs edit detection", () => {
+  const path = "C:\\Videos\\Learn PyTorch in 5 Projects – Tutorial [E0bwEAWmVEM].webm";
+
+  it("treats an untouched single-clip default state as NOT edited", () => {
+    const empty = createEmptyState(path, 20880); // 5h 48m tutorial simply watched
+    expect(hasVideoEdits(empty, path)).toBe(false);
+    expect(summarize(empty, path)).toBeNull();
+  });
+
+  it("treats trimmed or split videos as edited", () => {
+    const trimmed = createEmptyState(path, 120);
+    trimmed.clips[0] = { ...trimmed.clips[0], start: 5 };
+    expect(hasVideoEdits(trimmed, path)).toBe(true);
+    expect(summarize(trimmed, path)).not.toBeNull();
+
+    const split = createEmptyState(path, 120);
+    split.clips = [
+      { ...split.clips[0], end: 60 },
+      { id: "clip-2", sourcePath: path, start: 60, end: 120 },
     ];
-    expect(exportsOf("C:/v/Demo.mp4", files).map((f) => f.path)).toEqual(["C:/v/Demo (share-ready) (2).mp4", "C:/v/Demo (edited).mp4"]);
-    expect(isExportName("C:/v/Demo (edited).mp4")).toBe(true);
-    expect(isExportName("C:/v/Demo.mp4")).toBe(false);
+    expect(hasVideoEdits(split, path)).toBe(true);
   });
 
-  it("names what an edit holds, most telling first", () => {
-    const parts = describeEdit({ outputDuration: 60, sourceDuration: 90, clips: 3, splitScreens: 1, titles: 1, layers: 0, captions: true, canvasLabel: null, canvasAspect: null, updatedAt: null });
-    expect(parts).toEqual(["1 split screen", "3 clips", "1 title", "captions"]);
+  it("treats overlays, screen styles, speed changes, or captions as edited", () => {
+    const withStyle = { ...createEmptyState(path, 60), screenStyle: { background: { kind: "color" as const, color: "#000" }, padding: 0.07, radius: 0.02, shadow: 0.5 } };
+    expect(hasVideoEdits(withStyle, path)).toBe(true);
+
+    const spedUp = createEmptyState(path, 60);
+    spedUp.clips[0] = { ...spedUp.clips[0], speed: 1.5 };
+    expect(hasVideoEdits(spedUp, path)).toBe(true);
+
+    const withChapter = { ...createEmptyState(path, 60), chapters: [{ id: "ch-1", sourcePath: path, sourceTime: 10, label: "Setup" }] };
+    expect(hasVideoEdits(withChapter, path)).toBe(true);
   });
 
-  it("groups a video with its exports wherever they sit, and names each", () => {
-    expect(exportBase("C:/lib/Exports/Demo - v2.mp4")).toBe(exportBase("C:/lib/recordings/Demo.mp4"));
-    expect(exportBase("C:/lib/Demo (edited) (edited).mp4")).toBe("demo");
-    expect(isExportName("C:/lib/Exports/Anything.mp4")).toBe(true);
-    expect(exportLabel("C:/lib/Exports/Demo - v12.mp4")).toBe("v12");
-    expect(exportLabel("C:/lib/Demo (share-ready).mp4")).toBe("share-ready");
-    expect(exportLabel("C:/lib/Demo (edited).mp4")).toBe("edited");
+  it("always treats .briefvideo project files as editable projects", () => {
+    const projectPath = "C:\\Videos\\Projects\\MyProject.briefvideo";
+    const emptyProject = createEmptyState(projectPath, 0);
+    expect(hasVideoEdits(emptyProject, projectPath)).toBe(true);
   });
 });

@@ -16,9 +16,13 @@ import { UseVideoEditStoreResult } from "../hooks/useVideoEditStore";
 import { ActiveClipEffects } from "../utils/videoColorFilters";
 import { loadSettings, updateSettings } from "../utils/appSettings";
 import { startSnip } from "../services/snip";
+import type { HomeItem } from "../utils/homeLibraryItems";
+import type { FileEntry } from "../utils/libraryEntries";
 
 // Dispatched (on window) to bring the dock back up when it was minimized.
 export const SHOW_DOCKER_EVENT = "briefcast:show-docker";
+// Dispatched (on window) to open the Recording Studio setup modal from outside BottomDocker.
+export const OPEN_RECORD_MODAL_EVENT = "briefcast:open-record-modal";
 
 const FEEDBACK_EMAIL = "withbriefs@gmail.com";
 
@@ -78,6 +82,7 @@ interface Props {
   activeFileIsPlaying: boolean;
   onTogglePlayActiveFile: () => void;
   onConvertFile: (file: DockerFile) => void;
+  onCompressFile?: (file: DockerFile) => void;
   onRenameFile: (file: DockerFile, newName: string) => Promise<void>;
   onDeleteFile: (file: DockerFile) => Promise<void>;
   // "Move or copy to..." for the open file (MoveCopyMenu.tsx).
@@ -238,6 +243,15 @@ interface Props {
   // Whether the last row (date/time, CPU RAM, OS, feedback link) is shown - see appSettings.ts's
   // showDockerStatusBar doc comment.
   showDockerStatusBar: boolean;
+  historyItems?: HomeItem[];
+  onOpenHistoryItem?: (item: HomeItem) => void;
+  libraryFilesByPath?: Map<string, FileEntry>;
+  arrivals?: Record<string, { from: string; at: number; count: number }>;
+  libraryPreviewDurations?: Map<string, number>;
+  isAnnotating?: boolean;
+  hasActiveBlur?: boolean;
+  onToggleAnnotation?: () => void;
+  onOpenAnnotationSettings?: () => void;
 }
 
 type ConnectedDevice = string[];
@@ -251,6 +265,7 @@ const BottomDocker = ({
   activeFileIsPlaying,
   onTogglePlayActiveFile,
   onConvertFile,
+  onCompressFile,
   onRenameFile,
   onDeleteFile,
   fileTransfer,
@@ -340,8 +355,8 @@ const BottomDocker = ({
   pausedAccumulatedMs,
   handlePauseRecording,
   handleResumeRecording,
-  isMonitoring,
-  setIsMonitoring,
+  isMonitoring: _isMonitoring,
+  setIsMonitoring: _setIsMonitoring,
   windowTitles,
   isRecording,
   recordingStartTime,
@@ -360,7 +375,16 @@ const BottomDocker = ({
   onOpenPhoneCamera,
   isPhoneCameraConnected,
   showRecordingPanelButtons,
-  showDockerStatusBar
+  showDockerStatusBar,
+  historyItems,
+  onOpenHistoryItem,
+  libraryFilesByPath,
+  arrivals,
+  libraryPreviewDurations,
+  isAnnotating,
+  hasActiveBlur,
+  onToggleAnnotation,
+  onOpenAnnotationSettings,
 }: Props) => {
   const [modalOpenScreen, setModalOpenScreen] = useState(false);
   // Set while the standalone Screenshot button drives the flow, so recordType can be
@@ -370,11 +394,16 @@ const BottomDocker = ({
   const [connectedAudioDevices, setConnectedAudioDevices] = useState<ConnectedDevice | null>(null);
   const [connectedCameraDevices, setConnectedCameraDevices] = useState<ConnectedDevice | null>(null);
   const [showDocker, setShowDocker] = useState(true);
-  // Something asked for the dock (the player's "Edit video") - bring it back if minimized.
+  // Something asked for the dock (the player's "Edit video") or the Recording Studio setup modal.
   useEffect(() => {
-    const open = () => setShowDocker(true);
-    window.addEventListener(SHOW_DOCKER_EVENT, open);
-    return () => window.removeEventListener(SHOW_DOCKER_EVENT, open);
+    const openDock = () => setShowDocker(true);
+    const openRecordModal = () => setModalOpenScreen(true);
+    window.addEventListener(SHOW_DOCKER_EVENT, openDock);
+    window.addEventListener(OPEN_RECORD_MODAL_EVENT, openRecordModal);
+    return () => {
+      window.removeEventListener(SHOW_DOCKER_EVENT, openDock);
+      window.removeEventListener(OPEN_RECORD_MODAL_EVENT, openRecordModal);
+    };
   }, []);
   // Click tracking (services/click_tracker.rs, a Win32 mouse hook) is still Windows-only with no
   // equivalent elsewhere, unlike system audio ("what you hear"), which is now attempted on every
@@ -387,7 +416,11 @@ const BottomDocker = ({
   const [isClickTrackingSupported, setIsClickTrackingSupported] = useState(true);
   useEffect(() => {
     invoke<string>('get_platform')
-      .then((platform) => setIsClickTrackingSupported(platform === 'windows'))
+      .then((platform) =>
+        setIsClickTrackingSupported(
+          platform === 'windows' || platform === 'macos' || platform === 'linux'
+        )
+      )
       .catch((err) => console.error('Failed to detect platform:', err));
   }, []);
   // This whole docker is `fixed bottom-0`, sitting on top of the video player rather than
@@ -443,30 +476,27 @@ const BottomDocker = ({
   const loadDevices = () => {
     const settings = loadSettings();
 
-    invoke<ConnectedDevice>("get_connected_audios")
-      .then((devices) => {
-        setConnectedAudioDevices(devices);
-        if (devices.length > 0) {
+    // Fetch cameras and microphones in a single IPC round trip instead of two separate calls.
+    invoke<[ConnectedDevice, ConnectedDevice]>("get_connected_devices")
+      .then(([cameraDevices, audioDevices]) => {
+        setConnectedAudioDevices(audioDevices);
+        if (audioDevices.length > 0) {
           // Prefer whatever's configured as the default in Settings, so long as it's actually
           // still plugged in - otherwise fall back to the first detected device like before.
           const preferred = settings.defaultAudioDevice;
-          setAudioDevice(preferred && devices.includes(preferred) ? preferred : devices[0]);
+          setAudioDevice(preferred && audioDevices.includes(preferred) ? preferred : audioDevices[0]);
         }
-      })
-      .catch(console.error);
 
-    invoke<ConnectedDevice>("get_connected_cameras")
-      .then((devices) => {
-        // The phone is appended rather than detected: it can never appear in get_connected_cameras
+        // The phone is appended rather than detected: it can never appear in get_connected_devices
         // (that enumerates DirectShow devices, and a phone isn't one - see
         // src-tauri/src/services/phone_camera.rs), so the entry has to be offered unconditionally
         // and is paired on demand from the panel behind it.
-        setConnectedCameraDevices([...devices, PHONE_CAMERA_DEVICE]);
+        setConnectedCameraDevices([...cameraDevices, PHONE_CAMERA_DEVICE]);
         // Defaults are chosen from the REAL cameras only - auto-selecting the phone on a machine
         // with no webcam would arm a source that isn't paired yet and record nothing.
-        if (devices.length > 0) {
-          const preferred = settings.defaultVideoDevices.filter((d) => devices.includes(d));
-          setVideoDevices(preferred.length > 0 ? preferred : [devices[0]]); // Default to the first detected camera
+        if (cameraDevices.length > 0) {
+          const preferred = settings.defaultVideoDevices.filter((d) => cameraDevices.includes(d));
+          setVideoDevices(preferred.length > 0 ? preferred : [cameraDevices[0]]); // Default to the first detected camera
         }
       })
       .catch(console.error);
@@ -574,22 +604,9 @@ const BottomDocker = ({
 
   };
 
-  const openModalScreen = async ()=>{
-    try {
-      if (!isMonitoring) {
-        console.log("Is monitoring: ",isMonitoring)
-        await invoke("start_monitoring_windows")
-
-        setIsMonitoring(true)
-        console.log("Monitoring started")
-      }
-
-
-    } catch (error) {
-      console.error("Error monitoring screens: ",error)
-    }
-    setModalOpenScreen(true)
-  }
+  const openModalScreen = () => {
+    setModalOpenScreen(true);
+  };
 
   const closeModalScreen = ()=>{
     setModalOpenScreen(false)
@@ -617,6 +634,7 @@ const BottomDocker = ({
 
   return (
     <>
+    {modalOpenScreen && (
     <EnhancedScreenOptions
      recordType={recordType}
      videoDevices={videoDevices}
@@ -662,7 +680,9 @@ const BottomDocker = ({
       onStartRecording={onStartRecording} 
       setOpen={setModalOpenScreen}
       onRecordTypeChange={handleRecordTypeSelected}
+      onOpenAnnotationSettings={onOpenAnnotationSettings}
     />
+    )}
     <div ref={dockerRef} className="w-full fixed bottom-0 flex flex-col print:hidden">
      
         <ActiveRecordingState
@@ -699,7 +719,15 @@ const BottomDocker = ({
             onToggleRecordSource={toggleRecordSource}
             onStartRecordingClick={() => openModalScreen()}
             onScreenshotClick={handleScreenshotClick}
+            isAnnotating={isAnnotating}
+            hasActiveBlur={hasActiveBlur}
+            onToggleAnnotation={onToggleAnnotation}
             showRecordingPanelButtons={showRecordingPanelButtons}
+            historyItems={historyItems}
+            onOpenHistoryItem={onOpenHistoryItem}
+            libraryFilesByPath={libraryFilesByPath}
+            arrivals={arrivals}
+            libraryPreviewDurations={libraryPreviewDurations}
         />
 
       {/* Hidden rather than unmounted when minimized, so the video editor's open tool panel
@@ -718,6 +746,7 @@ const BottomDocker = ({
             isPlaying={activeFileIsPlaying}
             onTogglePlay={onTogglePlayActiveFile}
             onConvert={onConvertFile}
+            onCompress={onCompressFile}
             onRename={onRenameFile}
             onDelete={onDeleteFile}
             fileTransfer={fileTransfer}
@@ -798,8 +827,8 @@ const BottomDocker = ({
         ) : null}
 
         {showDockerStatusBar && (
-        <div className="w-full grid grid-cols-1 grid-flow-col text-xs">
-          <div>
+        <div className="w-full flex items-center justify-between gap-2 text-xs">
+          <div className="truncate">
           <span>{Date()}</span>
 
           <span className="cpu-info">
@@ -822,12 +851,48 @@ const BottomDocker = ({
           </span>
           <OsInfo />
           </div>
-          <div className="right-0"><span> <a
-            href={`mailto:${FEEDBACK_EMAIL}`}
-            onClick={(e) => { e.preventDefault(); void openFeedbackEmail(); }}
-            title={`Email ${FEEDBACK_EMAIL}`}
-            className="text-blue-600 dark:text-blue-400"
-          >Request feature / Report a bug</a></span></div>
+          <div className="flex items-center gap-2.5 shrink-0">
+            <a
+              href={`mailto:${FEEDBACK_EMAIL}`}
+              onClick={(e) => { e.preventDefault(); void openFeedbackEmail(); }}
+              title={`Email ${FEEDBACK_EMAIL}`}
+              className="text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              Request feature / Report a bug
+            </a>
+            <a
+              href="https://x.com/withbriefs"
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternal("https://x.com/withbriefs");
+              }}
+              title="Follow on X (x.com/withbriefs)"
+              aria-label="X"
+              className="inline-flex items-center justify-center text-neutral-600 dark:text-neutral-400 hover:text-neutral-950 dark:hover:text-white transition-colors"
+            >
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 fill-current" aria-hidden="true">
+                <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+              </svg>
+            </a>
+            <a
+              href="https://linkedin.com/company/withbriefs"
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternal("https://linkedin.com/company/withbriefs");
+              }}
+              title="Follow on LinkedIn (linkedin.com/company/withbriefs)"
+              aria-label="LinkedIn"
+              className="inline-flex items-center justify-center text-neutral-600 dark:text-neutral-400 hover:text-[#0A66C2] dark:hover:text-[#60a5fa] transition-colors"
+            >
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 fill-current" aria-hidden="true">
+                <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 0 1-2.063-2.065 2.064 2.064 0 1 1 2.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
+              </svg>
+            </a>
+          </div>
         </div>
         )}
       </div>)}

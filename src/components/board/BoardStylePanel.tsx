@@ -25,26 +25,198 @@ import {
   IoChevronForward,
   IoChevronUp,
   IoColorFillOutline,
+  IoColorFilterOutline,
   IoContrastOutline,
   IoCopyOutline,
+  IoCropOutline,
+  IoDownloadOutline,
   IoImageOutline,
   IoEllipseOutline,
   IoLockClosed,
   IoLockOpenOutline,
   IoOptionsOutline,
   IoShapesOutline,
+  IoSparklesOutline,
   IoSquareOutline,
   IoSwapHorizontalOutline,
   IoText,
   IoTrashOutline,
 } from "react-icons/io5";
-import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbHexagon, TbLine, TbOctagon, TbPentagon, TbStar, TbTriangle } from "react-icons/tb";
-import { BoardBlur, BoardImage, BoardItem, BoardShadow, BoardShape, BoardText } from "../../utils/boardTypes";
+import { TbArrowBigRight, TbArrowsMove, TbArrowUpRight, TbBlur, TbFlipHorizontal, TbFlipVertical, TbHexagon, TbLine, TbOctagon, TbPentagon, TbScissors, TbStar, TbTriangle } from "react-icons/tb";
+import {
+  BOARD_BLEND_MODES,
+  BoardBlendMode,
+  BoardBlur,
+  BoardGradientBackground,
+  BoardImage,
+  BoardImageAdjustments,
+  BoardImageMaskShape,
+  BoardItem,
+  BoardShadow,
+  BoardShape,
+  BoardText,
+} from "../../utils/boardTypes";
 import { BOARD_FONT_GROUPS, BOARD_FONT_OPTIONS } from "../../utils/boardFonts";
 import { growTextItemToFitContent } from "../../handlers/boardHandlers";
 import ColorInput from "../common/ColorInput";
 
 const DEFAULT_SHADOW: BoardShadow = { blur: 16, offsetX: 0, offsetY: 6, color: "rgba(0,0,0,0.35)" };
+
+interface ImageFramePreset {
+  id: string;
+  label: string;
+  title: string;
+  patch: Pick<BoardImage, "padding" | "borderWidth" | "borderColor" | "cornerRadius" | "backgroundColor" | "shadow">;
+}
+
+const IMAGE_FRAME_PRESETS: ImageFramePreset[] = [
+  {
+    id: "clean",
+    label: "Clean",
+    title: "Flat image with no border or shadow",
+    patch: { padding: 0, borderWidth: 0, borderColor: "#ffffff", cornerRadius: 0, backgroundColor: "transparent", shadow: undefined },
+  },
+  {
+    id: "soft-card",
+    label: "Soft Card",
+    title: "Rounded corners with a gentle studio drop shadow",
+    patch: {
+      padding: 0,
+      borderWidth: 0,
+      borderColor: "#ffffff",
+      cornerRadius: 20,
+      backgroundColor: "transparent",
+      shadow: { blur: 28, offsetX: 0, offsetY: 12, color: "rgba(0,0,0,0.28)" },
+    },
+  },
+  {
+    id: "shot",
+    label: "Shot",
+    title: "Beautified screenshot frame with subtle border and deep shadow",
+    patch: {
+      padding: 0,
+      borderWidth: 2,
+      borderColor: "#ffffff",
+      cornerRadius: 18,
+      backgroundColor: "transparent",
+      shadow: { blur: 40, offsetX: 0, offsetY: 18, color: "rgba(0,0,0,0.38)" },
+    },
+  },
+  {
+    id: "polaroid",
+    label: "Polaroid",
+    title: "Classic white photo print frame with soft shadow",
+    patch: {
+      padding: 18,
+      borderWidth: 0,
+      borderColor: "#ffffff",
+      cornerRadius: 6,
+      backgroundColor: "#ffffff",
+      shadow: { blur: 22, offsetX: 0, offsetY: 10, color: "rgba(0,0,0,0.24)" },
+    },
+  },
+  {
+    id: "cutout",
+    label: "Cutout",
+    title: "Transparent frame with crisp shadow — pairs with Remove background",
+    patch: {
+      padding: 0,
+      borderWidth: 0,
+      borderColor: "#ffffff",
+      cornerRadius: 0,
+      backgroundColor: "transparent",
+      shadow: { blur: 24, offsetX: 0, offsetY: 10, color: "rgba(0,0,0,0.45)" },
+    },
+  },
+];
+
+const IMAGE_MASK_PICKS: { value: BoardImageMaskShape; label: string }[] = [
+  { value: "rect", label: "Rect" },
+  { value: "circle", label: "Circle" },
+  { value: "squircle", label: "Squircle" },
+  { value: "arch", label: "Arch" },
+  { value: "diamond", label: "Diamond" },
+  { value: "hexagon", label: "Hex" },
+  { value: "star", label: "Star" },
+  { value: "heart", label: "Heart" },
+];
+
+const PHOTO_FILTER_PRESETS: { id: string; label: string; adj: BoardImageAdjustments | undefined }[] = [
+  { id: "original", label: "Original", adj: undefined },
+  { id: "vivid", label: "Vivid", adj: { brightness: 105, contrast: 114, saturation: 132 } },
+  { id: "bw", label: "B&W", adj: { brightness: 102, contrast: 115, saturation: 0 } },
+  { id: "noir", label: "Noir", adj: { brightness: 94, contrast: 138, saturation: 0 } },
+  { id: "warm", label: "Warm", adj: { brightness: 104, contrast: 106, saturation: 118, sepia: 28 } },
+  { id: "cool", label: "Cool", adj: { brightness: 102, contrast: 108, saturation: 92, hue: -12 } },
+  { id: "fade", label: "Fade", adj: { brightness: 108, contrast: 84, saturation: 82, sepia: 12 } },
+  { id: "cinema", label: "Cinema", adj: { brightness: 96, contrast: 122, saturation: 114, sepia: 14 } },
+];
+
+const TEXT_STYLE_PRESETS: { id: string; label: string; patch: Partial<BoardText> }[] = [
+  {
+    id: "clean",
+    label: "Clean",
+    patch: { color: "#111111", backgroundColor: null, strokeWidth: 0, shadow: undefined, textTransform: "none", letterSpacing: 0 },
+  },
+  {
+    id: "yt-punch",
+    label: "YouTube",
+    patch: {
+      fontWeight: "bold",
+      color: "#ffffff",
+      backgroundColor: null,
+      strokeWidth: 4,
+      strokeColor: "#000000",
+      shadow: { blur: 18, offsetX: 0, offsetY: 6, color: "rgba(0,0,0,0.65)" },
+      textTransform: "uppercase",
+      letterSpacing: 1,
+    },
+  },
+  {
+    id: "neon",
+    label: "Neon Glow",
+    patch: {
+      fontWeight: "bold",
+      color: "#ffffff",
+      backgroundColor: null,
+      strokeWidth: 1,
+      strokeColor: "#38bdf8",
+      shadow: { blur: 26, offsetX: 0, offsetY: 0, color: "#38bdf8" },
+      textTransform: "none",
+    },
+  },
+  {
+    id: "badge",
+    label: "Badge Pill",
+    patch: {
+      fontWeight: "bold",
+      color: "#ffffff",
+      backgroundColor: "#2563eb",
+      cornerRadius: 28,
+      padding: 14,
+      strokeWidth: 0,
+      shadow: { blur: 18, offsetX: 0, offsetY: 8, color: "rgba(37,99,235,0.4)" },
+      textTransform: "uppercase",
+      letterSpacing: 1.5,
+    },
+  },
+  {
+    id: "editorial",
+    label: "Editorial",
+    patch: {
+      fontWeight: "normal",
+      fontStyle: "italic",
+      color: "#ffffff",
+      backgroundColor: null,
+      strokeWidth: 0,
+      shadow: { blur: 14, offsetX: 0, offsetY: 4, color: "rgba(0,0,0,0.45)" },
+      textTransform: "none",
+      letterSpacing: 0.5,
+    },
+  },
+];
+
+const DEFAULT_SHAPE_GRADIENT: BoardGradientBackground = { from: "#3b82f6", to: "#8b5cf6", angleDeg: 135 };
 
 // Same shapeType/sides/points parameterization as BoardEditor.tsx's SHAPE_ADD_PRESETS (Triangle/
 // Pentagon/Hexagon/Octagon all share the "polygon" shapeType at a different `sides` - see
@@ -118,11 +290,16 @@ interface BoardStylePanelProps {
   // same prop.
   onReplaceImage: (image: BoardImage) => void;
   isReplacingImage: boolean;
+  onRemoveBackground?: (image: BoardImage) => void;
+  isRemovingBackground?: boolean;
+  onDownloadImage?: (image: BoardImage) => void;
+  isDownloadingImage?: boolean;
   // Moves every selected item by (dx, dy) * step - the same function the keyboard arrow-key handler
   // calls (see BoardEditor.tsx's handleNudge), so a click here and pressing an arrow key always
   // agree on what "nudge" means. Works for any selection regardless of kind - position is the one
   // thing every board item shares, unlike the kind-specific cards below.
   onNudge: (dx: number, dy: number, step: number) => void;
+  offsetRight?: boolean;
 }
 
 // ---- Shared field primitives -------------------------------------------------------------------
@@ -243,7 +420,12 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   boardShapeCount,
   onReplaceImage,
   isReplacingImage,
+  onRemoveBackground,
+  isRemovingBackground,
+  onDownloadImage,
+  isDownloadingImage,
   onNudge,
+  offsetRight,
 }) => {
   if (items.length === 0) return null;
   const primary = items[0];
@@ -282,15 +464,29 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
   const setOpacity = (value: number): void => {
     onChange(items, items.map((item) => ({ ...item, opacity: value, updatedAt: Date.now() })));
   };
+  const setBlendMode = (blendMode: BoardBlendMode): void => {
+    onChange(items, items.map((item) => ({ ...item, blendMode: blendMode === "source-over" ? undefined : blendMode, updatedAt: Date.now() })));
+  };
+  const toggleFlip = (axis: "flipH" | "flipV"): void => {
+    const nextVal = !primary[axis];
+    onChange(items, items.map((item) => ({ ...item, [axis]: nextVal, updatedAt: Date.now() })));
+  };
+  const setImageAdjustment = <K extends keyof BoardImageAdjustments>(key: K, value: BoardImageAdjustments[K]): void => {
+    onChange(
+      imageItems,
+      imageItems.map((img) => ({
+        ...img,
+        adjustments: { ...(img.adjustments ?? {}), [key]: value },
+        updatedAt: Date.now(),
+      }))
+    );
+  };
 
   return (
-    // pb tracks --docker-height (published by BottomDocker's own ResizeObserver - see
-    // Dashboard.tsx's sidebar file list for the same pattern) so the last button (Delete) always
-    // scrolls clear of the fixed bottom icon bar instead of rendering underneath it, unclickable -
-    // this panel previously had no bottom padding at all, so a selection long enough to need
-    // scrolling left Delete permanently hidden behind that bar.
-    <div className="w-72 shrink-0 h-full overflow-y-auto overscroll-contain border-l border-neutral-200 dark:border-neutral-800 bg-neutral-50/70 dark:bg-neutral-950/40 p-3.5 pb-[var(--docker-height,64px)] flex flex-col gap-3.5">
-      <div className="flex items-center gap-2.5 px-0.5">
+    <div
+      className={`absolute top-3 ${offsetRight ? "right-[276px]" : "right-3"} bottom-[calc(var(--docker-height,60px)+10px)] w-72 bg-white dark:bg-neutral-900 ring-1 ring-black/[0.08] dark:ring-white/[0.09] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 z-30`}
+    >
+      <div className="shrink-0 p-3.5 border-b border-black/[0.05] dark:border-white/[0.06] flex items-center gap-2.5">
         <div
           className={`flex items-center justify-center w-9 h-9 rounded-xl shrink-0 text-white shadow-sm ${
             allText
@@ -314,8 +510,9 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
         </div>
       </div>
 
-      <div className={CARD}>
-        <SectionHeader icon={<TbArrowsMove size={12} />} label="Position" />
+      <div className="flex-1 overflow-y-auto overscroll-contain p-3.5 pb-6 flex flex-col gap-3.5">
+        <div className={CARD}>
+          <SectionHeader icon={<TbArrowsMove size={12} />} label="Position" />
         <div className="grid grid-cols-3 grid-rows-3 gap-1 w-28 mx-auto">
           <div />
           <button
@@ -363,14 +560,47 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       </div>
 
       {allImages && imageItems.length === 1 && (
-        <button
-          type="button"
-          onClick={() => onReplaceImage(imageItems[0])}
-          disabled={isReplacingImage}
-          className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
-        >
-          <IoSwapHorizontalOutline size={15} /> {isReplacingImage ? "Replacing…" : "Replace image"}
-        </button>
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={() => onReplaceImage(imageItems[0])}
+            disabled={isReplacingImage || isRemovingBackground}
+            className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-white bg-gradient-to-b from-blue-500 to-blue-600 shadow-[0_1px_2px_rgba(37,99,235,0.35),0_0_0_1px_rgba(37,99,235,0.15)] hover:from-blue-600 hover:to-blue-700 hover:shadow-[0_2px_6px_rgba(37,99,235,0.4)] transition-all disabled:opacity-50 disabled:shadow-none"
+          >
+            <IoSwapHorizontalOutline size={15} /> {isReplacingImage ? "Replacing…" : "Replace image"}
+          </button>
+          {onRemoveBackground && (
+            <button
+              type="button"
+              onClick={() => onRemoveBackground(imageItems[0])}
+              disabled={isRemovingBackground || isReplacingImage}
+              title="Remove background - cuts people out using AI"
+              className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition-all disabled:opacity-50"
+            >
+              {isRemovingBackground ? (
+                <>
+                  <span className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Removing background…
+                </>
+              ) : (
+                <>
+                  <TbScissors size={16} /> Remove background
+                </>
+              )}
+            </button>
+          )}
+          {onDownloadImage && (
+            <button
+              type="button"
+              onClick={() => onDownloadImage(imageItems[0])}
+              disabled={isReplacingImage || isRemovingBackground || isDownloadingImage}
+              title="Download selected image"
+              className="flex items-center justify-center gap-1.5 h-10 py-1.5 rounded-xl text-sm font-semibold tracking-tight text-neutral-700 dark:text-neutral-200 bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-all disabled:opacity-50"
+            >
+              <IoDownloadOutline size={16} /> Download image
+            </button>
+          )}
+        </div>
       )}
 
       {allText && textItems.length === 1 && (
@@ -389,6 +619,24 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       {allText && (
         <div className={CARD}>
           <SectionHeader icon={<IoOptionsOutline size={12} />} label="Typography" />
+
+          <div className="flex flex-wrap gap-1.5">
+            {TEXT_STYLE_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() =>
+                  onChange(
+                    textItems,
+                    textItems.map((t) => growTextItemToFitContent({ ...t, ...preset.patch, updatedAt: Date.now() }))
+                  )
+                }
+                className="px-2 py-1 rounded-md text-[11px] font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
 
           <label className="flex flex-col gap-1.5">
             <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Font</span>
@@ -453,6 +701,102 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
             </div>
           </div>
           <ColorField label="Text color" value={textItems[0].color} onChange={(v) => setTextField("color", v)} />
+
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Case</span>
+            <div className="inline-flex items-center h-7 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+              {([
+                { value: "none", label: "Aa" },
+                { value: "uppercase", label: "AA" },
+                { value: "lowercase", label: "aa" },
+              ] as const).map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setTextField("textTransform", opt.value)}
+                  className={`px-2.5 h-full text-[11px] font-medium transition-colors ${
+                    (textItems[0].textTransform ?? "none") === opt.value ? SEGMENT_ON : SEGMENT_OFF
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <SliderField
+            label="Letter spacing"
+            display={`${textItems[0].letterSpacing ?? 0}px`}
+            min={-4}
+            max={20}
+            step={0.5}
+            value={textItems[0].letterSpacing ?? 0}
+            onChange={(v) => setTextField("letterSpacing", v)}
+          />
+          <SliderField
+            label="Line height"
+            display={`${(textItems[0].lineHeight ?? 1.25).toFixed(2)}×`}
+            min={0.9}
+            max={2.2}
+            step={0.05}
+            value={textItems[0].lineHeight ?? 1.25}
+            onChange={(v) => setTextField("lineHeight", v)}
+          />
+        </div>
+      )}
+
+      {allText && (
+        <div className={CARD}>
+          <SectionHeader icon={<IoSparklesOutline size={12} />} label="Outline & Shadow" />
+
+          <SliderField
+            label="Outline width"
+            display={`${textItems[0].strokeWidth ?? 0}px`}
+            min={0}
+            max={16}
+            value={textItems[0].strokeWidth ?? 0}
+            onChange={(v) => setTextField("strokeWidth", v)}
+          />
+          {(textItems[0].strokeWidth ?? 0) > 0 && (
+            <ColorField label="Outline color" value={textItems[0].strokeColor ?? "#000000"} onChange={(v) => setTextField("strokeColor", v)} />
+          )}
+
+          <button
+            type="button"
+            onClick={() => setTextField("shadow", textItems[0].shadow ? undefined : { blur: 16, offsetX: 0, offsetY: 5, color: "rgba(0,0,0,0.55)" })}
+            className={GHOST_BUTTON}
+          >
+            {textItems[0].shadow ? "Remove text shadow" : "Add text shadow / glow"}
+          </button>
+
+          {textItems[0].shadow && (
+            <>
+              <SliderField
+                label="Shadow blur"
+                display={`${textItems[0].shadow.blur}px`}
+                min={0}
+                max={60}
+                value={textItems[0].shadow.blur}
+                onChange={(v) => setTextField("shadow", { ...(textItems[0].shadow ?? DEFAULT_SHADOW), blur: v })}
+              />
+              <SliderField
+                label="Shadow offset Y"
+                display={`${textItems[0].shadow.offsetY}px`}
+                min={-40}
+                max={40}
+                value={textItems[0].shadow.offsetY}
+                onChange={(v) => setTextField("shadow", { ...(textItems[0].shadow ?? DEFAULT_SHADOW), offsetY: v })}
+              />
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Shadow / glow color</span>
+                <ColorInput
+                  value={rgbaToHex(textItems[0].shadow.color)}
+                  onChange={(e) => setTextField("shadow", { ...(textItems[0].shadow ?? DEFAULT_SHADOW), color: e.target.value })}
+                  className={SWATCH}
+                />
+              </label>
+            </>
+          )}
         </div>
       )}
 
@@ -496,7 +840,195 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
 
       {allImages && (
         <div className={CARD}>
+          <div className="flex items-center justify-between">
+            <SectionHeader icon={<IoCropOutline size={12} />} label="Mask & Framing" />
+            {((imageItems[0].cropZoom ?? 1) !== 1 || (imageItems[0].cropOffsetX ?? 0) !== 0 || (imageItems[0].cropOffsetY ?? 0) !== 0 || (imageItems[0].maskShape ?? "rect") !== "rect") && (
+              <button
+                type="button"
+                onClick={() =>
+                  onChange(
+                    imageItems,
+                    imageItems.map((img) => ({ ...img, maskShape: "rect", cropZoom: 1, cropOffsetX: 0, cropOffsetY: 0, fitMode: "cover", updatedAt: Date.now() }))
+                  )
+                }
+                className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-4 gap-1">
+            {IMAGE_MASK_PICKS.map((m) => (
+              <button
+                key={m.value}
+                type="button"
+                onClick={() => setImageField("maskShape", m.value)}
+                className={`h-7 rounded-md text-[11px] font-medium border transition-colors ${
+                  (imageItems[0].maskShape ?? "rect") === m.value
+                    ? "border-blue-300 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400"
+                    : "border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+            {([
+              { value: "cover", label: "Fill frame" },
+              { value: "contain", label: "Fit whole" },
+            ] as const).map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setImageField("fitMode", opt.value)}
+                className={`flex-1 h-full flex items-center justify-center text-[11px] font-medium transition-colors ${
+                  (imageItems[0].fitMode ?? "cover") === opt.value ? SEGMENT_ON : SEGMENT_OFF
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          <SliderField
+            label="Photo zoom"
+            display={`${Math.round((imageItems[0].cropZoom ?? 1) * 100)}%`}
+            min={1}
+            max={3}
+            step={0.05}
+            value={imageItems[0].cropZoom ?? 1}
+            onChange={(v) => setImageField("cropZoom", v)}
+          />
+          <SliderField
+            label="Focal pan X"
+            display={`${Math.round((imageItems[0].cropOffsetX ?? 0) * 100)}%`}
+            min={-1}
+            max={1}
+            step={0.05}
+            value={imageItems[0].cropOffsetX ?? 0}
+            onChange={(v) => setImageField("cropOffsetX", v)}
+          />
+          <SliderField
+            label="Focal pan Y"
+            display={`${Math.round((imageItems[0].cropOffsetY ?? 0) * 100)}%`}
+            min={-1}
+            max={1}
+            step={0.05}
+            value={imageItems[0].cropOffsetY ?? 0}
+            onChange={(v) => setImageField("cropOffsetY", v)}
+          />
+        </div>
+      )}
+
+      {allImages && (
+        <div className={CARD}>
+          <div className="flex items-center justify-between">
+            <SectionHeader icon={<IoColorFilterOutline size={12} />} label="Adjust & Filters" />
+            {imageItems[0].adjustments && (
+              <button
+                type="button"
+                onClick={() => setImageField("adjustments", undefined)}
+                className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-4 gap-1">
+            {PHOTO_FILTER_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => setImageField("adjustments", preset.adj ? { ...preset.adj } : undefined)}
+                className="h-7 rounded-md text-[11px] font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+
+          <SliderField
+            label="Brightness"
+            display={`${imageItems[0].adjustments?.brightness ?? 100}%`}
+            min={50}
+            max={180}
+            value={imageItems[0].adjustments?.brightness ?? 100}
+            onChange={(v) => setImageAdjustment("brightness", v)}
+          />
+          <SliderField
+            label="Contrast"
+            display={`${imageItems[0].adjustments?.contrast ?? 100}%`}
+            min={50}
+            max={180}
+            value={imageItems[0].adjustments?.contrast ?? 100}
+            onChange={(v) => setImageAdjustment("contrast", v)}
+          />
+          <SliderField
+            label="Saturation"
+            display={`${imageItems[0].adjustments?.saturation ?? 100}%`}
+            min={0}
+            max={200}
+            value={imageItems[0].adjustments?.saturation ?? 100}
+            onChange={(v) => setImageAdjustment("saturation", v)}
+          />
+          <SliderField
+            label="Warmth"
+            display={`${imageItems[0].adjustments?.sepia ?? 0}%`}
+            min={0}
+            max={100}
+            value={imageItems[0].adjustments?.sepia ?? 0}
+            onChange={(v) => setImageAdjustment("sepia", v)}
+          />
+          <SliderField
+            label="Hue shift"
+            display={`${imageItems[0].adjustments?.hue ?? 0}°`}
+            min={-180}
+            max={180}
+            value={imageItems[0].adjustments?.hue ?? 0}
+            onChange={(v) => setImageAdjustment("hue", v)}
+          />
+          <SliderField
+            label="Soft blur"
+            display={`${imageItems[0].adjustments?.blur ?? 0}px`}
+            min={0}
+            max={20}
+            step={0.5}
+            value={imageItems[0].adjustments?.blur ?? 0}
+            onChange={(v) => setImageAdjustment("blur", v)}
+          />
+        </div>
+      )}
+
+      {allImages && (
+        <div className={CARD}>
           <SectionHeader icon={<IoOptionsOutline size={12} />} label="Frame" />
+
+          <div className="flex flex-wrap gap-1.5">
+            {IMAGE_FRAME_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                title={preset.title}
+                onClick={() =>
+                  onChange(
+                    imageItems,
+                    imageItems.map((img) => ({
+                      ...img,
+                      ...preset.patch,
+                      updatedAt: Date.now(),
+                    }))
+                  )
+                }
+                className="px-2 py-1 rounded-md text-[11px] font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-200 hover:bg-blue-50 dark:hover:bg-blue-500/15 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
 
           <SliderField label="Padding" display={`${imageItems[0].padding}px`} min={0} max={80} value={imageItems[0].padding} onChange={(v) => setImageField("padding", v)} />
           <SliderField label="Border width" display={`${imageItems[0].borderWidth}px`} min={0} max={40} value={imageItems[0].borderWidth} onChange={(v) => setImageField("borderWidth", v)} />
@@ -509,7 +1041,33 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
             value={imageItems[0].cornerRadius}
             onChange={(v) => setImageField("cornerRadius", v)}
           />
-          <ColorField label="Frame color" value={imageItems[0].backgroundColor} onChange={(v) => setImageField("backgroundColor", v)} />
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Frame color</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  setImageField(
+                    "backgroundColor",
+                    imageItems[0].backgroundColor === "transparent" ? "#ffffff" : "transparent"
+                  )
+                }
+                title="Toggle transparent frame background"
+                className={`px-2 py-1 rounded-md text-xs font-medium transition-colors ${
+                  imageItems[0].backgroundColor === "transparent"
+                    ? "bg-blue-50 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/30"
+                    : "bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-200 dark:hover:bg-neutral-700"
+                }`}
+              >
+                Transparent
+              </button>
+              <ColorInput
+                value={imageItems[0].backgroundColor === "transparent" ? "#ffffff" : imageItems[0].backgroundColor}
+                onChange={(e) => setImageField("backgroundColor", e.target.value)}
+                className={`${SWATCH} ${imageItems[0].backgroundColor === "transparent" ? "opacity-30" : ""}`}
+              />
+            </div>
+          </div>
 
           <div className="flex items-center gap-2">
             <button
@@ -668,16 +1226,76 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
           </div>
 
           {SHAPE_FILL_TYPES.includes(shapeItems[0].shapeType) && (
-            <div className="flex items-center gap-2">
-              <ColorInput
-                value={shapeItems[0].fillColor ?? "#93c5fd"}
-                onChange={(e) => setShapeField("fillColor", e.target.value)}
-                className={`${SWATCH} ${shapeItems[0].fillColor === null ? "opacity-30" : ""}`}
-              />
-              <button type="button" onClick={() => setShapeField("fillColor", shapeItems[0].fillColor === null ? "#93c5fd" : null)} className={`flex-1 ${GHOST_BUTTON}`}>
-                {shapeItems[0].fillColor === null ? "Add fill" : "Remove fill"}
-              </button>
-            </div>
+            <>
+              <div className="inline-flex items-center h-8 rounded-lg border border-neutral-200 dark:border-neutral-700 overflow-hidden divide-x divide-neutral-200 dark:divide-neutral-700">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange(
+                      shapeItems,
+                      shapeItems.map((s) => ({ ...s, fillGradient: null, fillColor: s.fillColor ?? "#93c5fd", updatedAt: Date.now() }))
+                    );
+                  }}
+                  className={`flex-1 h-full text-[11px] font-medium transition-colors ${
+                    !shapeItems[0].fillGradient && shapeItems[0].fillColor !== null ? SEGMENT_ON : SEGMENT_OFF
+                  }`}
+                >
+                  Solid
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange(
+                      shapeItems,
+                      shapeItems.map((s) => ({ ...s, fillGradient: s.fillGradient ?? DEFAULT_SHAPE_GRADIENT, updatedAt: Date.now() }))
+                    );
+                  }}
+                  className={`flex-1 h-full text-[11px] font-medium transition-colors ${shapeItems[0].fillGradient ? SEGMENT_ON : SEGMENT_OFF}`}
+                >
+                  Gradient
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange(
+                      shapeItems,
+                      shapeItems.map((s) => ({ ...s, fillGradient: null, fillColor: null, updatedAt: Date.now() }))
+                    );
+                  }}
+                  className={`flex-1 h-full text-[11px] font-medium transition-colors ${
+                    !shapeItems[0].fillGradient && shapeItems[0].fillColor === null ? SEGMENT_ON : SEGMENT_OFF
+                  }`}
+                >
+                  None
+                </button>
+              </div>
+              {shapeItems[0].fillGradient ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <ColorField
+                      label="From"
+                      value={shapeItems[0].fillGradient.from}
+                      onChange={(from) => setShapeField("fillGradient", { ...(shapeItems[0].fillGradient ?? DEFAULT_SHAPE_GRADIENT), from })}
+                    />
+                    <ColorField
+                      label="To"
+                      value={shapeItems[0].fillGradient.to}
+                      onChange={(to) => setShapeField("fillGradient", { ...(shapeItems[0].fillGradient ?? DEFAULT_SHAPE_GRADIENT), to })}
+                    />
+                  </div>
+                  <SliderField
+                    label="Gradient angle"
+                    display={`${shapeItems[0].fillGradient.angleDeg}°`}
+                    min={0}
+                    max={360}
+                    value={shapeItems[0].fillGradient.angleDeg}
+                    onChange={(angleDeg) => setShapeField("fillGradient", { ...(shapeItems[0].fillGradient ?? DEFAULT_SHAPE_GRADIENT), angleDeg })}
+                  />
+                </>
+              ) : shapeItems[0].fillColor !== null ? (
+                <ColorField label="Fill color" value={shapeItems[0].fillColor} onChange={(v) => setShapeField("fillColor", v)} />
+              ) : null}
+            </>
           )}
 
           {shapeItems[0].shapeType === "rectangle" && (
@@ -735,6 +1353,35 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
             ))}
           </div>
 
+          <button
+            type="button"
+            onClick={() => setShapeField("shadow", shapeItems[0].shadow ? undefined : DEFAULT_SHADOW)}
+            className={GHOST_BUTTON}
+          >
+            {shapeItems[0].shadow ? "Remove shadow" : "Add shadow"}
+          </button>
+
+          {shapeItems[0].shadow && (
+            <>
+              <SliderField
+                label="Shadow blur"
+                display={`${shapeItems[0].shadow.blur}px`}
+                min={0}
+                max={60}
+                value={shapeItems[0].shadow.blur}
+                onChange={(v) => setShapeField("shadow", { ...(shapeItems[0].shadow ?? DEFAULT_SHADOW), blur: v })}
+              />
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Shadow color</span>
+                <ColorInput
+                  value={rgbaToHex(shapeItems[0].shadow.color)}
+                  onChange={(e) => setShapeField("shadow", { ...(shapeItems[0].shadow ?? DEFAULT_SHADOW), color: e.target.value })}
+                  className={SWATCH}
+                />
+              </label>
+            </>
+          )}
+
           {shapeItems.length === 1 && boardShapeCount > 1 && (
             <button type="button" onClick={() => onApplyStyleToAllShapes(shapeItems[0])} className={GHOST_BUTTON}>
               Apply style to all shapes
@@ -746,6 +1393,36 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       <div className={CARD}>
         <SectionHeader icon={<IoContrastOutline size={12} />} label="Appearance" />
         <SliderField label="Opacity" display={`${Math.round(primary.opacity * 100)}%`} min={0.1} max={1} step={0.05} value={primary.opacity} onChange={setOpacity} />
+        <label className="flex items-center justify-between gap-2">
+          <span className="text-xs font-medium text-neutral-600 dark:text-neutral-300">Blend mode</span>
+          <select
+            value={primary.blendMode ?? "source-over"}
+            onChange={(e) => setBlendMode(e.target.value as BoardBlendMode)}
+            className="h-8 px-2 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950/60 text-xs text-neutral-800 dark:text-neutral-100 outline-none focus:border-blue-400"
+          >
+            {BOARD_BLEND_MODES.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => toggleFlip("flipH")}
+            className={`flex-1 flex items-center justify-center gap-1.5 ${GHOST_BUTTON} ${primary.flipH ? "ring-1 ring-blue-400 text-blue-600 dark:text-blue-400" : ""}`}
+          >
+            <TbFlipHorizontal size={14} /> Flip H
+          </button>
+          <button
+            type="button"
+            onClick={() => toggleFlip("flipV")}
+            className={`flex-1 flex items-center justify-center gap-1.5 ${GHOST_BUTTON} ${primary.flipV ? "ring-1 ring-blue-400 text-blue-600 dark:text-blue-400" : ""}`}
+          >
+            <TbFlipVertical size={14} /> Flip V
+          </button>
+        </div>
       </div>
 
       <button
@@ -777,6 +1454,7 @@ const BoardStylePanel: React.FC<BoardStylePanelProps> = ({
       >
         <IoTrashOutline size={14} /> Delete {items.length > 1 ? "items" : kindLabel}
       </button>
+      </div>
     </div>
   );
 };

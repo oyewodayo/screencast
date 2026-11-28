@@ -16,7 +16,7 @@ export const FILE_CATEGORY_EXTENSIONS: Record<FileCategory, string[]> = {
   // heic/heif are iPhone's default photo format - Chromium (WebView2) has no built-in decoder for
   // them, so Dashboard.tsx special-cases these two extensions to show a "Convert to view" prompt
   // (via the same ffmpeg-backed convert_image path below) instead of handing them to ImageEditor.
-  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "heic", "heif"],
+  image: ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "heic", "heif", "webp"],
   pdf: ["pdf"],
   // What Docs' export feature (DocsEditor.tsx's Export menu) writes into the Briefcast root -
   // docx/md/txt have no inline previewer (unlike pdf/image/video), so Dashboard.tsx falls back to
@@ -40,6 +40,15 @@ export const CONVERTIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio"
 
 export const isConvertibleCategory = (category: FileCategory | null): category is "video" | "audio" | "image" =>
   category !== null && (CONVERTIBLE_CATEGORIES as readonly FileCategory[]).includes(category);
+
+// All file categories in Briefcast can be compressed:
+// - Video, Audio, and Image: smart media compression via ffmpeg & image codecs
+// - PDF: stream & object structure optimization (kept as a viewable .pdf)
+// - Document: efficient ZIP deflation compression
+export const COMPRESSIBLE_CATEGORIES: readonly FileCategory[] = ["video", "audio", "image", "pdf", "document"];
+
+export const isCompressibleCategory = (category: FileCategory | null): category is FileCategory =>
+  category !== null && (COMPRESSIBLE_CATEGORIES as readonly FileCategory[]).includes(category);
 
 // Video extensions that are real media files - everything in the video category except Video
 // Editor projects (.briefvideo), which only the editor itself can open. What a "pick a video to

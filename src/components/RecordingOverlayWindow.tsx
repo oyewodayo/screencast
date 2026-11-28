@@ -1,6 +1,6 @@
 // RecordingOverlayWindow.tsx - This should be a separate component/page
 import { useEffect, useRef, useState } from 'react'
-import { IoContractOutline, IoExpandOutline, IoMic, IoPause, IoPlay, IoScanSharp, IoSquare, IoVideocam } from 'react-icons/io5'
+import { IoBrushOutline, IoContractOutline, IoExpandOutline, IoMic, IoPause, IoPlay, IoScanSharp, IoShieldCheckmarkOutline, IoSquare, IoVideocam } from 'react-icons/io5'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { LogicalSize } from '@tauri-apps/api/dpi';
 import { listen, emit } from '@tauri-apps/api/event';
@@ -8,12 +8,16 @@ import { invoke } from '@tauri-apps/api/core';
 import { message } from '@tauri-apps/plugin-dialog';
 import { trackEvent } from "../utils/telemetry";
 import type { RecordingStatus } from "../utils/recordingStatus";
+import { loadSettings, SETTINGS_CHANGED_DOM_EVENT, type AppSettings } from "../utils/appSettings";
+import { isPrivacyShieldArmed } from "../utils/privacyShield";
+import type { BlurRegion } from "../hooks/useScreenBlur";
 const appWindow = getCurrentWebviewWindow()
 
 // The window is sized to the pill it's showing (plus room for the shadow) rather than staying at
 // the full bar's size when minimized - a transparent window still takes clicks across its whole
 // rectangle, so a small pill in a big window blocked whatever was underneath it.
-const FULL_SIZE = new LogicalSize(380, 68);
+const FULL_SIZE_BASE = new LogicalSize(380, 68);
+const FULL_SIZE_SCREEN = new LogicalSize(472, 68);
 const MINI_SIZE = new LogicalSize(196, 52);
 
 // Which inputs this recording captures, as small icons - the same set in both sizes of the bar.
@@ -67,6 +71,7 @@ const RecordingOverlayWindow = () => {
     useEffect(() => {
         document.documentElement.style.background = "transparent";
         document.body.style.background = "transparent";
+        invoke("exclude_from_screen_capture").catch(() => {});
     }, []);
     const [elapsedTime, setElapsedTime] = useState<number>(0);
     const [isMinimized, setIsMinimized] = useState<boolean>(false);
@@ -101,6 +106,11 @@ const RecordingOverlayWindow = () => {
     const [canSwitchView, setCanSwitchView] = useState<boolean>(false);
     const [showSourceLabel, setShowSourceLabel] = useState<boolean>(false);
     const [viewMode, setViewMode] = useState<'screen' | 'camera'>('screen');
+    const [annotationActive, setAnnotationActive] = useState<boolean>(false);
+    const [annotationTool, setAnnotationTool] = useState<'ink' | 'blur'>('ink');
+    const [blurCount, setBlurCount] = useState<number>(0);
+    const [privacyShieldArmed, setPrivacyShieldArmed] = useState<boolean>(() => isPrivacyShieldArmed(loadSettings()));
+    const hasScreen = ["sva", "sa", "s"].includes(recordType);
 
     const formatTime = (seconds: number): string => {
         const mins = Math.floor(seconds / 60);
@@ -113,8 +123,35 @@ const RecordingOverlayWindow = () => {
     };
 
     useEffect(() => {
-        appWindow.setSize(isMinimized ? MINI_SIZE : FULL_SIZE).catch((err) => console.error("Couldn't resize the recording bar:", err));
-    }, [isMinimized]);
+        const size = isMinimized ? MINI_SIZE : hasScreen ? FULL_SIZE_SCREEN : FULL_SIZE_BASE;
+        appWindow.setSize(size).catch((err) => console.error("Couldn't resize the recording bar:", err));
+    }, [isMinimized, hasScreen]);
+
+    useEffect(() => {
+        const onSettings = (e: Event) => {
+            const detail = (e as CustomEvent<AppSettings>).detail;
+            setPrivacyShieldArmed(isPrivacyShieldArmed(detail ?? loadSettings()));
+        };
+        window.addEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
+        const unlistenMode = listen<{ active: boolean; tool?: 'ink' | 'blur' }>('annotation-mode-changed', (e) => {
+            setAnnotationActive(e.payload.active);
+            if (e.payload.tool) setAnnotationTool(e.payload.tool);
+            else if (!e.payload.active) setAnnotationTool('ink');
+        });
+        const unlistenTool = listen<{ tool: 'ink' | 'blur' }>('annotation-tool-changed', (e) => {
+            setAnnotationTool(e.payload.tool);
+        });
+        const unlistenBlur = listen<BlurRegion[]>('screen-blur-changed', (e) => {
+            setBlurCount(e.payload.length);
+        });
+        invoke<BlurRegion[]>('screen_blur_list').then((list) => setBlurCount(list.length)).catch(() => {});
+        return () => {
+            window.removeEventListener(SETTINGS_CHANGED_DOM_EVENT, onSettings);
+            unlistenMode.then((fn) => fn());
+            unlistenTool.then((fn) => fn());
+            unlistenBlur.then((fn) => fn());
+        };
+    }, []);
 
     const handleStopRecording = async () => {
         // ffmpeg has already been asked to stop and torn down on the backend by the time
@@ -408,6 +445,51 @@ const RecordingOverlayWindow = () => {
                     {pauseButton}
                     {stopButton}
                 </div>
+
+                {hasScreen && (
+                    <>
+                        <span className="w-px h-6 bg-white/15" />
+                        <div className="flex items-center gap-1">
+                            <button
+                                type="button"
+                                onClick={() => void emit('annotation-toggle-request', { tool: 'ink' })}
+                                title="Draw on screen (Ctrl+Shift+D)"
+                                aria-label="Draw on screen"
+                                aria-pressed={annotationActive && annotationTool === 'ink'}
+                                className={`${ICON_BUTTON_CLASS} ${
+                                    annotationActive && annotationTool === 'ink'
+                                        ? "bg-blue-500 text-white shadow-[0_0_0_2px_rgba(59,130,246,0.35)]"
+                                        : "bg-white/10 hover:bg-white/20 text-white/85 hover:text-white"
+                                }`}
+                            >
+                                <IoBrushOutline size={15} />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => void emit('annotation-toggle-request', { tool: 'blur' })}
+                                title="Privacy Shield — drag to blur (B) or Ctrl+Alt+B to blur active window"
+                                aria-label="Privacy Shield"
+                                aria-pressed={annotationActive && annotationTool === 'blur'}
+                                className={`relative ${ICON_BUTTON_CLASS} ${
+                                    annotationActive && annotationTool === 'blur'
+                                        ? "bg-sky-500 text-white shadow-[0_0_0_2px_rgba(14,165,233,0.35)]"
+                                        : blurCount > 0 || privacyShieldArmed
+                                        ? "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300"
+                                        : "bg-white/10 hover:bg-white/20 text-white/85 hover:text-white"
+                                }`}
+                            >
+                                <IoShieldCheckmarkOutline size={15} />
+                                {blurCount > 0 ? (
+                                    <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-0.5 rounded-full bg-sky-500 text-[9px] font-semibold leading-[14px] text-white text-center">
+                                        {blurCount}
+                                    </span>
+                                ) : privacyShieldArmed ? (
+                                    <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                                ) : null}
+                            </button>
+                        </div>
+                    </>
+                )}
 
                 <span className="w-px h-6 bg-white/15" />
 

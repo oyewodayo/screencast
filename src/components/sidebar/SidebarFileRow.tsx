@@ -27,14 +27,16 @@ import { MdOutlineDescription } from "react-icons/md";
 import SidebarFileIcon from "../SidebarFileIcon";
 import InlineRenameInput from "../InlineRenameInput";
 import { FileNameText } from "../SidebarResize";
-import { getFileCategory, isConvertibleCategory } from "../../utils/fileCategory";
+import { getFileCategory, isConvertibleCategory, isCompressibleCategory } from "../../utils/fileCategory";
+import { IoContractOutline } from "react-icons/io5";
 import { isVideoProjectPath } from "../../utils/videoEditTypes";
 import { openPhoneTransfer } from "../../services/phoneTransfer";
+import { cancelVideoPreview, scheduleVideoPreview } from "../video/VideoHoverPreview";
 import type { DocSummary } from "../../utils/docTypes";
 import type { FileEntry } from "../../utils/libraryEntries";
 import type { SidebarFileTreeProps } from "./SidebarFileTree";
 
-export type SidebarRowActions = Pick<SidebarFileTreeProps, "addMediaToVideo" | "cancelRename" | "categoryIcon" | "categoryIconColorClassName" | "commitRename" | "filesToActOn" | "handleAddFilesToBoard" | "handleCopyFileImage" | "handleCopyFilePath" | "handleDeleteFile" | "handleLinkNotes" | "handleSetThumbnail" | "handleSidebarFilePointerDown" | "handleSidebarFilePointerMove" | "handleTogglePin" | "refreshDocsIndex" | "resolveImageThumbnailUrl" | "resolveVideoThumbnailUrl" | "startRename" | "toggleFileSelected" | "setAddMenuFor" | "setConversionFile" | "setDocsScreen" | "setDraggingFiles" | "setDragOverFolder" | "setError" | "setInfoFile" | "setLinkDocsMenuOpenFor" | "setOpenMenu" | "setSelectedFile" | "setTransferMenu"> & {
+export type SidebarRowActions = Pick<SidebarFileTreeProps, "addMediaToVideo" | "cancelRename" | "categoryIcon" | "categoryIconColorClassName" | "commitRename" | "filesToActOn" | "handleAddFilesToBoard" | "handleCopyFileImage" | "handleCopyFilePath" | "handleDeleteFile" | "handleLinkNotes" | "handleSetThumbnail" | "handleSidebarFilePointerDown" | "handleSidebarFilePointerMove" | "handleTogglePin" | "refreshDocsIndex" | "resolveImageThumbnailUrl" | "resolveVideoThumbnailUrl" | "startRename" | "toggleFileSelected" | "setAddMenuFor" | "setConversionFile" | "setCompressionFile" | "setDocsScreen" | "setDraggingFiles" | "setDragOverFolder" | "setError" | "setInfoFile" | "setLinkDocsMenuOpenFor" | "setOpenMenu" | "setSelectedFile" | "setTransferMenu"> & {
   // The tree's tap: lights the row at once, opens the file after that's painted.
   tapFile: (file: FileEntry) => (e: React.PointerEvent) => void;
 };
@@ -86,6 +88,7 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
     toggleFileSelected,
     setAddMenuFor,
     setConversionFile,
+    setCompressionFile,
     setDocsScreen,
     setDraggingFiles,
     setDragOverFolder,
@@ -97,11 +100,14 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
     setTransferMenu,
     tapFile,
   } = actions;
+  const isVideoFile = getFileCategory(file.name) === "video";
+  const canPreviewInGrid = isGridView && isVideoFile && !renaming && !isVideoProjectPath(file.path) && file.size > 0;
   return (
     <li
       data-file-path={file.path}
       draggable
       onDragStart={(e) => {
+        if (canPreviewInGrid) cancelVideoPreview("sidebar", file.path);
         // While a video is being edited, dragging a video, picture or sound
         // takes it into the editor (handleSidebarFilePointerDown) - the
         // browser's own drag would cancel that gesture the moment it began.
@@ -115,6 +121,14 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
       onDragEnd={() => {
         setDraggingFiles(null);
         setDragOverFolder(null);
+      }}
+      onPointerEnter={() => {
+        if (canPreviewInGrid && !menuOpen && !addMenuOpen) {
+          scheduleVideoPreview("sidebar", file.path, file.size);
+        }
+      }}
+      onPointerLeave={() => {
+        if (isGridView && isVideoFile) cancelVideoPreview("sidebar", file.path);
       }}
       className={`${isGridView ? "relative flex flex-col gap-1 min-w-0 group cursor-pointer p-1 rounded-lg" : "flex items-center gap-1.5 min-w-0 group cursor-pointer -mx-1 px-1 py-1 rounded-md"} hover:bg-gray-50 dark:hover:bg-neutral-800 ${
         selected ? 'bg-blue-50 dark:bg-blue-500/10' : ''
@@ -133,18 +147,31 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
       {isGridView ? (
         // Same tap-to-open / drag-to-timeline gesture as the filename in list view.
         <div
-          className="w-full"
+          className="w-full outline-none rounded-lg focus-visible:ring-2 focus-visible:ring-blue-500"
+          tabIndex={canPreviewInGrid ? 0 : undefined}
           title={file.name}
-          onPointerDown={(e) => handleSidebarFilePointerDown(file)(e)}
+          onFocus={() => {
+            if (canPreviewInGrid && !menuOpen && !addMenuOpen) {
+              scheduleVideoPreview("sidebar", file.path, file.size);
+            }
+          }}
+          onBlur={() => {
+            if (isVideoFile) cancelVideoPreview("sidebar", file.path);
+          }}
+          onPointerDown={(e) => {
+            if (isVideoFile) cancelVideoPreview("sidebar", file.path);
+            handleSidebarFilePointerDown(file)(e);
+          }}
           onPointerMove={handleSidebarFilePointerMove}
           onPointerUp={(e) => tapFile(file)(e)}
         >
           <SidebarFileIcon
             large
+            isVideo={isVideoFile && !isVideoProjectPath(file.path) && file.size > 0}
             name={file.name}
             path={file.path}
             isImage={["image", "video"].includes(getFileCategory(file.name) ?? "")}
-            resolveThumbnailUrl={getFileCategory(file.name) === "video" ? resolveVideoThumbnailUrl : resolveImageThumbnailUrl}
+            resolveThumbnailUrl={isVideoFile ? resolveVideoThumbnailUrl : resolveImageThumbnailUrl}
             fallbackIcon={categoryIcon(getFileCategory(file.name))}
             fallbackClassName={categoryIconColorClassName(getFileCategory(file.name))}
           />
@@ -267,6 +294,7 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
           }`}
           onClick={(e) => {
             e.stopPropagation();
+            if (isVideoFile) cancelVideoPreview("sidebar", file.path);
             setOpenMenu(menuOpen ? null : file.path);
             setLinkDocsMenuOpenFor(null);
           }}
@@ -415,6 +443,19 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
                   <span className="flex-1 text-left">Convert</span>
                 </button>
                )}
+               {isCompressibleCategory(getFileCategory(file.name)) && (
+                 <button
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700/70 transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setCompressionFile(file);
+                      setOpenMenu(null);
+                    }}
+                  >
+                  <IoContractOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+                  <span className="flex-1 text-left">Compress</span>
+                </button>
+               )}
 
               {/* Only when a board is actually open (boardEditorRef) and
                   this is an image - see handleAddFilesToBoard. */}
@@ -428,7 +469,7 @@ const SidebarFileRow: React.FC<SidebarFileRowProps> = ({ file, selected, isOpen,
                 >
                   <IoAddCircleOutline size={15} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
                   <span className="flex-1 text-left">
-                    {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to board` : "Add to board"}
+                    {filesToActOn(file).length > 1 ? `Add ${filesToActOn(file).length} to Design` : "Add to Design"}
                   </span>
                 </button>
               )}
