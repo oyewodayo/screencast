@@ -301,6 +301,11 @@ const TemplateCard = memo(function TemplateCard({
         style={{ background: template ? `radial-gradient(120% 90% at 20% 10%, ${template.swatch[1]}, ${template.swatch[0]} 70%)` : undefined }}
       >
         {!template && <span className="absolute inset-0 bg-neutral-200 dark:bg-neutral-700" />}
+        {template?.featured && (
+          <span className="absolute top-1 left-1 z-10 rounded px-1 py-px text-[8.5px] font-bold tracking-wider bg-black/55 text-white backdrop-blur-sm ring-1 ring-white/20">
+            PRO
+          </span>
+        )}
         <span className="absolute inset-0 flex items-center justify-center transition-transform duration-300 group-hover:scale-110">
           {template && look ? (
             <TitleLookTile look={look} text={template.cardWord} width={104} height={64} />

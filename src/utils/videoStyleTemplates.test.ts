@@ -248,6 +248,20 @@ describe("suggestTemplateTracks", () => {
   });
 });
 
+describe("double exposure & accent assets", () => {
+  it("layers feathered screen-blended partner photos and animated accent assets on Double Exposure", () => {
+    const t = styleTemplate("dream-blend")!;
+    const state = buildStyledProject(photos(3), frame, { ...templateOptions(t), music: null });
+    const blended = state.imageOverlays.filter((o) => !o.asset && o.mask && o.blendMode === "screen");
+    expect(blended).toHaveLength(3);
+    expect(blended[0].src).toBe("p1.jpg");
+    expect(blended[2].src).toBe("p0.jpg");
+    expect(blended[0].mask?.feather).toBeGreaterThan(0.15);
+    expect(state.imageOverlays.some((o) => o.asset?.kind === "heart" && o.asset.loop === "pulse")).toBe(true);
+    expect(state.imageOverlays.some((o) => o.asset?.kind === "scribble" && o.asset.entrance === "draw")).toBe(true);
+  });
+});
+
 describe("every template", () => {
   it("uses only looks that exist, transitions the stage can draw and words it defines", () => {
     for (const t of STYLE_TEMPLATES) {
