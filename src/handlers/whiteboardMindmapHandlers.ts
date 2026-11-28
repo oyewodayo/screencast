@@ -778,3 +778,363 @@ export function convertMindmapDocumentToWhiteboardDocument(
     updatedAt: now,
   };
 }
+
+// ===============================================================================================
+// Pro Mind Map Operations (Smart Directional Branching, Subtree Selection/Recolor/Delete,
+// Sibling Reordering, Insert Parent, Expand/Collapse All, and Outline -> Briefcast Doc Export)
+// ===============================================================================================
+
+/**
+ * Walks incoming parent edges up to the root of the Mind Map tree containing `nodeId`
+ * (cycle-safe). Lets Auto-Layout, Expand/Collapse All, and Doc Export work cleanly regardless
+ * of which branch node the user currently has selected.
+ */
+export function findMindmapRoot(nodeId: string, nodes: WhiteboardNode[], edges: WhiteboardEdge[]): string {
+  const byId = new Set(nodes.map((n) => n.id));
+  if (!byId.has(nodeId)) return nodeId;
+  let curr = nodeId;
+  const visited = new Set<string>([curr]);
+  while (true) {
+    const incoming = edges.find((e) => e.target.nodeId === curr && e.source.nodeId && byId.has(e.source.nodeId));
+    if (!incoming?.source.nodeId || visited.has(incoming.source.nodeId)) break;
+    curr = incoming.source.nodeId;
+    visited.add(curr);
+  }
+  return curr;
+}
+
+/**
+ * Picks the natural outward side when pressing `Tab` (Add Child) on a Mind Map node:
+ *   - Non-root left-branch nodes keep expanding `"left"` instead of crashing back through the root.
+ *   - Non-root right-branch nodes expand `"right"`; top/bottom spine nodes expand outward.
+ *   - Root nodes automatically balance left vs. right children so balanced mind maps stay symmetric.
+ */
+export function inferMindmapChildSide(node: WhiteboardNode, page: WhiteboardPage): CardinalSide {
+  const incoming = page.edges.find((e) => e.target.nodeId === node.id && e.source.nodeId);
+  if (incoming?.source.nodeId) {
+    const parent = page.nodes.find((n) => n.id === incoming.source.nodeId);
+    if (parent) {
+      return inferBranchSide(parent, node, incoming);
+    }
+  }
+  // Root node: balance right vs left outgoing branches.
+  let leftCount = 0;
+  let rightCount = 0;
+  for (const e of page.edges) {
+    if (e.source.nodeId !== node.id || !e.target.nodeId) continue;
+    const child = page.nodes.find((n) => n.id === e.target.nodeId);
+    if (!child) continue;
+    const side = inferBranchSide(node, child, e);
+    if (side === "left") leftCount++;
+    else if (side === "right") rightCount++;
+  }
+  return leftCount < rightCount ? "left" : "right";
+}
+
+/**
+ * Collects `rootId` and every descendant node + all edges touching that subtree.
+ * Powers Select Subtree, Delete Subtree, Move Subtree, and Branch Recoloring.
+ */
+export function getMindmapSubtree(
+  rootId: string,
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[]
+): { nodeIds: Set<string>; edgeIds: Set<string> } {
+  const nodeSet = new Set(nodes.map((n) => n.id));
+  const nodeIds = new Set<string>();
+  const edgeIds = new Set<string>();
+  if (!nodeSet.has(rootId)) return { nodeIds, edgeIds };
+
+  const outgoing = new Map<string, WhiteboardEdge[]>();
+  for (const e of edges) {
+    if (!e.source.nodeId || !e.target.nodeId || e.source.nodeId === e.target.nodeId) continue;
+    if (!nodeSet.has(e.source.nodeId) || !nodeSet.has(e.target.nodeId)) continue;
+    let list = outgoing.get(e.source.nodeId);
+    if (!list) {
+      list = [];
+      outgoing.set(e.source.nodeId, list);
+    }
+    list.push(e);
+  }
+
+  const queue: string[] = [rootId];
+  nodeIds.add(rootId);
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    for (const e of outgoing.get(curr) ?? []) {
+      edgeIds.add(e.id);
+      const child = e.target.nodeId!;
+      if (!nodeIds.has(child)) {
+        nodeIds.add(child);
+        queue.push(child);
+      }
+    }
+  }
+
+  return { nodeIds, edgeIds };
+}
+
+/**
+ * Applies a Mind Map palette color key harmonically to `rootId`, all of its descendants, and the
+ * internal connectors linking them, returning an undoable `{ before, after, beforeEdges, afterEdges }`.
+ */
+export function recolorMindmapBranch(
+  rootId: string,
+  colorKey: MindmapColorKey,
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[]
+): {
+  before: WhiteboardNode[];
+  after: WhiteboardNode[];
+  beforeEdges: WhiteboardEdge[];
+  afterEdges: WhiteboardEdge[];
+} {
+  const { nodeIds, edgeIds } = getMindmapSubtree(rootId, nodes, edges);
+  const entry = MINDMAP_PALETTE[colorKey];
+  const before: WhiteboardNode[] = [];
+  const after: WhiteboardNode[] = [];
+  const now = Date.now();
+  for (const n of nodes) {
+    if (!nodeIds.has(n.id) || n.locked) continue;
+    before.push(n);
+    after.push({ ...applyMindmapPaletteKey(n, colorKey), updatedAt: now });
+  }
+  const beforeEdges: WhiteboardEdge[] = [];
+  const afterEdges: WhiteboardEdge[] = [];
+  for (const e of edges) {
+    if (!edgeIds.has(e.id) || e.locked) continue;
+    beforeEdges.push(e);
+    afterEdges.push({ ...e, strokeColor: entry.border, updatedAt: now });
+  }
+  return { before, after, beforeEdges, afterEdges };
+}
+
+/**
+ * Sets `mindmapCollapsed` across all branch-parent nodes in the tree containing `nodeId`
+ * (keeping the root itself expanded when collapsing so the main topics remain visible).
+ */
+export function setAllMindmapCollapsed(
+  nodeId: string,
+  collapsed: boolean,
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[]
+): { before: WhiteboardNode[]; after: WhiteboardNode[] } {
+  const rootId = findMindmapRoot(nodeId, nodes, edges);
+  const { nodeIds } = getMindmapSubtree(rootId, nodes, edges);
+  const { childrenByParent } = getCollapsedState(nodes, edges);
+  const before: WhiteboardNode[] = [];
+  const after: WhiteboardNode[] = [];
+  const now = Date.now();
+
+  for (const n of nodes) {
+    if (!nodeIds.has(n.id) || n.locked) continue;
+    const hasKids = (childrenByParent.get(n.id)?.length ?? 0) > 0;
+    if (!hasKids) continue;
+    const targetState = collapsed ? n.id !== rootId : false;
+    if (Boolean(n.mindmapCollapsed) !== targetState) {
+      before.push(n);
+      after.push({ ...n, mindmapCollapsed: targetState, updatedAt: now });
+    }
+  }
+  return { before, after };
+}
+
+/**
+ * Reorders a Mind Map sibling branch up or down relative to its peers on the same side of their
+ * shared parent, shifting each sibling's entire subtree cleanly by the swapped vertical delta.
+ */
+export function reorderMindmapSibling(
+  nodeId: string,
+  direction: "up" | "down",
+  page: WhiteboardPage
+): { before: WhiteboardNode[]; after: WhiteboardNode[] } {
+  const incoming = page.edges.find((e) => e.target.nodeId === nodeId && e.source.nodeId);
+  if (!incoming?.source.nodeId) return { before: [], after: [] };
+  const parent = page.nodes.find((n) => n.id === incoming.source.nodeId);
+  const target = page.nodes.find((n) => n.id === nodeId);
+  if (!parent || !target) return { before: [], after: [] };
+
+  const targetSide = inferBranchSide(parent, target, incoming);
+  const siblings: WhiteboardNode[] = [];
+  for (const e of page.edges) {
+    if (e.source.nodeId !== parent.id || !e.target.nodeId) continue;
+    const child = page.nodes.find((n) => n.id === e.target.nodeId);
+    if (!child) continue;
+    if (inferBranchSide(parent, child, e) === targetSide) siblings.push(child);
+  }
+  const isHorizontal = targetSide === "left" || targetSide === "right";
+  siblings.sort((a, b) => (isHorizontal ? a.y - b.y : a.x - b.x));
+
+  const idx = siblings.findIndex((s) => s.id === nodeId);
+  const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+  if (idx < 0 || swapIdx < 0 || swapIdx >= siblings.length) return { before: [], after: [] };
+
+  const a = siblings[idx];
+  const b = siblings[swapIdx];
+  const dxA = isHorizontal ? 0 : b.x - a.x;
+  const dyA = isHorizontal ? b.y - a.y : 0;
+  const dxB = -dxA;
+  const dyB = -dyA;
+
+  const subA = getMindmapSubtree(a.id, page.nodes, page.edges).nodeIds;
+  const subB = getMindmapSubtree(b.id, page.nodes, page.edges).nodeIds;
+  const before: WhiteboardNode[] = [];
+  const after: WhiteboardNode[] = [];
+  const now = Date.now();
+
+  for (const n of page.nodes) {
+    if (n.locked) continue;
+    if (subA.has(n.id) && !subB.has(n.id)) {
+      before.push(n);
+      after.push({ ...n, x: Math.round(n.x + dxA), y: Math.round(n.y + dyA), updatedAt: now });
+    } else if (subB.has(n.id) && !subA.has(n.id)) {
+      before.push(n);
+      after.push({ ...n, x: Math.round(n.x + dxB), y: Math.round(n.y + dyB), updatedAt: now });
+    }
+  }
+  return { before, after };
+}
+
+/**
+ * Inserts a new grouping parent topic between `node` and its existing parent (if any), shifting
+ * `node`'s subtree slightly outward so the new parent fits cleanly without overlap.
+ */
+export function buildMindmapInsertedParent(
+  node: WhiteboardNode,
+  page: WhiteboardPage,
+  newNodeId: string,
+  newEdgeId: string
+): {
+  newParent: WhiteboardNode;
+  newEdge: WhiteboardEdge;
+  updatedIncomingEdge?: { before: WhiteboardEdge; after: WhiteboardEdge };
+  shiftedNodes: { before: WhiteboardNode[]; after: WhiteboardNode[] };
+} {
+  const incoming = page.edges.find((e) => e.target.nodeId === node.id && e.source.nodeId);
+  const oldParent = incoming?.source.nodeId ? page.nodes.find((n) => n.id === incoming.source.nodeId) : undefined;
+  const side: CardinalSide = oldParent ? inferBranchSide(oldParent, node, incoming) : "right";
+
+  let newParent = createDefaultWhiteboardNode(newNodeId, "mindmapTopic", 0, 0);
+  newParent = {
+    ...newParent,
+    text: "Group topic",
+    x: Math.round(node.x),
+    y: Math.round(node.y),
+  };
+  if (node.mindmapColorKey) {
+    newParent = applyMindmapPaletteKey(newParent, node.mindmapColorKey);
+  }
+
+  const shiftX = side === "right" ? newParent.width + BRANCH_GAP_X : side === "left" ? -(newParent.width + BRANCH_GAP_X) : 0;
+  const shiftY = side === "bottom" ? newParent.height + BRANCH_GAP_Y : side === "top" ? -(newParent.height + BRANCH_GAP_Y) : 0;
+
+  const { nodeIds } = getMindmapSubtree(node.id, page.nodes, page.edges);
+  const before: WhiteboardNode[] = [];
+  const after: WhiteboardNode[] = [];
+  const now = Date.now();
+  for (const n of page.nodes) {
+    if (!nodeIds.has(n.id) || n.locked) continue;
+    before.push(n);
+    after.push({ ...n, x: Math.round(n.x + shiftX), y: Math.round(n.y + shiftY), updatedAt: now });
+  }
+
+  const newEdge: WhiteboardEdge = {
+    ...createDefaultWhiteboardEdge(
+      newEdgeId,
+      { nodeId: newParent.id, anchor: side },
+      { nodeId: node.id, anchor: oppositeSide(side) }
+    ),
+    routing: "curved",
+    strokeColor: incoming?.strokeColor ?? "#2b7fff",
+    strokeWidth: 2,
+    strokeStyle: "dashed",
+    startArrowType: "none",
+    endArrowType: "none",
+  };
+
+  const updatedIncomingEdge = incoming
+    ? {
+        before: incoming,
+        after: {
+          ...incoming,
+          target: { nodeId: newParent.id, anchor: oppositeSide(side) },
+          updatedAt: now,
+        },
+      }
+    : undefined;
+
+  return {
+    newParent,
+    newEdge,
+    updatedIncomingEdge,
+    shiftedNodes: { before, after },
+  };
+}
+
+/**
+ * Exports the Mind Map tree rooted at `rootId` into clean, structured Markdown (Title + H2 main
+ * branches + nested bullet subtopics + descriptions/checklists) ready for clipboard or Briefcast Docs.
+ */
+export function exportMindmapToOutlineMarkdown(
+  nodeId: string,
+  nodes: WhiteboardNode[],
+  edges: WhiteboardEdge[]
+): { title: string; markdown: string } {
+  const rootId = findMindmapRoot(nodeId, nodes, edges);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const root = byId.get(rootId);
+  if (!root) return { title: "Mind Map", markdown: "" };
+
+  const { childrenByParent } = getCollapsedState(nodes, edges);
+  const title = root.text.trim() || "Mind Map";
+  const lines: string[] = [`# ${title}`, ""];
+  if (root.mindmapDescription?.trim()) {
+    lines.push(root.mindmapDescription.trim(), "");
+  }
+
+  const visited = new Set<string>([rootId]);
+  const sortKids = (ids: string[]) =>
+    ids
+      .map((id) => byId.get(id))
+      .filter((n): n is WhiteboardNode => !!n)
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  const renderBranch = (node: WhiteboardNode, depth: number) => {
+    if (visited.has(node.id)) return;
+    visited.add(node.id);
+    const label = node.text.trim() || "Untitled topic";
+    if (depth === 1) {
+      lines.push(`## ${label}`);
+      if (node.mindmapDescription?.trim()) {
+        lines.push("", node.mindmapDescription.trim());
+      }
+      lines.push("");
+    } else {
+      const indent = "  ".repeat(Math.max(0, depth - 2));
+      lines.push(`${indent}- **${label}**`);
+      if (node.mindmapDescription?.trim()) {
+        lines.push(`${indent}  ${node.mindmapDescription.trim()}`);
+      }
+    }
+    if (node.mindmapItems && node.mindmapItems.length > 0) {
+      const indent = depth === 1 ? "" : "  ".repeat(Math.max(0, depth - 1));
+      for (const item of node.mindmapItems) {
+        lines.push(`${indent}- [${item.checked ? "x" : " "}] ${item.text}`);
+      }
+    }
+    const kids = sortKids(childrenByParent.get(node.id) ?? []);
+    for (const kid of kids) {
+      renderBranch(kid, depth + 1);
+    }
+    if (depth === 1) lines.push("");
+  };
+
+  for (const mainBranch of sortKids(childrenByParent.get(rootId) ?? [])) {
+    renderBranch(mainBranch, 1);
+  }
+
+  return {
+    title,
+    markdown: lines.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+  };
+}

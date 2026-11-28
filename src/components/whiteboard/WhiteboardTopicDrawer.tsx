@@ -181,27 +181,55 @@ const WhiteboardTopicDrawer: React.FC<WhiteboardTopicDrawerProps> = memo(({ node
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
         {/* Progress pills for topic/subtopic nodes */}
         {isTopic && (
-          <div>
-            <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-neutral-500 mb-1.5">Progress</p>
-            <div className="flex flex-wrap gap-1.5">
-              {PROGRESS_OPTIONS.map((opt) => {
-                const active = currentProgress === opt.value;
-                return (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    onClick={() => handleSetProgress(opt.value)}
-                    className={`h-7 px-2.5 rounded-full text-[11px] font-medium border transition ${
-                      active
-                        ? opt.activeClass
-                        : "border-gray-200 dark:border-neutral-700 text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
+          <div className="flex flex-col gap-2.5">
+            <div>
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-neutral-500 mb-1.5">Progress</p>
+              <div className="flex flex-wrap gap-1.5">
+                {PROGRESS_OPTIONS.map((opt) => {
+                  const active = currentProgress === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => handleSetProgress(opt.value)}
+                      className={`h-7 px-2.5 rounded-full text-[11px] font-medium border transition ${
+                        active
+                          ? opt.activeClass
+                          : "border-gray-200 dark:border-neutral-700 text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
+            <label className="flex items-center justify-between gap-2 pt-0.5 cursor-pointer select-none">
+              <span className="text-[11px] font-medium text-gray-600 dark:text-neutral-300">Show Done badge</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={node.mindmapShowDoneBadge !== false}
+                onClick={() =>
+                  onUpdateNode(node, {
+                    ...node,
+                    mindmapShowDoneBadge: node.mindmapShowDoneBadge === false ? true : false,
+                    updatedAt: Date.now(),
+                  })
+                }
+                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                  node.mindmapShowDoneBadge !== false
+                    ? "bg-emerald-500"
+                    : "bg-gray-200 dark:bg-neutral-700"
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                    node.mindmapShowDoneBadge !== false ? "translate-x-[18px]" : "translate-x-[3px]"
+                  }`}
+                />
+              </button>
+            </label>
           </div>
         )}
 

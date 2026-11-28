@@ -4941,7 +4941,7 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
       ctx.roundRect(0, 0, node.width, node.height, node.cornerRadius || 6);
       ctx.fillStyle =
         node.mindmapProgress === "done"
-          ? "rgba(22, 163, 74, 0.16)"
+          ? "rgba(22, 163, 74, 0.14)"
           : node.mindmapProgress === "in-progress"
           ? "rgba(234, 179, 8, 0.18)"
           : "rgba(156, 163, 175, 0.22)";
@@ -4957,6 +4957,29 @@ async function renderNode(ctx: CanvasRenderingContext2D, node: WhiteboardNode, i
       ctx.restore();
     }
     paintNodeText(ctx, node);
+    if (node.mindmapProgress === "done" && node.mindmapShowDoneBadge !== false) {
+      ctx.save();
+      const bx = node.width - 1.5;
+      const by = 1.5;
+      const r = 6.5;
+      ctx.beginPath();
+      ctx.arc(bx, by, r, 0, Math.PI * 2);
+      ctx.fillStyle = "#16a34a";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(bx - 2.6, by + 0.25);
+      ctx.lineTo(bx - 0.8, by + 2.05);
+      ctx.lineTo(bx + 2.7, by - 1.9);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.6;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      ctx.restore();
+    }
   }
   ctx.restore();
 }

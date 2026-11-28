@@ -1233,6 +1233,8 @@ export interface WhiteboardNode extends WhiteboardItemBase {
   mindmapDescription?: string;
   // Learner progress state ("pending" | "in-progress" | "done" | "skipped").
   mindmapProgress?: MindmapProgress;
+  // Whether to display the top-right emerald checkmark badge when mindmapProgress === "done" (defaults to true).
+  mindmapShowDoneBadge?: boolean;
   // Curated resource links attached to a topic/subtopic.
   mindmapResources?: MindmapResource[];
   // Inline items for "mindmapChecklist" and "mindmapLinksGroup" cards.
@@ -1584,6 +1586,7 @@ export function createDefaultWhiteboardNode(
       | "mindmapCollapsed"
       | "mindmapDescription"
       | "mindmapProgress"
+      | "mindmapShowDoneBadge"
       | "mindmapResources"
       | "mindmapItems"
       | "mindmapCheckStyle"
@@ -1739,6 +1742,7 @@ export function createDefaultWhiteboardNode(
     mindmapCollapsed: overrides?.mindmapCollapsed,
     mindmapDescription: overrides?.mindmapDescription,
     mindmapProgress: overrides?.mindmapProgress,
+    mindmapShowDoneBadge: overrides?.mindmapShowDoneBadge,
     mindmapResources: overrides?.mindmapResources,
     mindmapItems:
       overrides?.mindmapItems ??
@@ -2057,6 +2061,7 @@ export function createDefaultWhiteboardEdge(id: string, source: WhiteboardEndpoi
     strokeWidth: 2,
     strokeStyle: "solid",
     routing: "orthogonal",
+    cornerRadius: 12,
     startArrowType: "none",
     endArrowType: "triangle",
     createdAt: now,

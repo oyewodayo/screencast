@@ -238,7 +238,7 @@ function renderNodeSvg(node: WhiteboardNode): string {
   if (isMindmapTopicNode(node) && node.mindmapProgress && node.mindmapProgress !== "pending") {
     const pFill =
       node.mindmapProgress === "done"
-        ? "rgba(22,163,74,0.16)"
+        ? "rgba(22,163,74,0.14)"
         : node.mindmapProgress === "in-progress"
         ? "rgba(234,179,8,0.18)"
         : "rgba(156,163,175,0.22)";
@@ -250,6 +250,13 @@ function renderNodeSvg(node: WhiteboardNode): string {
         : "#9ca3af";
     const rx = node.cornerRadius || 6;
     parts.push(`<rect x="0" y="0" width="${node.width}" height="${node.height}" rx="${rx}" ry="${rx}" fill="${pFill}" stroke="${pStroke}" stroke-width="2"/>`);
+  }
+  if (node.mindmapProgress === "done" && node.mindmapShowDoneBadge !== false) {
+    const bx = node.width - 1.5;
+    const by = 1.5;
+    parts.push(
+      `<g><circle cx="${bx}" cy="${by}" r="6.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"/><path d="M${bx - 2.6} ${by + 0.25} L${bx - 0.8} ${by + 2.05} L${bx + 2.7} ${by - 1.9}" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></g>`
+    );
   }
 
   // Artboard title header above top-left corner

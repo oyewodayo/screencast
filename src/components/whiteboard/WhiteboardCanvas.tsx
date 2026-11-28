@@ -59,6 +59,9 @@ import {
   buildMindmapBranch,
   buildMindmapSibling,
   getCollapsedState,
+  getMindmapSubtree,
+  inferMindmapChildSide,
+  reorderMindmapSibling,
 } from "../../handlers/whiteboardMindmapHandlers";
 import { computeAutoTextBoxSize, cullVisibleItems, findContainedFrameItems } from "../../handlers/whiteboardProHandlers";
 import {
@@ -1015,7 +1018,11 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   }, [liveNodes, onLiveNodesChange]);
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
   const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
-  const [connectorPreview, setConnectorPreview] = useState<{ from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null }; to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null } } | null>(null);
+  const [connectorPreview, setConnectorPreview] = useState<{
+    from: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null };
+    to: { x: number; y: number; side: "top" | "right" | "bottom" | "left" | null };
+    mindmapStyle?: boolean;
+  } | null>(null);
   // Live-updated bow for connectorPreview's own curve, computed from the gesture's pathPoints so
   // far - keeps the drag preview showing the SAME direction the committed edge will actually get,
   // rather than a fixed placeholder direction until release (see computeCurveBowFromPath).
@@ -1226,7 +1233,8 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         onSelectionChange(new Set(page.nodes.map((n) => n.id)), new Set(page.edges.map((ed) => ed.id)));
         return;
       }
-      // 1-keystroke Mind Map branching: Tab = add child branch, Enter = add sibling branch.
+      // 1-keystroke Mind Map branching: Tab = add child branch (respecting left/right side &
+      // auto-balancing roots), Enter = add sibling branch.
       if ((e.key === "Tab" || e.key === "Enter") && !e.ctrlKey && !e.metaKey && !e.altKey && selectedNodeIds.size === 1 && selectedEdgeIds.size === 0 && !editingNodeId) {
         const [selId] = Array.from(selectedNodeIds);
         const selNode = page.nodes.find((n) => n.id === selId);
@@ -1234,7 +1242,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           e.preventDefault();
           const built =
             e.key === "Tab"
-              ? buildMindmapBranch(selNode, "right", page.nodes, crypto.randomUUID(), crypto.randomUUID())
+              ? buildMindmapBranch(
+                  selNode,
+                  inferMindmapChildSide(selNode, page),
+                  page.nodes,
+                  crypto.randomUUID(),
+                  crypto.randomUUID()
+                )
               : buildMindmapSibling(selNode, page, crypto.randomUUID(), crypto.randomUUID());
           if (selNode.mindmapCollapsed && e.key === "Tab") {
             onEditNode(selNode, { ...selNode, mindmapCollapsed: false });
@@ -1250,14 +1264,40 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           return;
         }
       }
+      // Alt+Up / Alt+Down on a Mind Map branch reorders it cleanly among its sibling branches.
+      if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown") && !e.ctrlKey && !e.metaKey && selectedNodeIds.size === 1 && !editingNodeId) {
+        const [selId] = Array.from(selectedNodeIds);
+        const selNode = page.nodes.find((n) => n.id === selId);
+        if (selNode && isMindmapTopicNode(selNode)) {
+          const diff = reorderMindmapSibling(selId, e.key === "ArrowUp" ? "up" : "down", page);
+          if (diff.after.length > 0) {
+            e.preventDefault();
+            onBatchEditNodes(diff.before, diff.after);
+            return;
+          }
+        }
+      }
       if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
         e.preventDefault();
-        for (const id of selectedEdgeIds) {
+        // Shift+Delete on a Mind Map branch removes the topic AND its entire descendant subtree.
+        const deleteNodeIds = new Set<string>(selectedNodeIds);
+        const deleteEdgeIds = new Set<string>(selectedEdgeIds);
+        if (e.shiftKey) {
+          for (const id of selectedNodeIds) {
+            const node = page.nodes.find((n) => n.id === id);
+            if (node && isMindmapTopicNode(node)) {
+              const sub = getMindmapSubtree(id, page.nodes, page.edges);
+              sub.nodeIds.forEach((nid) => deleteNodeIds.add(nid));
+              sub.edgeIds.forEach((eid) => deleteEdgeIds.add(eid));
+            }
+          }
+        }
+        for (const id of deleteEdgeIds) {
           const edge = page.edges.find((ed) => ed.id === id);
           if (edge) onDeleteEdge(edge);
         }
-        for (const id of selectedNodeIds) {
+        for (const id of deleteNodeIds) {
           const node = page.nodes.find((n) => n.id === id);
           if (node) onDeleteNode(node);
         }
@@ -1350,6 +1390,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         ...(inSelection ? Array.from(nextEdges) : []),
         ...contained.edgeIds,
       ]);
+      // Subtree drag for Mind Maps: dragging a collapsed branch (always, so hidden descendants stay
+      // attached) or holding Alt while dragging any Mind Map branch carries its whole subtree.
+      for (const bn of baseNodes) {
+        if (isMindmapTopicNode(bn) && (bn.mindmapCollapsed || e.altKey)) {
+          const sub = getMindmapSubtree(bn.id, page.nodes, page.edges);
+          for (const nid of sub.nodeIds) {
+            const dn = page.nodes.find((x) => x.id === nid);
+            if (dn && !dn.locked) moveNodeIdSet.add(nid);
+          }
+          for (const eid of sub.edgeIds) moveEdgeIdSet.add(eid);
+        }
+      }
       const ids = Array.from(moveNodeIdSet);
       lastDragClientRef.current = null;
       interactionRef.current = {
@@ -1544,11 +1596,15 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         lastPathClientY: e.clientY,
       };
       const doc0 = clientToDoc(e.clientX, e.clientY);
-      setConnectorPreview({ from: resolveAnchorPoint(node, side, doc0), to: { x: doc0.x, y: doc0.y, side: null } });
+      setConnectorPreview({
+        from: resolveAnchorPoint(node, side, doc0),
+        to: { x: doc0.x, y: doc0.y, side: null },
+        mindmapStyle: !armedConnectorOverrides && isMindmapNode(node),
+      });
       setConnectorPreviewBow(DEFAULT_CURVE_BOW);
       (e.target as Element).setPointerCapture?.(e.pointerId);
     },
-    [clientToDoc]
+    [clientToDoc, armedConnectorOverrides]
   );
 
   // Starts a brand new connector from a free document-space point (not anchored to any node) -
@@ -1727,7 +1783,18 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           ? { x: sourceCenter.x - merged.width / 2, y: source.y + source.height + QUICK_CLONE_GAP }
           : { x: sourceCenter.x - merged.width / 2, y: source.y - QUICK_CLONE_GAP - merged.height };
       const newNode: WhiteboardNode = { ...merged, x, y };
-      const edge = createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: source.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
+      const isMindmapSource = isMindmapNode(source);
+      const edge: WhiteboardEdge = isMindmapSource
+        ? {
+            ...createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: source.id, anchor: side }, { nodeId: newNode.id, anchor: "auto" }),
+            routing: "curved",
+            strokeColor: "#2b7fff",
+            strokeWidth: newNode.shapeType === "mindmapTopic" ? 2.5 : 2,
+            strokeStyle: newNode.shapeType === "mindmapTopic" ? "solid" : "dashed",
+            startArrowType: "none",
+            endArrowType: "none",
+          }
+        : createDefaultWhiteboardEdge(crypto.randomUUID(), { nodeId: source.id, anchor: "auto" }, { nodeId: newNode.id, anchor: "auto" });
       onAddNodeWithEdge(newNode, edge);
       onSelectionChange(new Set([newNode.id]), new Set());
     },
@@ -2329,10 +2396,19 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         // follows the shape, not the grid).
         const freePoint = snapEnabled ? snapPoint(cur) : cur;
         const draggedResolved = target ? resolveAnchorPoint(target, "auto", fixedPoint) : { x: freePoint.x, y: freePoint.y, side: null };
-        const fixedResolved = interaction.fixed.nodeId
-          ? resolveAnchorPoint(nodesById.get(interaction.fixed.nodeId)!, interaction.fixed.anchor ?? "auto", draggedResolved)
+        const fixedNode = interaction.fixed.nodeId ? nodesById.get(interaction.fixed.nodeId) : undefined;
+        const fixedResolved = fixedNode
+          ? resolveAnchorPoint(fixedNode, interaction.fixed.anchor ?? "auto", draggedResolved)
           : { ...fixedPoint, side: null };
-        setConnectorPreview(interaction.end === "target" ? { from: fixedResolved, to: draggedResolved } : { from: draggedResolved, to: fixedResolved });
+        const mindmapStyle =
+          interaction.edgeId === null &&
+          !armedConnectorOverrides &&
+          Boolean((fixedNode && isMindmapNode(fixedNode)) || (target && isMindmapNode(target)));
+        setConnectorPreview(
+          interaction.end === "target"
+            ? { from: fixedResolved, to: draggedResolved, mindmapStyle }
+            : { from: draggedResolved, to: fixedResolved, mindmapStyle }
+        );
         // Only a brand-new edge's bow follows the drawn path live - reattaching an existing edge's
         // endpoint (edgeId !== null) leaves its curveBow exactly as beginConnectorReattach seeded it.
         if (interaction.edgeId === null) {
@@ -2341,7 +2417,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
         }
       }
     },
-    [zoom, page.nodes, page.edges, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid]
+    [zoom, page.nodes, page.edges, clientToDoc, nodes, nodesById, onPanChange, laserArmed, snapToGrid, armedConnectorOverrides]
   );
 
   const handlePointerUp = useCallback(
@@ -2461,7 +2537,24 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
             if (longEnough) {
               const endRef = droppedOnNode ? nodeCenter(droppedOnNode) : freePoint;
               const curveBow = computeCurveBowFromPath(interaction.fixedRefPoint, endRef, interaction.pathPoints);
-              const edge = { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
+              const fixedNode = interaction.fixed.nodeId ? nodesById.get(interaction.fixed.nodeId) : undefined;
+              const isMindmapConn =
+                !armedConnectorOverrides &&
+                Boolean((fixedNode && isMindmapNode(fixedNode)) || (droppedOnNode && isMindmapNode(droppedOnNode)));
+              const isMainMindmapBranch =
+                fixedNode?.shapeType === "mindmapTopic" && droppedOnNode?.shapeType === "mindmapTopic";
+              const edge: WhiteboardEdge = isMindmapConn
+                ? {
+                    ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint),
+                    routing: "curved",
+                    strokeColor: "#2b7fff",
+                    strokeWidth: isMainMindmapBranch ? 2.5 : 2,
+                    strokeStyle: isMainMindmapBranch ? "solid" : "dashed",
+                    startArrowType: "none",
+                    endArrowType: "none",
+                    curveBow,
+                  }
+                : { ...createDefaultWhiteboardEdge(crypto.randomUUID(), interaction.fixed, draggedEndpoint), curveBow, ...armedConnectorOverrides };
               onAddEdge(edge);
               onSelectionChange(new Set(), new Set([edge.id]));
             }
@@ -2710,17 +2803,36 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
   // regardless of which tool, if any, happens to be armed).
   const previewEdgeStyle = useMemo(
     () =>
-      connectorArmed
+      connectorPreview?.mindmapStyle
+        ? {
+            strokeColor: "#2b7fff",
+            strokeWidth: 2,
+            strokeStyle: "dashed" as const,
+            routing: "curved" as const,
+            cornerRadius: 12,
+            startArrowType: "none" as const,
+            endArrowType: "none" as const,
+          }
+        : connectorArmed
         ? {
             strokeColor: armedConnectorOverrides?.strokeColor ?? "#2563eb",
             strokeWidth: armedConnectorOverrides?.strokeWidth ?? 2,
             strokeStyle: armedConnectorOverrides?.strokeStyle ?? "solid",
             routing: armedConnectorOverrides?.routing ?? "orthogonal",
+            cornerRadius: armedConnectorOverrides?.cornerRadius ?? 12,
             startArrowType: armedConnectorOverrides?.startArrowType ?? "none",
             endArrowType: armedConnectorOverrides?.endArrowType ?? "triangle",
           }
-        : { strokeColor: "#2563eb", strokeWidth: 2, strokeStyle: "dashed" as const, routing: "orthogonal" as const, startArrowType: "none" as const, endArrowType: "triangle" as const },
-    [connectorArmed, armedConnectorOverrides]
+        : {
+            strokeColor: "#2563eb",
+            strokeWidth: 2,
+            strokeStyle: "dashed" as const,
+            routing: "orthogonal" as const,
+            cornerRadius: 12,
+            startArrowType: "none" as const,
+            endArrowType: "triangle" as const,
+          },
+    [connectorPreview?.mindmapStyle, connectorArmed, armedConnectorOverrides]
   );
 
   const markerCombos = useMemo(() => {
@@ -3398,7 +3510,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     );
                   })()}
 
-                {/* Progress status overlay + resource badge for Mind Map topics */}
+                {/* Progress status overlay + clean top-right Done badge + resource badge */}
                 {isTopic && topicProgress !== "pending" && (
                   <div
                     className="absolute inset-0 pointer-events-none"
@@ -3406,7 +3518,7 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       borderRadius: node.cornerRadius,
                       backgroundColor:
                         topicProgress === "done"
-                          ? "rgba(22, 163, 74, 0.16)"
+                          ? "rgba(22, 163, 74, 0.14)"
                           : topicProgress === "in-progress"
                           ? "rgba(234, 179, 8, 0.18)"
                           : "rgba(156, 163, 175, 0.22)",
@@ -3420,6 +3532,41 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                     }}
                   />
                 )}
+                {topicProgress === "done" && node.mindmapShowDoneBadge !== false && (() => {
+                  const badgeSize = Math.max(9, Math.min(15, 13 / zoom));
+                  const offset = -badgeSize * 0.36;
+                  const ringWidth = Math.max(1, Math.min(1.8, 1.5 / zoom));
+                  return (
+                    <div
+                      title="Done"
+                      className="absolute pointer-events-none flex items-center justify-center rounded-full"
+                      style={{
+                        top: offset,
+                        right: offset,
+                        width: badgeSize,
+                        height: badgeSize,
+                        background: "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)",
+                        boxShadow: `0 0 0 ${ringWidth}px #ffffff, 0 ${1.5 / zoom}px ${4 / zoom}px rgba(22, 163, 74, 0.35)`,
+                        zIndex: 6,
+                      }}
+                    >
+                      <svg
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        style={{ width: badgeSize * 0.62, height: badgeSize * 0.62 }}
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M3.4 8.35L6.55 11.45L12.6 4.75"
+                          stroke="#ffffff"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    </div>
+                  );
+                })()}
                 {isTopic && topicResourceCount > 0 && (
                   <button
                     type="button"
@@ -3429,14 +3576,20 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
                       e.stopPropagation();
                       onOpenTopicDrawer?.(node.id);
                     }}
-                    className="absolute -top-2 -right-2 flex items-center justify-center rounded-full bg-blue-600 text-white font-semibold shadow-sm hover:bg-blue-700"
+                    className="absolute flex items-center justify-center rounded-full bg-blue-600 text-white font-semibold shadow-sm hover:bg-blue-700"
                     style={{
                       pointerEvents: "auto",
+                      top: -7 / zoom,
+                      right:
+                        topicProgress === "done" && node.mindmapShowDoneBadge !== false
+                          ? Math.max(9, Math.min(15, 13 / zoom)) * 0.72 + 4 / zoom
+                          : -7 / zoom,
                       minWidth: 16 / zoom,
                       height: 16 / zoom,
                       padding: `0 ${4 / zoom}px`,
                       fontSize: 9 / zoom,
                       lineHeight: 1,
+                      zIndex: 5,
                     }}
                   >
                     {topicResourceCount}
@@ -4054,11 +4207,13 @@ const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProp
           <svg style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none", zIndex: nodes.length + edges.length + 10 }} width={1} height={1}>
             {connectorPreview && (
               <path
-                d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow)}
+                d={buildEdgePath(connectorPreview.from, connectorPreview.to, previewEdgeStyle.routing, connectorPreviewBow, [], previewEdgeStyle.cornerRadius)}
                 fill="none"
                 stroke={previewEdgeStyle.strokeColor}
                 strokeWidth={previewEdgeStyle.strokeWidth / zoom}
                 strokeDasharray={dashArrayFor(previewEdgeStyle.strokeStyle, previewEdgeStyle.strokeWidth) ?? `${6 / zoom},${4 / zoom}`}
+                strokeLinecap="round"
+                strokeLinejoin="round"
                 markerEnd={previewEdgeStyle.endArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.endArrowType, previewEdgeStyle.strokeColor)})` : undefined}
                 markerStart={previewEdgeStyle.startArrowType !== "none" ? `url(#${markerId(previewEdgeStyle.startArrowType, previewEdgeStyle.strokeColor)})` : undefined}
                 style={{ pointerEvents: "none" }}

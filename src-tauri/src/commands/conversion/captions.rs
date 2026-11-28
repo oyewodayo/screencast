@@ -458,12 +458,23 @@ pub struct DocTranscript {
 #[tauri::command]
 pub async fn transcribe_doc_audio(
     app_handle: AppHandle,
-    audio_bytes: Vec<u8>,
+    audio_bytes: Option<Vec<u8>>,
+    audio_base64: Option<String>,
     mime_type: Option<String>,
     language: Option<String>,
     prompt: Option<String>,
 ) -> Result<DocTranscript, String> {
-    if audio_bytes.is_empty() {
+    let bytes: Vec<u8> = if let Some(b64) = audio_base64.filter(|s| !s.is_empty()) {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| format!("Invalid base64 audio payload: {}", e))?
+    } else if let Some(raw) = audio_bytes {
+        raw
+    } else {
+        Vec::new()
+    };
+    if bytes.is_empty() {
         return Err("No audio was recorded".to_string());
     }
 
@@ -495,8 +506,8 @@ pub async fn transcribe_doc_audio(
     let output_stem = work_dir.join(format!("dictation-{}-{}", std::process::id(), stamp));
     let output_txt = output_stem.with_extension("txt");
 
-    let ready_wav = is_whisper_ready_wav(&audio_bytes);
-    std::fs::write(&input_path, audio_bytes)
+    let ready_wav = is_whisper_ready_wav(&bytes);
+    std::fs::write(&input_path, bytes)
         .map_err(|e| format!("Failed to write recorded audio: {}", e))?;
 
     let prompt = prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
@@ -512,7 +523,13 @@ pub async fn transcribe_doc_audio(
         let seconds = std::fs::metadata(whisper_input)
             .map(|m| m.len().saturating_sub(44) as f64 / 32000.0)
             .unwrap_or(30.0);
-        let vad_model_path = crate::services::whisper_model::existing_vad_model(&app_handle);
+        // Short dictation clips already passed the frontend's speech-band VAD and silence trim;
+        // skipping the second Silero VAD model load saves ~150-300ms per live phrase.
+        let vad_model_path = if seconds > 8.5 {
+            crate::services::whisper_model::existing_vad_model(&app_handle)
+        } else {
+            None
+        };
         let language = run_whisper_text_cli(
             &app_handle,
             &whisper_path,
@@ -543,8 +560,8 @@ pub async fn transcribe_doc_audio(
 // 1.0s tail margin, rounded up to 32 frames and clamped to a 128-frame (2.56s) floor, makes short
 // real-time dictation phrases more than twice as fast without truncating the tail.
 pub(super) fn dictation_audio_ctx(seconds: f64) -> u32 {
-    let frames = ((seconds + 1.0) * 50.0).ceil() as u32;
-    (frames.div_ceil(32) * 32).clamp(128, 1500)
+    let frames = ((seconds + 0.45) * 50.0).ceil() as u32;
+    (frames.div_ceil(32) * 32).clamp(96, 1500)
 }
 
 // True for a canonical 44-byte-header PCM WAV that's already 16kHz, mono, 16-bit.
@@ -947,7 +964,7 @@ pub(super) async fn run_whisper_text_cli(
             "-bo",
             "1",
             "-mc",
-            "64",
+            "32",
             "-nth",
             "0.50",
             "-et",

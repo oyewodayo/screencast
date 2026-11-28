@@ -45,18 +45,28 @@ export const DICTATION_LANGUAGES: { code: string; label: string }[] = [
 const LANGUAGE_STORAGE_KEY = "briefcast.docs.dictationLanguage";
 const DETECTED_STORAGE_KEY = "briefcast.docs.dictationDetectedLanguage";
 const SAMPLE_RATE = 16000;
-const FRAME_SIZE = 1024; // ScriptProcessor buffer at the context rate (~64ms at 16kHz)
-const PRE_ROLL_MS = 160; // audio kept from before speech onset so the first consonant isn't clipped
-const END_SILENCE_MS = 340; // pause that ends a short utterance
-const CLAUSE_MAX_MS = 1750; // past ~1.75s, cut on a brief clause pause
-const CLAUSE_SILENCE_MS = 210;
-const SOFT_MAX_MS = 3800; // past ~3.8s, cut on any short word-boundary pause
-const SOFT_SILENCE_MS = 140;
-const HARD_MAX_MS = 7500; // cap chunk length so real-time dictation never stalls on a long monologue
-const MIN_SPEECH_MS = 240; // shorter bursts are mouse clicks / breaths
-const PREVIEW_MIN_SPEECH_MS = 320; // start rolling word-by-word preview after ~0.32s of speech
-const PREVIEW_INTERVAL_MS = 460; // refresh rolling preview every ~0.46s while speaking
-const WORD_TICK_MS = 30; // word-by-word reveal cadence for smooth real-time typing feel
+const FRAME_SIZE = 1024; // ~64ms at 16kHz
+const PRE_ROLL_MS = 140; // audio kept from before speech onset so the first consonant isn't clipped
+const END_SILENCE_MS = 270; // snappy pause that commits a finished phrase
+const CLAUSE_MAX_MS = 1150; // past ~1.15s, commit on a natural clause pause
+const CLAUSE_SILENCE_MS = 175;
+const SOFT_MAX_MS = 2400; // past ~2.4s, commit on any brief word-boundary dip
+const SOFT_SILENCE_MS = 120;
+const HARD_MAX_MS = 4500; // cap chunk length so continuous speech commits smoothly every few seconds
+const MIN_SPEECH_MS = 200; // shorter bursts are mouse clicks / breaths
+const PREVIEW_MIN_SPEECH_MS = 220; // start rolling word-by-word preview after ~0.22s of speech
+const PREVIEW_INTERVAL_MS = 320; // refresh rolling preview every ~0.32s while speaking
+const WORD_TICK_MS = 20; // smooth word-by-word reveal cadence for real-time typing feel
+
+function encodeWavBase64(samples: Float32Array): string {
+  const bytes = encodeWav(samples);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
 
 // Disabled for the rest of the session once the engine reports it can't run (WebView2 ships the
 // API surface without a working backend on many machines).
@@ -395,7 +405,7 @@ export default function useDocDictation(editor: Editor | null, title: string): D
           const prompt =
             speechMs >= 650 ? buildWhisperPrompt(titleRef.current, precedingText) : "";
           result = await invoke<{ text: string; language: string | null }>("transcribe_doc_audio", {
-            audioBytes: Array.from(encodeWav(samples)),
+            audioBase64: encodeWavBase64(samples),
             mimeType: "audio/wav",
             language: lang,
             prompt: prompt || null,
@@ -531,7 +541,7 @@ export default function useDocDictation(editor: Editor | null, title: string): D
         const result = await invoke<{ text: string; language: string | null }>(
           "transcribe_doc_audio",
           {
-            audioBytes: Array.from(encodeWav(samples)),
+            audioBase64: encodeWavBase64(samples),
             mimeType: "audio/wav",
             language: lang,
             prompt: prompt || null,
@@ -725,7 +735,7 @@ export default function useDocDictation(editor: Editor | null, title: string): D
       const canReuseSnap =
         snap &&
         snap.segmentId === finishedSegmentId &&
-        Math.abs(ms - snap.speechMs) <= frameMs * 1.1 &&
+        Math.abs(ms - snap.speechMs) <= Math.max(280, frameMs * 2) &&
         (requested !== "auto" || lockedLanguageRef.current !== null);
 
       enqueue({

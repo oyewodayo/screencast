@@ -58,6 +58,7 @@ import { captionLabel, crossRefText, computeStructureFromJson, createDocStructur
 import { citationSpaceBefore, formatCitation, styleInfo, segmentsToText } from "../../utils/docCitationStyles";
 import { CITATION_EDIT_EVENT, CROSSREF_EDIT_EVENT, OPEN_PICKER_EVENT, type InlineEditDetail, type OpenPickerDetail } from "../../utils/docStructureNodes";
 import DocVersionHistoryPanel from "./DocVersionHistoryPanel";
+import DocSelectionBubble from "./DocSelectionBubble";
 import BrandLoader from "../common/BrandLoader";
 import DocReferencesSidebar from "./DocReferencesSidebar";
 import DocOutlinePanel from "./DocOutlinePanel";
@@ -965,15 +966,57 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
     }
   }, [store, showNotice]);
 
+  const [docZoom, setDocZoomState] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem("briefcast.docs.zoom"));
+      return Number.isFinite(saved) && saved >= 50 && saved <= 200 ? saved : 100;
+    } catch {
+      return 100;
+    }
+  });
+  const setDocZoom = useCallback((next: number) => {
+    const clamped = Math.max(50, Math.min(200, Math.round(next)));
+    setDocZoomState(clamped);
+    try {
+      localStorage.setItem("briefcast.docs.zoom", String(clamped));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const [showWordStats, setShowWordStats] = useState(false);
+
   // Recomputed per doc change, not per render - the editor re-renders this component on every
   // transaction, including selection-only ones that can't change the counts.
-  const { wordCount, charCount } = useMemo(() => {
-    if (!editor) return { wordCount: 0, charCount: 0 };
-    const text = editor.state.doc.textBetween(0, editor.state.doc.content.size, " ", " ");
+  const { wordCount, charCount, charNoSpaces, paragraphCount, readingMinutes } = useMemo(() => {
+    if (!editor) return { wordCount: 0, charCount: 0, charNoSpaces: 0, paragraphCount: 0, readingMinutes: 0 };
+    const text = editor.state.doc.textBetween(0, editor.state.doc.content.size, "\n", " ");
     const trimmed = text.trim();
-    return { wordCount: trimmed ? trimmed.split(/\s+/).length : 0, charCount: text.length };
+    const words = trimmed ? trimmed.split(/\s+/).length : 0;
+    const noSpaces = text.replace(/\s+/g, "").length;
+    let paragraphs = 0;
+    editor.state.doc.descendants((node) => {
+      if ((node.type.name === "paragraph" || node.type.name === "heading") && node.textContent.trim().length > 0) {
+        paragraphs++;
+      }
+      return true;
+    });
+    return {
+      wordCount: words,
+      charCount: text.length,
+      charNoSpaces: noSpaces,
+      paragraphCount: paragraphs,
+      readingMinutes: words === 0 ? 0 : Math.max(1, Math.round(words / 220)),
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, editor?.state.doc]);
+
+  const selectedWordCount = useMemo(() => {
+    if (!editor || !showWordStats || editor.state.selection.empty) return 0;
+    const { from, to } = editor.state.selection;
+    const selText = editor.state.doc.textBetween(from, to, " ", " ").trim();
+    return selText ? selText.split(/\s+/).length : 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, showWordStats, editor?.state.selection]);
 
   const openComments = store.comments.filter((c) => !c.resolved_at).length;
 
@@ -1039,6 +1082,19 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           e.preventDefault();
           e.stopPropagation();
           dictation.toggle();
+        } else if (mod && e.shiftKey && e.key.toLowerCase() === "c") {
+          // Google Docs' Word Count shortcut.
+          e.preventDefault();
+          setShowWordStats((v) => !v);
+        } else if (mod && !e.shiftKey && (e.key === "=" || e.key === "+")) {
+          e.preventDefault();
+          setDocZoom(docZoom + 10);
+        } else if (mod && !e.shiftKey && e.key === "-") {
+          e.preventDefault();
+          setDocZoom(docZoom - 10);
+        } else if (mod && !e.shiftKey && e.key === "0") {
+          e.preventDefault();
+          setDocZoom(100);
         }
       }}
     >
@@ -1058,6 +1114,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
         .doc-page-card { max-width: ${pageWidthPx(page)}px; padding: ${firstTop ?? margins.top}in ${margins.right}in ${margins.bottom}in ${margins.left}in; min-height: ${pageHeightPx(page)}px; }
         @media print {
           .doc-page-card { max-width: none; padding: 0; min-height: 0; }
+          .doc-zoom-wrap { zoom: 1 !important; }
         }
         @media print {
           /* The paper is @page's background (colour and watermark), so everything above it -
@@ -1100,10 +1157,61 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
               </span>
             )}
             {editor && !store.loading && (
-              <span className="shrink-0" data-tip={`${charCount.toLocaleString()} characters`}>
-                · {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
-                {pageCount > 1 && ` · ${pageCount} pages`}
-              </span>
+              <div className="relative shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowWordStats((v) => !v)}
+                  className="inline-flex items-center gap-1 rounded px-1 -mx-1 hover:bg-black/[0.05] dark:hover:bg-white/10 transition-colors"
+                  data-tip="Word count & reading time"
+                  data-tip-kbd="Ctrl+Shift+C"
+                >
+                  <span>
+                    · {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
+                    {pageCount > 1 && ` · ${pageCount} pages`}
+                    {readingMinutes > 0 && ` · ~${readingMinutes} min read`}
+                  </span>
+                </button>
+                {showWordStats && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowWordStats(false)} />
+                    <div className="absolute left-0 top-full mt-1.5 z-50 w-60 rounded-xl bg-white dark:bg-neutral-900 shadow-2xl ring-1 ring-black/10 dark:ring-white/15 p-3 text-xs text-neutral-700 dark:text-neutral-200">
+                      <div className="flex items-center justify-between pb-2 mb-2 border-b border-neutral-200 dark:border-neutral-800">
+                        <span className="font-semibold text-neutral-900 dark:text-white">Word count</span>
+                        <span className="text-[10px] text-neutral-400">Ctrl+Shift+C</span>
+                      </div>
+                      <dl className="space-y-1.5">
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Pages</dt>
+                          <dd className="font-medium tabular-nums">{pageCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Words</dt>
+                          <dd className="font-medium tabular-nums">
+                            {selectedWordCount > 0 ? `${selectedWordCount.toLocaleString()} of ` : ""}
+                            {wordCount.toLocaleString()}
+                          </dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Characters</dt>
+                          <dd className="font-medium tabular-nums">{charCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Characters (no spaces)</dt>
+                          <dd className="font-medium tabular-nums">{charNoSpaces.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Paragraphs</dt>
+                          <dd className="font-medium tabular-nums">{paragraphCount.toLocaleString()}</dd>
+                        </div>
+                        <div className="flex justify-between pt-1 border-t border-neutral-200 dark:border-neutral-800">
+                          <dt className="text-neutral-500 dark:text-neutral-400">Est. reading time</dt>
+                          <dd className="font-medium tabular-nums">{readingMinutes > 0 ? `${readingMinutes} min` : "< 1 min"}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
             {statusNotice && (
               <span className={`inline-flex items-center gap-1.5 min-w-0 ${statusNotice.error ? "text-red-600 dark:text-red-400" : "text-blue-700 dark:text-blue-300"}`}>
@@ -1286,6 +1394,17 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           onAddFont={() => (store.ydoc ? addFontFilesToDocument(docId, store.ydoc) : Promise.resolve([]))}
           twoColumns={layout.columns === 2}
           typeset={!!layout.body}
+          zoom={docZoom}
+          onZoomChange={setDocZoom}
+        />
+      )}
+
+      {editor && !store.loading && (
+        <DocSelectionBubble
+          editor={editor}
+          disabled={dictation.phase === "listening"}
+          onOpenLink={() => setLinkOpen(true)}
+          onAddComment={(text) => void submitComment(text)}
         />
       )}
 
@@ -1325,6 +1444,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
           ) : (
             <>
               {editor && (
+                <div className="doc-zoom-wrap" style={docZoom !== 100 ? ({ zoom: docZoom / 100 } as React.CSSProperties) : undefined}>
                 <table className="doc-print-frame">
                   <thead aria-hidden>
                     <tr>
@@ -1379,6 +1499,7 @@ const DocsEditor: React.FC<DocsEditorProps> = ({ docId, onBack }) => {
                     </tr>
                   </tfoot>
                 </table>
+                </div>
               )}
 
               {/* Infinite animated beam loader with graceful dissolve on finish */}

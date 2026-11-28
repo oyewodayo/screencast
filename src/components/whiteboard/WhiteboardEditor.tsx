@@ -78,10 +78,30 @@ import {
 } from "../../handlers/whiteboardHandlers";
 import {
   autoLayoutMindmap,
+  buildMindmapBranch,
+  buildMindmapInsertedParent,
+  buildMindmapSibling,
   computeMindmapProgressStats,
+  exportMindmapToOutlineMarkdown,
+  findMindmapRoot,
   findMindmapRootId,
+  getCollapsedState,
+  getMindmapSubtree,
+  inferMindmapChildSide,
   MindmapLayoutMode,
+  recolorMindmapBranch,
+  reorderMindmapSibling,
+  setAllMindmapCollapsed,
 } from "../../handlers/whiteboardMindmapHandlers";
+import { isMindmapTopicNode } from "../../utils/whiteboardTypes";
+import type { MindmapColorKey } from "../../utils/mindmapTypes";
+import * as Y from "yjs";
+import { getSchema } from "@tiptap/core";
+import { DOMParser as ProseMirrorDOMParser } from "@tiptap/pm/model";
+import { prosemirrorToYDoc } from "y-prosemirror";
+import { markdownToHtml } from "../../utils/docFileImport";
+import { getDocContentExtensions } from "../../utils/docSchemaExtensions";
+import { openBriefcastDoc } from "../../utils/videoToDoc";
 import {
   AlignMode,
   alignNodes,
@@ -112,6 +132,7 @@ import WhiteboardMinimap from "./WhiteboardMinimap";
 import WhiteboardSearchBar from "./WhiteboardSearchBar";
 import WhiteboardTopicDrawer from "./WhiteboardTopicDrawer";
 import WhiteboardPresentationBar from "./WhiteboardPresentationBar";
+import WhiteboardMindmapBar from "./WhiteboardMindmapBar";
 import WhiteboardCommandPalette, { WhiteboardCommandItem } from "./WhiteboardCommandPalette";
 import WhiteboardImportModal, { WhiteboardImportTabId } from "./WhiteboardImportModal";
 import WhiteboardShortcutsModal from "./WhiteboardShortcutsModal";
@@ -454,7 +475,7 @@ type ArrowPreset =
 const ARROW_PRESETS: ArrowPreset[] = [
   { kind: "connector", label: "Arrow", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
   { kind: "connector", label: "Bidirectional", overrides: { endArrowType: "triangle", startArrowType: "triangle", strokeStyle: "solid", routing: "straight" } },
-  { kind: "connector", label: "Orthogonal", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "orthogonal" } },
+  { kind: "connector", label: "Orthogonal", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "orthogonal", cornerRadius: 12 } },
   { kind: "connector", label: "Curved", overrides: { endArrowType: "triangle", startArrowType: "none", strokeStyle: "solid", routing: "curved" } },
   { kind: "connector", label: "Curved Line", overrides: { endArrowType: "none", startArrowType: "none", strokeStyle: "solid", routing: "curved" } },
   { kind: "connector", label: "Open Arrow", overrides: { endArrowType: "triangleOpen", startArrowType: "none", strokeStyle: "solid", routing: "straight" } },
@@ -982,12 +1003,19 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [topicDrawerNodeId, page]
   );
 
+  const whiteboardLinks = useItemLinks(
+    whiteboardId ? { kind: "whiteboard", id: whiteboardId } : null,
+    doc?.name ?? "Whiteboard"
+  );
+
   const handleAutoLayout = useCallback(
     (mode: MindmapLayoutMode) => {
       if (!page) return;
       setAutoLayoutMenuOpen(false);
       const preferred = selectedNodeIds.size === 1 ? Array.from(selectedNodeIds)[0] : null;
-      const rootId = findMindmapRootId(page.nodes, page.edges, preferred);
+      const rootId = preferred
+        ? findMindmapRoot(preferred, page.nodes, page.edges)
+        : findMindmapRootId(page.nodes, page.edges, null);
       if (!rootId) return;
       const diff = autoLayoutMindmap(rootId, page.nodes, page.edges, mode);
       if (diff.after.length === 0 && diff.afterEdges.length === 0) return;
@@ -999,6 +1027,127 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     },
     [page, selectedNodeIds, store]
   );
+
+  // ---- Pro Mind Map Contextual Actions ----------------------------------------------------------
+  const selectedMindmapNode = useMemo(
+    () => (selectedNodes.length === 1 && isMindmapTopicNode(selectedNodes[0]) ? selectedNodes[0] : null),
+    [selectedNodes]
+  );
+
+  const mindmapCollapsedInfo = useMemo(
+    () => (page && selectedMindmapNode ? getCollapsedState(page.nodes, page.edges) : null),
+    [page, selectedMindmapNode]
+  );
+
+  const handleMindmapAddChild = useCallback(() => {
+    if (!page || !selectedMindmapNode) return;
+    const side = inferMindmapChildSide(selectedMindmapNode, page);
+    const built = buildMindmapBranch(selectedMindmapNode, side, page.nodes, crypto.randomUUID(), crypto.randomUUID());
+    if (selectedMindmapNode.mindmapCollapsed) {
+      store.editNode(selectedMindmapNode, { ...selectedMindmapNode, mindmapCollapsed: false });
+    }
+    store.addNodeWithEdge(built.node, built.edge);
+    setSelectedNodeIds(new Set([built.node.id]));
+    setSelectedEdgeIds(new Set());
+  }, [page, selectedMindmapNode, store]);
+
+  const handleMindmapAddSibling = useCallback(() => {
+    if (!page || !selectedMindmapNode) return;
+    const built = buildMindmapSibling(selectedMindmapNode, page, crypto.randomUUID(), crypto.randomUUID());
+    store.addNodeWithEdge(built.node, built.edge);
+    setSelectedNodeIds(new Set([built.node.id]));
+    setSelectedEdgeIds(new Set());
+  }, [page, selectedMindmapNode, store]);
+
+  const handleMindmapInsertParent = useCallback(() => {
+    if (!page || !selectedMindmapNode) return;
+    const res = buildMindmapInsertedParent(selectedMindmapNode, page, crypto.randomUUID(), crypto.randomUUID());
+    if (res.shiftedNodes.after.length > 0 || res.updatedIncomingEdge) {
+      store.batchEditItems(
+        res.shiftedNodes.before,
+        res.shiftedNodes.after,
+        res.updatedIncomingEdge ? [res.updatedIncomingEdge.before] : [],
+        res.updatedIncomingEdge ? [res.updatedIncomingEdge.after] : []
+      );
+    }
+    store.addNodeWithEdge(res.newParent, res.newEdge);
+    setSelectedNodeIds(new Set([res.newParent.id]));
+    setSelectedEdgeIds(new Set());
+  }, [page, selectedMindmapNode, store]);
+
+  const handleMindmapRecolorBranch = useCallback(
+    (colorKey: MindmapColorKey) => {
+      if (!page || !selectedMindmapNode) return;
+      const diff = recolorMindmapBranch(selectedMindmapNode.id, colorKey, page.nodes, page.edges);
+      if (diff.after.length === 0 && diff.afterEdges.length === 0) return;
+      store.batchEditItems(diff.before, diff.after, diff.beforeEdges, diff.afterEdges);
+    },
+    [page, selectedMindmapNode, store]
+  );
+
+  const handleMindmapExpandCollapseAll = useCallback(
+    (collapsed: boolean) => {
+      if (!page || !selectedMindmapNode) return;
+      const diff = setAllMindmapCollapsed(selectedMindmapNode.id, collapsed, page.nodes, page.edges);
+      if (diff.after.length > 0) store.batchEditNodes(diff.before, diff.after);
+    },
+    [page, selectedMindmapNode, store]
+  );
+
+  const handleMindmapReorderSibling = useCallback(
+    (dir: "up" | "down") => {
+      if (!page || !selectedMindmapNode) return;
+      const diff = reorderMindmapSibling(selectedMindmapNode.id, dir, page);
+      if (diff.after.length > 0) store.batchEditNodes(diff.before, diff.after);
+    },
+    [page, selectedMindmapNode, store]
+  );
+
+  const handleMindmapSelectSubtree = useCallback(() => {
+    if (!page || !selectedMindmapNode) return;
+    const sub = getMindmapSubtree(selectedMindmapNode.id, page.nodes, page.edges);
+    setSelectedNodeIds(sub.nodeIds);
+    setSelectedEdgeIds(sub.edgeIds);
+  }, [page, selectedMindmapNode]);
+
+  const handleMindmapDeleteSubtree = useCallback(() => {
+    if (!page || !selectedMindmapNode) return;
+    const sub = getMindmapSubtree(selectedMindmapNode.id, page.nodes, page.edges);
+    for (const eid of sub.edgeIds) {
+      const edge = page.edges.find((e) => e.id === eid);
+      if (edge) store.deleteEdge(edge);
+    }
+    for (const nid of sub.nodeIds) {
+      const node = page.nodes.find((n) => n.id === nid);
+      if (node) store.deleteNode(node);
+    }
+    setSelectedNodeIds(new Set());
+    setSelectedEdgeIds(new Set());
+  }, [page, selectedMindmapNode, store]);
+
+  const handleMindmapExportToDoc = useCallback(async () => {
+    if (!page || !selectedMindmapNode) return;
+    const { title, markdown } = exportMindmapToOutlineMarkdown(selectedMindmapNode.id, page.nodes, page.edges);
+    if (!markdown) return;
+    try {
+      const id = crypto.randomUUID();
+      const html = markdownToHtml(markdown);
+      const dom = new DOMParser().parseFromString(`<body>${html}</body>`, "text/html");
+      const schema = getSchema(getDocContentExtensions());
+      const node = ProseMirrorDOMParser.fromSchema(schema).parse(dom.body);
+      const ydoc = prosemirrorToYDoc(node, "default");
+      const bytes = Array.from(Y.encodeStateAsUpdate(ydoc));
+      await invoke("create_doc", { id, title, bytes });
+      await invoke("add_link", {
+        a: { kind: "whiteboard", id: whiteboardId },
+        b: { kind: "doc", id },
+      }).catch(() => {});
+      void whiteboardLinks?.refresh();
+      openBriefcastDoc(id);
+    } catch (err) {
+      console.error("Failed to create Briefcast Doc from Mind Map:", err);
+    }
+  }, [page, selectedMindmapNode, whiteboardId, whiteboardLinks]);
 
   // ---- Phase 2 Pro Controls: Align / Distribute / Match Size / Tidy Up --------------------------
   const handleAlign = useCallback(
@@ -1190,10 +1339,6 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     [presentationDeck]
   );
 
-  const whiteboardLinks = useItemLinks(
-    whiteboardId ? { kind: "whiteboard", id: whiteboardId } : null,
-    doc?.name ?? "Whiteboard"
-  );
   const presentationRecorder = useWhiteboardPresentationRecorder({
     whiteboardId,
     whiteboardTitle: doc?.name ?? "Whiteboard Presentation",
@@ -2457,7 +2602,7 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
     // background matches the strip so any rounding sliver is invisible too.
     <div className="flex flex-col w-full h-full bg-gray-50 dark:bg-neutral-900 pb-[var(--docker-height,64px)]">
       {!presentMode && (
-      <div className="flex items-center gap-1 px-2.5 h-10 bg-white dark:bg-neutral-900 border-b border-gray-200/80 dark:border-neutral-800 shrink-0">
+      <div className="relative z-[35] flex items-center gap-1 px-2.5 h-10 bg-white dark:bg-neutral-900 border-b border-gray-200/80 dark:border-neutral-800 shrink-0">
         <ToolbarButton title="Back to whiteboards" onClick={() => void handleBack()}>
           <IoArrowBack size={16} />
         </ToolbarButton>
@@ -2696,8 +2841,8 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
           </button>
           {exportMenuOpen && (
             <>
-              <div className="fixed inset-0 z-20" onClick={() => setExportMenuOpen(false)} />
-              <div className="absolute right-0 top-8 z-30 w-52 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200">
+              <div className="fixed inset-0 z-40" onClick={() => setExportMenuOpen(false)} />
+              <div className="absolute right-0 top-8 z-50 w-52 rounded-lg border border-gray-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-xl py-1 text-xs text-neutral-700 dark:text-neutral-200">
                 <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Save to library</p>
                 <button type="button" onClick={() => void handleExport("png")} className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-neutral-700">
                   PNG image
@@ -3135,6 +3280,33 @@ const WhiteboardEditor: React.FC<WhiteboardEditorProps> = ({ whiteboardId, onBac
         )}
         {!studyMode && !presentMode && selectedNodes.length === 1 && selectedNodes[0].shapeType === "text" && (
           <WhiteboardTextToolbar node={selectedNodes[0]} onUpdateNode={store.editNode} offsetRight={hasRightPanel} />
+        )}
+        {!studyMode && !presentMode && selectedMindmapNode && (
+          <WhiteboardMindmapBar
+            hasChildren={(mindmapCollapsedInfo?.childrenByParent.get(selectedMindmapNode.id)?.length ?? 0) > 0}
+            isCollapsed={Boolean(selectedMindmapNode.mindmapCollapsed)}
+            canMoveUp={reorderMindmapSibling(selectedMindmapNode.id, "up", page).after.length > 0}
+            canMoveDown={reorderMindmapSibling(selectedMindmapNode.id, "down", page).after.length > 0}
+            activeColorKey={selectedMindmapNode.mindmapColorKey}
+            offsetRight={hasRightPanel}
+            onAddChild={handleMindmapAddChild}
+            onAddSibling={handleMindmapAddSibling}
+            onInsertParent={handleMindmapInsertParent}
+            onAutoLayout={handleAutoLayout}
+            onRecolorBranch={handleMindmapRecolorBranch}
+            onToggleCollapse={() =>
+              store.editNode(selectedMindmapNode, {
+                ...selectedMindmapNode,
+                mindmapCollapsed: !selectedMindmapNode.mindmapCollapsed,
+              })
+            }
+            onExpandAll={() => handleMindmapExpandCollapseAll(false)}
+            onCollapseAll={() => handleMindmapExpandCollapseAll(true)}
+            onReorderSibling={handleMindmapReorderSibling}
+            onSelectSubtree={handleMindmapSelectSubtree}
+            onDeleteSubtree={handleMindmapDeleteSubtree}
+            onExportToDoc={() => void handleMindmapExportToDoc()}
+          />
         )}
         {!studyMode && !presentMode && (
           <WhiteboardAlignToolbar

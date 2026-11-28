@@ -544,6 +544,12 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
     selectedNodes.every(canPaintFill) &&
     selectedNodes.every((n) => n.shapeType !== "artboard");
 
+  const hasMindmapTopic = selectedNodes.some(
+    (n) => n.shapeType === "mindmapTopic" || n.shapeType === "mindmapSubtopic"
+  );
+  const showDoneBadgeSection = hasMindmapTopic || selectedNodes.some((n) => n.mindmapProgress === "done");
+  const allShowDoneBadge = selectedNodes.length > 0 && selectedNodes.every((n) => n.mindmapShowDoneBadge !== false);
+
   return (
     <div className={`absolute top-3 ${offsetRight ? "right-[278px]" : "right-3"} bottom-3 w-[300px] bg-white dark:bg-neutral-900 ring-1 ring-black/[0.07] dark:ring-white/[0.08] rounded-2xl shadow-[0_12px_40px_-12px_rgba(0,0,0,0.18),0_2px_6px_-2px_rgba(0,0,0,0.06)] flex flex-col overflow-hidden text-neutral-800 dark:text-neutral-200 transition-all duration-200 animate-[wbPanelIn_180ms_ease-out]`}>
       <style>{"@keyframes wbPanelIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}"}</style>
@@ -573,6 +579,57 @@ const WhiteboardStylePanel: React.FC<WhiteboardStylePanelProps> = ({
         )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain flex flex-col [scrollbar-width:thin]">
+      {/* Mind Map Progress & Done Badge toggle */}
+      {showDoneBadgeSection && (
+        <Section title="Progress & Badge" dense>
+          {hasMindmapTopic && (
+            <div className="flex flex-wrap gap-1">
+              {(
+                [
+                  ["done", "Done", "border-emerald-500 bg-emerald-50 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"],
+                  ["in-progress", "In progress", "border-amber-500 bg-amber-50 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300"],
+                  ["skipped", "Skipped", "border-neutral-400 bg-neutral-100 dark:bg-neutral-700 text-neutral-700 dark:text-neutral-200"],
+                  ["pending", "Pending", "border-blue-500 bg-blue-50 dark:bg-blue-500/20 text-blue-700 dark:text-blue-300"],
+                ] as const
+              ).map(([value, label, activeClass]) => {
+                const active = selectedNodes.every((n) => (n.mindmapProgress ?? "pending") === value);
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => updateNodes({ mindmapProgress: value })}
+                    className={`h-6 px-2 rounded-full text-[11px] font-medium border transition ${
+                      active
+                        ? activeClass
+                        : "border-black/[0.08] dark:border-white/[0.1] text-neutral-600 dark:text-neutral-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-2 pt-0.5">
+            <span className="text-[11px] text-neutral-600 dark:text-neutral-300">Show Done badge</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={allShowDoneBadge}
+              onClick={() => updateNodes({ mindmapShowDoneBadge: !allShowDoneBadge })}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                allShowDoneBadge ? "bg-emerald-500" : "bg-neutral-200 dark:bg-neutral-700"
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                  allShowDoneBadge ? "translate-x-[18px]" : "translate-x-[3px]"
+                }`}
+              />
+            </button>
+          </div>
+        </Section>
+      )}
       {/* Realtime LaTeX Maths editor at the top of the panel when an Equation is selected */}
       {singleEquation && (
         <Section title="Equation (LaTeX)" dense>

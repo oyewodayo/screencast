@@ -41,7 +41,6 @@ import {
   MdInsertPageBreak,
   MdLink,
   MdLinkOff,
-  MdMic,
   MdMoreVert,
   MdRedo,
   MdRemove,
@@ -470,6 +469,17 @@ const TableGridPicker: React.FC<{ onPick: (rows: number, cols: number) => void }
   );
 };
 
+// Crisp microphone + acoustic soundwave glyph for Voice Typing (replaces generic plain mic).
+const VoiceTypingIcon: React.FC<{ size?: number; className?: string }> = ({ size = 17, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+    <rect x="8.5" y="3" width="7" height="11" rx="3.5" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M5.5 10.5a6.5 6.5 0 0 0 13 0" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <path d="M12 17v3.5M9.2 20.5h5.6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <path d="M2.5 8.5v4M21.5 8.5v4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" opacity="0.7" />
+    <path d="M4.8 6.8v1.2M19.2 6.8v1.2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.45" />
+  </svg>
+);
+
 // Mic level bars, animated straight from levelRef in a rAF loop - no React state at audio rate.
 const DictationLevelMeter: React.FC<{ levelRef: React.MutableRefObject<number> }> = ({ levelRef }) => {
   const barsRef = useRef<(HTMLSpanElement | null)[]>([]);
@@ -478,11 +488,11 @@ const DictationLevelMeter: React.FC<{ levelRef: React.MutableRefObject<number> }
     let shown = 0;
     const tick = () => {
       const target = levelRef.current;
-      shown = target > shown ? shown + (target - shown) * 0.6 : shown * 0.85;
+      shown = target > shown ? shown + (target - shown) * 0.65 : shown * 0.84;
       barsRef.current.forEach((bar, i) => {
         if (!bar) return;
-        const weight = [0.7, 1, 0.8][i] ?? 1;
-        bar.style.transform = `scaleY(${Math.max(0.2, Math.min(1, shown * weight * 1.6))})`;
+        const weight = [0.65, 1, 0.9, 0.72][i] ?? 1;
+        bar.style.transform = `scaleY(${Math.max(0.18, Math.min(1, shown * weight * 1.65))})`;
       });
       raf = requestAnimationFrame(tick);
     };
@@ -491,13 +501,13 @@ const DictationLevelMeter: React.FC<{ levelRef: React.MutableRefObject<number> }
   }, [levelRef]);
   return (
     <span className="flex items-center gap-[2px] h-3.5" aria-hidden>
-      {[0, 1, 2].map((i) => (
+      {[0, 1, 2, 3].map((i) => (
         <span
           key={i}
           ref={(el) => {
             barsRef.current[i] = el;
           }}
-          className="w-[3px] h-full rounded-full bg-current origin-center transition-none"
+          className="w-[2.5px] h-full rounded-full bg-current origin-center transition-none"
           style={{ transform: "scaleY(0.2)" }}
         />
       ))}
@@ -554,7 +564,10 @@ const DictationControl: React.FC<{ dictation: DocDictation; menu: ReturnType<Ret
             <span className="text-[11px] font-medium">{phase === "starting" ? "Starting…" : `Finishing${pending > 1 ? ` (${pending})` : ""}…`}</span>
           </>
         ) : (
-          <MdMic size={15} />
+          <span className="inline-flex items-center gap-1">
+            <VoiceTypingIcon size={16} />
+            <span className="hidden xl:inline text-[11px] font-medium">Voice</span>
+          </span>
         )}
       </button>
       <Dropdown
@@ -630,7 +643,11 @@ export interface DocToolbarProps {
   onOpenHeaderFooter: (focus: "header" | "pageNumbers") => void;
   onOpenWatermark: () => void;
   onOpenLetterhead: () => void;
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
 }
+
+const ZOOM_PRESETS = [50, 75, 90, 100, 115, 125, 150, 175, 200];
 
 const DocToolbar: React.FC<DocToolbarProps> = ({
   editor,
@@ -650,6 +667,8 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
   onOpenHeaderFooter,
   onOpenWatermark,
   onOpenLetterhead,
+  zoom,
+  onZoomChange,
 }) => {
   const { bind, setOpenMenu } = useOpenMenu();
   const close = () => setOpenMenu(null);
@@ -857,6 +876,35 @@ const DocToolbar: React.FC<DocToolbarProps> = ({
         <ToolButton label="Redo" shortcut="Ctrl+Y" disabled={!canRedo} onClick={() => editor.chain().focus().redo().run()}>
           <MdRedo size={15} />
         </ToolButton>
+
+        <Dropdown
+          {...bind("zoom")}
+          label="Zoom"
+          trigger={
+            <>
+              <span className="w-10 text-left text-xs tabular-nums">{zoom}%</span>
+              <MdArrowDropDown size={15} />
+            </>
+          }
+          triggerClassName={`${toolClass(false)} pl-1.5 pr-0.5 hidden @xl:inline-flex`}
+          className="hidden @xl:block"
+          panelClassName="w-28 py-1"
+        >
+          {ZOOM_PRESETS.map((pct) => (
+            <button
+              key={pct}
+              type="button"
+              className={`${menuItemClass} py-1.5 tabular-nums`}
+              onClick={() => {
+                onZoomChange(pct);
+                close();
+              }}
+            >
+              <span className="w-4 shrink-0">{zoom === pct && <MdCheck size={15} />}</span>
+              <span>{pct}%</span>
+            </button>
+          ))}
+        </Dropdown>
 
         <Divider />
 

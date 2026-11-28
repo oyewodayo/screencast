@@ -268,15 +268,16 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
   // ruler relies on it.
   let lastBottom = 0;
   let pageStartPending = false;
-  // The block before the current one, for keep-with-next: where it starts, and where the page's
-  // content ended before it.
-  let prev: {
-    node: import("@tiptap/pm/model").Node;
+  // Tracks the start of a chained keep-with-next run (e.g. Heading 2 -> Heading 3 -> Screenshot)
+  // so an H2 never ends up orphaned above half a page of empty whitespace when its following
+  // H3 + figure/paragraph move to the next sheet.
+  let keepRunStart: {
     offset: number;
     top: number;
     bottomBefore: number;
     marginTopPx: number;
   } | null = null;
+  let prevNode: import("@tiptap/pm/model").Node | null = null;
 
   // Pre-measure all currently rendered gaps once at the start of this pass:
   // single DOM query batch, no O(N*G) layout thrashing.
@@ -319,11 +320,13 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
       pageIndex++;
       pageTop = bottom;
       pageStartPending = true;
-      prev = null; // nothing keeps with a block across a manual break
+      keepRunStart = null;
+      prevNode = null; // nothing keeps with a block across a manual break
       lastBottom = bottom;
       return;
     }
 
+    const linkedToPrev = prevNode !== null && keepsWithNext(prevNode, node);
     const overflowsPage = bottom - pageTop > pageHeight();
     const tallerThanWholePage = bottom - top > pageHeight();
     // A block taller than an entire page (a huge image, a long table) has nowhere better to go -
@@ -331,26 +334,34 @@ function computeDecorations(view: EditorView, page: PageFormat, margins: PageMar
     // `top > pageTop` guards the degenerate case of a block that's *already* at the top of the
     // current page but still overflows - moving it "to the next page" would just repeat forever.
     if (overflowsPage && !tallerThanWholePage && top > pageTop) {
-      // Keep-with-next, as in Word and LaTeX: a heading never ends a page alone, a table caption
-      // stays with its table, a figure with the caption under it - the pair moves together,
-      // unless the first of them already starts the page.
-      if (prev && prev.top > pageTop + 4 && keepsWithNext(prev.node, node)) {
+      // Chained keep-with-next (Word / Google Docs / LaTeX): a heading or heading chain
+      // (H2 -> H3 -> figure/paragraph) never stays orphaned at the bottom of a page when moving
+      // the whole run fits on the next sheet.
+      if (
+        linkedToPrev &&
+        keepRunStart &&
+        keepRunStart.top > pageTop + 4 &&
+        bottom - keepRunStart.top <= pageHeight()
+      ) {
         addGap(
-          prev.offset,
+          keepRunStart.offset,
           -1,
-          pageTop + pageHeight() - prev.bottomBefore,
-          prev.marginTopPx,
-          prev.top - prev.bottomBefore
+          pageTop + pageHeight() - keepRunStart.bottomBefore,
+          keepRunStart.marginTopPx,
+          keepRunStart.top - keepRunStart.bottomBefore
         );
         pageIndex++;
-        pageTop = prev.top;
+        pageTop = keepRunStart.top;
       } else {
         addGap(offset, -1, pageTop + pageHeight() - lastBottom, marginTopPx, top - lastBottom);
         pageIndex++;
         pageTop = top;
+        keepRunStart = { offset, top, bottomBefore: lastBottom, marginTopPx };
       }
+    } else if (!linkedToPrev) {
+      keepRunStart = { offset, top, bottomBefore: lastBottom, marginTopPx };
     }
-    prev = { node, offset, top, bottomBefore: lastBottom, marginTopPx };
+    prevNode = node;
     lastBottom = bottom;
   });
 
@@ -411,11 +422,11 @@ const DocAutoPaginate = Extension.create({
         },
         view(editorView) {
           let frame: number | null = null;
+          let debounceTimer: number | null = null;
           let lastSignature = "";
           let consecutivePasses = 0;
 
-          const scheduleRecompute = (resetPasses = true) => {
-            if (resetPasses) consecutivePasses = 0;
+          const runRecomputeNow = () => {
             if (frame !== null) return;
             frame = requestAnimationFrame(() => {
               frame = null;
@@ -435,18 +446,35 @@ const DocAutoPaginate = Extension.create({
               consecutivePasses++;
               // Check settled layout once more, but cap consecutive passes at 2 to strictly prevent infinite oscillation
               if (consecutivePasses < 2) {
-                scheduleRecompute(false);
+                scheduleRecompute(false, false);
               }
             });
           };
 
+          const scheduleRecompute = (resetPasses = true, debounced = false) => {
+            if (resetPasses) consecutivePasses = 0;
+            if (debounced) {
+              if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+              debounceTimer = window.setTimeout(() => {
+                debounceTimer = null;
+                runRecomputeNow();
+              }, 55);
+              return;
+            }
+            if (debounceTimer !== null) {
+              window.clearTimeout(debounceTimer);
+              debounceTimer = null;
+            }
+            runRecomputeNow();
+          };
+
           const observer = new ResizeObserver(() => {
-            scheduleRecompute();
+            scheduleRecompute(true, true);
           });
           observer.observe(editorView.dom);
 
           // Always run initial pagination pass on mount so gaps appear as soon as the document opens
-          scheduleRecompute();
+          scheduleRecompute(true, false);
 
           return {
             update(view, prevState) {
@@ -454,13 +482,15 @@ const DocAutoPaginate = Extension.create({
               const next = DocAutoPaginatePluginKey.getState(view.state);
               const meta = view.state.tr.getMeta(DocAutoPaginatePluginKey) as { force?: boolean } | undefined;
               if (meta?.force || prev?.page !== next?.page || prev?.margins !== next?.margins || prev?.columns !== next?.columns) {
-                scheduleRecompute();
+                scheduleRecompute(true, false);
               } else if (!prevState.doc.eq(view.state.doc)) {
-                scheduleRecompute();
+                // Coalesce rapid keystrokes on long multi-page documents so typing stays 60fps.
+                scheduleRecompute(true, true);
               }
             },
             destroy() {
               observer.disconnect();
+              if (debounceTimer !== null) window.clearTimeout(debounceTimer);
               if (frame !== null) cancelAnimationFrame(frame);
             },
           };
