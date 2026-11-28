@@ -478,11 +478,15 @@
   }
 
   function paintVoice() {
-    const ready = BC.connected() && !!pc.editing;
-    $("vo-where").textContent = !BC.connected() ? "Connect to your computer to record a voice-over."
-      : !pc.editing ? "Open a video in Briefcast's editor - your voice-over lands on it."
-      : take ? `Recording onto ${pc.editing}` : `Starts at ${fmtClock(pc.time)} in ${pc.editing}`;
-    $("vo-mic").disabled = !ready && !take;
+    const synced = BC.connected() && !!pc.editing;
+    $("vo-where").textContent = synced
+      ? (take ? `Recording onto ${pc.editing}` : `Starts at ${fmtClock(pc.time)} in ${pc.editing}`)
+      : take
+      ? "Recording standalone voice note on this phone"
+      : BC.connected()
+      ? "Standalone mode — record now, save or send to library anytime (open a video to sync with timeline)."
+      : "Offline Voice Studio — record voice-over takes anytime and send to Briefcast when connected.";
+    $("vo-mic").disabled = false;
     $("vo-mic").classList.toggle("live", !!take);
     $("vo-mic-label").textContent = take ? "Stop" : "Record";
     const list = $("vo-takes");
@@ -491,17 +495,64 @@
       const row = document.createElement("div"); row.className = "take";
       const info = document.createElement("div");
       const title = document.createElement("div"); title.className = "take-title";
-      title.textContent = `Take ${t.n} · ${fmtClock(t.dur)} at ${fmtClock(t.at)}`;
+      title.textContent = t.standalone
+        ? `Take ${t.n} · ${fmtClock(t.dur)} (Phone draft)`
+        : `Take ${t.n} · ${fmtClock(t.dur)} at ${fmtClock(t.at)}`;
       const st = document.createElement("div"); st.className = "take-state " + t.state;
-      st.textContent = { recording: "Recording…", sending: "Sending…", placed: "✓ On the timeline", kept: t.note || "Saved to library", failed: t.note || "Didn't send" }[t.state];
+      st.textContent = { recording: "Recording…", local: "Saved on phone", sending: "Sending…", placed: "✓ On the timeline", kept: t.note || "✓ Saved to library", failed: t.note || "Didn't send" }[t.state] || "";
       info.append(title, st);
       row.appendChild(info);
+      const act = document.createElement("div");
+      act.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap";
+      if (t.audioUrl) {
+        const play = document.createElement("button");
+        play.type = "button"; play.className = "chip";
+        play.textContent = t.playing ? "Stop" : "Play";
+        play.addEventListener("click", () => {
+          if (t.audioEl && !t.audioEl.paused) {
+            t.audioEl.pause(); t.audioEl.currentTime = 0; t.playing = false; paintVoice(); return;
+          }
+          const a = new Audio(t.audioUrl);
+          t.audioEl = a; t.playing = true; paintVoice();
+          a.onended = () => { t.playing = false; paintVoice(); };
+          a.play().catch(() => { t.playing = false; paintVoice(); });
+        });
+        act.appendChild(play);
+      }
+      if (t.file && (t.state === "local" || t.state === "failed")) {
+        if (BC.connected()) {
+          const send = document.createElement("button");
+          send.type = "button"; send.className = "chip"; send.textContent = "Send to PC";
+          send.addEventListener("click", () => {
+            t.state = "sending"; paintVoice();
+            BC.queue([t.file], pc.editing ? "voiceover" : "library", {
+              at: pc.editing ? pc.time : undefined,
+              dur: t.dur,
+              onUpdate: (u) => {
+                t.upload = u;
+                if (u.state === "failed") { t.state = "failed"; t.note = u.error; }
+                else if (u.state === "done" && !pc.editing) { t.state = "kept"; t.note = "✓ Sent to library"; }
+                else if (u.placed === true) { t.state = "placed"; }
+                else if (u.placed === false) { t.state = "kept"; t.note = u.note; }
+                paintVoice();
+              },
+            });
+          });
+          act.appendChild(send);
+        } else if (t.audioUrl) {
+          const save = document.createElement("a");
+          save.className = "chip"; save.href = t.audioUrl; save.download = t.file.name; save.textContent = "Save";
+          save.style.textDecoration = "none";
+          act.appendChild(save);
+        }
+      }
       if (t.state === "placed" && t === takes[takes.length - 1]) {
         const retake = document.createElement("button"); retake.className = "chip"; retake.textContent = "Retake";
-        retake.disabled = !ready || !!take;
+        retake.disabled = !synced || !!take;
         retake.addEventListener("click", () => startTake(t));
-        row.appendChild(retake);
+        act.appendChild(retake);
       }
+      if (act.children.length) row.appendChild(act);
       list.appendChild(row);
     }
   }
@@ -531,21 +582,23 @@
 
   async function startTake(replacing) {
     if (take) return;
+    const synced = BC.connected() && !!pc.editing;
     try {
       mic = await openMic({ echoCancellation: true, noiseSuppression: true, autoGainControl: true });
     } catch (_) { BC.toast("Allow the microphone to record a voice-over"); return; }
-    if (!(await countIn(replacing ? `Retake ${replacing.n}` : "Voice-over starts"))) { closeMic(mic); mic = null; return; }
+    if (!(await countIn(replacing ? `Retake ${replacing.n}` : synced ? "Voice-over starts" : "Recording starts"))) { closeMic(mic); mic = null; return; }
     rolling = null;
-    BC.send({ type: "remote", action: "voiceover.start", value: replacing ? replacing.at : null });
-    // Studio Silence engaged on the computer, playback rolling - only then does the mic record.
-    const t0 = performance.now();
-    while (!rolling && performance.now() - t0 < 4000) await new Promise((r) => setTimeout(r, 30));
-    if (!rolling) { closeMic(mic); mic = null; BC.toast("Briefcast didn't start playback - is a video open?"); return; }
+    if (synced) {
+      BC.send({ type: "remote", action: "voiceover.start", value: replacing ? replacing.at : null });
+      const t0 = performance.now();
+      while (!rolling && performance.now() - t0 < 4000) await new Promise((r) => setTimeout(r, 30));
+      if (!rolling) { closeMic(mic); mic = null; BC.toast("Briefcast didn't start playback - is a video open?"); return; }
+    }
     const type = pickType();
     const rec = new MediaRecorder(mic.stream, type ? { mimeType: type } : undefined);
     const chunks = [];
     rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-    take = { n: takes.length + 1, at: rolling.at, started: performance.now(), rec, chunks, replacing, state: "recording", dur: 0 };
+    take = { n: takes.length + 1, at: rolling ? rolling.at : 0, standalone: !synced, started: performance.now(), rec, chunks, replacing, state: "recording", dur: 0 };
     takes.push(take);
     rec.start(250);
     BC.haptic(50);
@@ -559,7 +612,7 @@
     if (!t) return;
     take = null;
     t.dur = (performance.now() - t.started) / 1000;
-    BC.send({ type: "remote", action: "voiceover.stop" });
+    if (!t.standalone) BC.send({ type: "remote", action: "voiceover.stop" });
     t.rec.onstop = () => {
       closeMic(mic); mic = null;
       cancelAnimationFrame(waveRaf); lightArcs($("vo-arcs").querySelector(".arcs"), 0);
@@ -567,6 +620,14 @@
       const ext = type.includes("mp4") ? "m4a" : "webm";
       const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, "-");
       const file = new File(t.chunks, `Voice-over ${stamp}.${ext}`, { type: type.split(";")[0] });
+      t.file = file;
+      t.audioUrl = URL.createObjectURL(file);
+      if (t.standalone) {
+        t.state = "local";
+        BC.toast("✓ Voice take saved on phone");
+        paintVoice();
+        return;
+      }
       t.state = "sending";
       BC.queue([file], "voiceover", {
         at: t.at, dur: t.dur, replaces: t.replacing && t.replacing.upload && t.replacing.upload.id,

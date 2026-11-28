@@ -372,6 +372,63 @@
   .vf-exp { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
   .vf-exp input { flex: 1; accent-color: #facc15; }
   .clip-text { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
+  /* ---- Pro Mode Switcher, Phone-to-Phone P2P Radar, Room Codes & QR Scanner ---- */
+  .mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 14px;
+    border-radius: 14px; background: color-mix(in srgb, var(--line) 75%, transparent); border: 1px solid var(--line); }
+  .mode-switch button { height: 38px; border: 0; border-radius: 10px; background: transparent; color: var(--muted);
+    font: inherit; font-size: 13.5px; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 6px; transition: .15s; }
+  .mode-switch button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.09); }
+  .pill-cnt { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 999px; background: var(--ok); color: #fff; font-size: 11px; font-weight: 700; line-height: 1; }
+  .p2p-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .p2p-bar button { font: inherit; color: var(--text); font-weight: 600; background: none; border: 0; padding: 2px 4px;
+    text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; flex: none; }
+  .p2p-empty { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 26px 16px; text-align: center;
+    margin-bottom: 12px; color: var(--muted); font-size: 13.5px; }
+  .p2p-empty p { margin: 14px 0 0; line-height: 1.5; }
+  .p2p-empty b { color: var(--text); }
+  .radar-ring { position: relative; width: 64px; height: 64px; margin: 0 auto; display: grid; place-items: center; }
+  .radar-ring i { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .radar-ring span { position: absolute; inset: 0; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); animation: radar 2.4s ease-out infinite; }
+  .radar-ring span:nth-child(2) { animation-delay: 1.2s; }
+  @keyframes radar { 0% { transform: scale(.35); opacity: .9; } 100% { transform: scale(1.15); opacity: 0; } }
+  .p2p-peer { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin-bottom: 10px;
+    display: grid; grid-template-columns: 44px 1fr; gap: 10px; align-items: center; animation: rise .2s ease-out; }
+  .p2p-av { width: 44px; height: 44px; border-radius: 12px; background: color-mix(in srgb, var(--accent) 12%, transparent);
+    display: grid; place-items: center; font-size: 21px; }
+  .p2p-pinfo { min-width: 0; }
+  .p2p-pacts { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+  .p2p-pacts .btn { height: 40px; padding: 0 14px; font-size: 14px; display: inline-flex; align-items: center; justify-content: center; }
+  .p2p-incoming { background: var(--card); border: 1.5px solid var(--accent); border-radius: 16px; padding: 14px; margin-bottom: 12px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--accent) 18%, transparent); animation: rise .2s ease-out; }
+  .p2p-incoming h2 { font-size: 15px; margin: 0 0 4px; }
+  .p2p-incoming p { margin: 0 0 12px; font-size: 13px; color: var(--muted); word-break: break-word; }
+  .p2p-incoming .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .p2p-room { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 14px; margin-bottom: 14px; }
+  .p2p-room h3 { font-size: 14px; margin: 0 0 4px; }
+  .p2p-room p { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; }
+  .p2p-code-box { text-align: center; padding: 12px; border-radius: 12px; background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent); margin-bottom: 10px; }
+  .p2p-code-big { font: 800 32px/1.1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .16em; color: var(--text); }
+  .p2p-code-acts { display: flex; gap: 8px; margin-top: 10px; }
+  .p2p-code-acts .btn { padding: 8px 10px; font-size: 13px; }
+  .p2p-join-row { display: flex; gap: 8px; margin-top: 10px; }
+  .p2p-join-row input { flex: 1; min-width: 0; height: 42px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg);
+    color: var(--text); padding: 0 12px; font: 600 15px ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .12em; text-align: center; }
+  .p2p-join-row .btn { flex: none; padding: 0 16px; height: 42px; font-size: 14px; }
+  .p2p-xfer { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; font-size: 13px; }
+  .p2p-xfer .row { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+  .p2p-xfer .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .row-acts { display: inline-flex; gap: 6px; margin-left: 6px; flex: none; }
+  .mini-btn { border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 6px; padding: 2px 7px; font-size: 11.5px; font-weight: 600; }
+  .qr-modal { position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,.72); backdrop-filter: blur(8px);
+    display: flex; align-items: flex-end; justify-content: center; padding: 12px; }
+  .qr-sheet { width: 100%; max-width: 460px; background: var(--card); border: 1px solid var(--line); border-radius: 20px;
+    padding: 16px; padding-bottom: calc(env(safe-area-inset-bottom) + 16px); animation: rise .2s ease-out; }
+  .qr-sheet-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .qr-sheet-head h2 { margin: 0; font-size: 16px; }
+  .qr-video { width: 100%; aspect-ratio: 1; max-height: 280px; object-fit: cover; border-radius: 14px; background: #000; display: block; margin-bottom: 10px; }
+  .qr-note { font-size: 13px; color: var(--muted); margin: 0 0 10px; line-height: 1.45; }
 </style>
 </head>
 <body data-tab="files">
@@ -383,6 +440,9 @@
       <div class="sub"><span id="dot" class="dot wait"></span><span id="status">Connecting…</span></div>
     </div>
     <span id="onair" class="onair-pill" hidden><span class="ai" data-arcs></span>ON AIR <b id="onair-time">0:00</b></span>
+    <button id="scan-qr-btn" class="retry" type="button" aria-label="Scan QR or Enter Code" title="Scan QR or Enter Code">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="7" y="7" width="4" height="4" rx=".5"/><rect x="13" y="7" width="4" height="4" rx=".5"/><rect x="7" y="13" width="4" height="4" rx=".5"/><path d="M13 13h4v4h-4"/></svg>
+    </button>
     <button id="theme-toggle" class="retry" type="button" aria-label="Toggle OLED Dark Mode" title="Toggle OLED Dark Mode">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
     </button>
@@ -401,6 +461,11 @@
     </div>
   </div>
   <section id="tab-files" class="tab">
+  <div class="mode-switch" id="files-mode" role="tablist" aria-label="Transfer target">
+    <button type="button" data-fmode="pc" class="on" role="tab" aria-selected="true">Computer</button>
+    <button type="button" data-fmode="p2p" role="tab" aria-selected="false">Phone to Phone <span id="p2p-badge" class="pill-cnt" hidden></span></button>
+  </div>
+  <div id="panel-pc">
   <div id="share" class="share" hidden>
     <div class="share-head">
       <h2 id="share-title"></h2>
@@ -421,6 +486,8 @@
     <label id="add-tl" class="btn primary" for="pick-tl" hidden>Add to timeline</label>
     <input id="pick-tl" type="file" multiple accept="image/*,video/*,audio/*" hidden>
     <label id="send-lib" class="btn primary" for="pick">Send to computer</label>
+    <label id="queue-offline" class="btn" for="pick-offline" hidden style="margin-top:8px">Queue files offline for later</label>
+    <input id="pick-offline" type="file" multiple hidden>
     <input id="pick" type="file" multiple hidden>
     <input id="pick-media" type="file" multiple accept="image/*,video/*" hidden>
     <div id="uploads"></div>
@@ -428,7 +495,43 @@
   </div>
   <div id="received-title" class="section" hidden>Received</div>
   <div id="list" class="list"></div>
-  <footer id="footer">Keep this page on your home screen to move files either way. Everything travels over your Wi-Fi in full original quality — no mobile data, no upload to the internet.</footer>
+  <footer id="footer">Keep this app on your home screen. Computer transfers run over your Wi-Fi in original quality; Phone-to-Phone works anywhere via direct encrypted P2P.</footer>
+  </div>
+  <div id="panel-p2p" hidden>
+    <div class="p2p-bar">
+      <span id="p2p-status">Finding nearby phones…</span>
+      <button id="p2p-me" type="button" title="Rename this phone"></button>
+    </div>
+    <div id="p2p-incoming" class="p2p-incoming" hidden>
+      <h2 id="p2p-inc-title"></h2>
+      <p id="p2p-inc-sub"></p>
+      <div class="row">
+        <button id="p2p-inc-decline" type="button" class="btn">Decline</button>
+        <button id="p2p-inc-accept" type="button" class="btn primary">Accept</button>
+      </div>
+    </div>
+    <div id="p2p-transfers"></div>
+    <div id="p2p-peers"></div>
+    <input id="p2p-pick" type="file" multiple hidden>
+    <div class="p2p-room">
+      <h3>Pair any phone anywhere</h3>
+      <p>Not on the same Wi-Fi? Create a 6-digit code or enter one to transfer directly over 4G/5G or Wi-Fi — encrypted end-to-end, zero cloud storage.</p>
+      <div id="p2p-room-active" class="p2p-code-box" hidden>
+        <div id="p2p-room-code" class="p2p-code-big"></div>
+        <div class="p2p-code-acts">
+          <button id="p2p-copy-room" type="button" class="btn primary">Share invite link</button>
+          <button id="p2p-leave-room" type="button" class="btn">Close code</button>
+        </div>
+      </div>
+      <button id="p2p-create-room" type="button" class="btn" style="width:100%">Create 6-digit room code</button>
+      <div class="p2p-join-row">
+        <input id="p2p-join-input" type="text" inputmode="numeric" maxlength="7" placeholder="Enter 6-digit code" aria-label="6-digit room code">
+        <button id="p2p-join-btn" type="button" class="btn primary">Join</button>
+      </div>
+    </div>
+    <div id="p2p-rx-title" class="section" hidden>Received from phones</div>
+    <div id="p2p-rx-list" class="list"></div>
+  </div>
   </section>
   <section id="tab-remote" class="tab" hidden>
     <div class="card rec-card">
@@ -544,7 +647,7 @@
     <div id="beam-history"></div>
   </section>
 </main>
-<nav id="tabs" class="tabs" hidden aria-label="Briefcast">
+<nav id="tabs" class="tabs" aria-label="Briefcast">
   <button type="button" data-tab="files" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>Files</button>
   <button type="button" data-tab="remote"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></svg>Remote</button>
   <button type="button" data-tab="voice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Voice</button>
@@ -564,8 +667,23 @@
     <span id="pr-arcs" data-arcs></span>
   </div>
 </div>
+<div id="qr-modal" class="qr-modal" hidden>
+  <div class="qr-sheet">
+    <div class="qr-sheet-head">
+      <h2>Scan QR or Enter Code</h2>
+      <button id="qr-close" class="x" type="button" aria-label="Close">×</button>
+    </div>
+    <video id="qr-video" class="qr-video" autoplay muted playsinline hidden></video>
+    <p id="qr-note" class="qr-note"></p>
+    <div class="p2p-join-row">
+      <input id="qr-manual" type="text" placeholder="6-digit code or Briefcast link" aria-label="Code or link" style="letter-spacing:0;text-align:left;font-family:inherit;font-weight:500;font-size:14px">
+      <button id="qr-manual-go" type="button" class="btn primary">Connect</button>
+    </div>
+  </div>
+</div>
 <div id="toast" class="toast"></div>
 <script src="/studio.js" defer></script>
+<script src="/p2p.js" defer></script>
 <script>
 (() => {
   const STORE = "briefcast-transfer";
@@ -581,12 +699,36 @@
   // bookmark of this page is just the address.
   const fragment = new URLSearchParams(location.hash.slice(1));
   let pairKey = fragment.get("k") || "";
-  // Handed over by the HTTP page when it moved us onto HTTPS - localStorage is per origin, so
-  // without this the phone would have to pair all over again.
+  const initialJoinCode = (fragment.get("join") || "").replace(/\D/g, "").slice(0, 6);
+  const initialMode = fragment.get("mode") || (initialJoinCode ? "p2p" : "");
+  const initialTab = fragment.get("tab") || "";
+  const DEFAULT_PWA_ORIGIN = "https://transfer.briefcast.app";
+  const isLocalLanOrigin =
+    /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname) ||
+    /^\d+-\d+-\d+-\d+\./.test(location.hostname);
+  const isHostedPwa = !isLocalLanOrigin && location.protocol === "https:";
+  const pcParam = fragment.get("pc");
+  let pcOrigin = pcParam ? pcParam.replace(/\/+$/, "") : (creds && creds.origin) || (isLocalLanOrigin ? location.origin : "");
+  // Handed over by the HTTP or LAN HTTPS page when moving to the permanent PWA origin.
   if (fragment.get("d") && fragment.get("t")) {
-    creds = { d: fragment.get("d"), t: fragment.get("t"), name: fragment.get("n") || undefined };
+    creds = { d: fragment.get("d"), t: fragment.get("t"), name: fragment.get("n") || undefined, origin: pcOrigin || undefined };
+    saveCreds();
+  } else if (pcParam && creds) {
+    creds = { ...creds, origin: pcOrigin };
     saveCreds();
   }
+  const pcBase = () => pcOrigin || (isLocalLanOrigin ? location.origin : "");
+  const pcWsBase = () => {
+    const base = pcBase();
+    if (!base) return "";
+    try {
+      const u = new URL(base);
+      return `${u.protocol === "https:" ? "wss" : "ws"}://${u.host}`;
+    } catch (_) {
+      return "";
+    }
+  };
+  const pcIsSecure = () => pcBase().startsWith("https://");
   // Set by sw.js after Android's share sheet handed files over (or by the server, when it couldn't).
   const shareParam = new URLSearchParams(location.search).get("share");
   // iPhone/iPad home-screen app, first launch: the one-time code "Add to Home Screen" carried in.
@@ -624,11 +766,35 @@
   }
   document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => { if (b.dataset.tab !== tab) { showTab(b.dataset.tab); if (navigator.vibrate) navigator.vibrate(8); } }));
 
+  let filesMode = "pc";
+  function setFilesMode(mode) {
+    filesMode = mode === "p2p" ? "p2p" : "pc";
+    $("panel-pc").hidden = filesMode !== "pc";
+    $("panel-p2p").hidden = filesMode !== "p2p";
+    document.querySelectorAll("#files-mode button").forEach((b) => {
+      const on = b.dataset.fmode === filesMode;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", String(on));
+    });
+    if (filesMode === "p2p" && window.BCP2P) window.BCP2P.connect();
+  }
+  document.querySelectorAll("#files-mode button").forEach((b) =>
+    b.addEventListener("click", () => {
+      setFilesMode(b.dataset.fmode);
+      if (navigator.vibrate) navigator.vibrate(8);
+    })
+  );
+  $("scan-qr-btn")?.addEventListener("click", () => {
+    if (window.BCScanQR) window.BCScanQR();
+  });
+
   // The reconnect button shows whenever a paired phone isn't connected, and spins while it tries.
   const setStatus = (text, kind) => {
     $("status").textContent = text; $("dot").className = "dot " + (kind || "");
-    $("retry").hidden = kind === "on" || !creds;
+    $("retry").hidden = kind === "on" || (!creds && !pcBase());
     $("retry").classList.toggle("spin", kind === "wait");
+    const offlineBtn = $("queue-offline");
+    if (offlineBtn) offlineBtn.hidden = welcomed;
     renderShare();
   };
   const toast = (text) => {
@@ -656,7 +822,28 @@
     return `${d.toLocaleDateString([], { day: "numeric", month: "short", year: days > 300 ? "numeric" : undefined })}, ${time}`;
   };
   const fileUrl = (id, inline) =>
-    `/f/${encodeURIComponent(id)}?d=${encodeURIComponent(creds.d)}&t=${encodeURIComponent(creds.t)}${inline ? "&inline=1" : ""}`;
+    `${pcBase()}/f/${encodeURIComponent(id)}?d=${encodeURIComponent(creds.d)}&t=${encodeURIComponent(creds.t)}${inline ? "&inline=1" : ""}`;
+
+  const fmtEta = (secs) => {
+    if (!isFinite(secs) || secs <= 0) return "";
+    if (secs < 60) return `${Math.ceil(secs)}s`;
+    return `${Math.floor(secs / 60)}m ${Math.ceil(secs % 60)}s`;
+  };
+  let uploadWakeLock = null;
+  async function syncUploadWakeLock(active) {
+    if (!("wakeLock" in navigator)) return;
+    if (active && document.visibilityState === "visible") {
+      if (!uploadWakeLock) {
+        try {
+          uploadWakeLock = await navigator.wakeLock.request("screen");
+          uploadWakeLock.addEventListener("release", () => { uploadWakeLock = null; });
+        } catch (_) {}
+      }
+    } else if (!active && uploadWakeLock) {
+      uploadWakeLock.release().catch(() => {});
+      uploadWakeLock = null;
+    }
+  }
 
   const download = (offer) => {
     const a = document.createElement("a");
@@ -682,9 +869,23 @@
       else if (u.state === "failed") { st.style.color = "var(--bad)"; st.textContent = u.error || "Failed"; }
       else if (u.state === "sending") {
         const pct = u.file.size ? Math.floor((u.sent / u.file.size) * 100) : 0;
-        st.textContent = `${pct}%${u.speed ? " · " + fmtSize(u.speed) + "/s" : ""}`;
+        const eta = u.speed > 0 && u.file.size > u.sent ? fmtEta((u.file.size - u.sent) / u.speed) : "";
+        st.textContent = `${pct}%${u.speed ? " · " + fmtSize(u.speed) + "/s" : ""}${eta ? " · " + eta : ""}`;
       } else st.textContent = "Waiting…";
       top.append(n, st);
+      if (u.state === "sending" && u.xhr) {
+        const acts = document.createElement("span"); acts.className = "row-acts";
+        const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "mini-btn"; cancel.textContent = "Cancel";
+        cancel.addEventListener("click", () => { u.cancelled = true; try { u.xhr.abort(); } catch (_) {} });
+        acts.appendChild(cancel);
+        top.appendChild(acts);
+      } else if (u.state === "failed") {
+        const acts = document.createElement("span"); acts.className = "row-acts";
+        const retry = document.createElement("button"); retry.type = "button"; retry.className = "mini-btn"; retry.textContent = "Retry";
+        retry.addEventListener("click", () => { u.state = "waiting"; u.error = ""; u.cancelled = false; renderUploads(); pump(); });
+        acts.appendChild(retry);
+        top.appendChild(acts);
+      }
       row.appendChild(top);
       if (u.state === "sending") {
         const bar = document.createElement("div"); bar.className = "bar";
@@ -697,18 +898,20 @@
   }
 
   function pump() {
-    if (uploading || !creds) return;
+    if (uploading || !creds || !pcBase()) return;
     const u = uploads.find((x) => x.state === "waiting");
-    if (!u) return;
+    if (!u) { syncUploadWakeLock(false); return; }
     uploading = true;
-    u.state = "sending"; u.sent = 0; u.speed = 0;
+    syncUploadWakeLock(true);
+    u.state = "sending"; u.sent = 0; u.speed = 0; u.cancelled = false;
     const started = Date.now();
     const xhr = new XMLHttpRequest();
+    u.xhr = xhr;
     const q = new URLSearchParams({ d: creds.d, t: creds.t, name: u.file.name, size: String(u.file.size), to: u.target, batch: u.batch });
     if (u.at != null) q.set("at", String(u.at));
     if (u.dur != null) q.set("dur", String(u.dur));
     if (u.replaces) q.set("replaces", u.replaces);
-    xhr.open("POST", `/u?${q}`);
+    xhr.open("POST", `${pcBase()}/u?${q}`);
     // XHR rather than fetch: only XHR reports upload progress. A File body is streamed from
     // storage by the browser, never read into memory whole.
     xhr.upload.onprogress = (e) => {
@@ -718,7 +921,8 @@
       renderUploads();
     };
     const finish = (ok, error) => {
-      u.state = ok ? "done" : "failed"; u.error = error;
+      u.xhr = null;
+      u.state = ok ? "done" : "failed"; u.error = u.cancelled ? "Cancelled" : error;
       uploading = false;
       if (ok && navigator.vibrate) navigator.vibrate(20);
       renderUploads();
@@ -726,6 +930,7 @@
       if (u.onUpdate) u.onUpdate(u);
       // Timeline files are announced once Briefcast says where they landed (batchSettled).
       if (!uploads.some((x) => x.state === "waiting")) {
+        syncUploadWakeLock(false);
         const done = uploads.filter((x) => x.state === "done" && x.target === "library" && !x.toasted);
         done.forEach((x) => (x.toasted = true));
         if (done.length) toast(done.length === 1 ? `✓ Sent ${done[0].file.name}` : `✓ Sent ${done.length} files`);
@@ -743,6 +948,7 @@
       finish(ok, xhr.status === 403 ? "Not paired — scan again" : (xhr.responseText || "Failed").slice(0, 60));
     };
     xhr.onerror = () => finish(false, "Connection lost");
+    xhr.onabort = () => finish(false, "Cancelled");
     xhr.send(u.file);
     renderUploads();
   }
@@ -754,7 +960,29 @@
     renderUploads();
     pump();
   }
-  $("pick").addEventListener("change", (e) => { queue([...e.target.files], "library"); e.target.value = ""; });
+  async function queueOfflineFiles(files) {
+    if (!files || !files.length) return;
+    if (!window.isSecureContext || !("indexedDB" in window)) {
+      toast("Offline queue requires HTTPS");
+      return;
+    }
+    try {
+      const id = await shareTx("readwrite", (st) => st.add({ at: Date.now(), files, text: "", fields: [] }));
+      shares.push({ id, at: Date.now(), files, text: "", fields: [] });
+      renderShare();
+      toast(files.length === 1 ? `Queued ${files[0].name} for later` : `Queued ${files.length} files for later`);
+    } catch (_) {
+      toast("Couldn't save offline queue");
+    }
+  }
+  $("pick").addEventListener("change", (e) => {
+    const files = [...e.target.files]; e.target.value = "";
+    if (!welcomed) queueOfflineFiles(files); else queue(files, "library");
+  });
+  $("pick-offline")?.addEventListener("change", (e) => {
+    const files = [...e.target.files]; e.target.value = "";
+    queueOfflineFiles(files);
+  });
   $("pick-tl").addEventListener("change", (e) => { queue([...e.target.files], "timeline"); e.target.value = ""; });
   $("pick-media").addEventListener("change", (e) => { queue([...e.target.files], "library"); e.target.value = ""; });
 
@@ -1150,10 +1378,14 @@
   }
 
   function unpaired() {
-    setStatus("Not connected", "");
-    $("tabs").hidden = true;
-    if (tab !== "files") showTab("files");
-    $("me").hidden = true; $("sender").hidden = true; $("install").hidden = true;
+    setStatus(isHostedPwa ? "Standalone · Phone to Phone ready" : "Not connected", isHostedPwa ? "on" : "");
+    $("me").hidden = true;
+    $("sender").hidden = !isHostedPwa;
+    if (isHostedPwa) {
+      $("send-lib").hidden = true;
+      if ($("queue-offline")) $("queue-offline").hidden = false;
+    }
+    showInstall();
   }
 
   function forgotten(title, body) {
@@ -1166,9 +1398,13 @@
     if (stopped) return;
     if (ws && ws.readyState <= 1) return;
     clearTimeout(retryTimer);
-    if (!creds && !pairKey) {
+    if ((!creds && !pairKey) || !pcWsBase()) {
       unpaired();
-      notice("Scan the code in Briefcast", "On your computer, choose Transfer to phone › Connect another phone and scan the QR code it shows with this phone's camera.");
+      if (isHostedPwa && !creds) {
+        notice("Pair a computer anytime", "Tap the QR button above to link Briefcast on your PC, or use Phone to Phone, Voice Studio, and Teleprompter right away.");
+      } else {
+        notice("Scan the code in Briefcast", "On your computer, choose Transfer to phone › Connect another phone and scan the QR code it shows with this phone's camera.");
+      }
       return;
     }
     welcomed = false;
@@ -1177,7 +1413,7 @@
     if (pairKey) p.set("k", pairKey);
     p.set("n", (creds && creds.name) || defaultName);
     setStatus(creds ? "Reconnecting…" : "Connecting…", "wait");
-    const socket = new WebSocket(`${secure ? "wss" : "ws"}://${location.host}/ws?${p}`);
+    const socket = new WebSocket(`${pcWsBase()}/ws?${p}`);
     ws = socket;
 
     socket.onmessage = (ev) => {
@@ -1186,19 +1422,19 @@
       setTimeout(() => emit(m.type, m), 0);
       if (m.type === "welcome") {
         welcomed = true; attempt = 0; pairKey = "";
-        creds = { d: m.device.id, t: m.device.token, name: m.device.name, host: m.host };
+        creds = { d: m.device.id, t: m.device.token, name: m.device.name, host: m.host, origin: pcBase() || undefined };
         saveCreds();
-        setStatus(`Connected to ${m.host}${secure ? " · 🔒 encrypted" : ""}`, "on");
+        setStatus(`Connected to ${m.host}${pcIsSecure() ? " · 🔒 encrypted" : ""}`, "on");
         $("me").hidden = false; $("me").textContent = m.device.name + " ✎";
         $("sender").hidden = false;
+        $("send-lib").hidden = false;
         host = m.host;
         setTimeline(m.timeline);
-        $("tabs").hidden = false;
         setTimeout(() => emit("connected"), 0);
-        if (isIOS && secure && !standalone) socket.send('{"type":"handoff.create"}');
+        if (isIOS && secure && !standalone && isLocalLanOrigin) socket.send('{"type":"handoff.create"}');
         notice("", "");
         // Unencrypted is allowed (the desktop offers it only on purpose) but never invisible.
-        $("security").innerHTML = secure ? "" : `<div class="warn"><b>Unencrypted connection.</b> Anyone on this network could see the files you send or receive here.</div>`;
+        $("security").innerHTML = pcIsSecure() ? "" : `<div class="warn"><b>Unencrypted connection.</b> Anyone on this network could see the files you send or receive here.</div>`;
         render();
         showInstall();
         // Briefcast answers every ping. Silence means the connection died without a close (Wi-Fi
@@ -1268,24 +1504,27 @@
     if (welcomed) { setStatus("Reconnecting…", "wait"); scheduleReconnect(); return; }
     // Closed before we were welcomed. A WebSocket close can't say why, so ask: only a definite
     // "not paired" from Briefcast makes this phone forget its pairing - never a guess.
-    if (creds) {
+    if (creds && pcBase()) {
       let res = null;
-      try { res = await fetch(`/hello?d=${encodeURIComponent(creds.d)}&t=${encodeURIComponent(creds.t)}`, { cache: "no-store" }); } catch (_) {}
+      try { res = await fetch(`${pcBase()}/hello?d=${encodeURIComponent(creds.d)}&t=${encodeURIComponent(creds.t)}`, { cache: "no-store" }); } catch (_) {}
       if (ws || stopped) return;
       if (res && res.status === 401) {
         forgotten("This phone was removed", "Briefcast on the computer no longer knows this phone. Scan the QR code again to reconnect.");
         return;
       }
       if (!res) {
-        setStatus("Waiting for Briefcast…", "wait");
-        notice("Can't reach your computer", "Make sure Briefcast is open and this phone is on the same Wi-Fi. It reconnects on its own, or tap ⟳.");
+        setStatus("Computer offline · Standalone ready", "wait");
+        $("sender").hidden = false;
+        $("send-lib").hidden = true;
+        if ($("queue-offline")) $("queue-offline").hidden = false;
+        notice("Computer is offline", "You can still use Phone to Phone, Offline Outbox, Voice Studio, and Teleprompter. This app reconnects automatically when Briefcast opens on your Wi-Fi.");
       } else setStatus("Reconnecting…", "wait");
       scheduleReconnect();
       return;
     }
     // Pairing with a QR code's key, which works once and expires.
     let reachable = false;
-    try { reachable = (await fetch("/ping", { cache: "no-store" })).ok; } catch (_) {}
+    try { reachable = !!pcBase() && (await fetch(`${pcBase()}/ping`, { cache: "no-store" })).ok; } catch (_) {}
     if (ws || stopped) return;
     if (reachable) {
       pairKey = "";
@@ -1308,18 +1547,18 @@
   function showInstall() {
     const box = $("install");
     const iosAdd = isIOS && secure && !installPrompt;
-    if (standalone || !welcomed || installDismissed() || (!installPrompt && !/Android/.test(ua) && !iosAdd)) { box.hidden = true; return; }
-    $("install-title").textContent = "Add Briefcast to your home screen";
+    const readyToInstall = welcomed || isHostedPwa;
+    if (standalone || !readyToInstall || installDismissed() || (!installPrompt && !/Android/.test(ua) && !iosAdd)) { box.hidden = true; return; }
+    $("install-title").textContent = "Install Briefcast Transfer";
     if (iosAdd) {
-      // The pairing travels with it (see requestHandoff) - the app opens already connected.
-      $("install-body").textContent = "In Safari, tap the Share button (the square with an arrow), then Add to Home Screen. Briefcast opens like an app and stays connected to your computer.";
+      $("install-body").textContent = "In Safari, tap Share › Add to Home Screen. It launches offline anytime for Phone-to-Phone, Voice Studio, Teleprompter, and PC transfers.";
       $("install-go").textContent = "OK";
       box.hidden = false;
       return;
     }
     $("install-body").textContent = installPrompt
-      ? "It opens like an app — no browser bar — and reconnects to your computer by itself."
-      : "This card can't add it for you. In Chrome's ⋮ menu (top right) tap Install and create shortcut › Create shortcut (older Chrome: Add to Home screen), then confirm. The icon may land on a later home-screen page.";
+      ? "Opens like a native app — works even when your computer is off for Phone-to-Phone, Voice-Over, and Teleprompter."
+      : "In Chrome's ⋮ menu tap Install app / Add to Home screen so Briefcast Transfer opens independently anytime.";
     $("install-go").textContent = installPrompt ? "Install" : "OK";
     box.hidden = false;
   }
@@ -1371,19 +1610,44 @@
   window.addEventListener("pageshow", (e) => { if (e.persisted && !stopped) reconnectNow(); });
   window.addEventListener("online", () => { if (!stopped) reconnectNow(); });
 
-  // Moves onto this computer's trusted HTTPS name if the phone can actually reach it. Bounded by a
-  // short timeout: a router that blocks the name, or no internet to resolve it, must not hold up
-  // a transfer that works fine over HTTP.
+  // Moves onto this computer's trusted HTTPS name — and if the permanent hosted PWA
+  // (https://transfer.briefcast.app) is reachable, hands the session over there so the installed
+  // app works completely independently even when Briefcast Desktop is closed.
+  async function tryMigrateToHostedPwa(lanHttpsOrigin, pwaUrl) {
+    if (isHostedPwa || standalone || !lanHttpsOrigin || !pwaUrl) return false;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2200);
+    try {
+      const probe = await fetch(`${pwaUrl}/ping`, { cache: "no-store", mode: "cors", signal: ctl.signal });
+      if (!probe.ok) return false;
+      const p = new URLSearchParams();
+      p.set("pc", lanHttpsOrigin);
+      if (pairKey) p.set("k", pairKey);
+      if (creds) { p.set("d", creds.d); p.set("t", creds.t); if (creds.name) p.set("n", creds.name); }
+      location.replace(`${pwaUrl}/#${p.toString()}`);
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function upgradeToHttps() {
-    if (secure) return false;
+    if (isHostedPwa) return false;
+    if (secure) {
+      // Already on LAN HTTPS: if the permanent hosted PWA is live, upgrade there seamlessly.
+      return tryMigrateToHostedPwa(location.origin, DEFAULT_PWA_ORIGIN);
+    }
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 3500);
     try {
       const target = await fetch("/tls", { cache: "no-store", signal: ctl.signal });
       if (!target.ok) return false;
-      const { https } = await target.json();
+      const { https, pwa } = await target.json();
       const probe = await fetch(`${https}/ping`, { cache: "no-store", mode: "cors", signal: ctl.signal });
       if (!probe.ok) return false;
+      if (await tryMigrateToHostedPwa(https, pwa || DEFAULT_PWA_ORIGIN)) return true;
       const p = new URLSearchParams();
       if (pairKey) p.set("k", pairKey);
       if (creds) { p.set("d", creds.d); p.set("t", creds.t); if (creds.name) p.set("n", creds.name); }
@@ -1397,38 +1661,60 @@
     }
   }
 
+  function pairWithPc(origin, key) {
+    if (!origin || !key) return;
+    pcOrigin = origin.replace(/\/+$/, "");
+    pairKey = key;
+    stopped = false;
+    attempt = 0;
+    if (ws) abandon(ws);
+    setFilesMode("pc");
+    showTab("files");
+    connect();
+  }
+
   window.BC = {
     send: (msg) => { if (ws && ws.readyState === 1 && welcomed) { ws.send(JSON.stringify(msg)); return true; } return false; },
     on: (type, fn) => { if (!bus.has(type)) bus.set(type, []); bus.get(type).push(fn); },
     connected: () => !!(ws && ws.readyState === 1 && welcomed),
     host: () => host,
     tab: () => tab,
+    pcOrigin: () => pcBase(),
+    pwaOrigin: () => DEFAULT_PWA_ORIGIN,
+    deviceName: () => (creds && creds.name) || "",
+    setFilesMode,
+    pairWithPc,
+    initialJoinCode,
     toast,
     haptic: (pattern) => { if (navigator.vibrate) navigator.vibrate(pattern); },
     queue: (files, target, extra) => queue(files, target, null, extra),
     // studio.js loads after this script: a share card drawn before it arrived gets its Beam buttons.
     ready: () => renderShare(),
   };
-  if (creds) {
-    $("tabs").hidden = false;
+
+  if (initialMode === "p2p" || (isHostedPwa && !creds && !pairKey)) {
+    setFilesMode("p2p");
+  }
+  if (initialTab && document.getElementById("tab-" + initialTab)) {
+    showTab(initialTab);
+  } else if (creds && !shareParam && !initialMode) {
     let saved = "files";
     try { saved = localStorage.getItem(STORE + "-tab") || "files"; } catch (_) {}
-    if (!shareParam && document.getElementById("tab-" + saved)) showTab(saved);
+    if (document.getElementById("tab-" + saved)) showTab(saved);
   }
 
   async function redeemHandoff() {
-    if (creds || !handoffCode) return;
+    if (creds || !handoffCode || !pcBase()) return;
     try {
-      const r = await fetch(`/handoff?h=${encodeURIComponent(handoffCode)}`, { cache: "no-store" });
+      const r = await fetch(`${pcBase()}/handoff?h=${encodeURIComponent(handoffCode)}`, { cache: "no-store" });
       if (!r.ok) return;
       const p = await r.json();
-      creds = { d: p.d, t: p.t, name: p.n || undefined };
+      creds = { d: p.d, t: p.t, name: p.n || undefined, origin: pcBase() || undefined };
       saveCreds();
-      $("tabs").hidden = false;
     } catch (_) {}
   }
 
-  setStatus("Connecting…", "wait");
+  setStatus(isHostedPwa && !creds && !pairKey ? "Standalone · Phone to Phone ready" : "Connecting…", isHostedPwa && !creds && !pairKey ? "on" : "wait");
   loadShares();
   redeemHandoff().then(() => upgradeToHttps()).then((moved) => { if (!moved) connect(); });
 })();

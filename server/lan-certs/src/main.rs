@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+
+mod transfer;
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -725,7 +727,8 @@ async fn main() -> Result<()> {
         .route("/v1/health", get(health))
         .route("/v1/installs", post(register))
         .route("/v1/certificates", post(certificate))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .merge(transfer::router(config.trust_proxy));
     let listener = TcpListener::bind(config.api_bind).await.with_context(|| format!("binding API on {}", config.api_bind))?;
     log::info!("API listening on {}", config.api_bind);
 

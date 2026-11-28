@@ -1,18 +1,26 @@
-// Service worker for the phone transfer page (served by phone_transfer.rs as /sw.js). Browsers
-// only run it over HTTPS.
+// Service worker for Briefcast Transfer Pro (served by both transfer.briefcast.app and
+// phone_transfer.rs as /sw.js). Browsers only run it over HTTPS.
 //
 // Two jobs:
-// - When the installed app is opened while Briefcast isn't running (or the PC is asleep), show the
-//   page from cache - which says "can't reach your computer" and has a reconnect button - instead
-//   of the browser's own "site can't be reached" error. The page is always fetched fresh when the
-//   computer answers. Files, uploads and the socket never go through the cache.
-// - Android's share sheet ("Share > Briefcast" in Gallery, WhatsApp, Files...) posts the shared
-//   files to /share. They're kept on the phone (IndexedDB) and the page is opened to send them, so
-//   a share made while the computer is asleep isn't lost - it waits until it's sent.
-const CACHE = "briefcast-transfer-v6";
-const SHELL = ["/", "/studio.js", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png", "/icons/logo-96.png"];
+// - Instant offline-first launch: serves the app shell with a tight 600ms network timeout so
+//   tapping the home-screen icon opens immediately (<100ms when offline or Briefcast Desktop is
+//   closed) instead of waiting on a TCP timeout, while still refreshing the cache in the background
+//   whenever the server is reachable.
+// - Android's share sheet ("Share > Briefcast" in Gallery, WhatsApp, Files...) posts shared files
+//   to /share. They're persisted in IndexedDB so shares made while the PC is off wait safely until
+//   sent (either to your PC or directly Phone-to-Phone).
+const CACHE = "briefcast-transfer-v7";
+const SHELL = [
+  "/",
+  "/studio.js",
+  "/p2p.js",
+  "/manifest.webmanifest",
+  "/icons/icon-192.png",
+  "/icons/icon-512.png",
+  "/icons/maskable-512.png",
+  "/icons/logo-96.png",
+];
 
-// The same tiny store the page reads (phone_transfer_page.html, openShares).
 const DB = "briefcast-transfer", SHARES = "shares";
 const openShares = () => new Promise((resolve, reject) => {
   const req = indexedDB.open(DB, 1);
@@ -21,8 +29,6 @@ const openShares = () => new Promise((resolve, reject) => {
   req.onerror = () => reject(req.error);
 });
 
-// Every file in the share, whatever field it came under. Apps often hand files over without a
-// display name - those still count, and get one the computer can save them under.
 function sharedFiles(form) {
   const files = [];
   for (const [, value] of form.entries()) {
@@ -38,7 +44,6 @@ async function keepShare(request) {
   const form = await request.formData();
   const files = sharedFiles(form);
   const text = ["title", "text", "url"].map((k) => form.get(k)).filter((v) => typeof v === "string" && v.trim()).join("\n");
-  // What actually arrived, so a share that brings nothing usable can say so rather than guess.
   const fields = [...form.entries()].map(([k, v]) => (typeof v === "string" ? `${k} (text)` : `${k} (${v.type || "file"}, ${v.size} B)`));
   const db = await openShares();
   const id = await new Promise((resolve, reject) => {
@@ -63,6 +68,32 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+async function fastNetworkThenCache(req, shell) {
+  const cache = await caches.open(CACHE);
+  const cached = await cache.match(shell);
+
+  const networkPromise = fetch(req)
+    .then((res) => {
+      if (res && res.ok) {
+        cache.put(shell, res.clone()).catch(() => {});
+      }
+      return res;
+    })
+    .catch(() => null);
+
+  // If we already have a cached copy, don't hang more than 600ms waiting for an unreachable PC or
+  // slow cell connection — serve the cached shell immediately while network updates in background.
+  if (cached) {
+    const fast = await Promise.race([
+      networkPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 600)),
+    ]);
+    return fast || cached;
+  }
+
+  return (await networkPromise) || Response.error();
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   const url = new URL(req.url);
@@ -78,16 +109,5 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
   const shell = req.mode === "navigate" ? "/" : SHELL.includes(url.pathname) ? url.pathname : null;
   if (!shell) return;
-  // Network first, so a newer Briefcast's page is picked up the moment it's reachable.
-  event.respondWith(
-    fetch(req)
-      .then((res) => {
-        if (res.ok) {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put(shell, copy));
-        }
-        return res;
-      })
-      .catch(() => caches.match(shell).then((hit) => hit || Response.error())),
-  );
+  event.respondWith(fastNetworkThenCache(req, shell));
 });

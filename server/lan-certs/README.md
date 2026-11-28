@@ -112,3 +112,36 @@ For release builds, set the GitHub Actions variable `BRIEFCAST_LAN_TLS_API` (see
   connects from the phone, so routers with DNS-rebinding protection and hotspots with no internet
   keep working over plain HTTP.
 - **Back up** `/var/lib/briefcast-lan-certs` (the install registry and the ACME account).
+
+## 6. Standalone PWA & Phone-to-Phone (`transfer.briefcast.app`)
+
+`briefcast-lan-certs` now also serves the **Briefcast Transfer Pro PWA** (`/`, `/sw.js`, `/studio.js`,
+`/p2p.js`, `/manifest.webmanifest`, `/icons/*`) and the lightweight **WebRTC Phone-to-Phone signaling
+WebSocket** (`/p2p/ws`) on the exact same `127.0.0.1:8787` listener. Zero file bytes pass through the
+VPS — phones transfer directly peer-to-peer over DTLS-encrypted WebRTC DataChannels, and PC transfers
+continue going directly over LAN HTTPS.
+
+### Deploy on the existing VPS + Cloudflare Tunnel (2 minutes)
+
+1. **Rebuild and restart `briefcast-lan-certs`** on your VPS as `briefcastlan`:
+   ```sh
+   cd ~/screencast/server/lan-certs   # or wherever you keep the repo
+   git pull
+   cargo test
+   cargo build --release
+   install -m 755 target/release/briefcast-lan-certs ~/bin/briefcast-lan-certs
+   sudo systemctl restart briefcast-lan-certs
+   ```
+   *(If you `scp` only `server/lan-certs` instead of cloning the whole repo, make sure `server/lan-certs/pwa/` is included — `build.rs` auto-picks `../../src-tauri/src/services/` inside the repo or `./pwa/` standalone.)*
+
+2. **Add the Cloudflare Tunnel public hostname** (in Cloudflare Zero Trust › Networks › Tunnels › your existing `briefcast-lan-tunnel` › Public Hostname › **Add a public hostname**):
+   - **Subdomain**: `transfer`
+   - **Domain**: `briefcast.app` (or `briefcast.space` — set `BRIEFCAST_TRANSFER_PWA_URL` in release builds if using a different host)
+   - **Service**: `HTTP` → `127.0.0.1:8787`
+
+3. **Verify**:
+   ```sh
+   curl https://transfer.briefcast.app/health   # -> ok
+   ```
+   Open `https://transfer.briefcast.app` on any phone to install **Briefcast Transfer** independently of
+   Briefcast Desktop and start transferring Phone ↔ Phone or Phone ↔ Computer.
