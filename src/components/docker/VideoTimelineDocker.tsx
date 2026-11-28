@@ -123,7 +123,8 @@ import { Audition, type AuditionPiece, type AuditionState } from "../../utils/au
 import { getResumeTime } from "../../utils/playbackResume";
 import { dbToGain, gainDbAt, hasAutomation } from "../../utils/audioAutomation";
 import { fadeLevel, joinFades, NO_FADES } from "../../utils/audioJoins";
-import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundLabel, type CutSounds } from "../../utils/cutSounds";
+import { CUT_SOUNDS_CHANNEL, CUT_SOUNDS_LABEL, DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundLabel, type CutCue, type CutSounds } from "../../utils/cutSounds";
+import { stageSoundCues } from "../../utils/stage/stageSounds";
 import { CutSoundPlayer } from "../../utils/cutSoundPlayer";
 import DuckShade from "./DuckShade";
 import SoundProPopover from "./SoundProPopover";
@@ -2986,6 +2987,18 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     () => cutSoundCues(editStore.clips, editStore.edgeTransitions, editStore.cutSounds ?? undefined),
     [editStore.clips, editStore.edgeTransitions, editStore.cutSounds]
   );
+  // Built-in SFX attached to Stage scene beats (stageSounds.ts) - played alongside cut sounds.
+  const stageCues = useMemo(() => stageSoundCues(editStore.scenes), [editStore.scenes]);
+  const allSoundCues = useMemo(() => {
+    const cutActive =
+      !!editStore.cutSounds?.on &&
+      !editStore.cutSounds.muted &&
+      !silencedBySolo(mixerSession, CUT_SOUNDS_CHANNEL);
+    const merged: CutCue[] = [];
+    if (cutActive) merged.push(...cutCues);
+    if (stageCues.length > 0) merged.push(...stageCues);
+    return merged.sort((a, b) => a.start - b.start);
+  }, [cutCues, stageCues, editStore.cutSounds, mixerSession]);
 
   // Every piece's fades as played: its own, plus a crossfade where pieces of one track overlap and a
   // click-proof edge fade where one is cut mid-sound (audioJoins.ts) - the export's, exactly.
@@ -3069,23 +3082,30 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
   const cutPlayer = () => (cutSoundPlayerRef.current ??= new CutSoundPlayer());
   useEffect(() => () => cutSoundPlayerRef.current?.dispose(), []);
   useEffect(() => {
-    if (cutCues.length) cutPlayer().preload(cutCues);
-  }, [cutCues]);
+    if (allSoundCues.length) cutPlayer().preload(allSoundCues);
+  }, [allSoundCues]);
   const cutSoundsSilenced = !editStore.cutSounds || !!editStore.cutSounds.muted || timelineMuted || silencedBySolo(mixerSession, CUT_SOUNDS_CHANNEL);
+  const sfxPlayerVolume = timelineMuted
+    ? 0
+    : !cutSoundsSilenced && editStore.cutSounds?.on
+      ? editStore.cutSounds.volume
+      : stageCues.length > 0
+        ? 0.78
+        : 0;
   useEffect(() => {
-    cutSoundPlayerRef.current?.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
-  }, [cutSoundsSilenced, editStore.cutSounds?.volume]);
+    cutSoundPlayerRef.current?.setVolume(sfxPlayerVolume);
+  }, [sfxPlayerVolume]);
   useEffect(() => {
     const player = cutSoundPlayerRef.current;
-    if (!isPlaying || cutCues.length === 0) {
+    if (!isPlaying || allSoundCues.length === 0) {
       player?.stop();
       return;
     }
     const p = cutPlayer();
-    p.setVolume(cutSoundsSilenced ? 0 : editStore.cutSounds?.volume ?? 0);
+    p.setVolume(sfxPlayerVolume);
     const now = () => getExactOutputTime?.() ?? currentOutputTime;
-    p.play(cutCues, now());
-    const timer = window.setInterval(() => p.check(cutCues, now()), 200);
+    p.play(allSoundCues, now());
+    const timer = window.setInterval(() => p.check(allSoundCues, now()), 200);
     return () => {
       window.clearInterval(timer);
       p.stop();
@@ -3093,7 +3113,7 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
     // currentOutputTime is read live through getExactOutputTime; a change of it alone isn't a reason
     // to re-queue (check() catches seeks).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, cutCues]);
+  }, [isPlaying, allSoundCues]);
 
   // The mixer's play: the selected pieces on their own, on their own clock (audition.ts) - the
   // timeline stays where it is. Rebuilt when the selection changes; stopped by the timeline starting,

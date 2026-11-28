@@ -10,7 +10,18 @@ import { parseStageColor } from "./stageColor";
 import { defaultGraph } from "./stageGraph";
 import type { ShapeForm } from "./stageShapes";
 import { resolvedBeats } from "./stageEngine";
-import { StageBeat, StageElement, StageProps, StageScene, STAGE_HEIGHT, defaultStageProps } from "./stageTypes";
+import { StageBackground, StageBeat, StageBeatSound, StageCamera, StageElement, StageProps, StageScene, STAGE_HEIGHT, defaultStageProps } from "./stageTypes";
+
+// True when a scene background is light enough to take dark ink (supports solid & gradient).
+export function isLightStageBackground(bg: StageBackground): boolean {
+  if (bg.kind === "none") return false;
+  const lum = (css: string) => {
+    const rgb = parseStageColor(css);
+    return rgb ? (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 : 0;
+  };
+  if (bg.kind === "color") return lum(bg.color) > 0.55;
+  return (lum(bg.from) + lum(bg.to)) * 0.5 > 0.55;
+}
 
 export const MIN_BEAT_HOLD = 0.1;
 export const MAX_BEAT_HOLD = 600;
@@ -47,12 +58,10 @@ export function makeStageScene(opts: { startTime: number; frameWidth: number; fr
   };
   const like = opts.like;
   if (!like) return fresh;
-  const inherited: StageScene = { ...fresh, background: like.background, spring: like.spring, stagger: like.stagger, wordStagger: like.wordStagger, perspective: like.perspective };
-  const light = (sc: StageScene) => {
-    const rgb = sc.background.kind === "color" ? parseStageColor(sc.background.color) : null;
-    return !!rgb && (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 > 0.55;
-  };
-  return light(fresh) === light(inherited) ? inherited : reinkScene(inherited, !light(inherited));
+  const inherited: StageScene = { ...fresh, background: like.background, spring: like.spring, stagger: like.stagger, wordStagger: like.wordStagger, perspective: like.perspective, beatSound: like.beatSound };
+  return isLightStageBackground(fresh.background) === isLightStageBackground(inherited.background)
+    ? inherited
+    : reinkScene(inherited, !isLightStageBackground(inherited.background));
 }
 
 // The scene a new one at `t` follows: the latest that starts at or before it.
@@ -350,4 +359,129 @@ export function makeMathElement(opts: { x: number; y: number; tex?: string; size
     textLook: { fontSize: opts.size ?? 72 },
     props: defaultStageProps({ x: opts.x, y: opts.y, width: 480, height: 140, text: opts.tex ?? "y = mx + b", color: opts.color ?? "#111111" }),
   };
+}
+
+export const NEUTRAL_CAMERA: Required<StageCamera> = { zoom: 1, panX: 0, panY: 0, tilt: 0 };
+
+// Resolved virtual camera in beat `b`: inherits from earlier beats until a beat overrides it.
+export function resolvedBeatCamera(s: StageScene, b: number): Required<StageCamera> {
+  const cur: Required<StageCamera> = { ...NEUTRAL_CAMERA };
+  const last = Math.max(0, Math.min(b, s.beats.length - 1));
+  for (let i = 0; i <= last; i++) {
+    const cam = s.beats[i]?.camera;
+    if (!cam) continue;
+    if (cam.zoom !== undefined) cur.zoom = cam.zoom;
+    if (cam.panX !== undefined) cur.panX = cam.panX;
+    if (cam.panY !== undefined) cur.panY = cam.panY;
+    if (cam.tilt !== undefined) cur.tilt = cam.tilt;
+  }
+  return cur;
+}
+
+const clampNum = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Number.isFinite(v) ? v : lo));
+
+// Updates beat `b`'s virtual camera (`null` resets this beat back to neutral framing).
+export function setBeatCamera(s: StageScene, b: number, patch: Partial<StageCamera> | null): StageScene {
+  if (b < 0 || b >= s.beats.length) return s;
+  const prev = b > 0 ? resolvedBeatCamera(s, b - 1) : NEUTRAL_CAMERA;
+  const base = patch === null ? NEUTRAL_CAMERA : { ...resolvedBeatCamera(s, b), ...patch };
+  const next: Required<StageCamera> = {
+    zoom: Math.round(clampNum(base.zoom, 0.4, 4) * 100) / 100,
+    panX: Math.round(clampNum(base.panX, -3000, 3000)),
+    panY: Math.round(clampNum(base.panY, -2000, 2000)),
+    tilt: Math.round(clampNum(base.tilt, -25, 25) * 10) / 10,
+  };
+  const sameAsPrev =
+    Math.abs(next.zoom - prev.zoom) < 1e-4 &&
+    Math.abs(next.panX - prev.panX) < 1e-4 &&
+    Math.abs(next.panY - prev.panY) < 1e-4 &&
+    Math.abs(next.tilt - prev.tilt) < 1e-4;
+  return {
+    ...s,
+    beats: s.beats.map((bt, i) => {
+      if (i !== b) return bt;
+      if (sameAsPrev) {
+        const { camera: _drop, ...rest } = bt;
+        return rest;
+      }
+      return { ...bt, camera: next };
+    }),
+  };
+}
+
+// Computes camera framing that smoothly zooms & pans to spotlight `rect` with clean breathing room.
+export function frameElementCamera(
+  scene: StageScene,
+  rect: { x: number; y: number; width: number; height: number },
+  padding = 1.45
+): Required<StageCamera> {
+  const safeW = Math.max(40, rect.width);
+  const safeH = Math.max(40, rect.height);
+  const zoom = clampNum(Math.min(scene.width / (safeW * padding), STAGE_HEIGHT / (safeH * padding)), 1.05, 2.8);
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  return {
+    zoom: Math.round(zoom * 100) / 100,
+    panX: Math.round(cx - scene.width / 2),
+    panY: Math.round(cy - STAGE_HEIGHT / 2),
+    tilt: 0,
+  };
+}
+
+export function setBeatSound(s: StageScene, b: number, sound: StageBeatSound | undefined): StageScene {
+  if (b < 0 || b >= s.beats.length) return s;
+  return {
+    ...s,
+    beats: s.beats.map((bt, i) => {
+      if (i !== b) return bt;
+      if (sound === undefined) {
+        const { sound: _drop, ...rest } = bt;
+        return rest;
+      }
+      return { ...bt, sound };
+    }),
+  };
+}
+
+// Fits a free element proportionally inside the stage with uniform breathing margin and centres it.
+export function fitElementToStage(s: StageScene, b: number, id: string, margin = 72): StageScene {
+  const el = s.elements.find((e) => e.id === id);
+  const p = elementInBeat(s, b, id);
+  if (!el || !p || el.kind === "connector") return s;
+  const availW = Math.max(64, s.width - margin * 2);
+  const availH = Math.max(64, STAGE_HEIGHT - margin * 2);
+  const ratio = Math.min(availW / Math.max(1, p.width), availH / Math.max(1, p.height));
+  const width = Math.max(8, Math.round(p.width * ratio));
+  const height = Math.max(8, Math.round(p.height * ratio));
+  return setElementProps(s, b, id, {
+    x: Math.round((s.width - width) / 2),
+    y: Math.round((STAGE_HEIGHT - height) / 2),
+    width,
+    height,
+  });
+}
+
+// Evenly spaces all visible free (non-stacked, non-connector) elements in beat `b` along `axis`.
+export function distributeElements(s: StageScene, b: number, axis: "x" | "y"): StageScene {
+  const free = s.elements
+    .filter((e) => !e.parent && e.kind !== "stack" && e.kind !== "connector")
+    .map((e) => ({ id: e.id, p: elementInBeat(s, b, e.id) }))
+    .filter((item): item is { id: string; p: StageProps } => !!item.p && item.p.visible);
+  if (free.length < 3) return s;
+  const posKey = axis;
+  const sizeKey = axis === "x" ? "width" : "height";
+  const sorted = [...free].sort((a, c) => a.p[posKey] - c.p[posKey]);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const span = last.p[posKey] + last.p[sizeKey] - first.p[posKey];
+  const totalSize = sorted.reduce((sum, item) => sum + item.p[sizeKey], 0);
+  const gap = (span - totalSize) / (sorted.length - 1);
+  let cursor = first.p[posKey] + first.p[sizeKey] + gap;
+  let out = s;
+  for (let i = 1; i < sorted.length - 1; i++) {
+    const item = sorted[i];
+    out = setElementProps(out, b, item.id, { [posKey]: Math.round(cursor) } as Partial<StageProps>);
+    cursor += item.p[sizeKey] + gap;
+  }
+  return out;
 }

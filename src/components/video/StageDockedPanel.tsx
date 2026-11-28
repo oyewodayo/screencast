@@ -11,7 +11,6 @@ import { IoAdd, IoCopyOutline, IoEllipsisHorizontal, IoEyeOffOutline, IoEyeOutli
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { FILE_CATEGORY_EXTENSIONS } from "../../utils/fileCategory";
 import { loadStageImage } from "../../utils/stage/stageImages";
-import { parseStageColor } from "../../utils/stage/stageColor";
 import { MdFormatAlignCenter, MdFormatAlignLeft, MdFormatAlignRight } from "react-icons/md";
 import { STICKER_ICONS, StickerIcon, drawStickerIcon, searchIcons } from "../../utils/stickerIcons";
 import { FontSection, SliderRow, Swatches } from "./OverlayDockedPanels";
@@ -22,6 +21,13 @@ import { MathEditor } from "./StageMathPanel";
 import { GraphEditor } from "./StageGraphPanel";
 import { ArrangeSection } from "./StageArrangePanel";
 import { ShapeGallery, ShapeSection } from "./StageShapePanel";
+import {
+  BeatCameraAndSound,
+  QuickAnimateBar,
+  SceneBeatSoundRow,
+  StudioBackgroundPicker,
+  TemplatesImportBar,
+} from "./StageProSections";
 import type { ShapePreset } from "../../utils/stage/stageShapes";
 import { valueToken } from "../../utils/stage/stageValues";
 import {
@@ -30,6 +36,7 @@ import {
   beatIndexAt,
   beatRestTime,
   duplicateElement,
+  isLightStageBackground,
   renameElement,
   beatStarts,
   deleteBeat,
@@ -40,7 +47,6 @@ import {
   makeImageElement,
   makeMathElement,
   makeGraphElement,
-  reinkScene,
   makeShapeElement,
   makeTextElement,
   sceneDuration,
@@ -68,7 +74,6 @@ interface Props {
   occupied?: { id?: string; x: number; y: number; width: number; height: number }[];
 }
 
-const STAGE_BACKGROUNDS = [undefined, "#f2f1ee", "#ffffff", "#e8e8e6", "#111111", "#0b1020", "#1e3a8a"];
 const MOTIONS: { value: SpringPreset; label: string; title: string }[] = [
   { value: "slow", label: "Slow", title: "A long, even settle" },
   { value: "gentle", label: "Gentle", title: "Unhurried, no overshoot" },
@@ -211,8 +216,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
   const [adding, setAdding] = useState<null | "icon" | "shape">(null);
   useEffect(() => setAdding(null), [scene.id]);
   // Ink that reads on the scene's background: dark on a light one, light on a dark one or on video.
-  const bg = scene.background.kind === "color" ? parseStageColor(scene.background.color) : null;
-  const lightBg = !!bg && (0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]) / 255 > 0.55;
+  const lightBg = isLightStageBackground(scene.background);
   const ink = lightBg ? "#111111" : "#f5f5f4";
   // A spot clear of what's on the stage: the centre if it's free, else the nearest free one around
   // it (below, above, beside, the corners), inside the frame. With nowhere free, the centre, stepped
@@ -390,6 +394,8 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
         </IconButton>
       </div>
 
+      <TemplatesImportBar scene={scene} onUpdate={onUpdate} onSelectElement={onSelectElement} onSeek={onSeek} />
+
       <Section
         title={`Beat ${beat + 1} of ${scene.beats.length}`}
         aside={
@@ -421,6 +427,16 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
             const start = beatStarts(next)[beat] ?? 0;
             if (local < start || local >= start + v || beatIndexAt(next, Math.max(0, local)) !== beat) onSeek(beatRestTime(next, beat));
           }}
+        />
+        <BeatCameraAndSound
+          scene={scene}
+          beat={beat}
+          selectedRect={
+            element && here && element.kind !== "connector"
+              ? occupied.find((o) => o.id === element.id) ?? { x: here.x, y: here.y, width: here.width, height: here.height }
+              : null
+          }
+          onUpdate={onUpdate}
         />
       </Section>
 
@@ -597,6 +613,7 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
           }
         >
           <Toggle label={`Shown in beat ${beat + 1}`} value={here.visible} onChange={() => toggleShown(element.id)} title="Show or hide it from this beat on - it arrives or leaves with the scene's motion" />
+          <QuickAnimateBar element={element} onUpdateElement={own} />
           {element.kind !== "connector" && <ArrangeSection scene={scene} beat={beat} element={element} here={here} onUpdate={onUpdate} lockByDefault={element.kind === "image" || element.kind === "math"} />}
           {element.kind === "math" && (
             <MathEditor
@@ -793,25 +810,10 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
 
       <Section title="Look & motion">
         <span className="text-[11px] text-white/60">Background</span>
-        <Swatches
-          colors={STAGE_BACKGROUNDS}
-          titles={["None - over the video", "Paper", "White", "Light grey", "Ink", "Night", "Blue"]}
-          value={scene.background.kind === "color" ? scene.background.color : undefined}
-          onPick={(c) =>
-            onUpdate((s) => {
-              const next: StageScene = { ...s, background: c ? { kind: "color", color: c } : { kind: "none" } };
-              // Light to dark (or back): the automatic inks follow, so nothing disappears.
-              const isLight = (sc: StageScene) => {
-                const rgb = sc.background.kind === "color" ? parseStageColor(sc.background.color) : null;
-                return !!rgb && (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 > 0.55;
-              };
-              return isLight(s) === isLight(next) ? next : reinkScene(next, !isLight(next));
-            })
-          }
-          custom
-        />
+        <StudioBackgroundPicker scene={scene} onUpdate={onUpdate} />
         <span className="text-[11px] text-white/60">Motion</span>
         <Segmented value={scene.spring} onChange={(v) => onUpdate((s) => ({ ...s, spring: v }))} options={MOTIONS} />
+        <SceneBeatSoundRow scene={scene} onUpdate={onUpdate} />
         <SliderRow label="Perspective" value={scene.perspective ?? 2000} min={600} max={6000} step={50} format={(v) => `${Math.round(v)}`} reset={2000} onChange={(v) => onUpdate((s) => ({ ...s, perspective: v }))} />
         <SliderRow label="Stagger" value={scene.stagger} min={0} max={0.3} step={0.01} format={(v) => `${Math.round(v * 1000)}ms`} onChange={(v) => onUpdate((s) => ({ ...s, stagger: v }))} reset={0.05} />
       </Section>

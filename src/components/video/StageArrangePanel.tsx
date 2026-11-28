@@ -5,10 +5,20 @@
 // linked to keep proportions, and one click to line it up with the stage's edges or centre. Every
 // change lands in the beat under the playhead, so a box can grow, move or turn from beat to beat.
 import React, { useRef, useState } from "react";
-import { IoLinkOutline, IoUnlinkOutline } from "react-icons/io5";
-import { MdAlignHorizontalCenter, MdAlignHorizontalLeft, MdAlignHorizontalRight, MdAlignVerticalBottom, MdAlignVerticalCenter, MdAlignVerticalTop } from "react-icons/md";
+import { IoExpandOutline, IoLinkOutline, IoUnlinkOutline } from "react-icons/io5";
+import {
+  MdAlignHorizontalCenter,
+  MdAlignHorizontalLeft,
+  MdAlignHorizontalRight,
+  MdAlignVerticalBottom,
+  MdAlignVerticalCenter,
+  MdAlignVerticalTop,
+  MdCenterFocusStrong,
+  MdHorizontalDistribute,
+  MdVerticalDistribute,
+} from "react-icons/md";
 import { IconButton } from "./StagePanelParts";
-import { setElementProps } from "../../utils/stage/stageEditing";
+import { distributeElements, elementInBeat, fitElementToStage, setElementProps } from "../../utils/stage/stageEditing";
 import { STAGE_HEIGHT, StageElement, StageProps, StageScene } from "../../utils/stage/stageTypes";
 
 type Update = (edit: (s: StageScene) => StageScene) => void;
@@ -146,24 +156,71 @@ export const ArrangeSection: React.FC<{
           <ScrubField label="Scale" value={here.scale * 100} step={1} min={1} max={2000} suffix="%" onChange={(v) => set({ scale: v / 100 })} title="Scale about its anchor - grows or shrinks everything in it" />
         </div>
       )}
-      {!placed && element.kind !== "connector" && (
-        <div className="flex items-center justify-between rounded-md bg-white/[0.04] px-0.5">
-          {(
-            [
-              ["left", <MdAlignHorizontalLeft size={14} />, "Align to the stage's left edge"],
-              ["centre", <MdAlignHorizontalCenter size={14} />, "Centre across the stage"],
-              ["right", <MdAlignHorizontalRight size={14} />, "Align to the stage's right edge"],
-              ["top", <MdAlignVerticalTop size={14} />, "Align to the stage's top"],
-              ["middle", <MdAlignVerticalCenter size={14} />, "Centre down the stage"],
-              ["bottom", <MdAlignVerticalBottom size={14} />, "Align to the stage's bottom"],
-            ] as const
-          ).map(([id, icon, title]) => (
-            <IconButton key={id} title={title} onClick={() => align(id)}>
-              {icon}
-            </IconButton>
-          ))}
-        </div>
-      )}
+      {!placed && element.kind !== "connector" && (() => {
+        const freeVisibleCount = scene.elements.filter(
+          (e) => !e.parent && e.kind !== "stack" && e.kind !== "connector" && elementInBeat(scene, beat, e.id)?.visible
+        ).length;
+        return (
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between rounded-md bg-white/[0.04] px-0.5">
+              {(
+                [
+                  ["left", <MdAlignHorizontalLeft size={14} />, "Align to the stage's left edge"],
+                  ["centre", <MdAlignHorizontalCenter size={14} />, "Centre across the stage"],
+                  ["right", <MdAlignHorizontalRight size={14} />, "Align to the stage's right edge"],
+                  ["top", <MdAlignVerticalTop size={14} />, "Align to the stage's top"],
+                  ["middle", <MdAlignVerticalCenter size={14} />, "Centre down the stage"],
+                  ["bottom", <MdAlignVerticalBottom size={14} />, "Align to the stage's bottom"],
+                ] as const
+              ).map(([id, icon, title]) => (
+                <IconButton key={id} title={title} onClick={() => align(id)}>
+                  {icon}
+                </IconButton>
+              ))}
+            </div>
+            <div className="grid grid-cols-4 gap-1">
+              <button
+                type="button"
+                onClick={() => set({ x: Math.round((scene.width - here.width) / 2), y: Math.round((STAGE_HEIGHT - here.height) / 2) })}
+                title="Centre both horizontally & vertically on stage"
+                className="h-6 rounded-md bg-white/[0.04] hover:bg-white/10 text-[10px] text-white/70 hover:text-white flex items-center justify-center gap-1 transition-colors"
+              >
+                <MdCenterFocusStrong size={12} />
+                Centre
+              </button>
+              <button
+                type="button"
+                onClick={() => onUpdate((s) => fitElementToStage(s, beat, element.id))}
+                title="Fit proportionally inside stage with breathing margin"
+                className="h-6 rounded-md bg-white/[0.04] hover:bg-white/10 text-[10px] text-white/70 hover:text-white flex items-center justify-center gap-1 transition-colors"
+              >
+                <IoExpandOutline size={11} />
+                Fit
+              </button>
+              <button
+                type="button"
+                disabled={freeVisibleCount < 3}
+                onClick={() => onUpdate((s) => distributeElements(s, beat, "x"))}
+                title={freeVisibleCount < 3 ? "Add 3+ visible elements to distribute horizontally" : "Evenly distribute visible elements horizontally"}
+                className="h-6 rounded-md bg-white/[0.04] hover:bg-white/10 text-[10px] text-white/70 hover:text-white flex items-center justify-center gap-0.5 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+              >
+                <MdHorizontalDistribute size={12} />
+                H
+              </button>
+              <button
+                type="button"
+                disabled={freeVisibleCount < 3}
+                onClick={() => onUpdate((s) => distributeElements(s, beat, "y"))}
+                title={freeVisibleCount < 3 ? "Add 3+ visible elements to distribute vertically" : "Evenly distribute visible elements vertically"}
+                className="h-6 rounded-md bg-white/[0.04] hover:bg-white/10 text-[10px] text-white/70 hover:text-white flex items-center justify-center gap-0.5 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+              >
+                <MdVerticalDistribute size={12} />
+                V
+              </button>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

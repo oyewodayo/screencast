@@ -7,6 +7,7 @@ import { audioChannelKey, fxForExport, tidyFx, type AudioFx } from "../utils/aud
 import { automationForExport, type GainPoint } from "../utils/audioAutomation";
 import { EDGE_FADE_SEC, joinFades, NO_FADES } from "../utils/audioJoins";
 import { DEFAULT_CUT_SOUNDS, cutSoundCues, cutSoundPieces, type CutSounds } from "../utils/cutSounds";
+import { stageSoundCues } from "../utils/stage/stageSounds";
 import { builtinSfxFile } from "../utils/builtinSfx";
 import { cleanedTrackPath, isCleaned } from "../utils/audioTrackCleanup";
 import { isNeutralMaster, masterForExport, type MasterBus } from "../utils/masterBus";
@@ -2627,18 +2628,19 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
           fx: fxForExport(o.fx),
           gain: automationForExport(o),
         }));
-      // Sound on every cut (cutSounds.ts): each cue as one more piece of audio, at the cut sounds'
-      // own volume - unless that channel is muted in the mixer.
-      if (current.cutSounds?.on && !current.cutSounds.muted && current.cutSounds.volume > 0) {
-        const total = totalOutputDuration(current.clips);
-        const pieces = await cutSoundPieces(cutSoundCues(current.clips, current.edgeTransitions, current.cutSounds), total, builtinSfxFile);
+      // Sound on every cut (cutSounds.ts) + Stage beat SFX (stageSounds.ts): each cue as one more
+      // piece of audio, mixed cleanly into the exported soundtrack.
+      const totalOut = totalOutputDuration(current.clips);
+      const pushSfxPieces = async (cues: ReturnType<typeof cutSoundCues>, volume: number) => {
+        if (cues.length === 0 || volume <= 0) return;
+        const pieces = await cutSoundPieces(cues, totalOut, builtinSfxFile);
         for (const piece of pieces) {
           audioOverlays.push({
             sourcePath: piece.sourcePath,
             startTime: piece.startTime,
             endTime: piece.endTime,
             trimStart: piece.trimStart,
-            volume: current.cutSounds.volume,
+            volume,
             // A sound cut short (at the video's edges) gets the click-proof edge fade.
             fadeIn: piece.trimStart > 0 ? EDGE_FADE_SEC : 0,
             fadeOut: EDGE_FADE_SEC,
@@ -2649,6 +2651,13 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
             gain: null,
           });
         }
+      };
+      if (current.cutSounds?.on && !current.cutSounds.muted && current.cutSounds.volume > 0) {
+        await pushSfxPieces(cutSoundCues(current.clips, current.edgeTransitions, current.cutSounds), current.cutSounds.volume);
+      }
+      const beatSfxCues = stageSoundCues(current.scenes);
+      if (beatSfxCues.length > 0) {
+        await pushSfxPieces(beatSfxCues, 0.78);
       }
 
       // Captions go to Rust as a finished ASS script (burned in last, with libass) rather than
