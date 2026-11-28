@@ -10,9 +10,10 @@ import { getStroke } from "perfect-freehand";
 export type AnnotationStyle = "pen" | "marker" | "neon" | "laser";
 export type AnnotationFade = "quick" | "normal" | "slow" | "never";
 
-// What follows the cursor while drawing. "hand" is the signature one - a glove on a stick, tinted
-// to the current ink colour; "custom" is the user's own PNG (appSettings.annotationPointerImage).
+// What follows the cursor while drawing. "hand" is the signature one - a sleek pointing hand or
+// presenter stylus, tinted to the current ink colour; "custom" is the user's own PNG.
 export type AnnotationPointer = "hand" | "dot" | "system" | "custom";
+export type AnnotationHandStyle = "minimal" | "classic" | "wand" | "stylus";
 export type AnnotationTapSound = "off" | "tick" | "pop" | "wood";
 
 export const ANNOTATION_POINTERS: { id: AnnotationPointer; label: string }[] = [
@@ -21,6 +22,16 @@ export const ANNOTATION_POINTERS: { id: AnnotationPointer; label: string }[] = [
   { id: "system", label: "Crosshair" },
   { id: "custom", label: "Custom" },
 ];
+
+export const ANNOTATION_HAND_STYLES: { id: AnnotationHandStyle; label: string; hint: string }[] = [
+  { id: "minimal", label: "Clean Hand", hint: "Compact, stick-free pointing hand" },
+  { id: "classic", label: "Pointer", hint: "Tinted glove with short handle" },
+  { id: "wand", label: "Baton", hint: "Presenter hand on a slender baton" },
+  { id: "stylus", label: "Stylus", hint: "Precision angled pen nib" },
+];
+
+export const DEFAULT_HAND_STYLE: AnnotationHandStyle = "classic";
+export const DEFAULT_POINTER_SCALE = 0.85;
 
 export const ANNOTATION_TAP_SOUNDS: { id: AnnotationTapSound; label: string }[] = [
   { id: "off", label: "Off" },
@@ -169,6 +180,71 @@ export const drawAnnotationInk = (ctx: CanvasRenderingContext2D, ink: Annotation
       dropShadow();
       ctx.fillStyle = ink.color;
       ctx.fill(tracePath(ink, ink.width, 0.6));
+  }
+  ctx.restore();
+};
+
+// O(1) incremental quadratic-Bezier segment renderer used while a stroke is actively being drawn on
+// the dedicated live overlay canvas. Avoids re-running perfect-freehand over all N points and avoids
+// clearing the full multi-megapixel canvas every frame (zero lag during 60fps recording/presenting).
+// On pointerup, the finished stroke is baked once with full pressure-tapered calligraphy.
+export const drawLiveInkSegment = (
+  ctx: CanvasRenderingContext2D,
+  from: { x: number; y: number },
+  ctrl: { x: number; y: number },
+  to: { x: number; y: number },
+  ink: Pick<AnnotationInk, "color" | "width" | "style" | "shadow">,
+  pressure = 0.5
+): void => {
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  const pScale = 0.72 + Math.max(0.1, Math.min(1, pressure)) * 0.56;
+  const strokeSeg = () => {
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.quadraticCurveTo(ctrl.x, ctrl.y, to.x, to.y);
+    ctx.stroke();
+  };
+  switch (ink.style) {
+    case "marker":
+      // Marker uses low opacity on the whole live layer (controlled via canvas CSS opacity or alpha),
+      // so incremental segments stay uniform without dark overlap joints at every sample.
+      ctx.strokeStyle = ink.color;
+      ctx.lineWidth = ink.width * 2.4;
+      strokeSeg();
+      break;
+    case "neon":
+    case "laser": {
+      const size = ink.style === "laser" ? ink.width * 0.85 : ink.width;
+      // Fast dual-pass glow without expensive per-segment Gaussian shadowBlur on transparent DWM windows.
+      ctx.globalAlpha = 0.26;
+      ctx.strokeStyle = ink.color;
+      ctx.lineWidth = size * 2.5;
+      strokeSeg();
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = size * 1.15;
+      strokeSeg();
+      ctx.globalAlpha = 0.95;
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = Math.max(1.5, size * 0.42);
+      strokeSeg();
+      break;
+    }
+    default:
+      if (ink.shadow) {
+        ctx.globalAlpha = 0.28;
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = ink.width * pScale + 1.5;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y + Math.max(1.5, ink.width * 0.25));
+        ctx.quadraticCurveTo(ctrl.x, ctrl.y + Math.max(1.5, ink.width * 0.25), to.x, to.y + Math.max(1.5, ink.width * 0.25));
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = ink.color;
+      ctx.lineWidth = Math.max(1.5, ink.width * pScale);
+      strokeSeg();
   }
   ctx.restore();
 };

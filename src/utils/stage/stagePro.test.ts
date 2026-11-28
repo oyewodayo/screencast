@@ -16,6 +16,7 @@ import {
   setBeatSound,
 } from "./stageEditing";
 import { STAGE_TEMPLATES, applyTemplateToScene, stageBackgroundCss } from "./stageTemplates";
+import { titleFont } from "../titleFonts";
 import {
   applyUserSceneTemplate,
   deleteUserSceneTemplate,
@@ -54,6 +55,11 @@ describe("Stage Pro Upgrades", () => {
         expect(sc.width).toBe(width);
         expect(sc.height).toBe(STAGE_HEIGHT);
         expect(sc.elements.length).toBeGreaterThan(0);
+        for (const el of sc.elements) {
+          if (el.textLook?.fontFamily) {
+            expect(titleFont(el.textLook.fontFamily), `font ${el.textLook.fontFamily} in ${tpl.id}`).not.toBeNull();
+          }
+        }
         expect(sc.beats.length).toBe(tpl.beatCount);
         expect(sceneDuration(sc)).toBeGreaterThan(0.5);
         const compiled = compileStage(sc);

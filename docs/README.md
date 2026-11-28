@@ -17,11 +17,12 @@ Briefcast is a free, open-source desktop app for recording, editing and explaini
 ## Your files
 
 - **[The library](library.md)**: folders, importing, renaming, moving, Trash, file info and format conversion.
-- **[Watching and listening](player.md)**: the video and audio player, captions, chapters and playback speed.
+- **[Watching and listening](player.md)**: the video and audio player, captions, chapters, playback speed, Study Notes, Slide Snaps, A–B loops, and turning any video into a Briefcast Doc.
 
 ## Editing and creating
 
-- **[Video editor](video-editor.md)**: cut, trim and arrange clips, effects and transitions, titles and animated elements, captions, edit by transcript, split screen and highlight intros.
+- **[Video editor](video-editor.md)**: cut, trim and arrange clips, 1-Click Studio Polish, photo-to-video templates, effects and transitions, titles and animated elements, captions, edit by transcript, split screen and highlight intros.
+- **[Scenes and motion graphics](video-scenes.md)**: build beat-driven intros, explainers, morphing shapes, animated LaTeX equations, live calculus and data graphs, virtual cameras, and data-driven dashboards right on your timeline.
 - **[Layers, masks and effects](video-layers.md)**: B-roll and video tracks, green screen, background removal, masks and reveals, blend modes, adjustment layers, motion tracking, and Find & hide.
 - **[Sound and music](video-sound.md)**: the free music library, auto-ducking under speech, cutting to the beat, and the mixer with EQ and compression.
 - **[Exporting and sharing](video-export.md)**: export options, the background export queue, chapters, and uploading to YouTube or a Google Drive link.

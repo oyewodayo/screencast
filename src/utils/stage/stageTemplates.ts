@@ -538,7 +538,7 @@ function makeQuoteCard(opts: { width: number; startTime: number; id?: string; la
     kind: "text",
     name: "Quote Mark",
     fit: "hug",
-    textLook: { fontFamily: "playfair-bold", fontSize: narrow ? 140 : 180, textAlign: "left", lineHeight: 0.8 },
+    textLook: { fontFamily: "playfair", fontSize: narrow ? 140 : 180, textAlign: "left", lineHeight: 0.8 },
     enter: { dx: 0, dy: -24, scale: 0.8, blur: 6 },
     props: defaultStageProps({ x: padX - 12, y: 200, width: 180, height: 140, text: "“", color: "#0d9488" }),
   };
