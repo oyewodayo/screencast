@@ -485,12 +485,11 @@ export function useTimelineOverlayDrags({
   const addScene = async () => {
     let frame = videoPixelSize;
     if (!frame && isProject) frame = await invoke<{ width: number; height: number }>("read_video_project", { projectPath: filePath }).catch(() => null);
-    const total = totalOutputDuration;
     const now = getCurrentOutputTime();
-    const startTime = editStore.clips.length > 0 ? Math.max(0, Math.min(now, total - 1)) : Math.max(0, now);
-    const id = editStore.addScene(startTime, frame ?? { width: 1920, height: 1080 });
-    onSelectScene?.(id);
-    seekToOutputTime(startTime + 1.4);
+    const created = await editStore.addScene(Math.max(0, now), frame ?? { width: 1920, height: 1080 });
+    if (!created) return;
+    onSelectScene?.(created.id);
+    requestAnimationFrame(() => seekToOutputTime(created.startTime + 1.4));
   };
   const addAdjustmentLayer = () => {
     const total = totalOutputDuration;

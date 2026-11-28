@@ -176,6 +176,8 @@ interface ControlsProps {
   onUpdateScene: (id: string, edit: (s: StageScene) => StageScene) => void;
   onDeleteScene: (id: string) => void;
   onDuplicateScene: (id: string) => void;
+  isSceneInline?: (id: string) => boolean;
+  onToggleScenePlacement?: (id: string) => void;
   onSeek: (t: number) => void;
 }
 
@@ -277,7 +279,7 @@ function dragTarget(scene: StageScene, id: string): StageElement | undefined {
   return e;
 }
 
-const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutputTime, selectedSceneId, onSelectScene, onUpdateScene, onDeleteScene, onDuplicateScene, onSeek }) => {
+const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutputTime, selectedSceneId, onSelectScene, onUpdateScene, onDeleteScene, onDuplicateScene, isSceneInline, onToggleScenePlacement, onSeek }) => {
   const host = useToolPanelHost();
   const scene = scenes.find((s) => s.id === selectedSceneId) ?? null;
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
@@ -571,6 +573,8 @@ const StageControls: React.FC<ControlsProps> = ({ frameRect, scenes, currentOutp
       onUpdate={(edit) => onUpdateScene(scene.id, edit)}
       onSeek={onSeek}
       onDuplicate={() => onDuplicateScene(scene.id)}
+      isInline={isSceneInline ? isSceneInline(scene.id) : undefined}
+      onTogglePlacement={onToggleScenePlacement ? () => onToggleScenePlacement(scene.id) : undefined}
       onDelete={() => {
         onDeleteScene(scene.id);
         onSelectScene(null);

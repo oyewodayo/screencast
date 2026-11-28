@@ -1861,6 +1861,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
       // One selection at a time across the clip and PiP lanes, so Split/Delete (which prefer a
       // selected PiP) can never act on a PiP the user has since clicked away from.
       onSelectPipOverlay?.(null);
+      if (clip.sceneId) {
+        onSelectScene?.(clip.sceneId);
+        if (!isPlaying) {
+          const clipStart = outputStarts[index] ?? 0;
+          const clipDur = clipDurations[index] ?? 0;
+          seekToOutputTime(clipStart + Math.min(clipDur, 1.5) * 0.9);
+        }
+        return;
+      }
+      onSelectScene?.(null);
       // Selecting a clip only jumps the playhead to its start while playback is paused - same
       // reasoning as endPipOverlayDrag's own comment just below: yanking the playhead back to a
       // clip's start on a plain click mid-playback reads as "clicking the timeline restarts the
@@ -4321,7 +4331,8 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 const isPending = clip.id === "__pending__";
                 const left = outputStarts[i] * pxPerSec;
                 const width = Math.max(1, clipDurations[i] * pxPerSec);
-                const isSelected = selectedClipIds.includes(clip.id);
+                const inlineScene = clip.sceneId ? renderScenes.find((sc) => sc.id === clip.sceneId) : undefined;
+                const isSelected = selectedClipIds.includes(clip.id) || (!!inlineScene && selectedSceneId === inlineScene.id);
                 const isDragging = clipDrag?.index === i && clipDrag.isDragging;
                 // Lifted and under the pointer while dragged; gliding aside for it otherwise.
                 const motion: React.CSSProperties = isDragging
@@ -4338,13 +4349,16 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                 // Only the tiles in the drawn window - a long clip zoomed in is thousands of them.
                 const firstTile = Math.max(0, Math.min(tileCount, Math.floor((drawWindow.from - left) / tileWidth)));
                 const lastTile = Math.max(firstTile, Math.min(tileCount, Math.ceil((drawWindow.to - left) / tileWidth)));
-                const isForeignVideo = !isImageClipPath(clip.sourcePath) && clip.sourcePath !== file.path;
-                const clipThumbs = thumbnails.length === 0 || isForeignVideo ? [] : Array.from({ length: lastTile - firstTile }, (_, j) => {
+                const isForeignVideo = !inlineScene && !isImageClipPath(clip.sourcePath) && clip.sourcePath !== file.path;
+                const clipThumbs = inlineScene || thumbnails.length === 0 || isForeignVideo ? [] : Array.from({ length: lastTile - firstTile }, (_, j) => {
                   const k = firstTile + j;
                   const outputOffset = Math.min((k + 0.5) * tileWidth, width) / pxPerSec;
                   return nearestFrame(thumbnails, Math.min(clip.end, outputOffsetToSource(clip, outputOffset)));
                 });
                 const tileSpacer = firstTile > 0 ? <div className="shrink-0" style={{ width: firstTile * tileWidth }} /> : null;
+                const sceneTitle = inlineScene ? (inlineScene.name ?? (inlineScene.elements.find((el) => el.kind === "text")?.props.text ?? "Scene")) : "";
+                const sceneBeatStarts = inlineScene ? stageBeatStarts(inlineScene) : [];
+                const sceneLocal = inlineScene ? currentOutputTime - outputStarts[i] : 0;
                 return (
                   <React.Fragment key={clip.id}>
                   <div
@@ -4357,14 +4371,50 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
                     onPointerMove={toolMode === "razor" ? undefined : handleClipDragMove}
                     onPointerUp={toolMode === "razor" ? undefined : endClipDrag}
                     onPointerCancel={toolMode === "razor" ? undefined : endClipDrag}
-                    title={isPending ? undefined : toolMode === "razor" ? `Clip ${i + 1} of ${renderClips.length} — click to split here` : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`}
-                    className={`tl-clip group/clip absolute inset-y-1 rounded-md overflow-hidden bg-neutral-900 flex ${
+                    title={
+                      isPending
+                        ? undefined
+                        : inlineScene
+                        ? `${sceneTitle} (${formatClipLength(clipDurations[i])}) — click to edit scene, drag left/right to reorder with media`
+                        : toolMode === "razor"
+                        ? `Clip ${i + 1} of ${renderClips.length} — click to split here`
+                        : `Clip ${i + 1} of ${renderClips.length} — click to select (Ctrl/Shift-click for more), drag to reorder`
+                    }
+                    className={`tl-clip group/clip absolute inset-y-1 rounded-md overflow-hidden ${
+                      inlineScene
+                        ? `flex flex-col bg-gradient-to-b ${isSelected ? "from-teal-700/95 to-teal-900/95" : "from-teal-900/90 to-teal-950/95"}`
+                        : "bg-neutral-900 flex"
+                    } ${
                       isPending ? "" : toolMode === "razor" ? "cursor-crosshair" : isDragging ? "cursor-grabbing shadow-[0_10px_24px_rgba(0,0,0,0.55)]" : "cursor-grab"
                     } ${mergingIds?.includes(clip.id) ? "animate-pulse" : ""}`}
                     // A hairline gap either side: clips read as separate pictures, not one band.
                     style={{ left: left + CLIP_GAP / 2, width: Math.max(1, width - CLIP_GAP), ...motion }}
                   >
-                    {isImageClipPath(clip.sourcePath) ? (
+                    {inlineScene ? (
+                      <>
+                        <div className="flex-1 min-h-0 flex flex-col justify-center gap-0.5 px-2.5">
+                          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-white/95">
+                            <IoLayersOutline size={12} className="shrink-0 text-teal-200" />
+                            <span className="truncate">{sceneTitle}</span>
+                          </span>
+                          <span className="text-[9.5px] text-teal-200/75 tabular-nums truncate">
+                            Scene · {inlineScene.beats.length} beat{inlineScene.beats.length === 1 ? "" : "s"} · {formatClipLength(clipDurations[i])}
+                          </span>
+                        </div>
+                        <span className="flex gap-px h-[4px] mx-1.5 mb-1.5">
+                          {inlineScene.beats.map((b, bi) => {
+                            const on = sceneLocal >= sceneBeatStarts[bi] && sceneLocal < sceneBeatStarts[bi] + b.hold;
+                            return (
+                              <span
+                                key={b.id}
+                                className={`rounded-full transition-colors duration-150 ${on ? "bg-white" : isSelected ? "bg-amber-200/80" : "bg-teal-300/45"}`}
+                                style={{ flexGrow: Math.max(b.hold, 0.01), flexBasis: 0 }}
+                              />
+                            );
+                          })}
+                        </span>
+                      </>
+                    ) : isImageClipPath(clip.sourcePath) ? (
                       <>
                         {tileSpacer}
                         <ImageClipTiles sourcePath={clip.sourcePath} first={firstTile} last={lastTile} tileWidth={tileWidth} />
@@ -4818,14 +4868,15 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               })}
             </div>
 
-            {/* Stage scene lane - teal. Scenes that overlap stack in rows. Each block shows its beats
-                as a strip along its foot, as long as each holds; the boundary between two beats drags
-                (how long the first holds), as does the scene's end. */}
+            {/* Overlay Stage scene lane - only shown for scenes explicitly placed in Overlay mode
+                (inline scenes live directly side-by-side on the main timeline lane above). */}
             {(() => {
+              const inlineSceneIds = new Set(baseClips.map((c) => c.sceneId).filter((id): id is string => Boolean(id)));
+              const overlayScenes = renderScenes.filter((sc) => !inlineSceneIds.has(sc.id));
               const ROW = 32;
               const rowEnds: number[] = [];
               const rowOf = new Map<string, number>();
-              for (const sc of [...renderScenes].sort((a, b) => a.startTime - b.startTime)) {
+              for (const sc of [...overlayScenes].sort((a, b) => a.startTime - b.startTime)) {
                 const end = sc.startTime + sceneDuration(sc);
                 let r = rowEnds.findIndex((e) => e <= sc.startTime + 1e-6);
                 if (r < 0) r = rowEnds.push(end) - 1;
@@ -4834,10 +4885,10 @@ const VideoTimelineDocker: React.FC<VideoTimelineDockerProps> = ({
               }
               return (
                 <div
-                  className={`tl-lane relative border-t border-neutral-800 ${sceneDrag?.isDragging || sceneEdgeDrag ? "tl-lane-dragging" : ""} ${renderScenes.length === 0 ? "hidden" : ""}`}
+                  className={`tl-lane relative border-t border-neutral-800 ${sceneDrag?.isDragging || sceneEdgeDrag ? "tl-lane-dragging" : ""} ${overlayScenes.length === 0 ? "hidden" : ""}`}
                   style={{ height: Math.max(1, rowEnds.length) * ROW }}
                 >
-                  {renderScenes.map((sc) => {
+                  {overlayScenes.map((sc) => {
                     const duration = sceneDuration(sc);
                     // Inset by half the gap each side, as clips and audio pieces are.
                     const fullWidth = Math.max(1, duration * pxPerSec);

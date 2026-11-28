@@ -289,6 +289,10 @@ export interface Clip {
   // An effect over the clip's whole picture (echo, RGB split, colour cycle...) - clipFx.ts in the
   // preview, services/clip_fx.rs on export.
   fx?: ClipFx;
+  // When set, this clip is an inline StageScene slot sitting side-by-side with media on the main
+  // timeline: its blank-frame duration matches sceneDuration(scene), and reordering/splitting/
+  // trimming media around it automatically keeps scene.startTime locked to this clip's start.
+  sceneId?: string;
 }
 
 export type ClipFxKind = "echo" | "rgbsplit" | "huecycle" | "focus" | "colorin" | "flicker";

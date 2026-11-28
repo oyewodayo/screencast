@@ -18,7 +18,8 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { addCloseGuard, addReleaseBlocker } from "../utils/closeGuards";
 import { AdjustmentLayer, AudioOverlay, BlurOverlay, PipShape, CaptionSettings, CaptionTrack, CaptionWord, Clip, ClipCrop, ClipTransitionIn, EdgeTransitions, TransitionEdge, EditableFields, KeepSegment, ImageOverlay, OverlayAnimation, PipOverlay, TextOverlay, VideoEditCommand, VideoEditState, createEmptyState, isVideoEditState, isImageClipPath, isVideoProjectPath, IMAGE_CLIP_MAX_SECONDS, DEFAULT_IMAGE_CLIP_SECONDS, VideoChapter, VideoProjectFrame, blankClipsFor, canvasEndTime, VIDEO_CANVAS_SECONDS } from "../utils/videoEditTypes";
 import type { StageScene } from "../utils/stage/stageTypes";
-import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore } from "../utils/stage/stageEditing";
+import { duplicateScene as duplicateStageScene, makeStageScene, sceneBefore, sceneDuration, setSceneDuration } from "../utils/stage/stageEditing";
+import { insertInlineSceneClip, syncInlineScenes } from "../utils/inlineSceneTimeline";
 import { StageLayerSpec, renderStageForExport } from "../utils/stage/stageExport";
 import { adjustmentLayerExport, makeAdjustmentLayer } from "../utils/adjustmentLayers";
 import type { TimelineClipboardItems } from "../utils/timelineClipboard";
@@ -294,11 +295,12 @@ export interface UseVideoEditStoreResult {
   // Motion-graphics scenes (Stage). updateScene takes the scene to its next state (stageEditing.ts);
   // a run of quick edits to one scene (a drag, a slider) is one undo step.
   scenes: StageScene[];
-  addScene: (startTime: number, frame: { width: number; height: number }) => string;
+  addScene: (startTime: number, frame: { width: number; height: number }) => Promise<{ id: string; startTime: number } | null>;
   updateScene: (id: string, edit: (scene: StageScene) => StageScene) => void;
   moveSceneTime: (id: string, startTime: number) => void;
   deleteScene: (id: string) => void;
   duplicateScene: (id: string) => string;
+  toggleScenePlacement: (id: string, frame: { width: number; height: number }) => Promise<number | null>;
   // Chapters (videoChapters.ts), anchored to source moments; replaced as a whole list.
   chapters: VideoChapter[];
   setChapters: (chapters: VideoChapter[]) => void;
@@ -829,35 +831,42 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // unchanged alongside whichever one an operation actually touches, so this is the one place that
   // shape is assembled rather than repeating `{ clips, textOverlays, imageOverlays }` at every call
   // site with the risk of one field silently missing from a future addition.
-  const snapshot = (current: VideoEditState, patch: Partial<EditableFields>): EditableFields => ({
-    clips: current.clips,
-    textOverlays: current.textOverlays,
-    imageOverlays: current.imageOverlays,
-    blurOverlays: current.blurOverlays,
-    audioOverlays: current.audioOverlays,
-    pipOverlays: current.pipOverlays,
-    adjustmentLayers: current.adjustmentLayers ?? [],
-    chapters: current.chapters ?? [],
-    videoAudioMuted: current.videoAudioMuted,
-    videoAudioVolume: current.videoAudioVolume,
-    videoAudioFx: current.videoAudioFx,
-    master: current.master,
-    hiddenVideoTracks: current.hiddenVideoTracks,
-    captions: current.captions ?? null,
-    screenStyle: current.screenStyle,
-    pointerStyle: current.pointerStyle,
-    keystrokeStyle: current.keystrokeStyle,
-    scenes: current.scenes ?? [],
-    canvas: current.canvas ?? null,
-    edgeTransitions: current.edgeTransitions,
-    cutSounds: current.cutSounds,
-    ...patch,
-  });
+  const snapshot = (current: VideoEditState, patch: Partial<EditableFields>): EditableFields => {
+    const merged: EditableFields = {
+      clips: current.clips,
+      textOverlays: current.textOverlays,
+      imageOverlays: current.imageOverlays,
+      blurOverlays: current.blurOverlays,
+      audioOverlays: current.audioOverlays,
+      pipOverlays: current.pipOverlays,
+      adjustmentLayers: current.adjustmentLayers ?? [],
+      chapters: current.chapters ?? [],
+      videoAudioMuted: current.videoAudioMuted,
+      videoAudioVolume: current.videoAudioVolume,
+      videoAudioFx: current.videoAudioFx,
+      master: current.master,
+      hiddenVideoTracks: current.hiddenVideoTracks,
+      captions: current.captions ?? null,
+      screenStyle: current.screenStyle,
+      pointerStyle: current.pointerStyle,
+      keystrokeStyle: current.keystrokeStyle,
+      scenes: current.scenes ?? [],
+      canvas: current.canvas ?? null,
+      edgeTransitions: current.edgeTransitions,
+      cutSounds: current.cutSounds,
+      ...patch,
+    };
+    const mergedScenes = merged.scenes ?? [];
+    const synced = syncInlineScenes(merged.clips, mergedScenes);
+    return synced.clips === merged.clips && synced.scenes === mergedScenes
+      ? merged
+      : { ...merged, clips: synced.clips, scenes: synced.scenes };
+  };
 
   const splitAt = useCallback(
     (index: number, sourceTime: number) => {
       const current = stateRef.current;
-      if (!current) return;
+      if (!current || current.clips[index]?.sceneId) return;
       const clips = splitClipAt(current.clips, index, sourceTime);
       if (clips === current.clips) return; // too close to an edge - no-op
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "split");
@@ -871,9 +880,11 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       // A recording never deletes down to nothing left (there'd be nothing to fall back on) - a
       // project may, since an empty project is just an empty timeline waiting for media.
       if (!current || (current.clips.length <= 1 && !(sourcePath && isVideoProjectPath(sourcePath)))) return;
+      const removedSceneId = current.clips[index]?.sceneId;
       const clips = deleteClipAtHandler(current.clips, index);
       if (clips === current.clips) return;
-      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+      const scenes = removedSceneId ? (current.scenes ?? []).filter((s) => s.id !== removedSceneId) : current.scenes ?? [];
+      pushCommand(snapshot(current, {}), snapshot(current, { clips, scenes }), "delete");
     },
     [pushCommand, sourcePath]
   );
@@ -921,10 +932,12 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (ids: string[]) => {
       const current = stateRef.current;
       if (!current) return;
+      const removedSceneIds = new Set(current.clips.filter((c) => ids.includes(c.id) && c.sceneId).map((c) => c.sceneId!));
       const clips = deleteClipsHandler(current.clips, ids);
       if (clips === current.clips) return;
+      const scenes = removedSceneIds.size > 0 ? (current.scenes ?? []).filter((s) => !removedSceneIds.has(s.id)) : current.scenes ?? [];
       // pushCommand refuses emptying a recording, same rule as deleteClipAt.
-      pushCommand(snapshot(current, {}), snapshot(current, { clips }), "delete");
+      pushCommand(snapshot(current, {}), snapshot(current, { clips, scenes }), "delete");
     },
     [pushCommand]
   );
@@ -1040,6 +1053,16 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       if (!current) return;
       const target = current.clips.find((c) => c.id === id);
       if (!target) return;
+      if (target.sceneId) {
+        const scene = (current.scenes ?? []).find((s) => s.id === target.sceneId);
+        if (scene) {
+          const newDur = Math.max(0.2, edge === "end" ? time - target.start : target.end - time);
+          const nextScene = setSceneDuration(scene, newDur);
+          const scenes = (current.scenes ?? []).map((s) => (s.id === scene.id ? nextScene : s));
+          pushCommand(snapshot(current, {}), snapshot(current, { scenes }), "edit-scene");
+          return;
+        }
+      }
       const maxEnd = getSourceDuration(target.sourcePath) ?? Number.POSITIVE_INFINITY;
       const clips = resizeClipEdgeHandler(current.clips, id, edge, maxEnd, time);
       pushCommand(snapshot(current, {}), snapshot(current, { clips }), "trim");
@@ -1384,14 +1407,40 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
   // ---- Stage scenes -----------------------------------------------------------------------------
 
   const addScene = useCallback(
-    (startTime: number, frame: { width: number; height: number }): string => {
+    async (startTime: number, frame: { width: number; height: number }): Promise<{ id: string; startTime: number } | null> => {
+      const requestedFor = sourcePathRef.current;
+      const blankPath = await invoke<string>("get_blank_frame_image", {
+        width: Math.max(2, Math.round(frame.width)),
+        height: Math.max(2, Math.round(frame.height)),
+      }).catch(() => null);
+      if (sourcePathRef.current !== requestedFor) return null;
       const current = stateRef.current;
-      if (!current) return "";
+      if (!current) return null;
       const scene = makeStageScene({ startTime, frameWidth: frame.width, frameHeight: frame.height, like: sceneBefore(current.scenes, startTime) });
+      if (blankPath) {
+        registerSourceDuration(blankPath, IMAGE_CLIP_MAX_SECONDS);
+        const dur = Math.max(0.2, sceneDuration(scene));
+        const sceneClip: Clip = {
+          id: crypto.randomUUID(),
+          sourcePath: blankPath,
+          start: 0,
+          end: dur,
+          muted: true,
+          sceneId: scene.id,
+        };
+        const inserted = insertInlineSceneClip(current.clips, startTime, sceneClip, () => crypto.randomUUID());
+        const nextScene = { ...scene, startTime: inserted.startTime };
+        pushCommand(
+          snapshot(current, {}),
+          snapshot(current, { clips: inserted.clips, scenes: [...(current.scenes ?? []), nextScene] }),
+          "add-scene"
+        );
+        return { id: scene.id, startTime: inserted.startTime };
+      }
       pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), scene] }), "add-scene");
-      return scene.id;
+      return { id: scene.id, startTime: scene.startTime };
     },
-    [pushCommand]
+    [pushCommand, registerSourceDuration]
   );
 
   const updateScene = useCallback(
@@ -1415,9 +1464,14 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     (id: string) => {
       const current = stateRef.current;
       if (!current) return;
-      pushCommand(snapshot(current, {}), snapshot(current, { scenes: (current.scenes ?? []).filter((s) => s.id !== id) }), "delete-scene");
+      const nextScenes = (current.scenes ?? []).filter((s) => s.id !== id);
+      const linkedIdx = current.clips.findIndex((c) => c.sceneId === id);
+      const canDropClip =
+        linkedIdx >= 0 && (current.clips.length > 1 || Boolean(sourcePath && isVideoProjectPath(sourcePath)));
+      const nextClips = canDropClip ? deleteClipAtHandler(current.clips, linkedIdx) : current.clips;
+      pushCommand(snapshot(current, {}), snapshot(current, { clips: nextClips, scenes: nextScenes }), "delete-scene");
     },
-    [pushCommand]
+    [pushCommand, sourcePath]
   );
 
   const duplicateScene = useCallback(
@@ -1425,12 +1479,74 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
       const current = stateRef.current;
       const original = current?.scenes?.find((s) => s.id === id);
       if (!current || !original) return "";
-      // Right after the original.
+      const linkedIdx = current.clips.findIndex((c) => c.sceneId === id);
       const copy = duplicateStageScene(original, original.startTime + original.beats.reduce((sum, b) => sum + b.hold, 0));
+      if (linkedIdx >= 0) {
+        const origClip = current.clips[linkedIdx];
+        const copyClip: Clip = {
+          ...origClip,
+          id: crypto.randomUUID(),
+          sceneId: copy.id,
+          transitionIn: undefined,
+          cutSound: undefined,
+        };
+        const nextClips = insertClipHandler(current.clips, linkedIdx + 1, copyClip);
+        pushCommand(
+          snapshot(current, {}),
+          snapshot(current, { clips: nextClips, scenes: [...(current.scenes ?? []), copy] }),
+          "add-scene"
+        );
+        return copy.id;
+      }
       pushCommand(snapshot(current, {}), snapshot(current, { scenes: [...(current.scenes ?? []), copy] }), "add-scene");
       return copy.id;
     },
     [pushCommand]
+  );
+
+  const toggleScenePlacement = useCallback(
+    async (id: string, frame: { width: number; height: number }): Promise<number | null> => {
+      const current = stateRef.current;
+      const scene = current?.scenes?.find((s) => s.id === id);
+      if (!current || !scene) return null;
+      const linkedIdx = current.clips.findIndex((c) => c.sceneId === id);
+      if (linkedIdx >= 0) {
+        // Inline -> Overlay: remove its dedicated clip slot so the scene overlays on top of media.
+        const canDropClip = current.clips.length > 1 || Boolean(sourcePath && isVideoProjectPath(sourcePath));
+        if (!canDropClip) return scene.startTime;
+        const nextClips = deleteClipAtHandler(current.clips, linkedIdx);
+        const remainingTotal = totalOutputDuration(nextClips);
+        const dur = sceneDuration(scene);
+        const clampedStart = remainingTotal > 0 ? Math.max(0, Math.min(scene.startTime, Math.max(0, remainingTotal - dur))) : 0;
+        const nextScenes = (current.scenes ?? []).map((s) => (s.id === id ? { ...s, startTime: clampedStart } : s));
+        pushCommand(snapshot(current, {}), snapshot(current, { clips: nextClips, scenes: nextScenes }), "edit-scene");
+        return clampedStart;
+      }
+      // Overlay -> Inline: allocate a blank-frame slot side-by-side on the main timeline.
+      const requestedFor = sourcePathRef.current;
+      const blankPath = await invoke<string>("get_blank_frame_image", {
+        width: Math.max(2, Math.round(frame.width)),
+        height: Math.max(2, Math.round(frame.height)),
+      }).catch(() => null);
+      if (!blankPath || sourcePathRef.current !== requestedFor) return null;
+      const latest = stateRef.current;
+      const latestScene = latest?.scenes?.find((s) => s.id === id);
+      if (!latest || !latestScene) return null;
+      registerSourceDuration(blankPath, IMAGE_CLIP_MAX_SECONDS);
+      const sceneClip: Clip = {
+        id: crypto.randomUUID(),
+        sourcePath: blankPath,
+        start: 0,
+        end: Math.max(0.2, sceneDuration(latestScene)),
+        muted: true,
+        sceneId: latestScene.id,
+      };
+      const inserted = insertInlineSceneClip(latest.clips, latestScene.startTime, sceneClip, () => crypto.randomUUID());
+      const nextScenes = (latest.scenes ?? []).map((s) => (s.id === id ? { ...s, startTime: inserted.startTime } : s));
+      pushCommand(snapshot(latest, {}), snapshot(latest, { clips: inserted.clips, scenes: nextScenes }), "edit-scene");
+      return inserted.startTime;
+    },
+    [pushCommand, registerSourceDuration, sourcePath]
   );
 
   const addAdjustmentLayer = useCallback(
@@ -2787,6 +2903,7 @@ export default function useVideoEditStore(sourcePath: string | undefined): UseVi
     moveSceneTime,
     deleteScene,
     duplicateScene,
+    toggleScenePlacement,
     addAdjustmentLayer,
     updateAdjustmentLayer,
     resizeAdjustmentLayerTime,

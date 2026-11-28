@@ -61,6 +61,9 @@ interface Props {
   onSeek: (t: number) => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  // True when this scene sits side-by-side on the main video lane; false when overlaid on video.
+  isInline?: boolean;
+  onTogglePlacement?: () => void;
   // What's on the stage now (stage units) - new elements are placed clear of it.
   occupied?: { id?: string; x: number; y: number; width: number; height: number }[];
 }
@@ -175,7 +178,7 @@ const BeatStrip: React.FC<{ scene: StageScene; beat: number; local: number; onPi
   );
 };
 
-const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElementId, onSelectElement, onUpdate, onSeek, onDuplicate, onDelete, occupied = [] }) => {
+const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElementId, onSelectElement, onUpdate, onSeek, onDuplicate, onDelete, isInline, onTogglePlacement, occupied = [] }) => {
   const element = scene.elements.find((e) => e.id === selectedElementId) ?? null;
   const here = element ? elementInBeat(scene, beat, element.id) : null;
   // Typing edits a draft; it lands in the scene when the field is left (or on Enter), so a word
@@ -361,6 +364,24 @@ const StageDockedPanel: React.FC<Props> = ({ scene, beat, playhead, selectedElem
           className="flex-1 min-w-0 bg-transparent rounded-md px-1.5 py-1 -ml-1.5 text-[13px] font-semibold text-white outline-none hover:bg-white/5 focus:bg-black/30 focus:ring-1 focus:ring-teal-400 placeholder:text-white/80 truncate"
         />
         <span className="shrink-0 rounded-full bg-teal-500/15 text-teal-200 px-2 py-0.5 text-[10px] tabular-nums">{duration.toFixed(1)}s</span>
+        {onTogglePlacement && (
+          <button
+            type="button"
+            onClick={onTogglePlacement}
+            title={
+              isInline
+                ? "Playing side-by-side on the main track — click to overlay on top of media instead"
+                : "Overlaying on top of media — click to place side-by-side on the main track"
+            }
+            className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium border transition-colors ${
+              isInline
+                ? "border-teal-400/35 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25"
+                : "border-amber-400/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+            }`}
+          >
+            {isInline ? "Inline" : "Overlay"}
+          </button>
+        )}
         <IconButton title="Duplicate the scene" onClick={onDuplicate}>
           <IoCopyOutline size={13} />
         </IconButton>

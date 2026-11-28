@@ -4557,23 +4557,39 @@ const setScreen = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showFileList]);
 
-  // The "Back to …" button for whatever VideoPlayer is showing - rendered at the left end of its
-  // control bar (fading with it) rather than as a row above the picture.
+  // The icon-only curved back button for whatever VideoPlayer is showing - rendered at the left end
+  // of its control bar (fading with it) rather than as a row above the picture.
   const playerBackButtonClass =
-    "flex items-center gap-1 min-w-0 max-w-full px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs font-medium text-white whitespace-nowrap transition-colors";
-  // Just "Back" - the title says where to (video editor / which folder) on hover. Drops to the
-  // bare chevron once the player is very narrow (VideoPlayer's `player` size container).
-  const playerBackLabelClass = "@max-[520px]/player:hidden";
+    "w-7 h-7 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white/90 hover:text-white transition-colors shrink-0";
+  const curvedBackIcon = (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+    </svg>
+  );
   const playerBackButton =
     videoEditorScreen?.mode === "editing" ? (
-      <button type="button" title="Back to video editor" className={playerBackButtonClass} onClick={() => { setSelectedFile(null); setVideoEditorScreen({ mode: "home" }); }}>
-        <IoChevronBack size={12} className="shrink-0" />
-        <span className={playerBackLabelClass}>Back</span>
+      <button
+        type="button"
+        title="Back to video editor"
+        aria-label="Back to video editor"
+        className={playerBackButtonClass}
+        onClick={() => {
+          setSelectedFile(null);
+          setVideoEditorScreen({ mode: "home" });
+        }}
+      >
+        {curvedBackIcon}
       </button>
     ) : selectedFolder !== null ? (
-      <button type="button" title={`Back to ${folderDisplayName(selectedFolder)}`} className={playerBackButtonClass} onClick={() => setSelectedFile(null)}>
-        <IoChevronBack size={12} className="shrink-0" />
-        <span className={playerBackLabelClass}>Back</span>
+      <button
+        type="button"
+        title={`Back to ${folderDisplayName(selectedFolder)}`}
+        aria-label={`Back to ${folderDisplayName(selectedFolder)}`}
+        className={playerBackButtonClass}
+        onClick={() => setSelectedFile(null)}
+      >
+        {curvedBackIcon}
       </button>
     ) : undefined;
 
@@ -5474,6 +5490,13 @@ const setScreen = () => {
                           onUpdateScene={editStore.updateScene}
                           onDeleteScene={editStore.deleteScene}
                           onDuplicateScene={(id) => selectScene(editStore.duplicateScene(id))}
+                          isSceneInline={(id) => editStore.clips.some((c) => c.sceneId === id)}
+                          onToggleScenePlacement={(id) => {
+                            const frame = { width: Math.max(2, Math.round(frameRect.width || 1920)), height: Math.max(2, Math.round(frameRect.height || 1080)) };
+                            void editStore.toggleScenePlacement(id, frame).then((t) => {
+                              if (t !== null) requestAnimationFrame(() => seekPlaybackTime(t + 0.5));
+                            });
+                          }}
                           onSeek={(t) => {
                             if (videoPlayerRef.current?.getPlaybackState()?.paused === false) videoPlayerRef.current.togglePlay();
                             seekPlaybackTime(t);
